@@ -61,7 +61,9 @@ extern "C" void sms_wiiu_exit(void)
 	WHBLogPrintf("SMS Wii U: exiting");
 	WHBProcShutdown();
 	WHBLogUdpDeinit();
-	std::exit(0);
+	/* _Exit, not std::exit: the game's global destructors run while its other
+	 * threads are still alive, and a relaunch froze right after "exiting". */
+	std::_Exit(0);
 }
 
 extern "C" int sms_wiiu_gfx_is_initialized(void)
