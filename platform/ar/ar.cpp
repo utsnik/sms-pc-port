@@ -4,6 +4,7 @@
 #include "port_os.h"
 #include "port_platform.h"
 #include <dolphin/ar.h>
+#include <dolphin/os/OSCache.h>
 #include <dolphin/arq.h>
 
 // DMA into main memory: cached GX decodes of it are checked again (weak:
@@ -26,6 +27,10 @@ void copy(u32 type, u32 src, u32 dst, u32 len)
 	} else {
 		if (src + len <= kAramSize) {
 			memcpy((void*)(uintptr_t)dst, g_aram + src, len);
+			// The game invalidates the destination after this "DMA"
+			// (JKRAramPiece::doneDMA); on real hardware (Wii U) that drops the
+			// dirty lines this CPU copy left in the cache. Write them back first.
+			DCFlushRange((void*)(uintptr_t)dst, len);
 			if (GXPC_MemoryWritten)
 				GXPC_MemoryWritten((void*)(uintptr_t)dst, len);
 		} else
