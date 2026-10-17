@@ -1,0 +1,19 @@
+Reason: wiiu: pushBreakPoint sends FIFO write pointers that threadFunc treats as its stop message unless >= 0x80000000; on the 32-bit Wii U the draw-sync thread exited and the main thread blocked forever in OSSendMessage after PerformLists.bin (silent freeze, frame ~1260). GX breakpoints are no-ops on TARGET_PC, so skip the send.
+--- a/src/System/DrawSyncManager.cpp
++++ b/src/System/DrawSyncManager.cpp
+@@ -212,6 +212,15 @@
+ 	if (mFlags & 3)
+ 		return;
+ 
++#ifdef TARGET_PC
++	// threadFunc() tells FIFO pointers from its stop message by address:
++	// only values >= 0x80000000 count as pointers. The port's GX has no real
++	// FIFO or breakpoints (GXEnableBreakPt is a no-op), and on a 32-bit host
++	// such as the Wii U (heap 0x1xxxxxxx) any pointer lands in the stop range,
++	// so the thread exited and the next 20 blocking sends hung the caller.
++	GXFlush();
++	return;
++#endif
+ 	GXFlush();
+ 	void* readPtr;
+ 	void* writePtr;
