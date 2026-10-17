@@ -193,9 +193,13 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 	if (!state || !address || length < 0 || offset < 0)
 		return DVD_RESULT_FATAL_ERROR;
 	FstEntry& entry = s_entries[state->entry];
-	if (static_cast<uint32_t>(offset) > entry.size ||
-	    static_cast<uint32_t>(length) > entry.size - static_cast<uint32_t>(offset))
+	/* A GameCube DVD read past the end of a file returns the disc bytes that
+	 * follow, and JKR's decompressor reads fixed 0xFE0 chunks that overrun the
+	 * last one. Read what the file has and zero-fill the rest. */
+	if (static_cast<uint32_t>(offset) > entry.size)
 		return DVD_RESULT_FATAL_ERROR;
+	const uint32_t remaining = entry.size - static_cast<uint32_t>(offset);
+	const size_t want = static_cast<uint32_t>(length) < remaining ? static_cast<size_t>(length) : remaining;
 	char path[kMaxPath + 128];
 	static uint32_t s_failures;
 	if (!files_path(state->entry, path, sizeof(path))) {
@@ -213,10 +217,15 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		std::fclose(file);
 		return DVD_RESULT_FATAL_ERROR;
 	}
-	size_t got = std::fread(address, 1, static_cast<size_t>(length), file);
+	size_t got = std::fread(address, 1, want, file);
 	std::fclose(file);
-	if (got != static_cast<size_t>(length))
+	if (got != want) {
+		if (s_failures++ < 16)
+			port_log("[dvd] short read %s: %u of %u\n", path, static_cast<unsigned>(got), static_cast<unsigned>(want));
 		return DVD_RESULT_FATAL_ERROR;
+	}
+	if (want < static_cast<size_t>(length))
+		std::memset(static_cast<unsigned char*>(address) + want, 0, static_cast<size_t>(length) - want);
 	if (std::strstr(entry.path, "/data/") != nullptr) {
 		std::strncpy(s_last_stage_path, entry.path, sizeof(s_last_stage_path) - 1);
 		s_last_stage_path[sizeof(s_last_stage_path) - 1] = '\0';
