@@ -38,7 +38,13 @@ void wut_OSWakeupThread(WutQueue*) __asm__("OSWakeupThread");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
 BOOL wut_OSDisableInterrupts(void) __asm__("OSDisableInterrupts");
 BOOL wut_OSRestoreInterrupts(BOOL) __asm__("OSRestoreInterrupts");
+uint32_t wut_OSGetSymbolName(uint32_t, char*, uint32_t) __asm__("OSGetSymbolName");
 }
+
+/* GameCube code guards shared state by disabling interrupts, which only
+ * excludes other threads on the same core. Run every game thread on core 1,
+ * beside the main thread, so those single-core rules still hold. */
+const uint8_t kGameThreadAffinityCpu1 = 1u << 1;
 
 const uint32_t kWutThreadBytes = 0x6a0;
 const unsigned kMaxThreads = 64;
@@ -253,11 +259,45 @@ int sms_wiiu_OSCreateThread(OSThread* game, void* (*entry)(void*), void* arg,
 	game->queueJoin.tail = nullptr;
 	if (!wut_OSCreateThread(r->wut, thread_entry, 0,
 	                        reinterpret_cast<char*>(r), stack, stack_size,
-	                        priority, 0)) {
+	                        priority, kGameThreadAffinityCpu1)) {
 		r->active = false;
 		return FALSE;
 	}
 	return TRUE;
+}
+
+/* Diagnostic: each game thread's state and the top of its saved stack, with
+ * symbol names from the loader, so a blocked loader thread names its wait. */
+extern "C" void sms_wiiu_dump_threads(void)
+{
+	for (unsigned i = 0; i < kMaxThreads; ++i) {
+		ThreadRecord& r = s_threads[i];
+		if (!r.active || !r.wut)
+			continue;
+		const uint32_t* ctx = reinterpret_cast<const uint32_t*>(r.wut);
+		uint32_t sp = ctx[0x0C / 4];
+		uint32_t lr = ctx[0x8C / 4];
+		uint32_t pc = ctx[0x98 / 4];
+		char pcs[48] = {}, lrs[48] = {};
+		wut_OSGetSymbolName(pc, pcs, sizeof(pcs));
+		wut_OSGetSymbolName(lr, lrs, sizeof(lrs));
+		port_log("[thr] #%u game=%p state=%u prio=%d pc=%08x %s lr=%08x %s\n", i,
+		         static_cast<void*>(r.game), static_cast<unsigned>(r.game->state),
+		         static_cast<int>(r.priority), pc, pcs, lr, lrs);
+		const uint32_t lo = reinterpret_cast<uint32_t>(r.stack) - r.stack_size;
+		const uint32_t hi = reinterpret_cast<uint32_t>(r.stack);
+		for (int depth = 0; depth < 8 && sp >= lo && sp + 8 <= hi && (sp & 3u) == 0; ++depth) {
+			const uint32_t* frame = reinterpret_cast<const uint32_t*>(sp);
+			uint32_t next = frame[0];
+			if (next <= sp || next > hi)
+				break;
+			uint32_t ret = reinterpret_cast<const uint32_t*>(next)[1];
+			char rs[48] = {};
+			wut_OSGetSymbolName(ret, rs, sizeof(rs));
+			port_log("[thr]   #%u frame %d ret=%08x %s\n", i, depth, ret, rs);
+			sp = next;
+		}
+	}
 }
 
 void sms_wiiu_OSExitThread(OSThread* game)
