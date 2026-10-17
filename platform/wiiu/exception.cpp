@@ -9,6 +9,8 @@
 #include <coreinit/time.h>
 #include <sysapp/launch.h>
 #include <whb/proc.h>
+#include <proc_ui/procui.h>
+#include <cstdlib>
 #include <whb/log.h>
 
 #include <cstdint>
@@ -114,17 +116,24 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_PROGRAM, on_program);
 }
 
-/* Runs on the main thread after a crash: ask for the Menu and pump ProcUI
- * until it says EXITING, then take the normal exit path. */
+/* Runs on the main thread after a crash: ask for the Menu, hand over the
+ * foreground when ProcUI asks, and end the process without running the game's
+ * global destructors (other game threads are still alive). WHBProc/std::exit
+ * were not used here: with them the Menu started (its music played) but the
+ * app never let go of the screen. */
 extern "C" void sms_wiiu_crash_return_to_menu(void)
 {
 	OSSetThreadPriority(OSGetCurrentThread(), 0);
 	WHBLogPrint("[crash] returning to the Wii U Menu");
 	SYSLaunchMenu();
-	while (WHBProcIsRunning())
-		OSSleepTicks(OSMillisecondsToTicks(16));
+	for (;;) {
+		ProcUIStatus status = ProcUIProcessMessages(TRUE);
+		if (status == PROCUI_STATUS_RELEASE_FOREGROUND)
+			ProcUIDrawDoneRelease();
+		else if (status == PROCUI_STATUS_EXITING)
+			break;
+	}
 	WHBLogPrint("[crash] ProcUI exiting");
-	sms_wiiu_exit();
-	for (;;)
-		OSSleepTicks(OSSecondsToTicks(1));
+	ProcUIShutdown();
+	_Exit(0);
 }

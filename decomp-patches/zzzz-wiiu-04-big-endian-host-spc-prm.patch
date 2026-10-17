@@ -1,0 +1,41 @@
+Reason: wiiu: endian-06 (SPC byte-code immediates) and endian-05 (.prm parameter values) byte-reverse under TARGET_PC, which the Wii U also defines; on big-endian Espresso they scrambled script values (TSpcInterp::execcall stored to 0xFFFDFFF8). Little-endian hosts only.
+--- a/include/Strategic/spcinterp.hpp
++++ b/include/Strategic/spcinterp.hpp
+@@ -425,7 +425,7 @@
+ 		f32 result;
+ 		u8* dst = (u8*)&result;
+ 		for (int i = 0; i < sizeof(f32); ++i)
+-#ifdef TARGET_PC
++#if defined(TARGET_PC) && !PORT_HOST_BIG_ENDIAN
+ 			dst[i] = src[sizeof(f32) - 1 - i]; // byte code immediates are big-endian
+ #else
+ 			dst[i] = src[i];
+@@ -439,7 +439,7 @@
+ 		s32 result;
+ 		u8* dst = (u8*)&result;
+ 		for (int i = 0; i < sizeof(s32); ++i)
+-#ifdef TARGET_PC
++#if defined(TARGET_PC) && !PORT_HOST_BIG_ENDIAN
+ 			dst[i] = src[sizeof(s32) - 1 - i]; // byte code immediates are big-endian
+ #else
+ 			dst[i] = src[i];
+@@ -454,7 +454,7 @@
+ 		u32 result;
+ 		u8* dst = (u8*)&result;
+ 		for (int i = 0; i < sizeof(u32); ++i)
+-#ifdef TARGET_PC
++#if defined(TARGET_PC) && !PORT_HOST_BIG_ENDIAN
+ 			dst[i] = src[sizeof(u32) - 1 - i]; // byte code immediates are big-endian
+ #else
+ 			dst[i] = src[i];
+--- a/src/System/ParamInst.cpp
++++ b/src/System/ParamInst.cpp
+@@ -9,7 +9,7 @@
+ 
+ 	stream.read(&discard[8], 4);
+ 	stream.read(&value, sizeof(T));
+-#ifdef TARGET_PC
++#if defined(TARGET_PC) && !PORT_HOST_BIG_ENDIAN
+ 	{
+ 		u8* v = (u8*)&value;
+ 		u32 w = sizeof(T) == 12 ? 4 : sizeof(T);
