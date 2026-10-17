@@ -86,6 +86,7 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/os_thread.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/dvd.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/vi.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/exception.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/pad.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub.cpp
   ${SMS_WIIU_COMMON_SOURCES}

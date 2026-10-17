@@ -17,7 +17,15 @@
 
 namespace {
 
-const char kAppRoot[] = "/fs/vol/external01/wiiu/apps/sms/";
+/* "/fs/vol/external01/..." is the FTP server's view and fails silently in the
+ * app's stdio. Probe the forms that can work and keep the first that opens
+ * sys/fst.bin (wut devoptab first, then cwd-relative for an SD-root cwd). */
+const char* const kAppRootCandidates[] = {
+	"fs:/vol/external01/wiiu/apps/sms/",
+	"wiiu/apps/sms/",
+	"/vol/external01/wiiu/apps/sms/",
+};
+const char* kAppRoot = kAppRootCandidates[0];
 const uint32_t kMem1Reserve = 0x10000u;
 const uint32_t kGameArenaBytes = 96u * 1024u * 1024u;
 const uint32_t kLogBufferBytes = 64u * 1024u;
@@ -44,6 +52,22 @@ uint32_t default_heap_free()
 {
 	MEMHeapHandle heap = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM2);
 	return heap ? MEMGetAllocatableSizeForBlockHeapEx(heap, 0x40) : 0;
+}
+
+void resolve_app_root()
+{
+	for (const char* root : kAppRootCandidates) {
+		char probe[160];
+		std::snprintf(probe, sizeof(probe), "%ssys/fst.bin", root);
+		FILE* file = std::fopen(probe, "rb");
+		WHBLogPrintf("SMS Wii U: app root probe %s -> %s", root, file ? "ok" : "missing");
+		if (file) {
+			std::fclose(file);
+			kAppRoot = root;
+			return;
+		}
+	}
+	WHBLogPrintf("SMS Wii U: no app root holds sys/fst.bin; keeping %s", kAppRoot);
 }
 
 void open_log()
@@ -181,6 +205,7 @@ void sms_wiiu_runtime_init(void)
 	}
 	sms_wiiu_mem2_base = reinterpret_cast<uint8_t*>(arena);
 	sms_wiiu_mem2_size = kGameArenaBytes;
+	resolve_app_root();
 	std::strncpy(s_files_root, kAppRoot, sizeof(s_files_root));
 	std::strncat(s_files_root, "files/", sizeof(s_files_root) -
 	                                      std::strlen(s_files_root) - 1);

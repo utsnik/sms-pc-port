@@ -213,8 +213,12 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		std::strncpy(s_last_stage_path, entry.path, sizeof(s_last_stage_path) - 1);
 		s_last_stage_path[sizeof(s_last_stage_path) - 1] = '\0';
 	}
-	port_log("[dvd] read path=%s entry=%u offset=0x%x bytes=%d state=complete\n",
-	         entry.path, state->entry, offset, length);
+	/* Keep UDP low-rate: the first reads in full, then every 256th. */
+	static uint32_t s_reads;
+	if (s_reads < 64 || (s_reads & 255u) == 0)
+		port_log("[dvd] read #%u path=%s entry=%u offset=0x%x bytes=%d state=complete\n",
+		         s_reads, entry.path, state->entry, offset, length);
+	++s_reads;
 	return length;
 }
 
