@@ -1,0 +1,45 @@
+Reason: port: the pause menu's Shine and blue coin tracker (src/pause_tracker.cpp) at its bottom left; L and R step it through the areas visited; SMS_PAUSE_TRACKER=0 turns it off
+--- a/src/GC2D/PauseMenu2.cpp
++++ b/src/GC2D/PauseMenu2.cpp
+@@ -35,6 +35,7 @@
+ extern JPAEmitterManager* gpEmitterManager4D2;
+ 
+ #ifdef TARGET_PC
++#include "port_pause_tracker.h"
+ #include "port_savestate.h"
+ #include "port_savestate_menu.h"
+ #include <string.h>
+@@ -164,6 +165,12 @@
+ 	}
+ #ifdef TARGET_PC
+ 	PauseStateHintDraw(this, gfx);
++	// the Shine and blue coin tracker at the bottom left (src/pause_tracker.cpp),
++	// out of the way of the save dialog
++	if (port_pause_tracker && mState != MENU_SAVING && mState != MENU_CLOSED) {
++		PauseTrackerDraw(gfx->getViewport(), mMenuPane->getAlpha());
++		gfx->setScissor(gfx->getScissor());
++	}
+ 	// the save state menu fades with the pause menu (it draws last in the frame)
+ 	if (mState == MENU_OPEN)
+ 		SaveStateMenuSetAlpha(mMenuPane->getAlpha());
+@@ -536,6 +543,9 @@
+ 		SaveStateMenuMove(mGamePad);
+ 		return;
+ 	}
++	// L and R step the tracker through the areas (src/pause_tracker.cpp)
++	if (mState == MENU_OPEN && port_pause_tracker)
++		PauseTrackerMove(mGamePad);
+ #endif
+ 	switch (mState) {
+ 	case MENU_APPEARING:
+@@ -785,6 +795,10 @@
+ 	PauseConsole(SMSGetMarDirector())->pauseIn();
+ 	SMSRumbleMgr->startPause();
+ 	gpMSound->pauseOn(true);
++#ifdef TARGET_PC
++	// the tracker opens on the area Mario is in, counted afresh
++	PauseTrackerReset();
++#endif
+ 	// TODO: frame-exact; four stack markers on the TColor assignment temps
+ 	// (0x58/0x50 retail vs 0x60/0x5c) — known-open JUTColor temp stride.
+ 	// Tried (cc50): setWhite()/TColor()/TColor(u32)/set(u32)/(u32) spellings at
