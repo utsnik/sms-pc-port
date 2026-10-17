@@ -89,6 +89,25 @@ include(${CMAKE_BINARY_DIR}/decomp_sources.cmake)
 # source lists.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches.cmake)
 
+# Wii U is a native big-endian target. Keep the source generator and the
+# decomp-patch copy pipeline above, then hand the target a deliberately small
+# platform boundary instead of creating the desktop SDL/OpenGL executable.
+if(SMS_WIIU)
+  set(SMS_COMMON_DEFS GEKKO TARGET_PC TARGET_WIIU __WIIU__ ESPRESSO
+      VERSION_GMSE01 BUILD_VERSION=2 NDEBUG=1)
+  set(SMS_GAME_INCLUDE_DIRS ${SMS_DECOMP_INCLUDE_DIRS})
+  set(SMS_GAME_PCH_DIR ${SMS_DECOMP}/include)
+  set(SMS_GAME_FLAGS
+    -w -fno-strict-aliasing -fwrapv -fno-omit-frame-pointer
+    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector
+    -ffunction-sections -fdata-sections -ffp-contract=off
+    $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics>
+    $<$<COMPILE_LANGUAGE:C>:-std=gnu99 -fcommon>
+    -include ${SMS_PORT_SRC}/port_compat.h)
+  add_subdirectory(platform/wiiu)
+  return()
+endif()
+
 set(SMS_COMMON_DEFS GEKKO TARGET_PC VERSION_GMSE01 BUILD_VERSION=2 NDEBUG=1)
 set(SMS_GAME_FLAGS
   -w -fno-strict-aliasing -fwrapv -fno-omit-frame-pointer
