@@ -158,7 +158,7 @@ const void* port_button_glyph(int) { return nullptr; }
 int port_draw_hd_thp(uint8_t*, uint8_t*, uint8_t*, int16_t, int16_t,
                      int16_t, int16_t, int16_t, int16_t) { return 0; }
 const char* port_hd_cutscene_directory(void) { return nullptr; }
-void __DSP_boot_task(void*) {}
+/* __DSP_boot_task comes from platform/audio/dsp_hle.cpp (DSP HLE). */
 
 const char* sms_wiiu_app_root(void) { return kAppRoot; }
 
