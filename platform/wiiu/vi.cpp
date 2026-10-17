@@ -12,6 +12,9 @@
 extern "C" {
 void sms_wiiu_gfx_frame(void);
 int sms_wiiu_gfx_is_initialized(void);
+/* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
+void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
+void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
 }
 
 namespace {
@@ -28,6 +31,13 @@ VIRetraceCallback s_pre_callback;
 VIRetraceCallback s_post_callback;
 char s_stage_path[512] = "unknown";
 bool s_soak_reported;
+bool s_exit_logged;
+u32 s_offthread_logged;
+/* GX2 and ProcUI belong to the thread that ran port_vi_init (the main thread on
+ * core 1); a frame boundary reached from any other thread must not touch them. */
+void* s_owner_thread;
+/* One 60 Hz frame of the 62.15625 MHz timebase. */
+constexpr int64_t kFrameTicks = 62156250 / 60;
 
 } // namespace
 
@@ -41,6 +51,7 @@ void port_vi_init(void)
 	s_retrace_count = 0;
 	s_frame_count = 0;
 	s_last_heartbeat = 0;
+	s_owner_thread = sms_wiiu_native_current_thread();
 	port_log("[vi] Wii U retrace boundary ready; WHBGfx=%s\n",
 	         sms_wiiu_gfx_is_initialized() ? "ready" : "missing");
 }
@@ -49,9 +60,21 @@ void sms_wiiu_frame_boundary(void)
 {
 	if (!s_initialized)
 		return;
-	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
-	if (!WHBProcIsRunning())
+	if (sms_wiiu_native_current_thread() != s_owner_thread) {
+		if (s_offthread_logged++ < 4)
+			port_log("[vi] frame boundary from a non-main thread; sleeping one frame\n");
+		sms_wiiu_native_sleep_ticks(kFrameTicks);
 		return;
+	}
+	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
+	if (!WHBProcIsRunning()) {
+		/* Stage 2 has no orderly exit path yet (Stage 5). */
+		if (!s_exit_logged) {
+			s_exit_logged = true;
+			port_log("SMS Wii U: ProcUI exit requested; no Stage 2 exit path\n");
+		}
+		return;
+	}
 	port_irq_check();
 	sms_wiiu_input_poll();
 	if (s_pre_callback)
