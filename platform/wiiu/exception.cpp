@@ -7,11 +7,41 @@
 #include <coreinit/exception.h>
 #include <whb/log.h>
 
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 
 namespace {
 
 char s_message[512];
+char s_trace[2048];
+
+/* The faulting PC is often inside a system RPL (outside .text at 0x02000000),
+ * so name every address and walk the stack back to the game's own frames. */
+void append_symbol(const char* tag, uint32_t addr)
+{
+	char name[96];
+	size_t used = std::strlen(s_trace);
+	name[0] = '\0';
+	OSGetSymbolName(addr, name, sizeof(name));
+	if (used < sizeof(s_trace))
+		std::snprintf(s_trace + used, sizeof(s_trace) - used, "%s %08X %s\n", tag, (unsigned)addr, name);
+}
+
+void trace(OSContext* context)
+{
+	uint32_t sp = context->gpr[1];
+	s_trace[0] = '\0';
+	append_symbol("PC", context->srr0);
+	append_symbol("LR", context->lr);
+	for (int i = 0; i < 16; i++) {
+		if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 3u)) break;
+		uint32_t next = *(const uint32_t*)sp;
+		if (next <= sp || next >= 0x50000000u) break;
+		append_symbol("BT", *(const uint32_t*)(next + 4));
+		sp = next;
+	}
+}
 
 BOOL fatal(const char* type, OSContext* context)
 {
@@ -26,6 +56,10 @@ BOOL fatal(const char* type, OSContext* context)
 		              (unsigned)context->gpr[1], (unsigned)context->gpr[3], (unsigned)context->gpr[4]);
 	}
 	WHBLogPrint(s_message);
+	if (context) {
+		trace(context);
+		WHBLogPrint(s_trace);
+	}
 	OSFatal(s_message);
 	return FALSE;
 }
