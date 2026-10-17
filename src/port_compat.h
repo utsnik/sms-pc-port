@@ -253,6 +253,14 @@ static inline u32 port_bswap32(u32 v)
 	return __builtin_bswap32(v);
 #endif
 }
+static inline u64 port_bswap64(u64 v)
+{
+#if PORT_HOST_BIG_ENDIAN
+	return v;
+#else
+	return __builtin_bswap64(v);
+#endif
+}
 static inline u32 port_be32(const void* p)
 {
 	const u8* b = (const u8*)p;
