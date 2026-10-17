@@ -1,0 +1,14 @@
+Reason: SMS_NO_AUDIO (0014) left JAIBasic::loadArcSeqData unguarded; entering a stage (MSMainProc::setMSoundEnterStage) asked for the stage music, getSoundInfoFromID returned NULL from the empty sound table and ->mSwBit was a DSI at DAR=0. Nothing to load without audio.
+--- a/libs/JSystem/src/JAudio/JAInterface/JAIBasic.cpp
++++ b/libs/JSystem/src/JAudio/JAInterface/JAIBasic.cpp
+@@ -1376,6 +1376,10 @@
+ 
+ int JAIBasic::loadArcSeqData(u32 sound_id, bool param_2)
+ {
++#ifdef TARGET_PC
++	if (port_no_audio)
++		return 0; // SMS_NO_AUDIO: no sequence table, nothing to load
++#endif
+ 	u32 uVar1   = sound_id & JAISoundID_IndexMask;
+ 	u32 uVar2   = JASystem::Vload::checkSize(uVar1);
+ 	void* iVar3 = unk0->checkOnMemory(uVar1, nullptr);
