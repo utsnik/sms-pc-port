@@ -12,6 +12,7 @@
 extern "C" {
 void sms_wiiu_gfx_frame(void);
 int sms_wiiu_gfx_is_initialized(void);
+void sms_wiiu_exit(void);
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
 void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
 void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -66,13 +67,15 @@ void sms_wiiu_frame_boundary(void)
 		sms_wiiu_native_sleep_ticks(kFrameTicks);
 		return;
 	}
+	/* After EXITING, WHBProcIsRunning must never be called again (it blocks
+	 * forever) and GX2 must not be touched: shut down and leave. */
+	if (s_exit_logged)
+		return;
 	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
 	if (!WHBProcIsRunning()) {
-		/* Stage 2 has no orderly exit path yet (Stage 5). */
-		if (!s_exit_logged) {
-			s_exit_logged = true;
-			port_log("SMS Wii U: ProcUI exit requested; no Stage 2 exit path\n");
-		}
+		s_exit_logged = true;
+		port_log("SMS Wii U: ProcUI exit requested; shutting down\n");
+		sms_wiiu_exit();
 		return;
 	}
 	port_irq_check();

@@ -6,6 +6,9 @@
 #include <dolphin/gx/GXFrameBuffer.h>
 #include <dolphin/gx/GXManage.h>
 #include <whb/log.h>
+#include <whb/log_udp.h>
+#include <whb/proc.h>
+#include <cstdlib>
 #include <whb/gfx.h>
 
 #include <cstddef>
@@ -43,6 +46,21 @@ extern "C" void sms_wiiu_gfx_init(void)
 	s_gfx_initialized = WHBGfxInit() != FALSE;
 	if (!s_gfx_initialized)
 		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
+}
+
+/* Orderly exit on the main thread after ProcUI reported EXITING: WHBGfx owns
+ * its foreground-release handling; release it, then end the process like a
+ * return from main. */
+extern "C" void sms_wiiu_exit(void)
+{
+	if (s_gfx_initialized) {
+		s_gfx_initialized = false;
+		WHBGfxShutdown();
+	}
+	WHBLogPrintf("SMS Wii U: exiting");
+	WHBProcShutdown();
+	WHBLogUdpDeinit();
+	std::exit(0);
 }
 
 extern "C" int sms_wiiu_gfx_is_initialized(void)
