@@ -7,6 +7,44 @@ set(SMS_WIIU_GAME_INCLUDES
   ${SMS_PATCHED_INCLUDE_DIRS}
   ${SMS_GAME_INCLUDE_DIRS})
 
+# The game and wut both expose symbols named OSCreateThread, OSJoinThread,
+# OSMutex, and OSMessageQueue, but their object layouts and ABIs differ.  The
+# decomp-facing names are redirected to the adapters in platform/wiiu; those
+# adapters call wut through explicit asm-labelled declarations.
+set(SMS_WIIU_OS_ADAPTER_DEFS
+  OSInitThreadQueue=sms_wiiu_OSInitThreadQueue
+  OSGetCurrentThread=sms_wiiu_OSGetCurrentThread
+  OSIsThreadTerminated=sms_wiiu_OSIsThreadTerminated
+  OSDisableScheduler=sms_wiiu_OSDisableScheduler
+  OSEnableScheduler=sms_wiiu_OSEnableScheduler
+  OSYieldThread=sms_wiiu_OSYieldThread
+  OSCreateThread=sms_wiiu_OSCreateThread
+  OSExitThread=sms_wiiu_OSExitThread
+  OSCancelThread=sms_wiiu_OSCancelThread
+  OSJoinThread=sms_wiiu_OSJoinThread
+  OSDetachThread=sms_wiiu_OSDetachThread
+  OSResumeThread=sms_wiiu_OSResumeThread
+  OSSuspendThread=sms_wiiu_OSSuspendThread
+  OSSleepThread=sms_wiiu_OSSleepThread
+  OSWakeupThread=sms_wiiu_OSWakeupThread
+  OSGetThreadPriority=sms_wiiu_OSGetThreadPriority
+  OSDisableInterrupts=sms_wiiu_OSDisableInterrupts
+  OSEnableInterrupts=sms_wiiu_OSEnableInterrupts
+  OSRestoreInterrupts=sms_wiiu_OSRestoreInterrupts
+  OSGetTime=sms_wiiu_OSGetTime
+  OSGetTick=sms_wiiu_OSGetTick
+  OSInitMessageQueue=sms_wiiu_OSInitMessageQueue
+  OSSendMessage=sms_wiiu_OSSendMessage
+  OSJamMessage=sms_wiiu_OSJamMessage
+  OSReceiveMessage=sms_wiiu_OSReceiveMessage
+  OSInitMutex=sms_wiiu_OSInitMutex
+  OSLockMutex=sms_wiiu_OSLockMutex
+  OSUnlockMutex=sms_wiiu_OSUnlockMutex
+  OSTryLockMutex=sms_wiiu_OSTryLockMutex
+  OSInitCond=sms_wiiu_OSInitCond
+  OSWaitCond=sms_wiiu_OSWaitCond
+  OSSignalCond=sms_wiiu_OSSignalCond)
+
 set(SMS_WIIU_COMMON_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
@@ -44,14 +82,25 @@ set_source_files_properties(${SMS_DECOMP_PCH_SOURCES} PROPERTIES
 add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/runtime.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/os_core.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/os_thread.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/dvd.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/vi.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/pad.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub.cpp
   ${SMS_WIIU_COMMON_SOURCES}
   ${SMS_WIIU_PS_SOURCES})
 target_include_directories(sms BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES}
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
-target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} SMS_AUDIO_DSP_HLE=0
-  SMS_WIIU_RUN_GAME=0)
+target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} ${SMS_WIIU_OS_ADAPTER_DEFS}
+  SMS_AUDIO_DSP_HLE=0 SMS_WIIU_RUN_GAME=1)
+target_compile_definitions(sms_game PRIVATE ${SMS_WIIU_OS_ADAPTER_DEFS})
+set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/os_core.cpp
+  PROPERTIES COMPILE_DEFINITIONS DEBUG=1)
+set_source_files_properties(${SMS_DECOMP}/libs/JSystem/src/JKernel/JKRHeap.cpp
+  PROPERTIES COMPILE_DEFINITIONS DEBUG=1
+  COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/debug_os.h")
 target_compile_options(sms PRIVATE
   -mcpu=750 -meabi -mhard-float -fno-strict-aliasing -fwrapv
   -ffunction-sections -fdata-sections -fno-omit-frame-pointer

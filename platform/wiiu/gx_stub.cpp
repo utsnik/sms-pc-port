@@ -1,7 +1,12 @@
 #include "include/dolphin/gx/GXVert.h"
 #include "../gx/include/sms_gx/gx_pc.h"
+#include "runtime.h"
 
+#include <dolphin/gx/GXCpu2Efb.h>
+#include <dolphin/gx/GXFrameBuffer.h>
+#include <dolphin/gx/GXManage.h>
 #include <whb/log.h>
+#include <whb/gfx.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -16,6 +21,10 @@ uint32_t s_frame_count;
 uint32_t s_present_count;
 float s_widescreen = 1.0f;
 bool s_logged;
+bool s_gfx_initialized;
+uint16_t s_draw_sync_token;
+GXDrawSyncCallback s_draw_sync_callback;
+GXDrawDoneCallback s_draw_done_callback;
 
 void log_active_once()
 {
@@ -26,6 +35,37 @@ void log_active_once()
 }
 
 } // namespace
+
+extern "C" void sms_wiiu_gfx_init(void)
+{
+	if (s_gfx_initialized)
+		return;
+	s_gfx_initialized = WHBGfxInit() != FALSE;
+	if (!s_gfx_initialized)
+		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
+}
+
+extern "C" int sms_wiiu_gfx_is_initialized(void)
+{
+	return s_gfx_initialized ? 1 : 0;
+}
+
+extern "C" void sms_wiiu_gfx_frame(void)
+{
+	log_active_once();
+	if (!s_gfx_initialized)
+		return;
+	const bool loaded = std::strcmp(sms_wiiu_stage_path(), "unknown") != 0;
+	const float r = loaded ? 0.02f : 0.0f;
+	const float g = loaded ? 0.18f : 0.02f;
+	const float b = loaded ? 0.03f : 0.16f;
+	WHBGfxBeginRender();
+	WHBGfxClearColor(r, g, b, 1.0f);
+	WHBGfxFinishRender();
+	WHBGfxBeginRenderDRC();
+	WHBGfxClearColor(r, g, b, 1.0f);
+	WHBGfxFinishRenderDRC();
+}
 
 extern "C" {
 
@@ -40,10 +80,10 @@ void GXPC_PrintDisplayInfo(void) {}
 int GXPC_InitAuto(float) { log_active_once(); return 1; }
 int GXPC_IsHeadless(void) { return 1; }
 void GXPC_SetAutoPresent(int) {}
-void GXPC_Present(const void*) { log_active_once(); ++s_present_count; ++s_frame_count; }
+void GXPC_Present(const void*) { log_active_once(); ++s_present_count; sms_wiiu_frame_boundary(); }
 void GXPC_SkipNextPresent(int) {}
 double GXPC_LastPresentSeconds(void) { return 0.0; }
-uint32_t GXPC_FrameCount(void) { return s_frame_count; }
+uint32_t GXPC_FrameCount(void) { return sms_wiiu_frame_count(); }
 void GXPC_SetWindowIcon(const uint8_t*, int, int) {}
 int GXPC_MouseCaptured(void) { return 0; }
 int GXPC_GameInputBlocked(void) { return 0; }
@@ -101,7 +141,7 @@ int GXPC_PresentXFB(const void*, int, int)
 {
 	log_active_once();
 	++s_present_count;
-	++s_frame_count;
+	sms_wiiu_frame_boundary();
 	return 1;
 }
 
@@ -130,6 +170,51 @@ void GXPC_OverlayFrame(void) {}
 int GXPC_OverlayVisible(void) { return 0; }
 void GXPC_CycleSpeed(void) {}
 int GXPC_GetSpeed(void) { return 1; }
+
+void GXSetDrawSync(u16 token)
+{
+	s_draw_sync_token = token;
+	if (s_draw_sync_callback)
+		s_draw_sync_callback(token);
+}
+u16 GXReadDrawSync(void) { return s_draw_sync_token; }
+u16 GXGetDrawSync(void) { return s_draw_sync_token; }
+GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback callback)
+{
+	GXDrawSyncCallback old = s_draw_sync_callback;
+	s_draw_sync_callback = callback;
+	return old;
+}
+GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback callback)
+{
+	GXDrawDoneCallback old = s_draw_done_callback;
+	s_draw_done_callback = callback;
+	return old;
+}
+void GXDrawDone(void)
+{
+	if (s_draw_done_callback)
+		s_draw_done_callback();
+}
+void GXSetDrawDone(void) { GXDrawDone(); }
+void GXWaitDrawDone(void) { GXDrawDone(); }
+void GXPeekZ(u16, u16, u32* z)
+{
+	if (z)
+		*z = 0;
+}
+void GXPeekARGB(u16, u16, u32* color)
+{
+	if (color)
+		*color = 0;
+}
+void GXReadBoundingBox(u16* left, u16* top, u16* right, u16* bottom)
+{
+	if (left) *left = 0;
+	if (top) *top = 0;
+	if (right) *right = 0;
+	if (bottom) *bottom = 0;
+}
 
 /* Ancillary weak interfaces used only when optional host menu sources slip
  * into a source list.  Stage 1 has no screenshots or prompt device. */

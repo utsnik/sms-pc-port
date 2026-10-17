@@ -9,6 +9,7 @@ extern "C" {
 extern u8* port_mem1_base;
 extern u32 port_mem1_size;
 void port_os_init(void);
+void port_os_threads_init(void);
 void port_dvd_init(void);
 void port_vi_init(void);
 void port_noaudio_init(void);
