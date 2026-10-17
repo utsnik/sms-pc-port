@@ -1,37 +1,45 @@
 Reason: endian: convert RARC metadata to host order when a memory archive is opened, and each resource (by magic or file name) when first fetched
 --- a/libs/JSystem/src/JKernel/JKRMemArchive.cpp
 +++ b/libs/JSystem/src/JKernel/JKRMemArchive.cpp
-@@ -138,6 +138,7 @@
+@@ -138,6 +138,9 @@
  	if (!mArcHeader) {
  		mMountMode = UNKNOWN_MOUNT_MODE;
  	} else {
++#if !PORT_HOST_BIG_ENDIAN
 +		port_rarc_to_native(mArcHeader);
++#endif
  		JUT_ASSERT(mArcHeader->signature == 'RARC');
  		mArcInfoBlock
  		    = (SArcDataInfo*)((u8*)mArcHeader + mArcHeader->header_length);
-@@ -159,6 +160,7 @@
+@@ -159,6 +162,9 @@
  bool JKRMemArchive::open(void* buffer, u32 bufferSize, JKRMemBreakFlag flag)
  {
  	mArcHeader = (SArcHeader*)buffer;
++#if !PORT_HOST_BIG_ENDIAN
 +	port_rarc_to_native(mArcHeader);
++#endif
  	JUT_ASSERT(mArcHeader->signature == 'RARC');
  	mArcInfoBlock
  	    = (SArcDataInfo*)((u8*)mArcHeader + mArcHeader->header_length);
-@@ -186,6 +188,8 @@
+@@ -186,6 +190,10 @@
  	JUT_ASSERT(isMounted());
  	if (!fileEntry->mData) {
  		fileEntry->mData = mArchiveData + fileEntry->mDataOffset;
++#if !PORT_HOST_BIG_ENDIAN
 +		port_res_to_native_named(fileEntry->mData, fileEntry->mSize,
 +		                         mStrTable + (fileEntry->mFlagsAndNameOffset & 0xFFFFFF));
++#endif
  	}
  
  	if (resourceSize) {
-@@ -215,6 +219,8 @@
+@@ -215,6 +221,10 @@
  		    bufferSize, compression);
  	}
  
++#if !PORT_HOST_BIG_ENDIAN
 +	port_res_to_native_named(buffer, srcLength,
 +	                         mStrTable + (fileEntry->mFlagsAndNameOffset & 0xFFFFFF));
++#endif
  	if (resourceSize) {
  		*resourceSize = srcLength;
  	}

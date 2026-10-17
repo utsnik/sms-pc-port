@@ -17,8 +17,22 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 
-inline u16 bswap16(u16 v) { return (u16)((v >> 8) | (v << 8)); }
-inline u32 bswap32(u32 v) { return __builtin_bswap32(v); }
+inline u16 bswap16(u16 v)
+{
+#if defined(PORT_HOST_BIG_ENDIAN) && PORT_HOST_BIG_ENDIAN
+	return v;
+#else
+	return (u16)((v >> 8) | (v << 8));
+#endif
+}
+inline u32 bswap32(u32 v)
+{
+#if defined(PORT_HOST_BIG_ENDIAN) && PORT_HOST_BIG_ENDIAN
+	return v;
+#else
+	return __builtin_bswap32(v);
+#endif
+}
 
 inline u16 ld16(const void* p) { u16 v; memcpy(&v, p, 2); return v; }
 inline u32 ld32(const void* p) { u32 v; memcpy(&v, p, 4); return v; }

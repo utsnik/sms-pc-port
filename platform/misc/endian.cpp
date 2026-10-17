@@ -14,15 +14,24 @@ inline void sw16(void* p) { *(u16*)p = port_bswap16(*(u16*)p); }
 // u32 data offset, u32 size, u32 runtime pointer), both relative to the info block.
 extern "C" void port_rarc_header_to_native(void* hdr)
 {
+#if PORT_HOST_BIG_ENDIAN
+	(void)hdr;
+	return;
+#else
 	u8* h = (u8*)hdr;
 	if (memcmp(h, "RARC", 4) != 0)
 		return; // already native (or not a RARC)
 	for (int i = 0; i < 8; i++)
 		sw32(h + i * 4);
+#endif
 }
 
 extern "C" void port_rarc_info_to_native(void* info)
 {
+#if PORT_HOST_BIG_ENDIAN
+	(void)info;
+	return;
+#else
 	u8* in = (u8*)info;
 	// A native info block has a sane node count in host order already; the
 	// big-endian one reads as a huge number for any count < 0x01000000.
@@ -52,15 +61,21 @@ extern "C" void port_rarc_info_to_native(void* info)
 		sw32(f + 12);
 		sw32(f + 16);
 	}
+#endif
 }
 
 extern "C" void port_rarc_to_native(void* arc)
 {
+#if PORT_HOST_BIG_ENDIAN
+	(void)arc;
+	return;
+#else
 	u8* a = (u8*)arc;
 	if (memcmp(a, "RARC", 4) != 0)
 		return;
 	port_rarc_header_to_native(a);
 	port_rarc_info_to_native(a + *(u32*)(a + 8));
+#endif
 }
 
 // --- Resource formats -----------------------------------------------------------
@@ -125,6 +140,12 @@ extern "C" void port_res_to_native(void* data, u32 size) { port_res_to_native_na
 
 extern "C" void port_res_to_native_named(void* data, u32 size, const char* name)
 {
+#if PORT_HOST_BIG_ENDIAN
+	(void)data;
+	(void)size;
+	(void)name;
+	return;
+#else
 	if (GXPC_PrefetchResource)
 		GXPC_PrefetchResource(data, size, name);
 	if (port_endian_resource && port_endian_resource(data, size, name) != 0)
@@ -153,4 +174,5 @@ extern "C" void port_res_to_native_named(void* data, u32 size, const char* name)
 	if (s_nseen < 64)
 		memcpy(s_seen[s_nseen++].magic, m, 9);
 	port_log("[endian] resource format not converted: '%s' (%u bytes%s%s)\n", m, size, name ? ", " : "", name ? name : "");
+#endif
 }

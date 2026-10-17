@@ -9,6 +9,30 @@
 #define TARGET_PC 1
 #endif
 
+/* The Wii U keeps TARGET_PC so the port fixes and source-patch pipeline stay
+ * enabled, but it is a native Espresso big-endian target rather than a host
+ * emulation build. */
+#if defined(TARGET_WIIU) || defined(__WIIU__)
+#ifndef TARGET_WIIU
+#define TARGET_WIIU 1
+#endif
+#ifndef __WIIU__
+#define __WIIU__ 1
+#endif
+#ifndef ESPRESSO
+#define ESPRESSO 1
+#endif
+#endif
+
+#ifndef PORT_HOST_BIG_ENDIAN
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && \
+	__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+#define PORT_HOST_BIG_ENDIAN 1
+#else
+#define PORT_HOST_BIG_ENDIAN 0
+#endif
+#endif
+
 /* Host C library first, before any macro below can disturb it. */
 #include <stddef.h>
 #include <stdint.h>
@@ -203,8 +227,24 @@ using ::sms_msl_expf; using ::sms_msl_powf; using ::sms_msl_fmodf; using ::sms_m
 
 /* Endianness: game data on disc is big-endian. Loaders that the port has
  * patched call these (decomp-patches/). */
-static inline u16 port_bswap16(u16 v) { return (u16)((v >> 8) | (v << 8)); }
-static inline u32 port_bswap32(u32 v) { return __builtin_bswap32(v); }
+/* These helpers convert a value that was loaded from a big-endian byte
+ * stream into host order. A native-BE target therefore leaves it alone. */
+static inline u16 port_bswap16(u16 v)
+{
+#if PORT_HOST_BIG_ENDIAN
+	return v;
+#else
+	return (u16)((v >> 8) | (v << 8));
+#endif
+}
+static inline u32 port_bswap32(u32 v)
+{
+#if PORT_HOST_BIG_ENDIAN
+	return v;
+#else
+	return __builtin_bswap32(v);
+#endif
+}
 static inline u32 port_be32(const void* p)
 {
 	const u8* b = (const u8*)p;
