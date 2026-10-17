@@ -13,6 +13,7 @@ extern "C" {
 void sms_wiiu_gfx_frame(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
+void sms_wiiu_dump_threads(void);
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
 void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
 void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -91,6 +92,10 @@ void sms_wiiu_frame_boundary(void)
 
 	std::strncpy(s_stage_path, port_dvd_stage_path(), sizeof(s_stage_path) - 1);
 	s_stage_path[sizeof(s_stage_path) - 1] = '\0';
+	/* While no stage has loaded, show where every game thread is waiting. */
+	if (s_frame_count % 300 == 0 && s_frame_count <= 1800 &&
+	    std::strcmp(s_stage_path, "unknown") == 0)
+		sms_wiiu_dump_threads();
 	if (s_frame_count - s_last_heartbeat >= 60) {
 		s_last_heartbeat = s_frame_count;
 		port_log("SMS Wii U: frame=%u stage=%s heap_free=%u dvd=%s\n",
