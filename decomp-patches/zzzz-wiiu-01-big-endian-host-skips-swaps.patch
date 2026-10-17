@@ -1,0 +1,44 @@
+Reason: wiiu: 0013/endian-18's typed stream reads and endian-11's card-save conversion byte-swap whenever TARGET_PC is defined, which the Wii U build also defines; on the big-endian Espresso that turned every stream u16/u32 into its reverse (stageArc.bin's root size 0x3008 read as 0x08300000, a NULL node type, strcmp DSI in TMarNameRefGen::getNameRef). Skip the swaps on a big-endian host.
+
+--- a/libs/JSystem/include/JSystem/JSupport/JSUInputStream.hpp
++++ b/libs/JSystem/include/JSystem/JSupport/JSUInputStream.hpp
+@@ -19,6 +19,12 @@
+ 	// replaces its leading bytes, as on the console.
+ 	static void swapBE(void* buf, s32 size)
+ 	{
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++		// A big-endian host (Wii U) already reads the stream in host order.
++		(void)buf;
++		(void)size;
++		return;
++#endif
+ 		u8* b = (u8*)buf;
+ 		for (s32 i = 0; i < size / 2; i++) {
+ 			u8 t = b[i];
+
+--- a/src/System/FlagManager.cpp
++++ b/src/System/FlagManager.cpp
+@@ -14,12 +14,23 @@
+ 	for (int o = 0; o < size; o += width) {
+ 		u8 tmp[8];
+ 		for (int i = 0; i < width; i++)
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++			tmp[i] = ((const u8*)p)[o + i]; // big-endian host: already card order
++#else
+ 			tmp[i] = ((const u8*)p)[o + width - 1 - i];
++#endif
+ 		out.write(tmp, width);
+ 	}
+ }
+ static void port_swap_in_place(void* p, int size, int width)
+ {
++#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
++	// A big-endian host (Wii U) already holds the save in card order.
++	(void)p;
++	(void)size;
++	(void)width;
++	return;
++#endif
+ 	u8* b = (u8*)p;
+ 	for (int o = 0; o < size; o += width)
+ 		for (int i = 0; i < width / 2; i++) {
