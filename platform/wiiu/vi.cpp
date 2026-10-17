@@ -15,6 +15,8 @@ int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
 void sms_wiiu_dump_threads(void);
 void sms_wiiu_dvd_pump(void);
+void sms_wiiu_crash_return_to_menu(void);
+extern volatile int sms_wiiu_crash_pending;
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
 void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
 void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -46,6 +48,8 @@ constexpr int64_t kFrameTicks = 62156250 / 60;
 
 extern "C" {
 
+void* sms_wiiu_vi_owner_thread(void) { return s_owner_thread; }
+
 void port_vi_init(void)
 {
 	if (s_initialized)
@@ -73,6 +77,13 @@ void sms_wiiu_frame_boundary(void)
 	 * forever) and GX2 must not be touched: shut down and leave. */
 	if (s_exit_logged)
 		return;
+	/* A game thread crashed (exception.cpp parked it): leave for the Menu
+	 * from here, the only thread allowed to pump ProcUI. */
+	if (sms_wiiu_crash_pending) {
+		s_exit_logged = true;
+		sms_wiiu_crash_return_to_menu();
+		return;
+	}
 	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
 	if (!WHBProcIsRunning()) {
 		s_exit_logged = true;
