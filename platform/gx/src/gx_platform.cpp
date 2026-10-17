@@ -701,7 +701,13 @@ int GXPC_MouseCaptured(void) {
     return 0;
 #endif
 }
-int GXPC_GameInputBlocked(void) { return menuVisible(); }
+int GXPC_GameInputBlocked(void) {
+#ifdef SMS_GX_HAVE_SDL2
+    return menuVisible();
+#else
+    return 0;
+#endif
+}
 int GXPC_IsHeadless(void) { return s_mode != MODE_WINDOW; }
 uint32_t GXPC_FrameCount(void) { return s_frame; }
 

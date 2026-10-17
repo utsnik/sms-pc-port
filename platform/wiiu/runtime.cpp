@@ -1,8 +1,12 @@
 #include "runtime.h"
 
 #include "port_stub.h"
+#include "port_os.h"
 
-#include <coreinit/time.h>
+#include <coreinit/memory.h>
+#include <coreinit/memblockheap.h>
+#include <coreinit/memdefaultheap.h>
+#include <coreinit/memheap.h>
 #include <whb/log.h>
 #include <whb/proc.h>
 
@@ -13,55 +17,86 @@
 
 namespace {
 
-constexpr uint32_t kArenaBytes = 20u * 1024u * 1024u;
-constexpr uint32_t kLowPoolBytes = 2u * 1024u * 1024u;
-alignas(64) uint8_t s_arena[kArenaBytes];
-uint32_t s_low_used;
+const char kAppRoot[] = "/fs/vol/external01/wiiu/apps/sms/";
+const uint32_t kMem1Reserve = 0x10000u;
+const uint32_t kGameArenaBytes = 96u * 1024u * 1024u;
+const uint32_t kLogBufferBytes = 64u * 1024u;
+
+alignas(64) unsigned char s_log_buffer[kLogBufferBytes];
+FILE* s_log;
+char s_files_root[128];
 bool s_initialized;
+bool s_heap_ready;
 port_stub_rec* s_stub_list;
 unsigned s_stub_distinct;
+
+bool pointer_above_32(const void* ptr)
+{
+#if UINTPTR_MAX > 0xffffffffu
+	return reinterpret_cast<uintptr_t>(ptr) > 0xffffffffu;
+#else
+	(void)ptr;
+	return false;
+#endif
+}
+
+uint32_t default_heap_free()
+{
+	MEMHeapHandle heap = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM2);
+	return heap ? MEMGetAllocatableSizeForBlockHeapEx(heap, 0x40) : 0;
+}
+
+void open_log()
+{
+	char path[160];
+	std::snprintf(path, sizeof(path), "%sstage2.log", kAppRoot);
+	s_log = std::fopen(path, "wb");
+	if (s_log) {
+		/* Wii U stdio is allowed here, but the buffer must be real storage. */
+		std::setvbuf(s_log, reinterpret_cast<char*>(s_log_buffer), _IOFBF,
+		             sizeof(s_log_buffer));
+	}
+}
 
 } // namespace
 
 extern "C" {
 
-uint8_t* port_mem1_base = s_arena;
-uint32_t port_mem1_size = kArenaBytes - kLowPoolBytes;
+u8* port_mem1_base;
+u32 port_mem1_size;
+u8* sms_wiiu_mem2_base;
+u32 sms_wiiu_mem2_size;
 
-const char* port_disc_root = nullptr;
-int port_disc_explicit = 0;
+const char* port_disc_root;
+int port_disc_explicit;
 int port_skip_movies = 1;
-int port_heat_haze = 0;
-int port_pause_tracker = 0;
+int port_heat_haze;
+int port_pause_tracker;
 float port_widescreen = 1.0f;
 int port_frame_rate = 30;
 int port_active_frame_rate = 30;
-int port_high_fps_active = 0;
-int port_cheat_god_mode = 0;
+int port_high_fps_active;
+int port_cheat_god_mode;
 int port_cheat_movement_speed = 1;
 int port_cheat_jump_height = 1;
-int port_cheat_infinite_lives = 0;
-int port_cheat_infinite_fludd = 0;
+int port_cheat_infinite_lives;
+int port_cheat_infinite_fludd;
 int port_cheat_coin_multiplier = 1;
-int port_free_camera = 0;
+int port_free_camera;
 float port_camera_speed_x = 1.0f;
 float port_camera_speed_y = 1.0f;
 float port_rumble_boost = 1.0f;
 int port_language_index(void) { return 0; }
 unsigned char lbl_80004600[4] = {};
-int (*port_warp_scenario_name_id)(int, int) = nullptr;
+int (*port_warp_scenario_name_id)(int, int);
 
-/* TARGET_PC keeps the mod-hook call sites in the generated game sources. No
- * mod registry is part of the link-only Stage 1 boundary. */
 unsigned int sms_mod_generation = 1;
 uintptr_t sms_mod_gpr[32] = {};
 void* sms_mod_target(unsigned int) { return nullptr; }
 int sms_mod_word(unsigned int, unsigned int*) { return 0; }
 void sms_mod_bind_data(unsigned int, void*, int) {}
 int sms_mod_active(void) { return 0; }
-
 void sms_mod_start(void) {}
-
 void port_cheat_unused(void) {}
 
 void port_savestate_hotkey(int) {}
@@ -94,56 +129,116 @@ const void* port_button_glyph(int) { return nullptr; }
 int port_draw_hd_thp(uint8_t*, uint8_t*, uint8_t*, int16_t, int16_t,
                      int16_t, int16_t, int16_t, int16_t) { return 0; }
 const char* port_hd_cutscene_directory(void) { return nullptr; }
-int32_t port_vi_frame_wait(int32_t due, uint16_t frames) { return due + frames; }
-
 void __DSP_boot_task(void*) {}
+
+const char* sms_wiiu_app_root(void) { return kAppRoot; }
+
+uint32_t sms_wiiu_heap_free(void) { return default_heap_free(); }
 
 void port_log(const char* fmt, ...)
 {
-	char line[768];
+	char line[1024];
 	va_list ap;
 	va_start(ap, fmt);
 	std::vsnprintf(line, sizeof(line), fmt, ap);
 	va_end(ap);
 	line[sizeof(line) - 1] = '\0';
 	WHBLogPrintf("%s", line);
+	if (s_log) {
+		std::fwrite(line, 1, std::strlen(line), s_log);
+		std::fflush(s_log);
+	}
 }
 
 void sms_wiiu_runtime_init(void)
 {
 	if (s_initialized)
 		return;
+
+	uint32_t mem1_address = 0;
+	uint32_t mem1_bytes = 0;
+	if (OSGetMemBound(OS_MEM1, &mem1_address, &mem1_bytes) != 0 ||
+	    mem1_bytes <= kMem1Reserve) {
+		WHBLogPrintf("SMS Wii U: OSGetMemBound(MEM1) failed");
+		WHBProcStopRunning();
+		return;
+	}
+	port_mem1_base = reinterpret_cast<uint8_t*>(
+	    static_cast<uintptr_t>(mem1_address + kMem1Reserve));
+	port_mem1_size = mem1_bytes - kMem1Reserve;
+
+	uint32_t before = default_heap_free();
+	void* arena = MEMAllocFromDefaultHeapEx(kGameArenaBytes, 0x40);
+	if (!arena) {
+		WHBLogPrintf("SMS Wii U: MEM2 game arena allocation failed (%u bytes)",
+		             kGameArenaBytes);
+		WHBProcStopRunning();
+		return;
+	}
+	if (pointer_above_32(arena)) {
+		port_ptr32_trap(arena);
+		return;
+	}
+	sms_wiiu_mem2_base = reinterpret_cast<uint8_t*>(arena);
+	sms_wiiu_mem2_size = kGameArenaBytes;
+	std::strncpy(s_files_root, kAppRoot, sizeof(s_files_root));
+	std::strncat(s_files_root, "files/", sizeof(s_files_root) -
+	                                      std::strlen(s_files_root) - 1);
+	port_disc_root = s_files_root;
+	port_disc_explicit = 1;
+	open_log();
 	s_initialized = true;
-	std::memset(s_arena, 0, sizeof(s_arena));
-	port_log("SMS Wii U: runtime stub arena=%u bytes\n", port_mem1_size);
+	port_log("SMS Wii U: runtime start\n");
+	port_log("SMS Wii U: MEM1 usable=%p size=%u (reserved=%u)\n",
+	         port_mem1_base, port_mem1_size, kMem1Reserve);
+	port_log("SMS Wii U: MEM2 game arena=%p size=%u default_free_before=%u "
+	         "default_free_after=%u\n",
+	         sms_wiiu_mem2_base, sms_wiiu_mem2_size, before,
+	         default_heap_free());
+	port_log("SMS Wii U: app root=%s data root=%s\n", kAppRoot,
+	         s_files_root);
 }
 
 void port_init(int, char**)
 {
+	if (s_initialized && s_heap_ready)
+		return;
 	sms_wiiu_runtime_init();
-	port_log("SMS Wii U: Stage 1 runtime initialized\n");
+	if (!s_initialized)
+		return;
+	port_os_init();
+	port_os_threads_init();
+	s_heap_ready = true;
+	port_dvd_init();
+	port_noaudio_init();
+	sms_wiiu_gfx_init();
+	port_vi_init();
+	port_pad_init();
+	port_log("SMS Wii U: target OS, threads, FST/DV, silent audio, VI, "
+	         "and input initialized\n");
+	port_stub_report();
 }
 
 void* port_low_alloc(unsigned long size)
 {
-	const uint32_t aligned = (static_cast<uint32_t>(size) + 63u) & ~63u;
-	if (size > kLowPoolBytes || aligned > kLowPoolBytes - s_low_used)
+	if (!size || size > sms_wiiu_mem2_size)
 		return nullptr;
-	uint8_t* result = s_arena + port_mem1_size + s_low_used;
-	s_low_used += aligned;
+	void* result = MEMAllocFromDefaultHeapEx(static_cast<uint32_t>(size), 64);
+	if (!result || pointer_above_32(result)) {
+		port_ptr32_trap(result);
+		return nullptr;
+	}
 	return result;
 }
 
 int64_t port_time_ticks(void)
 {
-	return static_cast<int64_t>(OSGetTime());
+	return static_cast<int64_t>(sms_wiiu_OSGetTime());
 }
 
-void* port_dvd_read_file(const char*, size_t* size)
+void* port_dvd_read_file(const char* path, size_t* size)
 {
-	if (size)
-		*size = 0;
-	return nullptr;
+	return sms_wiiu_dvd_read_file(path, size);
 }
 
 void port_stub_hit(port_stub_rec* rec)
@@ -154,13 +249,15 @@ void port_stub_hit(port_stub_rec* rec)
 		rec->next = s_stub_list;
 		s_stub_list = rec;
 		++s_stub_distinct;
-		port_log("[stub] %s (first call; %u distinct stubs hit)\n", rec->name, s_stub_distinct);
+		port_log("[stub] %s (first call; %u distinct stubs hit)\n", rec->name,
+		         s_stub_distinct);
 	}
 }
 
 void port_stub_report(void)
 {
-	port_log("[stub] summary: %u distinct SDK stubs were called\n", s_stub_distinct);
+	port_log("[stub] summary: %u distinct SDK stubs were called\n",
+	         s_stub_distinct);
 }
 
 void port_ptr32_trap(const void* ptr)
@@ -168,39 +265,6 @@ void port_ptr32_trap(const void* ptr)
 	port_log("[port] PTR32 address does not fit: %p\n", ptr);
 	WHBProcStopRunning();
 }
-
-/* These weak Stage 1 hooks cover common-source references without competing
- * with a later native implementation selected by the target source list. */
-__attribute__((weak)) void port_os_init(void) {}
-__attribute__((weak)) void port_os_threads_init(void) {}
-__attribute__((weak)) void port_dvd_init(void) {}
-__attribute__((weak)) void port_vi_init(void) {}
-__attribute__((weak)) void port_noaudio_init(void) {}
-__attribute__((weak)) uint8_t* port_noaudio_init_data(void) { return nullptr; }
-__attribute__((weak)) void port_window_icon_init(void) {}
-__attribute__((weak)) void port_irq_check(void) {}
-__attribute__((weak)) void port_irq_kick(void) {}
-__attribute__((weak)) void port_irq_add_source(void (*)(void)) {}
-__attribute__((weak)) void port_os_run_lower(double) {}
-__attribute__((weak)) double port_idle_seconds(void) { return 0.0; }
-__attribute__((weak)) int port_vi_idle_advance(void) { return 0; }
-__attribute__((weak)) int port_vi_deterministic(void) { return 0; }
-__attribute__((weak)) int64_t port_vi_virtual_ticks(void) { return port_time_ticks(); }
-__attribute__((weak)) void port_audio_on_retrace(void) {}
-__attribute__((weak)) void port_pad_autopress_field(uint32_t) {}
-__attribute__((weak)) int port_camera_take_mouse(float* dx, float* dy)
-{
-	if (dx)
-		*dx = 0.0f;
-	if (dy)
-		*dy = 0.0f;
-	return 0;
-}
-__attribute__((weak)) int port_dvd_busy(void) { return 0; }
-__attribute__((weak)) int port_dvd_override(const char*, const void*, uint32_t) { return 0; }
-__attribute__((weak)) const char* port_card_dir(void) { return nullptr; }
-__attribute__((weak)) int port_setenv(const char*, const char*, int) { return -1; }
-__attribute__((weak)) int port_mkdir(const char*, int) { return -1; }
 
 } // extern "C"
 

@@ -340,6 +340,9 @@ file(GLOB_RECURSE SMS_PLATFORM_SOURCES CONFIGURE_DEPENDS
 # platform/gx/CMakeLists.txt defining a library target `sms_gx`, it is linked
 # in and its strong GX* definitions replace the weak stubs.
 list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/gx/")
+# Wii U owns a separate target and requires WUT headers; keep those adapters
+# out of the desktop platform glob when the host build is configured.
+list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/wiiu/")
 # platform/mods/eclipse is built by cmake/eclipse.cmake, and only with SMS_ECLIPSE.
 list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/platform/mods/eclipse/")
 list(FILTER SMS_PLATFORM_SOURCES EXCLUDE REGEX "/tests/")
