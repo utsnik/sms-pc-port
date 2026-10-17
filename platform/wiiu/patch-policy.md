@@ -41,9 +41,13 @@ existing resource policy.
 The direct-bswap audit is intentionally narrow and repeatable:
 
 ```sh
-rg -n "__builtin_bswap" decomp-patches platform
+rg -n "__builtin_bswap(16|32|64)" decomp-patches platform \
+  -g '!platform/wiiu/patch-policy.md'
 ```
 
-At Stage 1 the remaining direct uses are the card-fixup patch text and the
-little-endian resource helper implementation; all runtime converter paths are
-behind `PORT_HOST_BIG_ENDIAN` or use `port_bswap16`/`port_bswap32`.
+Stage 1 result: 2 textual matches, with 0 unguarded runtime conversions. The
+remaining matches are `platform/endian/endian_util.h:33` (the little-endian
+`#else` of `PORT_HOST_BIG_ENDIAN`) and the card-fixup generator literal in
+`platform/mods/eclipse/fixup_sources.py:397`; the latter is emitted only for
+the host-side card-image patch. The resource converter uses
+`port_bswap16`/`port_bswap32`/`port_bswap64`, all identity helpers on native BE.

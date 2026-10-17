@@ -83,12 +83,12 @@ extern "C" void port_rarc_to_native(void* arc)
 namespace {
 
 // BFN font: "FONTbfn1", u32 file size, u32 block count, 16 bytes padding, then
-// blocks (u32 magic, u32 size, ...): INF1, WID1 (u8 pairs), GLY1 (texture), MAP1
+	// blocks (u32 magic, u32 size, ...): INF1, WID1 (u8 pairs), GLY1 (texture), MAP1
 // (u16 table).
 void bfn_to_native(u8* f)
 {
 	u64 m = *(u64*)f;
-	*(u64*)f = __builtin_bswap64(m);
+	*(u64*)f = port_bswap64(m);
 	sw32(f + 8);
 	sw32(f + 12);
 	u32 nblocks = *(u32*)(f + 12);
