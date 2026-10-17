@@ -1,0 +1,26 @@
+# Thin CMake/Ninja wrapper for the link-only Wii U Stage 1 target. All
+# generated state, objects, ELF and map stay below the external build cache.
+
+BUILD ?= /mnt/buildcache/wiiu-build/sms
+CMAKE_BUILD ?= $(BUILD)/cmake
+TOOLCHAIN ?= /opt/devkitpro/cmake/WiiU.cmake
+NINJA ?= ninja
+CMAKE ?= cmake
+
+.PHONY: all configure build clean
+
+all: build
+
+configure:
+	mkdir -p $(BUILD) $(CMAKE_BUILD)
+	$(CMAKE) -S . -B $(CMAKE_BUILD) -G Ninja \
+		-DCMAKE_TOOLCHAIN_FILE=$(TOOLCHAIN) \
+		-DSMS_WIIU=ON \
+		-DSMS_WIIU_BUILD_DIR=$(BUILD) \
+		-DCMAKE_BUILD_TYPE=Release
+
+build: configure
+	$(CMAKE) --build $(CMAKE_BUILD) --parallel 4
+
+clean:
+	rm -rf $(CMAKE_BUILD) $(BUILD)/sms.elf $(BUILD)/sms.map $(BUILD)/sms.rpx
