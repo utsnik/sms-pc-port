@@ -8,6 +8,7 @@
 #include <whb/log.h>
 #include <whb/log_udp.h>
 #include <whb/proc.h>
+#include <proc_ui/procui.h>
 #include <cstdlib>
 #include <whb/gfx.h>
 
@@ -71,7 +72,9 @@ extern "C" int sms_wiiu_gfx_is_initialized(void)
 extern "C" void sms_wiiu_gfx_frame(void)
 {
 	log_active_once();
-	if (!s_gfx_initialized)
+	/* After RELEASE_FOREGROUND, WHBProcIsRunning still returns true while the app
+	 * runs in the background; any GX2 call then freezes the console (DKR). */
+	if (!s_gfx_initialized || !ProcUIInForeground())
 		return;
 	const bool loaded = std::strcmp(sms_wiiu_stage_path(), "unknown") != 0;
 	const float r = loaded ? 0.02f : 0.0f;
