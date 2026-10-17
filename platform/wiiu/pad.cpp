@@ -27,6 +27,10 @@ s8 stick_value(float value)
 	return static_cast<s8>(value * 100.0f);
 }
 
+#ifndef SMS_WIIU_AUTOPRESS
+#define SMS_WIIU_AUTOPRESS 1
+#endif
+
 u16 map_vpad_buttons(uint32_t buttons)
 {
 	u16 result = 0;
@@ -204,6 +208,25 @@ void sms_wiiu_input_poll(void)
 			}
 		}
 	}
+#if SMS_WIIU_AUTOPRESS
+	/* Unattended test runs: press START+A on port 0 for 6 frames at a few
+	 * points after boot, so the title screen moves on to a stage with nobody
+	 * at the console. Build with -DSMS_WIIU_AUTOPRESS=0 for a release. */
+	{
+		static uint32_t s_poll_count;
+		static const uint32_t kPressAt[] = { 1200, 1500, 1800, 2400, 3000 };
+		uint32_t n = ++s_poll_count;
+		for (uint32_t at : kPressAt) {
+			if (n >= at && n < at + 6) {
+				if (s_status[0].err != PAD_ERR_NONE)
+					std::memset(&s_status[0], 0, sizeof(PADStatus));
+				s_status[0].button |= PAD_BUTTON_START | PAD_BUTTON_A;
+				if (n == at)
+					port_log("[pad] autopress START+A at poll %u\n", (unsigned)n);
+			}
+		}
+	}
+#endif
 	for (unsigned chan = 0; chan < PAD_MAX_CONTROLLERS; ++chan) {
 		if (s_status[chan].err == PAD_ERR_NONE)
 			connected |= 1u << chan;
