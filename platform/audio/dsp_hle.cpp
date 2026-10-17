@@ -20,6 +20,7 @@
 #include "dsp_mixer.h"
 
 #include <deque>
+#include <new>
 #include <string>
 #include <vector>
 
@@ -45,7 +46,23 @@ struct Hle {
 	u16 master;
 	u64 subframesRendered;
 	bool traced;
-} g;
+};
+
+#ifdef TARGET_WIIU
+/* No global constructor: the deque allocates, and code that runs before main()
+ * is where a Wii U boot dies silently. Build the state on first use. */
+Hle& hle_state()
+{
+	alignas(Hle) static unsigned char storage[sizeof(Hle)];
+	static Hle* state;
+	if (!state)
+		state = new (storage) Hle();
+	return *state;
+}
+#define g (hle_state())
+#else
+Hle g;
+#endif
 
 const uint8_t* aram_lookup(uint32_t a) { return port_aram_ptr(a); }
 
