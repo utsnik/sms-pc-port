@@ -1,0 +1,68 @@
+Reason: SMS_NO_AUDIO: MSRandPlay random-play SE operations are no-ops (stage setup crashed in createRandPlayVec on a list link with a NULL object); probes log the list state to find whether the list is corrupt (remove the probes once explained).
+--- a/src/MSound/MSoundSE.cpp
++++ b/src/MSound/MSoundSE.cpp
+@@ -1,4 +1,5 @@
+ #include <MSound/MSoundSE.hpp>
++extern "C" void port_log(const char* fmt, ...);
+ #include <MSound/MSound.hpp>
+ #include <MSound/MSHandle.hpp>
+ #include <MSound/MSRandVol.hpp>
+@@ -90,10 +91,19 @@
+ {
+ 	MSRandPlay* p = new MSRandPlay(sound_id, wait_min, wait_max, curve_slope, plus_slope);
+ 	smList.append(&p->mLink);
++#ifdef TARGET_PC
++	if (smList.getNumLinks() <= 2 || p == nullptr)
++		port_log("[probe] MSRandPlay::construct id=%x p=%p link.obj=%p count=%u\n", (unsigned)sound_id, p,
++		         p ? p->mLink.getObjectPtr() : nullptr, (unsigned)smList.getNumLinks());
++#endif
+ }
+ 
+ int MSRandPlay::registerTrans(u32 sound_id, const Vec* trans)
+ {
++#ifdef TARGET_PC
++	if (port_no_audio)
++		return -1; // SMS_NO_AUDIO (zzzz-wiiu-03)
++#endif
+ 	for (JSUListIterator<MSRandPlay> it = smList.getFirst();
+ 	     it != smList.getEnd(); ++it) {
+ 		if (sound_id == it.getObject()->mSoundID) {
+@@ -110,8 +120,27 @@
+ 	return mRandPlayVecNum++;
+ }
+ 
++#ifdef TARGET_PC
++static void port_randplay_probe(const char* where, u32 sound_id)
++{
++	static int s_logged;
++	if (s_logged >= 6)
++		return;
++	s_logged++;
++	JSUPtrLink* first = MSRandPlay::smList.getFirstLink();
++	port_log("[probe] MSRandPlay %s id=%x list=%p count=%u first=%p obj=%p next=%p\n", where,
++	         (unsigned)sound_id, &MSRandPlay::smList, (unsigned)MSRandPlay::smList.getNumLinks(),
++	         first, first ? first->getObjectPtr() : nullptr, first ? first->getNext() : nullptr);
++}
++#endif
++
+ void MSRandPlay::createRandPlayVec(u32 sound_id, u16 max_vecs)
+ {
++#ifdef TARGET_PC
++	port_randplay_probe("createRandPlayVec", sound_id);
++	if (port_no_audio)
++		return; // SMS_NO_AUDIO: random-play SEs never sound (zzzz-wiiu-03)
++#endif
+ 	JSUListIterator<MSRandPlay> it;
+ 	for (it = MSRandPlay::smList.getFirst(); it != MSRandPlay::smList.getEnd();
+ 	     ++it) {
+@@ -131,6 +160,10 @@
+ 
+ void MSRandPlay::startSeRandPlay(u32 sound_id, u32 vec_idx)
+ {
++#ifdef TARGET_PC
++	if (port_no_audio)
++		return; // SMS_NO_AUDIO (zzzz-wiiu-03)
++#endif
+ 	JSUListIterator<MSRandPlay> it;
+ 	for (it = MSRandPlay::smList.getFirst(); it != MSRandPlay::smList.getEnd();
+ 	     ++it) {
