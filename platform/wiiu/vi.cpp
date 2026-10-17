@@ -14,6 +14,7 @@ void sms_wiiu_gfx_frame(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
 void sms_wiiu_dump_threads(void);
+void sms_wiiu_dvd_pump(void);
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
 void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
 void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -80,6 +81,9 @@ void sms_wiiu_frame_boundary(void)
 		return;
 	}
 	port_irq_check();
+	/* Deliver queued DVD async-read callbacks (GameCube ran them from the DVD
+	 * interrupt); nothing else calls the pump. */
+	sms_wiiu_dvd_pump();
 	sms_wiiu_input_poll();
 	if (s_pre_callback)
 		s_pre_callback(s_retrace_count + 1);

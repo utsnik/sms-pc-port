@@ -177,8 +177,9 @@ bool files_path(u32 entry, char* out, uint32_t cap)
 {
 	if (entry >= s_entry_count || s_entries[entry].directory)
 		return false;
-	int n = std::snprintf(out, cap, "%s%s", sms_wiiu_app_root(),
-	                      s_entries[entry].path + 1);
+	/* FST paths are "/data/x.szs"; the extracted tree keeps them under files/. */
+	int n = std::snprintf(out, cap, "%sfiles%s", sms_wiiu_app_root(),
+	                      s_entries[entry].path);
 	if (n < 0 || static_cast<uint32_t>(n) >= cap)
 		return false;
 	const char* root = sms_wiiu_app_root();
@@ -196,11 +197,18 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 	    static_cast<uint32_t>(length) > entry.size - static_cast<uint32_t>(offset))
 		return DVD_RESULT_FATAL_ERROR;
 	char path[kMaxPath + 128];
-	if (!files_path(state->entry, path, sizeof(path)))
+	static uint32_t s_failures;
+	if (!files_path(state->entry, path, sizeof(path))) {
+		if (s_failures++ < 16)
+			port_log("[dvd] read rejected: bad path for entry %u (%s)\n", state->entry, entry.path);
 		return DVD_RESULT_FATAL_ERROR;
+	}
 	FILE* file = std::fopen(path, "rb");
-	if (!file)
+	if (!file) {
+		if (s_failures++ < 16)
+			port_log("[dvd] read failed: cannot open %s\n", path);
 		return DVD_RESULT_FATAL_ERROR;
+	}
 	if (std::fseek(file, offset, SEEK_SET) != 0) {
 		std::fclose(file);
 		return DVD_RESULT_FATAL_ERROR;
