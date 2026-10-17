@@ -103,7 +103,10 @@ if(SMS_WIIU)
     -ffunction-sections -fdata-sections -ffp-contract=off
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics>
     $<$<COMPILE_LANGUAGE:C>:-std=gnu99 -fcommon>
-    -include ${SMS_PORT_SRC}/port_compat.h)
+    -include ${SMS_PORT_SRC}/port_compat.h
+    # String literals are Shift-JIS on disc (see the CP932 note below): scene
+    # lookups by Japanese name fail with UTF-8 literals.
+    -finput-charset=UTF-8 -fexec-charset=CP932)
   add_subdirectory(platform/wiiu)
   return()
 endif()
