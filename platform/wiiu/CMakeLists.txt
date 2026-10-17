@@ -66,10 +66,24 @@ set(SMS_WIIU_COMMON_SOURCES
 file(GLOB SMS_WIIU_PS_SOURCES CONFIGURE_DEPENDS
   ${CMAKE_CURRENT_SOURCE_DIR}/ps/*.S)
 
+# GD display-list builders (J3DShape::makeVcdVatCmd and friends): compiled from
+# the decompiled SDK like the PC build's platform/gx; the sdk_stubs versions left
+# the list uninitialised and the first command write went to address 0.
+set(SMS_WIIU_GD_SOURCES
+  ${SMS_DECOMP}/libs/dolphin/src/gd/GDBase.c
+  ${SMS_DECOMP}/libs/dolphin/src/gd/GDGeometry.c
+  ${SMS_DECOMP}/libs/dolphin/src/gd/GDLight.c
+  ${SMS_DECOMP}/libs/dolphin/src/gd/GDPixel.c
+  ${SMS_DECOMP}/libs/dolphin/src/gd/GDTev.c
+  ${SMS_DECOMP}/libs/dolphin/src/gd/GDTransform.c)
+set_source_files_properties(${SMS_WIIU_GD_SOURCES} PROPERTIES
+  COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/gd_wiiu_prefix.h;-w;-fcommon")
+
 add_library(sms_game STATIC
   ${SMS_DECOMP_CXX_SOURCES}
   ${SMS_DECOMP_C_SOURCES}
-  ${SMS_DECOMP}/libs/dolphin/src/pad/Padclamp.c)
+  ${SMS_DECOMP}/libs/dolphin/src/pad/Padclamp.c
+  ${SMS_WIIU_GD_SOURCES})
 set_source_files_properties(${SMS_DECOMP_CXX_SOURCES} PROPERTIES LANGUAGE CXX)
 target_include_directories(sms_game BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES})
 target_compile_definitions(sms_game PRIVATE ${SMS_COMMON_DEFS})
