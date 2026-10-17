@@ -47,6 +47,8 @@ set(SMS_WIIU_OS_ADAPTER_DEFS
 
 set(SMS_WIIU_COMMON_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/endian/endian_dispatch.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/endian/endian_game.cpp
