@@ -73,6 +73,10 @@ void resolve_app_root()
 
 void open_log()
 {
+	/* No SD log: a console wedge needs a forced power-off, and a file left open
+	 * for writing then can damage the card's filesystem (2026-10-17 lost an
+	 * Aroma file that way). Logs go over UDP only. */
+	return;
 	char path[160];
 	std::snprintf(path, sizeof(path), "%sstage2.log", kAppRoot);
 	s_log = std::fopen(path, "wb");
