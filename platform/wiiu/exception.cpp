@@ -5,15 +5,37 @@
 #include <coreinit/core.h>
 #include <coreinit/debug.h>
 #include <coreinit/exception.h>
+#include <coreinit/thread.h>
+#include <coreinit/time.h>
+#include <sysapp/launch.h>
+#include <whb/proc.h>
 #include <whb/log.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
+extern "C" void* sms_wiiu_vi_owner_thread(void);
+extern "C" void sms_wiiu_crash_return_to_menu(void);
+extern "C" void sms_wiiu_exit(void);
+extern "C" volatile int sms_wiiu_crash_pending;
+volatile int sms_wiiu_crash_pending;
+
 namespace {
 
+/* A non-main thread that faulted: ask the main thread to leave, then wait.
+ * If the main thread never reaches a frame boundary (it may be waiting on this
+ * thread), fall back to the error screen after 10 seconds. */
+void park_crashed_thread(void)
+{
+	sms_wiiu_crash_pending = 1;
+	WHBLogPrint("[crash] game thread parked; the main thread returns to the Menu");
+	OSSleepTicks(OSSecondsToTicks(10));
+	OSFatal("SMS Wii U: crashed (see the UDP log); the main thread did not exit");
+}
+
 char s_message[512];
+volatile int s_crashed;
 char s_trace[2048];
 
 /* The faulting PC is often inside a system RPL (outside .text at 0x02000000),
@@ -60,8 +82,23 @@ BOOL fatal(const char* type, OSContext* context)
 		trace(context);
 		WHBLogPrint(s_trace);
 	}
-	OSFatal(s_message);
-	return FALSE;
+	/* A second fault (or none of the recovery paths apply): the old behaviour,
+	 * an error screen that needs a reboot. */
+	if (!context || s_crashed++) {
+		OSFatal(s_message);
+		return FALSE;
+	}
+	/* Crash safety: resume the faulting thread in a recovery function instead
+	 * of OSFatal. The main thread (which owns ProcUI and GX2) goes straight to
+	 * the Menu; any other thread parks, and the main thread leaves at its next
+	 * frame boundary. OSThread starts with its OSContext, so the context
+	 * address identifies the thread. */
+	bool main_thread = (void*)context == sms_wiiu_vi_owner_thread();
+	context->srr0 = main_thread ? (uint32_t)&sms_wiiu_crash_return_to_menu : (uint32_t)&park_crashed_thread;
+	context->lr = 0;
+	context->gpr[1] &= ~0xFu; // keep the stack, 16-byte aligned
+	context->gpr[1] -= 0x100;   // below the faulting frame's red zone
+	return TRUE;
 }
 
 BOOL on_dsi(OSContext* c) { return fatal("DSI", c); }
@@ -75,4 +112,19 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_DSI, on_dsi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ISI, on_isi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_PROGRAM, on_program);
+}
+
+/* Runs on the main thread after a crash: ask for the Menu and pump ProcUI
+ * until it says EXITING, then take the normal exit path. */
+extern "C" void sms_wiiu_crash_return_to_menu(void)
+{
+	OSSetThreadPriority(OSGetCurrentThread(), 0);
+	WHBLogPrint("[crash] returning to the Wii U Menu");
+	SYSLaunchMenu();
+	while (WHBProcIsRunning())
+		OSSleepTicks(OSMillisecondsToTicks(16));
+	WHBLogPrint("[crash] ProcUI exiting");
+	sms_wiiu_exit();
+	for (;;)
+		OSSleepTicks(OSSecondsToTicks(1));
 }
