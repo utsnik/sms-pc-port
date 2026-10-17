@@ -14,6 +14,7 @@ static void (*volatile s_game_entry)(void) = SMS_main;
 int main(int argc, char** argv)
 {
 	WHBLogUdpInit();
+	WHBLogPrint("SMS Wii U: main start (global constructors done)");
 	sms_wiiu_install_exception_handlers();
 	WHBProcInit();
 	port_init(argc, argv);
