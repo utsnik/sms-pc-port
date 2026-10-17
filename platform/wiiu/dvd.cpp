@@ -2,6 +2,7 @@
 #include "runtime.h"
 
 #include <dolphin/dvd.h>
+#include <dolphin/os/OSCache.h>
 
 #include <cctype>
 #include <cstdio>
@@ -218,6 +219,10 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		return DVD_RESULT_FATAL_ERROR;
 	}
 	size_t got = std::fread(address, 1, want, file);
+	/* A GameCube DVD read is a DMA; callers may invalidate the buffer after it,
+	 * which on the Wii U would drop this CPU copy. Write it back to memory. */
+	if (got)
+		DCFlushRange(address, got);
 	std::fclose(file);
 	if (got != want) {
 		if (s_failures++ < 16)
