@@ -98,6 +98,12 @@ static int resource(void* data, uint32_t size, const char* name)
 
 extern "C" int port_endian_resource(void* data, uint32_t size, const char* name)
 {
+#if defined(PORT_HOST_BIG_ENDIAN) && PORT_HOST_BIG_ENDIAN
+	(void)data;
+	(void)size;
+	(void)name;
+	return PE_FMT_ALREADY_NATIVE;
+#else
 	static int log = -1;
 	if (log < 0)
 		log = getenv("SMS_ENDIAN_LOG") != NULL;
@@ -105,6 +111,7 @@ extern "C" int port_endian_resource(void* data, uint32_t size, const char* name)
 	if (log)
 		fprintf(stderr, "[endian] %s: %s (%u bytes)\n", name ? name : "?", port_endian_format_name(fmt), size);
 	return fmt;
+#endif
 }
 
 extern "C" const char* port_endian_format_name(int fmt)
@@ -138,7 +145,14 @@ extern "C" void port_res_to_native(void*, uint32_t) { }
 // caller's buffer). Converts it once; `name` is the archive file name.
 extern "C" void port_endian_fetched(void* data, uint32_t size, const char* name)
 {
+#if defined(PORT_HOST_BIG_ENDIAN) && PORT_HOST_BIG_ENDIAN
+	(void)data;
+	(void)size;
+	(void)name;
+	return;
+#else
 	int fmt = port_endian_resource(data, size, name);
 	if (fmt == PE_FMT_UNKNOWN)
 		port_res_to_native(data, size);
+#endif
 }

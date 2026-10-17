@@ -5,7 +5,7 @@ Reason: Audio: TSeqParser::cmdNoteOn splits the BMS note-on flag byte with a bit
  	union {
  		u8 b;
  		struct {
-+#if defined(TARGET_PC) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
++#if defined(TARGET_PC) && !PORT_HOST_BIG_ENDIAN
 +			// GCC fills bitfields from the low bit on little-endian hosts;
 +			// MWCC from the high bit. Same bits of the command byte either way.
 +			u8 voice : 3;
