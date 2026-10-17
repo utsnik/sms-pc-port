@@ -8,7 +8,7 @@
 #define SMS_WIIU_RUN_GAME 0
 #endif
 
-extern "C" void SMS_main(void);
+extern void SMS_main(void);
 
 /* Keeping the entry point in volatile storage makes the Stage 1 ELF retain
  * the complete game even though normal Stage 1 builds never call it. */

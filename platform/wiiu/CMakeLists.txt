@@ -30,6 +30,7 @@ add_library(sms_game STATIC
   ${SMS_DECOMP_CXX_SOURCES}
   ${SMS_DECOMP_C_SOURCES}
   ${SMS_DECOMP}/libs/dolphin/src/pad/Padclamp.c)
+set_source_files_properties(${SMS_DECOMP_CXX_SOURCES} PROPERTIES LANGUAGE CXX)
 target_include_directories(sms_game BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES})
 target_compile_definitions(sms_game PRIVATE ${SMS_COMMON_DEFS})
 target_compile_options(sms_game PRIVATE
@@ -62,7 +63,6 @@ set_target_properties(sms PROPERTIES
   SUFFIX ".elf"
   RUNTIME_OUTPUT_DIRECTORY ${SMS_WIIU_BUILD_DIR})
 target_link_options(sms PRIVATE
-  "-specs=${DEVKITPRO}/wut/share/wut.specs"
   "-Wl,-Map,${SMS_WIIU_BUILD_DIR}/sms.map"
   -Wl,--gc-sections)
 target_link_libraries(sms PRIVATE

@@ -2,6 +2,7 @@
 #define _DOLPHIN_GX_GXVERT_H_
 
 #include <dolphin/types.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,11 @@ typedef union PPCWGPipe {
 } PPCWGPipe;
 
 extern volatile PPCWGPipe GXWGFifo;
+
+/* Resource patches may register retail-byte-order CPU/GX ranges. The Stage 1
+ * implementation records no ranges, but keeping the seam visible here lets
+ * the same game sources compile for the later GX2 backend. */
+void GXPC_AddBigEndianRange(const void* ptr, uint32_t size);
 
 #define SMS_WIIU_FIFO_1(name, type, member) \
 	static inline void name##1##type(type x) { GXWGFifo.member = x; }

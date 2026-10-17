@@ -25,7 +25,7 @@ __attribute__((weak)) GXRenderModeObj GXNtsc480Int = {
 	{ 0, 0, 21, 22, 21, 0, 0 },
 };
 
-#ifndef SMS_AUDIO_DSP_HLE // platform/audio/dsp_hle.cpp provides the real DSP HLE
+#if !SMS_AUDIO_DSP_HLE // platform/audio/dsp_hle.cpp provides the real DSP HLE
 // DSP task list (the task manager in JSystem/osdsp_task.c drives it). There is
 // no DSP on the host; the audio layer will replace this.
 __attribute__((weak)) DSPTaskInfo* __DSP_curr_task;

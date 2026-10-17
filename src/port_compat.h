@@ -66,6 +66,14 @@
 
 #include <dolphin/types.h> /* the port override (see port_include/) */
 
+/* JSystem's C DSP declaration uses the public struct tag as though it were a
+ * typedef name; the clean Dolphin header exposes the typedef as DSPTaskInfo.
+ * Keep both spellings available to the generated C units. */
+#ifndef SMS_STRUCT_DSP_TASK_ALIAS
+#define SMS_STRUCT_DSP_TASK_ALIAS
+typedef struct STRUCT_DSP_TASK STRUCT_DSP_TASK;
+#endif
+
 /* C++03 game code uses JSU's EOF enum. Modern platform code needs the
  * host EOF macro in libc++; its JSU header wrapper protects the enum. */
 #if !defined(__cplusplus) || __cplusplus < 201103L
