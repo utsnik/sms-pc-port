@@ -39,7 +39,7 @@
 #define ALU_WORD1_OP2(src0Abs, src1Abs, updateExecuteMask, updatePred, writeMask, omod, inst, encoding, bankSwizzle, dstGpr, dstRel, dstChan, clamp) \
     to_LE(src0Abs | (src1Abs << 1) | (updateExecuteMask << 2) | (updatePred << 3) | \
           (writeMask << 4) | (omod << 5) | (inst << 7) | (encoding << 15) | \
-          (bankSwizzle << 18) | ((dstGpr & __) << 21) | (dstRel << 28) | \
+          (bankSwizzle << 18) | ((dstGpr & 0x7f) << 21) | (dstRel << 28) | \
           ((dstChan & 0x3) << 29) | (clamp << 31))
 
 #define TEX_WORD0(inst, bcFracMode, fetchWholeQuad, resourceID, srcReg, srcRel, altConst) \
