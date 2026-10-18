@@ -111,6 +111,7 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_vert.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx2_texture.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx2_renderer.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/port_heap.cpp
   ${SMS_WIIU_COMMON_SOURCES}
   ${SMS_WIIU_PS_SOURCES})
 target_include_directories(sms BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES}
@@ -138,7 +139,8 @@ set_target_properties(sms PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${SMS_WIIU_BUILD_DIR})
 target_link_options(sms PRIVATE
   "-Wl,-Map,${SMS_WIIU_BUILD_DIR}/sms.map"
-  -Wl,--gc-sections)
+  -Wl,--gc-sections
+  -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvj)
 target_link_libraries(sms PRIVATE
   -Wl,--whole-archive sms_game -Wl,--no-whole-archive
   wut m)
