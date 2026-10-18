@@ -397,7 +397,7 @@ static uint64_t tevClamp(uint64_t op, bool clamp) {
 static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32_t channel,
                            TevSource a, TevSource b, TevSource c, TevSource d,
                            uint32_t bias, uint32_t op, uint32_t scale, bool clamp) {
-    tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel, a.chan _NEG)});
+    tevEmitAlu(program, {ALU_ADD(_R(16), channel, a.sel, a.chan, b.sel, b.chan _NEG)});
     tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
     uint64_t result = op ? ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel _NEG)
                          : ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel);
