@@ -28,6 +28,7 @@
 #include <gx2/surface.h>
 #include <gx2/texture.h>
 #include <gx2/utils.h>
+#include <coreinit/title.h>
 #include <coreinit/cache.h>
 #include <whb/gfx.h>
 #include <proc_ui/procui.h>
@@ -739,6 +740,11 @@ static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     *u = (float(e->sourceX) + *u * float(e->sourceW)) / s_tvW;
     *v = (float(e->sourceY) + *v * float(e->sourceH)) / s_tvH;
 }
+static bool runningUnderCemu() {
+    static int result = -1;
+    if (result < 0) result = (OSGetTitleID() >> 32) == 0xffffffffu;
+    return result != 0;
+}
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half) {
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!dest || !cb || !w || !h) return;
@@ -750,28 +756,31 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     CopyEntry* e = nullptr;
     for (CopyEntry& c : copyCache())
         if (c.dest == dest) { e = &c; break; }
+    const bool cemu = runningUnderCemu();
     // Cemu's GX2CopySurfaceEx implementation only handles a full-surface
-    // copy. Keep the backing texture the size of the TV target, copy that
-    // surface in one operation, and apply the source rectangle in the
-    // texture coordinates sent to the shader below.
+    // copy. Keep the compatibility path's backing texture the size of the
+    // TV target, copy that surface in one operation, and apply the source
+    // rectangle in the texture coordinates sent to the shader below.
     const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
     const uint32_t logicalW = half ? (w + 1) / 2 : w, logicalH = half ? (h + 1) / 2 : h;
-    if (e && (e->tex.texture.surface.width != fullW || e->tex.texture.surface.height != fullH)) {
+    const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
+    if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH)) {
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
         e->tex.valid = false;
     }
     if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
-    e->tex.width = logicalW;
-    e->tex.height = logicalH;
-    e->sourceX = tx; e->sourceY = ty; e->sourceW = tw; e->sourceH = th;
+    e->tex.width = cemu ? logicalW : copyW;
+    e->tex.height = cemu ? logicalH : copyH;
+    e->sourceX = cemu ? tx : 0; e->sourceY = cemu ? ty : 0;
+    e->sourceW = cemu ? tw : 0; e->sourceH = cemu ? th : 0;
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
         t.width = logicalW; t.height = logicalH;
         t.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
         t.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
-        t.texture.surface.width = fullW;
-        t.texture.surface.height = fullH;
+        t.texture.surface.width = copyW;
+        t.texture.surface.height = copyH;
         t.texture.surface.depth = 1;
         t.texture.surface.mipLevels = 1;
         t.texture.surface.format = cb->surface.format;
@@ -789,7 +798,14 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         GX2InitTextureRegs(&t.texture);
         t.valid = true;
     }
-    GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0);
+    if (cemu) {
+        GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0);
+    } else {
+        GX2Rect source = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
+        GX2Point destination = {0, 0};
+        GX2CopySurfaceEx(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0, 1,
+                        &source, &destination);
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, e->tex.texture.surface.image,
                   e->tex.texture.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e->tex.texture.surface.image,
