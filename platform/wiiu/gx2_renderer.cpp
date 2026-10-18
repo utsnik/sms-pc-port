@@ -1376,8 +1376,8 @@ void flushBatch() {
                 const size_t st = vertexFloats;
                 for (size_t k = 0; k < 3 && k * st < vbo.size(); k++) {
                     const float* o = vbo.data() + k * st;
-                    HostVertex hv;
-                    unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, defaults, hv);
+                    HostVertex hv; const uint8_t d9[9] = {0};
+                    unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, d9, hv);
                     const size_t co = tevPath ? 20 : (useTex ? 6 : 4);
                     fprintf(s_dbg, "  in %g %g %g mtx %u -> %g %g %g %g col %g %g %g %g\n", hv.pos[0], hv.pos[1], hv.pos[2],
                             (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[co], o[co + 1], o[co + 2], o[co + 3]);
