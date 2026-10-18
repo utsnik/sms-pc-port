@@ -1052,17 +1052,23 @@ static void transformPosition(const HostVertex& in, float* out) {
     const float x = m[0] * in.pos[0] + m[1] * in.pos[1] + m[2] * in.pos[2] + m[3];
     const float y = m[4] * in.pos[0] + m[5] * in.pos[1] + m[6] * in.pos[2] + m[7];
     const float z = m[8] * in.pos[0] + m[9] * in.pos[1] + m[10] * in.pos[2] + m[11];
-    const float* p = g.projection;
+    // The game can update projection through display-list XF writes rather
+    // than GXSetProjection(), so g.projection may lag the live registers.
+    // The PC shader reads XF_PROJ directly for this reason.
+    const float* xfProj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
+    const float p1 = xfProj[0], p2 = xfProj[1], p3 = xfProj[2], p4 = xfProj[3],
+                p5 = xfProj[4], p6 = xfProj[5];
+    const bool ortho = (g.xfReg[XFR_PROJ + 6] & 1) != 0;
     float cx, cy, cz, cw;
-    if (p[0] != 0.0f) {  // GX_ORTHOGRAPHIC == 1: p = {1, sx, tx, sy, ty, sz, tz}
-        cx = p[1] * x + p[2];
-        cy = p[3] * y + p[4];
-        cz = p[5] * z + p[6];
+    if (ortho) {  // GX_ORTHOGRAPHIC: {sx, tx, sy, ty, sz, tz, 1}
+        cx = p1 * x + p2;
+        cy = p3 * y + p4;
+        cz = p5 * z + p6;
         cw = 1.0f;
     } else {  // GX_PERSPECTIVE == 0
-        cx = p[1] * x + p[2] * z;
-        cy = p[3] * y + p[4] * z;
-        cz = p[5] * z + p[6];
+        cx = p1 * x + p2 * z;
+        cy = p3 * y + p4 * z;
+        cz = p5 * z + p6;
         cw = -z;
     }
     if (fabsf(cw) < 0.00001f) cw = 0.00001f;
