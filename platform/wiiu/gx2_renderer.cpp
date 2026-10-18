@@ -11,6 +11,7 @@
 #include "gx2_shader_pack.h"
 
 #include <gx2/draw.h>
+#include <gx2/clear.h>
 #include <gx2/event.h>
 #include <gx2/mem.h>
 #include <gx2/registers.h>
@@ -20,6 +21,8 @@
 #include <gx2/surface.h>
 #include <gx2/texture.h>
 #include <gx2/utils.h>
+#include <coreinit/cache.h>
+#include <whb/gfx.h>
 #include <proc_ui/procui.h>
 #include <whb/log.h>
 
@@ -63,9 +66,25 @@ static FixedShader s_untextured, s_modulate;
 static GX2AttribVar s_attribVars[] = {
     {"aVtxPos", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 0},
     {"aTexCoord0", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 1},
+    {"aTexCoord1", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 2},
+    {"aFog", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 3},
+    {"aGrayscaleColor", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 4},
     {"aInput1", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 5},
+    {"aInput2", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 6},
+    {"aInput3", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 7},
+    {"aInput4", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 8},
+    {"aInput5", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 9},
+    {"aInput6", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 10},
+    {"aInput7", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 11},
 };
-static GX2SamplerVar s_samplerVar = {"uTex0", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 0};
+static GX2SamplerVar s_samplerVars[] = {
+    {"uTex0", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 0},
+    {"uTex1", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 1},
+    {"uTexMask0", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 2},
+    {"uTexMask1", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 3},
+    {"uTexBlend0", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 4},
+    {"uTexBlend1", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 5},
+};
 static GX2UniformVar s_pixelUniform = {"window_params", GX2_SHADER_VAR_TYPE_FLOAT2, 1, 0, -1};
 
 struct Batch {
@@ -139,18 +158,32 @@ static bool initShader(FixedShader& shader, const unsigned char* vs, size_t vsSi
     memcpy(shader.psProgram, ps, psSize);
     memcpy(&shader.vertex.regs, vsRegs, sizeof(shader.vertex.regs));
     memcpy(&shader.pixel.regs, psRegs, sizeof(shader.pixel.regs));
+    // lus-rebase emits slot 0 for fragment position even when position_ena is
+    // clear.  Cafe ignores that reserved slot, while Cemu exposes it as a
+    // normal varying and sees semantic 0 twice (position plus the first
+    // parameter).  The stage-1 shaders never read fragment position, so
+    // remove the unused slot from the metadata consumed by both paths.
+    if (!(shader.pixel.regs.spi_ps_in_control_0 & (1u << 8)) &&
+        shader.pixel.regs.num_spi_ps_input_cntl > 0) {
+        const uint32_t count = shader.pixel.regs.num_spi_ps_input_cntl;
+        for (uint32_t i = 0; i + 1 < count; ++i)
+            shader.pixel.regs.spi_ps_input_cntls[i] = shader.pixel.regs.spi_ps_input_cntls[i + 1];
+        shader.pixel.regs.num_spi_ps_input_cntl = count - 1;
+        shader.pixel.regs.spi_ps_in_control_0 =
+            (shader.pixel.regs.spi_ps_in_control_0 & ~0x3fu) | (count - 1);
+    }
     shader.vertex.size = uint32_t(vsSize);
     shader.vertex.program = shader.vsProgram;
     shader.vertex.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
-    shader.vertex.attribVarCount = textured ? 3 : 2;
+    shader.vertex.attribVarCount = sizeof(s_attribVars) / sizeof(s_attribVars[0]);
     shader.vertex.attribVars = s_attribVars;
     shader.pixel.size = uint32_t(psSize);
     shader.pixel.program = shader.psProgram;
     shader.pixel.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
     shader.pixel.uniformVarCount = 1;
     shader.pixel.uniformVars = &s_pixelUniform;
-    shader.pixel.samplerVarCount = textured ? 1 : 0;
-    shader.pixel.samplerVars = textured ? &s_samplerVar : nullptr;
+    shader.pixel.samplerVarCount = sizeof(s_samplerVars) / sizeof(s_samplerVars[0]);
+    shader.pixel.samplerVars = s_samplerVars;
 
     addAttribute(shader, 0, 4, 0);
     if (textured) addAttribute(shader, 1, 2, 16);
@@ -283,7 +316,10 @@ static void applyState() {
     const int sw = int(g.scissor[2] * scaleX);
     const int sh = int(g.scissor[3] * scaleY);
     GX2SetScissor(sx, sy, sw, sh);
-    GX2SetColorControl(GX2_LOGIC_OP_COPY, (g.bp[BP_CMODE0] & 0x18) ? 0xff : 0, FALSE, TRUE);
+    // GX color-update enable is not encoded in the blend-mode bits.  In
+    // particular GX_BM_NONE has CMODE0 blend bits clear while still writing
+    // color; the DKR/lus GX2 path uses the full 0xff mask for this state.
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, 0xff, FALSE, TRUE);
 }
 
 static void transform(const HostVertex& in, float* out, int texCoord, bool textured) {
@@ -301,16 +337,25 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
         cz = p[5] * z + p[6];
         cw = 1.0f;
     } else {
-        cx = p[1] * x + p[2];
-        cy = p[3] * y + p[4];
+        cx = p[1] * x + p[2] * z;
+        cy = p[3] * y + p[4] * z;
         cz = p[5] * z + p[6];
         cw = -z;
     }
     if (fabsf(cw) < 0.00001f) cw = 0.00001f;
-    out[0] = cx; out[1] = cy;
-    // GX's XF viewport writes a 24-bit depth range. GX2 wants [0,w].
+    // Match the PC renderer's XF viewport conversion, then map the original
+    // 640x480 game rectangle into the 1280x720 TV target (4:3 letterboxed).
+    const float halfW = g.viewport[2] * 0.75f;
+    const float halfH = g.viewport[3] * 0.75f;
+    const float centerX = 160.0f + g.viewport[0] * 1.5f + halfW;
+    const float centerY = g.viewport[1] * 1.5f + halfH;
+    out[0] = ((centerX * cw + halfW * cx) * (2.0f / 1280.0f)) - cw;
+    out[1] = ((centerY * cw - halfH * cy) * (2.0f / 720.0f)) - cw;
+    // GX's XF viewport writes a 24-bit depth range. GX2's clip-space depth
+    // uses the same positive-w convention as the lus/DKR shader path.
     float* vp = reinterpret_cast<float*>(&g.xfReg[XFR_VIEWPORT]);
-    out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
+    const float depth = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
+    out[2] = (1.0f - depth) * 0.5f * cw;
     out[3] = cw;
     const float r = in.clr[0][0] / 255.0f, gcol = in.clr[0][1] / 255.0f;
     const float b = in.clr[0][2] / 255.0f, a = in.clr[0][3] / 255.0f;
@@ -411,21 +456,25 @@ void flushBatch() {
     applyState();
     setShader(shader, texture);
     std::vector<float> vbo;
-    vbo.reserve(size_t(s_batch.count) * (textured ? 10 : 8));
-    for (uint32_t i = 0; i < s_batch.count; ++i) {
+    // GX2DrawEx is the well-tested path on Wii U (and avoids relying on the
+    // lifetime/placement rules of a CPU-side index pointer).  Expand the
+    // already-decoded index list into a contiguous vertex stream for stage 1.
+    vbo.reserve(s_batch.indices.size() * (textured ? 10 : 8));
+    for (uint32_t index : s_batch.indices) {
         HostVertex hv;
-        const uint8_t* packed = s_batch.vertices.data() + size_t(i) * s_batch.stride;
+        const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
         const uint8_t defaults[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
         unpackVertex(s_batch.fmt, packed, defaults, hv);
         const size_t at = vbo.size();
         vbo.resize(at + (textured ? 10 : 8));
         transform(hv, vbo.data() + at, coord, textured);
     }
+    DCFlushRange(vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2SetAttribBuffer(0, uint32_t(vbo.size() * sizeof(float)), shader.stride, vbo.data());
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
-    GX2DrawIndexedEx(mode, uint32_t(s_batch.indices.size()), GX2_INDEX_TYPE_U32, s_batch.indices.data(), 0, 1);
+    GX2DrawEx(mode, uint32_t(s_batch.indices.size()), 0, 1);
     GX2DrawDone();
     s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
 }
@@ -455,6 +504,15 @@ extern "C" int sms_wiiu_gx2_renderer_init(void) {
 }
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     if (!s_ready || !ProcUIInForeground()) return;
+    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+    GX2ClearDepthStencilEx(WHBGfxGetTVDepthBuffer(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
+    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+    GX2SetViewport(0.0f, 0.0f, 1280.0f, 720.0f, 0.0f, 1.0f);
+    GX2SetScissor(0, 0, 1280, 720);
     s_frameActive = true;
     GX2SetRasterizerClipControl(TRUE, FALSE);
 }
