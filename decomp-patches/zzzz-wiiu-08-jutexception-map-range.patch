@@ -1,0 +1,28 @@
+Reason: wiiu: JUTException's map pages only recognize GameCube code at
+0x80000000..0x82ffffff, so Wii U game PCs and return addresses in the linked
+0x02000000..0x024xxxxx text image are discarded before map lookup. Use the
+Wii U link range for the diagnostic map pages and retain the retail range.
+--- a/libs/JSystem/src/JUtility/JUTException.cpp
++++ b/libs/JSystem/src/JUtility/JUTException.cpp
+@@ -299,7 +299,11 @@
+ 
+ bool JUTException::showMapInfo_subroutine(u32 address, bool begin_with_newline)
+ {
++#ifdef TARGET_WIIU
++	if ((address < 0x02000000) || (0x02500000 <= address)) {
++#else
+ 	if ((address < 0x80000000) || (0x82ffffff < address)) {
++#endif
+ 		return false;
+ 	}
+ 
+@@ -358,7 +362,11 @@
+ 	for (int i = 0; i < 31; i++) {
+ 		u32 address = context->gpr[i];
+ 
++#ifdef TARGET_WIIU
++		if (address >= 0x02000000 && 0x02500000 > address) {
++#else
+ 		if (address >= 0x80000000 && 0x83000000 - 1 >= address) {
++#endif
+ 			found_address_register = true;
