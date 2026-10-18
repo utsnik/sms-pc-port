@@ -15,6 +15,7 @@
  */
 #include "../gx/src/gx_internal.h"
 #include "gx2_shader_pack.h"
+#include "gx2_shader_inl.h"
 
 #include <gx2/draw.h>
 #include <gx2/clear.h>
@@ -39,6 +40,7 @@
 #include <malloc.h>
 #include <new>
 #include <stdio.h>
+#include <initializer_list>
 #include <vector>
 
 extern "C" const char* sms_wiiu_stage_path(void);
@@ -57,6 +59,7 @@ uint64_t g_statHiresBytes = 0;
 
 static bool s_ready;
 static bool s_frameActive;
+static bool initTevVertex();
 
 struct FixedShader {
     GX2VertexShader vertex;
@@ -70,7 +73,43 @@ struct FixedShader {
     void* psProgram;
 };
 
+// The TEV shader is generated from the current BP state.  Its vertex side is
+// shared by every cached pixel program: all eight texture coordinates and both
+// raster channels are carried to the fragment stage so a TEV order can choose
+// any map/channel without rebuilding the vertex program.
+struct TevKey {
+    uint32_t genmode;
+    uint32_t stages;
+    uint32_t colorEnv[16];
+    uint32_t alphaEnv[16];
+    uint32_t order[16];
+    uint32_t ksel[16];
+    uint32_t swap[4];
+    uint32_t alphaCompare;
+};
+
+struct TevShader {
+    TevKey key;
+    GX2PixelShader pixel;
+    GX2UniformVar uniform;
+    GX2SamplerVar samplers[8];
+    void* psProgram;
+    uint32_t textureMask;
+};
+
 static FixedShader s_untextured, s_modulate;
+static GX2VertexShader s_tevVertex;
+static GX2FetchShader s_tevFetch;
+static GX2AttribStream s_tevAttrs[11];
+static void* s_tevVertexProgram;
+static void* s_tevFetchProgram;
+static unsigned char s_tevShaderStorage[sizeof(std::vector<TevShader*>)] __attribute__((aligned(8)));
+static std::vector<TevShader*>* s_tevShaderObject;
+static std::vector<TevShader*>& tevShaders() {
+    if (!s_tevShaderObject) s_tevShaderObject = new (s_tevShaderStorage) std::vector<TevShader*>();
+    return *s_tevShaderObject;
+}
+#define s_tevShaders (tevShaders())
 static GX2AttribVar s_attribVars[] = {
     {"aVtxPos", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 0},
     {"aTexCoord0", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 1},
@@ -211,6 +250,7 @@ static bool initShaders() {
                     dkr_untextured_ps, sizeof(dkr_untextured_ps), dkr_untextured_ps_regs, false)) return false;
     if (!initShader(s_modulate, dkr_modulate_vs, sizeof(dkr_modulate_vs), dkr_modulate_vs_regs,
                     dkr_modulate_ps, sizeof(dkr_modulate_ps), dkr_modulate_ps_regs, true)) return false;
+    if (!initTevVertex()) return false;
     WHBLogPrintf("SMS Wii U: lus-rebase GX2 shaders loaded");
     return true;
 }
@@ -231,6 +271,345 @@ static bool usedTexture(int* coord, int* map) {
 static GX2TexClampMode clampMode(uint32_t value) {
     if (value & 2) return (value & 1) ? GX2_TEX_CLAMP_MODE_MIRROR_ONCE : GX2_TEX_CLAMP_MODE_CLAMP;
     return (value & 1) ? GX2_TEX_CLAMP_MODE_MIRROR : GX2_TEX_CLAMP_MODE_WRAP;
+}
+
+static int tevSext11(uint32_t v) { return int(v << 21) >> 21; }
+
+static uint32_t tevKsel(uint32_t stage) {
+    const uint32_t r = g.bp[BP_TEV_KSEL + (stage >> 1)];
+    return (r >> ((stage & 1) ? 14 : 4)) & 0x3ff;
+}
+
+static TevKey currentTevKey() {
+    TevKey k;
+    memset(&k, 0, sizeof(k));
+    k.genmode = g.bp[BP_GENMODE] & ((15u << 10) | (7u << 16));
+    k.stages = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
+    for (uint32_t s = 0; s < k.stages; ++s) {
+        k.colorEnv[s] = g.bp[BP_TEV_COLOR_ENV + 2 * s] & 0xffffff;
+        k.alphaEnv[s] = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1] & 0xffffff;
+        k.order[s] = (g.bp[BP_TREF + (s >> 1)] >> ((s & 1) * 12)) & 0x3ff;
+        k.ksel[s] = tevKsel(s);
+    }
+    for (uint32_t t = 0; t < 4; ++t)
+        k.swap[t] = (g.bp[BP_TEV_KSEL + 2 * t] & 15) |
+                    ((g.bp[BP_TEV_KSEL + 2 * t + 1] & 15) << 4);
+    k.alphaCompare = g.bp[BP_ALPHACOMPARE];
+    return k;
+}
+
+static uint32_t tevTextureMask(const TevKey& k) {
+    uint32_t mask = 0;
+    for (uint32_t s = 0; s < k.stages; ++s)
+        if ((k.order[s] >> 6) & 1) mask |= 1u << (k.order[s] & 7);
+    return mask;
+}
+
+static bool tevSupported(const TevKey& k) {
+    // Indirect texturing changes the coordinates between stages and remains
+    // on the old path until its Latte implementation is added.  Comparison
+    // forms (bias=3) need predicate ALU and are also a deliberate fallback.
+    if (((k.genmode >> 16) & 7) != 0) return false;
+    for (uint32_t s = 0; s < k.stages; ++s) {
+        if (((k.order[s] >> 6) & 1) && (k.order[s] & 7) >= 8) return false;
+        if (((k.colorEnv[s] >> 16) & 3) == 3 || ((k.alphaEnv[s] >> 16) & 3) == 3) return false;
+    }
+    // The title screen uses the always form.  Keep other alpha compares on
+    // the fallback until the two-reference compare is emitted in ALU.
+    const uint32_t c0 = (k.alphaCompare >> 16) & 7, c1 = (k.alphaCompare >> 19) & 7;
+    return c0 == 7 && c1 == 7;
+}
+
+struct TevSource {
+    uint32_t sel;
+    uint32_t chan;
+};
+
+static TevSource tevFixed(uint32_t value) {
+    // Uniform vectors 8..15 hold the fixed TEV constants.  Keeping these in
+    // the same constant file as TEVREG/KONST makes every numeric input a
+    // uniform and avoids baking colour values into a cached program.
+    return {_GX2_C(32 + 4 * (value >> 2)), value & 3};
+}
+
+static TevSource tevKonst(const TevKey& k, uint32_t sel, uint32_t chan) {
+    if (sel < 8) return tevFixed(sel);
+    if (sel >= 12 && sel < 16) return {_GX2_C(4 * (4 + sel - 12)), chan};
+    if (sel >= 16) return {_GX2_C(4 * (4 + (sel & 3))), (sel - 16) >> 2};
+    return tevFixed(12);
+}
+
+static uint32_t tevSwapChannel(const TevKey& k, uint32_t table, uint32_t channel) {
+    return (k.swap[table & 3] >> (channel * 2)) & 3;
+}
+
+static TevSource tevColorSource(const TevKey& k, uint32_t stage, uint32_t sel, uint32_t channel) {
+    if (sel < 8) return {_R(12 + (sel >> 1)), (sel & 1) ? _w : channel};
+    const uint32_t order = k.order[stage];
+    const uint32_t rasTable = k.alphaEnv[stage] & 3;
+    const uint32_t texTable = (k.alphaEnv[stage] >> 2) & 3;
+    if (sel == 8 || sel == 9) {
+        const uint32_t map = order & 7;
+        const uint32_t ch = tevSwapChannel(k, texTable, sel == 8 ? channel : 3);
+        return {_R(20 + map), ch};
+    }
+    if (sel == 10 || sel == 11) {
+        const uint32_t chan = (order >> 7) & 7;
+        const uint32_t ch = tevSwapChannel(k, rasTable, sel == 10 ? channel : 3);
+        return {_R(10 + (chan == 1 ? 1 : 0)), ch};
+    }
+    if (sel == 12) return tevFixed(12);
+    if (sel == 13) return tevFixed(13);
+    if (sel == 14) return tevKonst(k, k.ksel[stage] & 31, channel);
+    return tevFixed(15);
+}
+
+static TevSource tevAlphaSource(const TevKey& k, uint32_t stage, uint32_t sel) {
+    if (sel < 4) return {_R(12 + sel), _w};
+    const uint32_t order = k.order[stage];
+    const uint32_t rasTable = k.alphaEnv[stage] & 3;
+    const uint32_t texTable = (k.alphaEnv[stage] >> 2) & 3;
+    if (sel == 4) return {_R(20 + (order & 7)), tevSwapChannel(k, texTable, 3)};
+    if (sel == 5) return {_R(10 + (((order >> 7) & 7) == 1 ? 1 : 0)), tevSwapChannel(k, rasTable, 3)};
+    if (sel == 6) return tevKonst(k, (k.ksel[stage] >> 5) & 31, 0);
+    return tevFixed(15);
+}
+
+static void tevEmitAlu(std::vector<uint64_t>& program, std::initializer_list<uint64_t> ops) {
+    if (ops.size() == 0) return;
+    for (uint64_t op : ops) program.push_back(op);
+    program.back() |= to_QWORD(to_LE(1ull << 31), 0);
+}
+
+static uint64_t tevClamp(uint64_t op, bool clamp) {
+    return clamp ? op | to_QWORD(0, to_LE(1ull << 31)) : op;
+}
+
+static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32_t channel,
+                           TevSource a, TevSource b, TevSource c, TevSource d,
+                           uint32_t bias, uint32_t op, uint32_t scale, bool clamp) {
+    tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel, a.chan _NEG)});
+    tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
+    uint64_t result = op ? ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel _NEG)
+                         : ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel);
+    tevEmitAlu(program, {result});
+    if (bias == 1 || bias == 2) {
+        const uint32_t sign = bias == 2 ? (ALU_SRC_0_5 | (1 << 12)) : ALU_SRC_0_5;
+        tevEmitAlu(program, {ALU_ADD(_R(dest), channel, ALU_SRC_PV, channel, sign, _x)});
+    }
+    if (scale == 1 || scale == 2 || scale == 3) {
+        const uint32_t one = ALU_SRC_1;
+        uint64_t scaled = scale == 1 ? ALU_MUL_x2(_R(dest), channel, ALU_SRC_PV, channel, one, _x)
+                                     : scale == 2 ? ALU_MUL_x4(_R(dest), channel, ALU_SRC_PV, channel, one, _x)
+                                                  : ALU_ADD_D2(_R(dest), channel, ALU_SRC_PV, channel, ALU_SRC_0, _x);
+        tevEmitAlu(program, {tevClamp(scaled, clamp)});
+    } else if (bias == 1 || bias == 2) {
+        // The bias instruction is now the last operation for this channel.
+        if (clamp) {
+            // Re-emit the preceding clamp by moving PV through the same
+            // destination.  This keeps the operation sequence independent of
+            // whether a scale was requested.
+            tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, ALU_SRC_PV, channel), true)});
+        }
+    } else if (clamp) {
+        // The third instruction is already the final result when no bias or
+        // scale follows; a second move supplies the clamp bit without relying
+        // on macro token concatenation.
+        tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, ALU_SRC_PV, channel), true)});
+    }
+}
+
+static bool initTevVertex() {
+    std::vector<uint64_t> program;
+    program.reserve(64);
+    program.push_back(CALL_FS NO_BARRIER);
+    program.push_back(EXP_DONE(POS0, _R(1), _x, _y, _z, _w));
+    for (uint32_t i = 0; i < 10; ++i) {
+        const uint64_t exp = EXP(i == 9 ? PARAM(9) : PARAM(i), _R(2 + i), _x, _y, _z, _w);
+        if (i == 9) program.push_back(exp END_OF_PROGRAM);
+        else program.push_back(exp NO_BARRIER);
+    }
+    s_tevVertexProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, program.size() * sizeof(uint64_t));
+    if (!s_tevVertexProgram) return false;
+    memcpy(s_tevVertexProgram, program.data(), program.size() * sizeof(uint64_t));
+    memset(&s_tevVertex, 0, sizeof(s_tevVertex));
+    s_tevVertex.regs.sq_pgm_resources_vs = 12;
+    s_tevVertex.regs.spi_vs_out_config = 9 << 1;
+    s_tevVertex.regs.num_spi_vs_out_id = 3;
+    memset(s_tevVertex.regs.spi_vs_out_id, 0xff, sizeof(s_tevVertex.regs.spi_vs_out_id));
+    s_tevVertex.regs.spi_vs_out_id[0] = 0x03020100;
+    s_tevVertex.regs.spi_vs_out_id[1] = 0x07060504;
+    s_tevVertex.regs.spi_vs_out_id[2] = 0xffff0908;
+    s_tevVertex.regs.sq_vtx_semantic_clear = ~((1u << 11) - 1);
+    s_tevVertex.regs.num_sq_vtx_semantic = 11;
+    for (uint32_t i = 0; i < 11; ++i) s_tevVertex.regs.sq_vtx_semantic[i] = i;
+    s_tevVertex.regs.vgt_vertex_reuse_block_cntl = 14;
+    s_tevVertex.regs.vgt_hos_reuse_depth = 16;
+    s_tevVertex.size = uint32_t(program.size() * sizeof(uint64_t));
+    s_tevVertex.program = s_tevVertexProgram;
+    s_tevVertex.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
+    s_tevVertex.attribVarCount = sizeof(s_attribVars) / sizeof(s_attribVars[0]);
+    s_tevVertex.attribVars = s_attribVars;
+
+    uint32_t offset = 0, n = 0;
+    auto attr = [&](uint32_t location, uint32_t components) {
+        GX2AttribStream& a = s_tevAttrs[n++];
+        a.location = location;
+        a.buffer = 0;
+        a.offset = offset;
+        a.format = components == 2 ? GX2_ATTRIB_FORMAT_FLOAT_32_32 : GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
+        a.type = GX2_ATTRIB_INDEX_PER_VERTEX;
+        a.aluDivisor = 0;
+        a.mask = GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W);
+        a.endianSwap = GX2_ENDIAN_SWAP_DEFAULT;
+        offset += components * sizeof(float);
+    };
+    attr(0, 4);
+    for (uint32_t i = 0; i < 8; ++i) attr(1 + i, 2);
+    attr(9, 4);
+    attr(10, 4);
+    s_tevFetch.size = GX2CalcFetchShaderSizeEx(n, GX2_FETCH_SHADER_TESSELLATION_NONE,
+                                                GX2_TESSELLATION_MODE_DISCRETE);
+    s_tevFetchProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, s_tevFetch.size);
+    if (!s_tevFetchProgram) return false;
+    s_tevFetch.program = s_tevFetchProgram;
+    GX2InitFetchShaderEx(&s_tevFetch, static_cast<uint8_t*>(s_tevFetch.program), n, s_tevAttrs,
+                         GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, s_tevVertex.program, s_tevVertex.size);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, s_tevFetch.program, s_tevFetch.size);
+    return true;
+}
+
+static bool initTevPixel(TevShader& shader) {
+    std::vector<uint64_t> program(4096, 0);
+    size_t offset = 32;
+    const uint32_t textureMask = shader.textureMask;
+    const size_t texOffset = offset;
+    uint32_t texCount = 0;
+    for (uint32_t map = 0; map < 8; ++map) {
+        if (!(textureMask & (1u << map))) continue;
+        uint32_t coord = 0;
+        for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
+            if (((shader.key.order[stage] >> 6) & 1) &&
+                ((shader.key.order[stage] & 7) == map)) {
+                coord = (shader.key.order[stage] >> 3) & 7;
+                break;
+            }
+        }
+        uint64_t sample[2] = {TEX_SAMPLE(_R(20 + map), _x, _y, _z, _w, _R(2 + coord), _x, _y, _0, _x, map, map)};
+        program[offset++] = sample[0];
+        program[offset++] = sample[1];
+        ++texCount;
+    }
+    const size_t aluOffset = offset;
+    uint32_t lastColor = 0, lastAlpha = 0;
+    for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
+        const uint32_t ce = shader.key.colorEnv[stage], ae = shader.key.alphaEnv[stage];
+        const uint32_t colorDest = (ce >> 22) & 3, alphaDest = (ae >> 22) & 3;
+        const uint32_t colorBias = (ce >> 16) & 3, alphaBias = (ae >> 16) & 3;
+        const uint32_t colorScale = (ce >> 20) & 3, alphaScale = (ae >> 20) & 3;
+        for (uint32_t ch = 0; ch < 3; ++ch) {
+            tevEmitChannel(program, 12 + colorDest, ch,
+                           tevColorSource(shader.key, stage, (ce >> 12) & 15, ch),
+                           tevColorSource(shader.key, stage, (ce >> 8) & 15, ch),
+                           tevColorSource(shader.key, stage, (ce >> 4) & 15, ch),
+                           tevColorSource(shader.key, stage, ce & 15, ch),
+                           colorBias, (ce >> 18) & 1, colorScale, (ce >> 19) & 1);
+        }
+        tevEmitChannel(program, 12 + alphaDest, _w,
+                       tevAlphaSource(shader.key, stage, (ae >> 13) & 7),
+                       tevAlphaSource(shader.key, stage, (ae >> 10) & 7),
+                       tevAlphaSource(shader.key, stage, (ae >> 7) & 7),
+                       tevAlphaSource(shader.key, stage, (ae >> 4) & 7),
+                       alphaBias, (ae >> 18) & 1, alphaScale, (ae >> 19) & 1);
+        lastColor = colorDest;
+        lastAlpha = alphaDest;
+    }
+    if (lastColor != lastAlpha)
+        tevEmitAlu(program, {ALU_MOV(_R(12 + lastColor), _w, _R(12 + lastAlpha), _w)});
+    const size_t aluCount = offset - aluOffset;
+    size_t cf = 0;
+    if (texCount) program[cf++] = TEX(texOffset, texCount) VALID_PIX;
+    if (aluCount) program[cf++] = ALU(aluOffset, aluCount);
+    program[cf++] = EXP_DONE(PIX0, _R(12 + lastColor), _x, _y, _z, _w) END_OF_PROGRAM;
+    const size_t programSize = offset * sizeof(uint64_t);
+    shader.psProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, programSize);
+    if (!shader.psProgram) return false;
+    memcpy(shader.psProgram, program.data(), programSize);
+    memset(&shader.pixel, 0, sizeof(shader.pixel));
+    shader.pixel.regs.sq_pgm_resources_ps = 28;
+    shader.pixel.regs.sq_pgm_exports_ps = 2;
+    shader.pixel.regs.spi_ps_in_control_0 = 11 | (1u << 26) | (1u << 28);
+    shader.pixel.regs.num_spi_ps_input_cntl = 11;
+    // Keep the unused fragment-position import slot.  Cemu rejects a
+    // duplicate semantic here, while deleting it shifts every real input.
+    shader.pixel.regs.spi_ps_input_cntls[0] = 0x17f;
+    for (uint32_t i = 0; i < 10; ++i) shader.pixel.regs.spi_ps_input_cntls[i + 1] = i | 0x100;
+    shader.pixel.regs.cb_shader_mask = 0xf;
+    shader.pixel.regs.cb_shader_control = 1;
+    shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6);
+    shader.pixel.size = uint32_t(programSize);
+    shader.pixel.program = shader.psProgram;
+    shader.pixel.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
+    shader.uniform = {"tev_params", GX2_SHADER_VAR_TYPE_FLOAT4, 16, 0, -1};
+    shader.pixel.uniformVars = &shader.uniform;
+    shader.pixel.uniformVarCount = 1;
+    static const char* names[8] = {"uTex0", "uTex1", "uTex2", "uTex3", "uTex4", "uTex5", "uTex6", "uTex7"};
+    for (uint32_t map = 0; map < 8; ++map)
+        shader.samplers[map] = {names[map], GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, map};
+    shader.pixel.samplerVars = shader.samplers;
+    shader.pixel.samplerVarCount = 8;
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, shader.pixel.program, shader.pixel.size);
+    return true;
+}
+
+static TevShader* tevShaderForKey(const TevKey& key) {
+    for (TevShader* shader : s_tevShaders)
+        if (!memcmp(&shader->key, &key, sizeof(key))) return shader;
+    TevShader* shader = new TevShader();
+    memset(shader, 0, sizeof(*shader));
+    shader->key = key;
+    shader->textureMask = tevTextureMask(key);
+    if (!initTevPixel(*shader)) {
+        delete shader;
+        return nullptr;
+    }
+    s_tevShaders.push_back(shader);
+    WHBLogPrintf("SMS Wii U: generated TEV pixel shader stages=%u tex=%02x cache=%u",
+                 (unsigned)key.stages, (unsigned)shader->textureMask, (unsigned)s_tevShaders.size());
+    return shader;
+}
+
+static void setTevShader(TevShader& shader, TextureEntry* const* textures) {
+    GX2SetFetchShader(&s_tevFetch);
+    GX2SetVertexShader(&s_tevVertex);
+    GX2SetPixelShader(&shader.pixel);
+    float params[64] = {};
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t ra = g.bp[BP_TEV_REG + 2 * i], bg = g.bp[BP_TEV_REG + 2 * i + 1];
+        params[4 * i + 0] = float(tevSext11(ra & 0x7ff)) / 255.0f;
+        params[4 * i + 1] = float(tevSext11((bg >> 12) & 0x7ff)) / 255.0f;
+        params[4 * i + 2] = float(tevSext11(bg & 0x7ff)) / 255.0f;
+        params[4 * i + 3] = float(tevSext11((ra >> 12) & 0x7ff)) / 255.0f;
+    }
+    for (int i = 0; i < 4; ++i) {
+        const uint32_t ra = g.kreg[2 * i], bg = g.kreg[2 * i + 1];
+        params[16 + 4 * i + 0] = float(ra & 0xff) / 255.0f;
+        params[16 + 4 * i + 1] = float((bg >> 12) & 0xff) / 255.0f;
+        params[16 + 4 * i + 2] = float(bg & 0xff) / 255.0f;
+        params[16 + 4 * i + 3] = float((ra >> 12) & 0xff) / 255.0f;
+    }
+    static const int k8[8] = {255, 223, 191, 159, 127, 95, 63, 31};
+    for (int i = 0; i < 8; ++i) params[32 + i] = float(k8[i]) / 255.0f;
+    params[32 + 12] = 1.0f;
+    params[32 + 13] = 128.0f / 255.0f;
+    params[32 + 15] = 0.0f;
+    GX2SetPixelUniformReg(shader.uniform.offset, 64, params);
+    for (uint32_t map = 0; map < 8; ++map) {
+        if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
+        GX2SetPixelTexture(&textures[map]->texture, map);
+        GX2SetPixelSampler(&textures[map]->sampler, map);
+    }
 }
 
 static float s_tvW = 1280.0f, s_tvH = 720.0f, s_gameScale = 1.5f, s_gameX = 160.0f;
@@ -561,7 +940,7 @@ static bool evalTev(const HostVertex& in, float* rgba, bool* usesTex) {
     return true;
 }
 
-static void transform(const HostVertex& in, float* out, int texCoord, bool textured) {
+static void transformPosition(const HostVertex& in, float* out) {
     const uint32_t matrix = in.mtx[0] & 63;
     const uint32_t addr = matrix * 4;
     const float* m = reinterpret_cast<const float*>(&g.xfMem[addr]);
@@ -598,6 +977,10 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
     // GX2's 0..w clip range (the PC GL path maps the same value to -w..w).
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
+}
+
+static void transform(const HostVertex& in, float* out, int texCoord, bool textured) {
+    transformPosition(in, out);
     // Layout as the fetch shader declares it: pos(4) [uv(2)] colour(4).
     evalTev(in, out + (textured ? 6 : 4), nullptr);
     if (textured) {
@@ -608,6 +991,28 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
             u *= float(ss + 1); v *= float(ts + 1);
         }
         out[4] = u; out[5] = v;
+    }
+}
+
+static void transformTev(const HostVertex& in, float* out) {
+    transformPosition(in, out);
+    for (int coord = 0; coord < 8; ++coord) {
+        float u = in.tex[coord][0], v = in.tex[coord][1];
+        if (g.tcManual[coord]) {
+            const uint32_t ss = g.bp[BP_SU_SSIZE + coord * 2] & 0xffff;
+            const uint32_t ts = g.bp[BP_SU_SSIZE + coord * 2 + 1] & 0xffff;
+            u *= float(ss + 1);
+            v *= float(ts + 1);
+        }
+        out[4 + coord * 2] = u;
+        out[5 + coord * 2] = v;
+    }
+    int ras0[4], ras1[4];
+    chanColor(in, 0, ras0);
+    chanColor(in, 1, ras1);
+    for (int i = 0; i < 4; ++i) {
+        out[20 + i] = float(ras0[i]) / 255.0f;
+        out[24 + i] = float(ras1[i]) / 255.0f;
     }
 }
 
@@ -700,20 +1105,42 @@ void flushBatch() {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
     }
-    const bool textured = usedTexture(nullptr, nullptr);
+    const TevKey tevKey = currentTevKey();
+    const bool textured = tevTextureMask(tevKey) != 0;
+    TextureEntry* tevTextures[8] = {};
+    TevShader* tevShader = nullptr;
+    if (tevSupported(tevKey)) {
+        const uint32_t mask = tevTextureMask(tevKey);
+        // getTexture() may grow its cache, so resolve all entries once more
+        // after the insertions have settled and pointers cannot be invalidated.
+        for (int map = 0; map < 8; ++map)
+            if (mask & (1u << map)) getTexture(map);
+        bool allTextures = true;
+        for (int map = 0; map < 8; ++map) {
+            if (!(mask & (1u << map))) continue;
+            tevTextures[map] = getTexture(map);
+            if (!tevTextures[map]) allTextures = false;
+        }
+        if (allTextures) tevShader = tevShaderForKey(tevKey);
+    }
+    const bool tevPath = tevShader != nullptr;
     int coord = 0, map = 0;
     TextureEntry* texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
-    // samples a texture we could not load still draws untextured (8 floats).
-    const bool useTex = textured && texture;
+    // samples a texture we could not load still draws through the stage-1
+    // fallback (8 or 10 floats), while the TEV path uses 28 floats.
+    const bool useTex = !tevPath && textured && texture;
     FixedShader& shader = useTex ? s_modulate : s_untextured;
     applyState();
-    setShader(shader, texture);
+    if (tevPath) setTevShader(*tevShader, tevTextures);
+    else setShader(shader, texture);
     std::vector<float> vbo;
     // GX2DrawEx is the well-tested path on Wii U (and avoids relying on the
     // lifetime/placement rules of a CPU-side index pointer).  Expand the
     // already-decoded index list into a contiguous vertex stream for stage 1.
-    vbo.reserve(s_batch.indices.size() * (useTex ? 10 : 8));
+    const size_t vertexFloats = tevPath ? 28 : (useTex ? 10 : 8);
+    const uint32_t vertexStride = uint32_t(vertexFloats * sizeof(float));
+    vbo.reserve(s_batch.indices.size() * vertexFloats);
     for (uint32_t index : s_batch.indices) {
         HostVertex hv;
         const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
@@ -724,8 +1151,9 @@ void flushBatch() {
                                      uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
         unpackVertex(s_batch.fmt, packed, defaults, hv);
         const size_t at = vbo.size();
-        vbo.resize(at + (useTex ? 10 : 8));
-        transform(hv, vbo.data() + at, coord, useTex);
+        vbo.resize(at + vertexFloats);
+        if (tevPath) transformTev(hv, vbo.data() + at);
+        else transform(hv, vbo.data() + at, coord, useTex);
         { const float* o = vbo.data() + at; ++s_dbgVerts;
           if (o[3] > 0 && fabsf(o[0]) <= o[3] && fabsf(o[1]) <= o[3] && o[2] >= 0 && o[2] <= o[3]) ++s_dbgIn;
           else if (o[3] <= 0) ++s_dbgBehind; else if (o[2] < 0 || o[2] > o[3]) ++s_dbgZ; }
@@ -741,13 +1169,14 @@ void flushBatch() {
                         g.projection[2], g.projection[3], g.projection[4], g.projection[5], g.projection[6]);
                 { const uint8_t* ab = g.arrayBase[0]; fprintf(s_dbg, "  arr0 %p stride %u be %d vcd %08x/%08x vatA0 %08x bytes %02x%02x %02x%02x %02x%02x\n", (const void*)ab, (unsigned)g.arrayStride[0], (int)g.arrayBigEndian[0], (unsigned)g.cpVcdLo, (unsigned)g.cpVcdHi, (unsigned)g.cpVatA[0], ab?ab[0]:0, ab?ab[1]:0, ab?ab[2]:0, ab?ab[3]:0, ab?ab[4]:0, ab?ab[5]:0); }
                 { const float* m = reinterpret_cast<const float*>(&g.xfMem[0]); fprintf(s_dbg, "  m0 %g %g %g %g | %g %g %g %g | %g %g %g %g matA %08x cpA %08x\n", m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11], (unsigned)g.xfReg[XFR_MATIDX_A], (unsigned)g.cpMatA); }
-                const size_t st = useTex ? 10 : 8;
+                const size_t st = vertexFloats;
                 for (size_t k = 0; k < 3 && k * st < vbo.size(); k++) {
                     const float* o = vbo.data() + k * st;
                     HostVertex hv; const uint8_t d9[9] = {0};
                     unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, d9, hv);
+                    const size_t co = tevPath ? 20 : (useTex ? 6 : 4);
                     fprintf(s_dbg, "  in %g %g %g mtx %u -> %g %g %g %g col %g %g %g %g\n", hv.pos[0], hv.pos[1], hv.pos[2],
-                            (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]);
+                            (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[co], o[co + 1], o[co + 2], o[co + 3]);
                 }
                 if (texture) { const uint8_t* t = static_cast<const uint8_t*>(texture->texture.surface.image); fprintf(s_dbg, "  src %p base %p image0 %08x image3 %08x\n", (const void*)texture->source, physToPtr(0x20), (unsigned)g.bp[BP_TX_IMAGE0], (unsigned)g.bp[BP_TX_IMAGE3]); fprintf(s_dbg, "  tex %ux%u fmt %u texel0 %u %u %u %u mid %u %u %u %u\n", (unsigned)texture->width, (unsigned)texture->height, (unsigned)texture->fmt, t[0], t[1], t[2], t[3], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+1], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+2], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+3]); }
                 if (++s_dbgDraws == 120) { fclose(s_dbg); s_dbg = nullptr; }
@@ -756,7 +1185,7 @@ void flushBatch() {
     }
     DCFlushRange(vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo.data(), uint32_t(vbo.size() * sizeof(float)));
-    GX2SetAttribBuffer(0, uint32_t(vbo.size() * sizeof(float)), shader.stride, vbo.data());
+    GX2SetAttribBuffer(0, uint32_t(vbo.size() * sizeof(float)), tevPath ? vertexStride : shader.stride, vbo.data());
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
     GX2DrawEx(mode, uint32_t(s_batch.indices.size()), 0, 1);
