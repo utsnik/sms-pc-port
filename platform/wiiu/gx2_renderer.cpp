@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <malloc.h>
+#include <new>
 #include <stdio.h>
 #include <vector>
 
@@ -75,7 +76,16 @@ struct Batch {
     uint32_t count = 0;
     PrimClass cls = PRIM_TRIS;
 };
-static Batch s_batch;
+// These containers must not be constructed by the Wii U image's static
+// initializer.  Cemu reaches that initializer before the port has installed
+// its MEM2 heap, so construct them on the first renderer call instead.
+static unsigned char s_batchStorage[sizeof(Batch)] __attribute__((aligned(8)));
+static Batch* s_batchObject;
+static Batch& batchObject() {
+    if (!s_batchObject) s_batchObject = new (s_batchStorage) Batch();
+    return *s_batchObject;
+}
+#define s_batch (batchObject())
 
 struct TextureEntry {
     const uint8_t* source = nullptr;
@@ -84,7 +94,13 @@ struct TextureEntry {
     GX2Sampler sampler;
     bool valid = false;
 };
-static std::vector<TextureEntry> s_textures;
+static unsigned char s_textureStorage[sizeof(std::vector<TextureEntry>)] __attribute__((aligned(8)));
+static std::vector<TextureEntry>* s_textureObject;
+static std::vector<TextureEntry>& textureCache() {
+    if (!s_textureObject) s_textureObject = new (s_textureStorage) std::vector<TextureEntry>();
+    return *s_textureObject;
+}
+#define s_textures (textureCache())
 
 static void* alignedZero(size_t alignment, size_t size) {
     void* p = memalign(alignment, size);
