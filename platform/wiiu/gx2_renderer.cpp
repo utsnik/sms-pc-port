@@ -332,8 +332,9 @@ static TevSource tevFixed(uint32_t value) {
     return {_GX2_C(32 + 4 * (value >> 2)), value & 3};
 }
 
-static TevSource tevKonst(const TevKey& k, uint32_t sel, uint32_t chan) {
+static TevSource tevKonst(const TevKey& k, uint32_t sel, uint32_t chan, bool alpha = false) {
     if (sel < 8) return tevFixed(sel);
+    if (alpha) return tevFixed(12);
     if (sel >= 12 && sel < 16) return {_GX2_C(4 * (4 + sel - 12)), chan};
     if (sel >= 16) return {_GX2_C(4 * (4 + (sel & 3))), (sel - 16) >> 2};
     return tevFixed(12);
@@ -349,14 +350,15 @@ static TevSource tevColorSource(const TevKey& k, uint32_t stage, uint32_t sel, u
     const uint32_t rasTable = k.alphaEnv[stage] & 3;
     const uint32_t texTable = (k.alphaEnv[stage] >> 2) & 3;
     if (sel == 8 || sel == 9) {
-        const uint32_t map = order & 7;
+        if (!((order >> 6) & 1)) return tevFixed(12);
         const uint32_t ch = tevSwapChannel(k, texTable, sel == 8 ? channel : 3);
-        return {_R(20 + map), ch};
+        return {_R(20 + stage), ch};
     }
     if (sel == 10 || sel == 11) {
         const uint32_t chan = (order >> 7) & 7;
+        if (chan > 1) return {ALU_SRC_0, 0};
         const uint32_t ch = tevSwapChannel(k, rasTable, sel == 10 ? channel : 3);
-        return {_R(10 + (chan == 1 ? 1 : 0)), ch};
+        return {_R(9 + chan), ch};
     }
     if (sel == 12) return tevFixed(12);
     if (sel == 13) return tevFixed(13);
@@ -369,9 +371,16 @@ static TevSource tevAlphaSource(const TevKey& k, uint32_t stage, uint32_t sel) {
     const uint32_t order = k.order[stage];
     const uint32_t rasTable = k.alphaEnv[stage] & 3;
     const uint32_t texTable = (k.alphaEnv[stage] >> 2) & 3;
-    if (sel == 4) return {_R(20 + (order & 7)), tevSwapChannel(k, texTable, 3)};
-    if (sel == 5) return {_R(10 + (((order >> 7) & 7) == 1 ? 1 : 0)), tevSwapChannel(k, rasTable, 3)};
-    if (sel == 6) return tevKonst(k, (k.ksel[stage] >> 5) & 31, 0);
+    if (sel == 4) {
+        if (!((order >> 6) & 1)) return tevFixed(12);
+        return {_R(20 + stage), tevSwapChannel(k, texTable, 3)};
+    }
+    if (sel == 5) {
+        const uint32_t chan = (order >> 7) & 7;
+        if (chan > 1) return {ALU_SRC_0, 0};
+        return {_R(9 + chan), tevSwapChannel(k, rasTable, 3)};
+    }
+    if (sel == 6) return tevKonst(k, (k.ksel[stage] >> 5) & 31, 0, true);
     return tevFixed(15);
 }
 
@@ -486,17 +495,11 @@ static bool initTevPixel(TevShader& shader) {
     const uint32_t textureMask = shader.textureMask;
     const size_t texOffset = offset;
     uint32_t texCount = 0;
-    for (uint32_t map = 0; map < 8; ++map) {
-        if (!(textureMask & (1u << map))) continue;
-        uint32_t coord = 0;
-        for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
-            if (((shader.key.order[stage] >> 6) & 1) &&
-                ((shader.key.order[stage] & 7) == map)) {
-                coord = (shader.key.order[stage] >> 3) & 7;
-                break;
-            }
-        }
-        uint64_t sample[2] = {TEX_SAMPLE(_R(20 + map), _x, _y, _z, _w, _R(2 + coord), _x, _y, _0, _x, map, map)};
+    for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
+        const uint32_t order = shader.key.order[stage];
+        if (!((order >> 6) & 1)) continue;
+        const uint32_t map = order & 7, coord = (order >> 3) & 7;
+        uint64_t sample[2] = {TEX_SAMPLE(_R(20 + stage), _x, _y, _z, _w, _R(1 + coord), _x, _y, _0, _x, map, map)};
         program[offset++] = sample[0];
         program[offset++] = sample[1];
         ++texCount;
@@ -540,7 +543,7 @@ static bool initTevPixel(TevShader& shader) {
     if (!shader.psProgram) return false;
     memcpy(shader.psProgram, program.data(), programSize);
     memset(&shader.pixel, 0, sizeof(shader.pixel));
-    shader.pixel.regs.sq_pgm_resources_ps = 28;
+    shader.pixel.regs.sq_pgm_resources_ps = 20 + shader.key.stages;
     shader.pixel.regs.sq_pgm_exports_ps = 2;
     shader.pixel.regs.spi_ps_in_control_0 = 11 | (1u << 26) | (1u << 28);
     shader.pixel.regs.num_spi_ps_input_cntl = 11;
