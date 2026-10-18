@@ -1438,29 +1438,9 @@ uint32_t peekZ(int, int) { return 0xffffff; }
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
 
-static void invalidateTextureCache(const void* address = nullptr, uint32_t size = 0) {
-    if (!s_textureObject) return;
-    // Texture pointers are resolved while the batch is built. Finish that
-    // work before releasing any decoded images they may reference.
-    if (!s_batch.indices.empty()) flushBatch();
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
-    const uintptr_t end = begin + size;
-    for (auto it = s_textures.begin(); it != s_textures.end();) {
-        bool invalidate = !address || !size;
-        if (!invalidate) {
-            const uintptr_t source = reinterpret_cast<uintptr_t>(it->source);
-            const uintptr_t sourceEnd = source + gx2TexLevelBytes(it->fmt, it->width, it->height);
-            invalidate = source && sourceEnd > source && source < end && begin < sourceEnd;
-        }
-        if (!invalidate) { ++it; continue; }
-        MEMFreeToDefaultHeap(it->texture.surface.image);
-        it = s_textures.erase(it);
-    }
-}
-
-void textureInvalidateAll() { invalidateTextureCache(); }
-void textureInvalidateRange(const void* address, uint32_t size) { invalidateTextureCache(address, size); }
-void textureCpuWrote(const void* address, uint32_t size) { invalidateTextureCache(address, size); }
+void textureInvalidateAll() {}
+void textureInvalidateRange(const void*, uint32_t) {}
+void textureCpuWrote(const void*, uint32_t) {}
 
 void* physToPtr(uint32_t);
 uint32_t ptrToPhys(const void*);
