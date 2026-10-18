@@ -99,6 +99,33 @@
 #define ALU_MOV(dstGpr, dstChan, src0Sel, src0Chan) \
     ALU_OP2(0x19, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
 
+/* Predicate and comparison instructions from the lus-rebase Latte assembler. */
+#define ALU_OP2_INST_MIN 0x04
+#define ALU_OP2_INST_MAX 0x03
+#define ALU_OP2_INST_SETE 0x08
+#define ALU_OP2_INST_SETGT 0x09
+#define ALU_OP2_INST_SETGE 0x0A
+#define ALU_OP2_INST_SETNE 0x0B
+#define ALU_OP2_INST_PRED_SETGT 0x21
+#define ALU_OP2_INST_KILLGT 0x2D
+
+#define ALU_MIN(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_MIN, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_MAX(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_MAX, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_SETE(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_SETE, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_SETGT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_SETGT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_SETGE(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_SETGE, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_SETNE(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_SETNE, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_PRED_SETGT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_PRED_SETGT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_KILLGT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_KILLGT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+
 #define CF_INST_TEX 0x01
 #define CF_INST_ALU 0x08
 #define CF_INST_CALL_FS 0x13
