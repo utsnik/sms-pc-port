@@ -1086,32 +1086,102 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
         if (g.tcManual[texCoord]) {
             const uint32_t ss = g.bp[BP_SU_SSIZE + texCoord * 2] & 0xffff;
             const uint32_t ts = g.bp[BP_SU_SSIZE + texCoord * 2 + 1] & 0xffff;
-            u *= float(ss + 1); v *= float(ts + 1);
+            if (texture && texture->width && texture->height) {
+                u *= float(ss + 1) / float(texture->width);
+                v *= float(ts + 1) / float(texture->height);
+            }
         }
         adjustCopyUv(texture, &u, &v);
         out[4] = u; out[5] = v;
     }
 }
 
+static TextureEntry* textureForCoord(const TevKey& key, TextureEntry* const* textures, int coord) {
+    for (uint32_t stage = 0; stage < key.stages; ++stage) {
+        const uint32_t order = key.order[stage];
+        if (((order >> 6) & 1) && ((order >> 3) & 7) == uint32_t(coord)) {
+            const uint32_t map = order & 7;
+            if (textures[map]) return textures[map];
+        }
+    }
+    return nullptr;
+}
+
 static void transformTev(const HostVertex& in, float* out, const TevKey& key, TextureEntry* const* textures) {
     transformPosition(in, out);
+    int ras0[4], ras1[4];
+    chanColor(in, 0, ras0);
+    chanColor(in, 1, ras1);
+    float texgen[8][3] = {};
     for (int coord = 0; coord < 8; ++coord) {
-        float u = in.tex[coord][0], v = in.tex[coord][1];
+        const uint32_t tg = g.xfReg[XFR_TEXGEN + coord];
+        const uint32_t proj = (tg >> 1) & 1, form = (tg >> 2) & 1;
+        const uint32_t type = (tg >> 4) & 7, row = (tg >> 7) & 31;
+        const uint32_t emboss = (tg >> 12) & 7;
+        float source[4] = {0, 0, 1, 1};
+        if (row == 0) {
+            source[0] = in.pos[0]; source[1] = in.pos[1]; source[2] = in.pos[2];
+        } else if (row == 1) {
+            source[0] = in.nrm[0]; source[1] = in.nrm[1]; source[2] = in.nrm[2];
+        } else if (row == 2) {
+            for (int i = 0; i < 4; ++i) source[i] = float(ras0[i]) / 255.0f;
+        } else if (row == 3) {
+            source[0] = in.bin[0]; source[1] = in.bin[1]; source[2] = in.bin[2];
+        } else if (row == 4) {
+            source[0] = in.tan[0]; source[1] = in.tan[1]; source[2] = in.tan[2];
+        } else {
+            const int input = int((row - 5) & 7);
+            source[0] = in.tex[input][0]; source[1] = in.tex[input][1];
+        }
+        if (form == 0 && row < 5) {
+            source[2] = 1.0f;
+            source[3] = 1.0f;
+        }
+        float t[3] = {0, 0, 1};
+        if (type == 0) {
+            const uint32_t matrix = in.mtx[coord + 1] & 63;
+            const float* m = reinterpret_cast<const float*>(&g.xfMem[0x500 + matrix * 4]);
+            for (int r = 0; r < 3; ++r)
+                t[r] = m[r * 4 + 0] * source[0] + m[r * 4 + 1] * source[1] +
+                       m[r * 4 + 2] * source[2] + m[r * 4 + 3] * source[3];
+            if (!proj) t[2] = 1.0f;
+        } else if (type == 1) {
+            const uint32_t sourceCoord = emboss < uint32_t(coord) ? emboss : 0;
+            t[0] = texgen[sourceCoord][0]; t[1] = texgen[sourceCoord][1]; t[2] = texgen[sourceCoord][2];
+        } else {
+            const int* color = type == 3 ? ras1 : ras0;
+            t[0] = float(color[0]) / 255.0f;
+            t[1] = float(color[1]) / 255.0f;
+            t[2] = 1.0f;
+        }
+        if ((g.xfReg[XFR_DUALTEX] & 1) && type == 0) {
+            const uint32_t post = g.xfReg[XFR_POSTTEX + coord];
+            const uint32_t matrix = post & 63;
+            if ((post >> 8) & 1) {
+                const float len = sqrtf(t[0] * t[0] + t[1] * t[1] + t[2] * t[2]);
+                if (len > 0.0f) { t[0] /= len; t[1] /= len; t[2] /= len; }
+            }
+            const float pv[4] = {t[0], t[1], t[2], 1.0f};
+            const float* m = reinterpret_cast<const float*>(&g.xfMem[0x500 + matrix * 4]);
+            for (int r = 0; r < 3; ++r)
+                t[r] = m[r * 4 + 0] * pv[0] + m[r * 4 + 1] * pv[1] +
+                       m[r * 4 + 2] * pv[2] + m[r * 4 + 3] * pv[3];
+        }
+        if (proj && fabsf(t[2]) > 0.00001f) {
+            t[0] /= t[2]; t[1] /= t[2];
+        }
+        texgen[coord][0] = t[0]; texgen[coord][1] = t[1]; texgen[coord][2] = t[2];
+        float u = t[0], v = t[1];
+        TextureEntry* texture = textureForCoord(key, textures, coord);
         if (g.tcManual[coord]) {
             const uint32_t ss = g.bp[BP_SU_SSIZE + coord * 2] & 0xffff;
             const uint32_t ts = g.bp[BP_SU_SSIZE + coord * 2 + 1] & 0xffff;
-            u *= float(ss + 1);
-            v *= float(ts + 1);
-        }
-        for (uint32_t stage = 0; stage < key.stages; ++stage) {
-            const uint32_t order = key.order[stage];
-            if (!((order >> 6) & 1)) continue;
-            const uint32_t map = order & 7;
-            if (((order >> 3) & 7) == uint32_t(coord) && textures[map]) {
-                adjustCopyUv(textures[map], &u, &v);
-                break;
+            if (texture && texture->width && texture->height) {
+                u *= float(ss + 1) / float(texture->width);
+                v *= float(ts + 1) / float(texture->height);
             }
         }
+        adjustCopyUv(texture, &u, &v);
         out[4 + coord * 2] = u;
         out[5 + coord * 2] = v;
     }
