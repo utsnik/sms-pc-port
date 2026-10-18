@@ -2,6 +2,7 @@
 
 #include "port_stub.h"
 #include "port_os.h"
+#include <sms_gx/gx_pc.h>
 
 #include <coreinit/memory.h>
 #include <coreinit/memblockheap.h>
@@ -220,6 +221,7 @@ void sms_wiiu_runtime_init(void)
 	}
 	sms_wiiu_mem2_base = reinterpret_cast<uint8_t*>(arena);
 	sms_wiiu_mem2_size = kGameArenaBytes;
+	GXPC_SetMemoryWindow(sms_wiiu_mem2_base, sms_wiiu_mem2_size);
 	resolve_app_root();
 	std::strncpy(s_files_root, kAppRootCandidates[kAppRootIndex],
 	             sizeof(s_files_root));

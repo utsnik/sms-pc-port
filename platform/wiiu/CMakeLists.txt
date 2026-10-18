@@ -3,6 +3,7 @@ set(SMS_WIIU_BUILD_DIR "/mnt/buildcache/wiiu-build/sms" CACHE PATH
 
 set(SMS_WIIU_GAME_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src/port_include
   ${SMS_PATCHED_INCLUDE_DIRS}
   ${SMS_GAME_INCLUDE_DIRS})
@@ -105,9 +106,16 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/exception.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/pad.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_api.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_fifo.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_vert.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gx2_texture.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gx2_renderer.cpp
   ${SMS_WIIU_COMMON_SOURCES}
   ${SMS_WIIU_PS_SOURCES})
 target_include_directories(sms BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES}
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} ${SMS_WIIU_OS_ADAPTER_DEFS}

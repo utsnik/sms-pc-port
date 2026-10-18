@@ -18,23 +18,21 @@
 
 namespace {
 
-uint8_t s_pipe_sink[64];
-uint8_t* s_memory_base;
-uint32_t s_memory_size;
-uint32_t s_frame_count;
 uint32_t s_present_count;
 float s_widescreen = 1.0f;
 bool s_logged;
 bool s_gfx_initialized;
-uint16_t s_draw_sync_token;
-GXDrawSyncCallback s_draw_sync_callback;
-GXDrawDoneCallback s_draw_done_callback;
+bool s_frame_open;
+
+extern "C" int sms_wiiu_gx2_renderer_init(void);
+extern "C" void sms_wiiu_gx2_renderer_begin(void);
+extern "C" void sms_wiiu_gx2_renderer_end(void);
 
 void log_active_once()
 {
 	if (!s_logged) {
 		s_logged = true;
-		WHBLogPrintf("SMS Wii U: GX link stub active");
+		WHBLogPrintf("SMS Wii U: GX2 renderer active");
 	}
 }
 
@@ -47,6 +45,14 @@ extern "C" void sms_wiiu_gfx_init(void)
 	s_gfx_initialized = WHBGfxInit() != FALSE;
 	if (!s_gfx_initialized)
 		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
+	else if (!sms_wiiu_gx2_renderer_init())
+		WHBLogPrintf("SMS Wii U: GX2 renderer setup failed");
+	else {
+		WHBGfxBeginRender();
+		WHBGfxBeginRenderTV();
+		sms_wiiu_gx2_renderer_begin();
+		s_frame_open = true;
+	}
 }
 
 /* Orderly exit on the main thread after ProcUI reported EXITING: WHBGfx owns
@@ -55,6 +61,10 @@ extern "C" void sms_wiiu_gfx_init(void)
 extern "C" void sms_wiiu_exit(void)
 {
 	if (s_gfx_initialized) {
+		if (s_frame_open) {
+			sms_wiiu_gx2_renderer_end();
+			s_frame_open = false;
+		}
 		s_gfx_initialized = false;
 		WHBGfxShutdown();
 	}
@@ -82,30 +92,30 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	const float r = loaded ? 0.02f : 0.0f;
 	const float g = loaded ? 0.18f : 0.02f;
 	const float b = loaded ? 0.03f : 0.16f;
-	/* BeginRender/FinishRender only wait for and swap the scan buffers; each
-	 * screen needs its own Begin/Finish pair or it is never drawn (the TV
-	 * stayed black in Cemu). */
-	WHBGfxBeginRender();
-	WHBGfxBeginRenderTV();
-	WHBGfxClearColor(r, g, b, 1.0f);
+	if (!s_frame_open) {
+		WHBGfxBeginRender();
+		WHBGfxBeginRenderTV();
+		sms_wiiu_gx2_renderer_begin();
+		s_frame_open = true;
+	}
+	sms_wiiu_gx2_renderer_end();
 	WHBGfxFinishRenderTV();
 	WHBGfxBeginRenderDRC();
 	WHBGfxClearColor(r, g, b, 1.0f);
 	WHBGfxFinishRenderDRC();
 	WHBGfxFinishRender();
+	WHBGfxBeginRender();
+	WHBGfxBeginRenderTV();
+	sms_wiiu_gx2_renderer_begin();
+	s_frame_open = true;
 }
 
 extern "C" {
 
-volatile PPCWGPipe GXWGFifo = {};
-uint8_t* GXPC_PipeBuf = s_pipe_sink;
-uint32_t GXPC_PipeLen = 0;
-uint32_t GXPC_PipeFast = 0;
-
 int GXPC_ParseArgs(int*, char**) { return 0; }
 void GXPC_SetHeadless(int) {}
 void GXPC_PrintDisplayInfo(void) {}
-int GXPC_InitAuto(float) { log_active_once(); return 1; }
+int GXPC_InitAuto(float scale) { log_active_once(); return sms_wiiu_gx2_renderer_init() ? 1 : 0; }
 int GXPC_IsHeadless(void) { return 1; }
 void GXPC_SetAutoPresent(int) {}
 void GXPC_Present(const void*) { log_active_once(); ++s_present_count; sms_wiiu_frame_boundary(); }
@@ -130,40 +140,6 @@ void GXPC_Shutdown(void) {}
 void GXPC_PrefetchResource(const void*, uint32_t, const char*) {}
 void GXPC_PreloadTextures(void) {}
 void GXPC_PrepareStage(int) {}
-
-void GXPC_SetMemoryWindow(void* base, uint32_t size)
-{
-	s_memory_base = static_cast<uint8_t*>(base);
-	s_memory_size = size;
-}
-
-uint32_t GXPC_PtrToPhys(const void* ptr)
-{
-	if (!s_memory_base || !ptr)
-		return 0;
-	const uintptr_t address = reinterpret_cast<uintptr_t>(ptr);
-	const uintptr_t base = reinterpret_cast<uintptr_t>(s_memory_base);
-	if (address < base)
-		return 0;
-	const uintptr_t offset = address - base;
-	return offset < s_memory_size ? static_cast<uint32_t>(offset) : 0;
-}
-
-void* GXPC_PhysToPtr(uint32_t phys)
-{
-	return s_memory_base && phys < s_memory_size ? s_memory_base + phys : nullptr;
-}
-
-void GXPC_InvalidateRange(const void*, uint32_t) {}
-void GXPC_MemoryWritten(const void*, uint32_t) {}
-void GXPC_SetArrayBigEndian(int, int) {}
-void GXPC_SetDefaultArrayBigEndian(int) {}
-void GXPC_AddBigEndianRange(const void*, uint32_t) {}
-void GXPC_RemoveBigEndianRange(const void*) {}
-void GXPC_Write8(uint8_t) {}
-void GXPC_Write16(uint16_t) {}
-void GXPC_Write32(uint32_t) {}
-void GXPC_WriteF32(float) {}
 
 int GXPC_PresentXFB(const void*, int, int)
 {
@@ -198,51 +174,6 @@ void GXPC_OverlayFrame(void) {}
 int GXPC_OverlayVisible(void) { return 0; }
 void GXPC_CycleSpeed(void) {}
 int GXPC_GetSpeed(void) { return 1; }
-
-void GXSetDrawSync(u16 token)
-{
-	s_draw_sync_token = token;
-	if (s_draw_sync_callback)
-		s_draw_sync_callback(token);
-}
-u16 GXReadDrawSync(void) { return s_draw_sync_token; }
-u16 GXGetDrawSync(void) { return s_draw_sync_token; }
-GXDrawSyncCallback GXSetDrawSyncCallback(GXDrawSyncCallback callback)
-{
-	GXDrawSyncCallback old = s_draw_sync_callback;
-	s_draw_sync_callback = callback;
-	return old;
-}
-GXDrawDoneCallback GXSetDrawDoneCallback(GXDrawDoneCallback callback)
-{
-	GXDrawDoneCallback old = s_draw_done_callback;
-	s_draw_done_callback = callback;
-	return old;
-}
-void GXDrawDone(void)
-{
-	if (s_draw_done_callback)
-		s_draw_done_callback();
-}
-void GXSetDrawDone(void) { GXDrawDone(); }
-void GXWaitDrawDone(void) { GXDrawDone(); }
-void GXPeekZ(u16, u16, u32* z)
-{
-	if (z)
-		*z = 0;
-}
-void GXPeekARGB(u16, u16, u32* color)
-{
-	if (color)
-		*color = 0;
-}
-void GXReadBoundingBox(u16* left, u16* top, u16* right, u16* bottom)
-{
-	if (left) *left = 0;
-	if (top) *top = 0;
-	if (right) *right = 0;
-	if (bottom) *bottom = 0;
-}
 
 /* Ancillary weak interfaces used only when optional host menu sources slip
  * into a source list.  Stage 1 has no screenshots or prompt device. */

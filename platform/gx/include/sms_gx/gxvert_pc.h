@@ -13,8 +13,8 @@
  * The writers become calls into sms_gx, and in C++ `GXWGFifo.u8 = x` style
  * stores (MarioUtil/PacketUtil.cpp) go through GXPC_WGPipe.
  */
-#ifndef _DOLPHIN_GX_GXVERT_H_
-#define _DOLPHIN_GX_GXVERT_H_
+#ifndef SMS_GX_GXVERT_PC_H
+#define SMS_GX_GXVERT_PC_H
 
 #include <dolphin/types.h>
 #include <sms_gx/gx_pc.h>
