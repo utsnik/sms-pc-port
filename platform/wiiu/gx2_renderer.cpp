@@ -1094,7 +1094,7 @@ static void transformPosition(const HostVertex& in, float* out) {
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
     static uint32_t s_tpDebug;
-    if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_tpDebug < 3 && fabsf(in.pos[0] + 1650.0f) < 0.1f) {
+    if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_tpDebug < 3) {
         FILE* f = fopen("fs:/vol/external01/gx2dbg.txt", "a");
         if (f) {
             fprintf(f, "tp mtx %u m %g %g %g %g | %g %g %g %g | %g %g %g %g xyz %g %g %g clip %g %g %g %g out %g %g %g %g\n",
