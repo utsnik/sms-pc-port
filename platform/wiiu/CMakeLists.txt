@@ -1,5 +1,6 @@
 set(SMS_WIIU_BUILD_DIR "/mnt/buildcache/wiiu-build/sms" CACHE PATH
     "Stage 1 Wii U output directory")
+option(SMS_WIIU_SKIP_INTRO "Skip opening movies in Wii U test builds" ON)
 
 set(SMS_WIIU_GAME_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -120,7 +121,8 @@ target_include_directories(sms BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES}
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} ${SMS_WIIU_OS_ADAPTER_DEFS}
-  SMS_AUDIO_DSP_HLE=0 SMS_WIIU_RUN_GAME=1)
+  SMS_AUDIO_DSP_HLE=0 SMS_WIIU_RUN_GAME=1
+  SMS_WIIU_SKIP_INTRO=$<BOOL:${SMS_WIIU_SKIP_INTRO}>)
 target_compile_definitions(sms_game PRIVATE ${SMS_WIIU_OS_ADAPTER_DEFS})
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/os_core.cpp
   PROPERTIES COMPILE_DEFINITIONS DEBUG=1)

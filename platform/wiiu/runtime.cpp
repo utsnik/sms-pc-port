@@ -106,7 +106,10 @@ u32 sms_wiiu_mem2_size;
 
 const char* port_disc_root;
 int port_disc_explicit;
-int port_skip_movies = 1;
+#ifndef SMS_WIIU_SKIP_INTRO
+#define SMS_WIIU_SKIP_INTRO 1
+#endif
+int port_skip_movies = SMS_WIIU_SKIP_INTRO ? 1 : 0;
 int port_heat_haze;
 int port_pause_tracker;
 float port_widescreen = 1.0f;
@@ -251,6 +254,8 @@ void port_init(int, char**)
 {
 	if (s_initialized && s_heap_ready)
 		return;
+	if (const char* skip = std::getenv("SMS_WIIU_SKIP_INTRO"))
+		port_skip_movies = *skip && std::strcmp(skip, "0") != 0;
 	sms_wiiu_runtime_init();
 	if (!s_initialized)
 		return;
