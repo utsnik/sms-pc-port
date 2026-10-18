@@ -1365,7 +1365,7 @@ void flushBatch() {
     { // TEMP debug dump
         static int s_dbgDraws = 0; static FILE* s_dbg = nullptr;
         if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_dbgDraws < 120) {
-            if (!s_dbg) s_dbg = fopen("fs:/vol/external01/gx2dbg.txt", "a");
+            if (!s_dbg) s_dbg = fopen("fs:/vol/external01/gx2dbg.txt", "w");
             if (s_dbg) {
                 fprintf(s_dbg, "draw %d frame %u fmt %x n %u tex %d tev %d stages %u mask %02x gen %08x vp %g %g %g %g proj %g %g %g %g %g %g %g\n", s_dbgDraws,
                         (unsigned)g_displayFrames, (unsigned)s_batch.fmt, (unsigned)s_batch.indices.size(), (int)textured,
