@@ -1,6 +1,7 @@
 // Register file, command-stream parser and vertex loader.
 #ifdef __WIIU__
 #include "../../wiiu/port_heap.h"
+#include "../../wiiu/runtime.h"
 #else
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
@@ -114,6 +115,13 @@ static uint32_t s_memSize = 0x01800000;
 void* physToPtr(uint32_t phys) {
     phys &= 0x3FFFFFFF;
     if (!phys) return nullptr;
+#ifdef __WIIU__
+    // The Wii U renderer uses an address-zero window for MEM2.  The title's
+    // low GX texture addresses are physical offsets into the app arena, so
+    // resolve them through the same MEM2 base as the OS compatibility shim.
+    if (!s_memBase && sms_wiiu_mem2_base && phys < sms_wiiu_mem2_size)
+        return sms_wiiu_mem2_base + phys;
+#endif
     return s_memBase + phys;
 }
 
