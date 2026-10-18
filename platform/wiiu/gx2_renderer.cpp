@@ -158,6 +158,8 @@ struct TextureEntry {
     uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0;
     GX2Texture texture;
     GX2Sampler sampler;
+    uint64_t sourceHash = 0;
+    uint32_t checkedFrame = 0;
     bool valid = false;
 };
 static unsigned char s_textureStorage[sizeof(std::vector<TextureEntry>)] __attribute__((aligned(8)));
@@ -651,6 +653,31 @@ static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     *u = (float(e->sourceX) + *u * float(e->sourceW)) / s_tvW;
     *v = (float(e->sourceY) + *v * float(e->sourceH)) / s_tvH;
 }
+
+static bool textureSourceReadable(const uint8_t* source, uint32_t srcBytes) {
+    const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
+    return source && srcBytes && a1 > a0 &&
+        ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
+}
+
+static void decodeTextureEntry(TextureEntry& e, const uint8_t* source, uint32_t fmt, uint32_t w, uint32_t h,
+                               uint32_t tlut, uint32_t tlutFmt, bool readable) {
+    uint8_t* rgba = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64));
+    if (!readable && rgba) { MEMFreeToDefaultHeap(rgba); rgba = nullptr; }
+    if (!rgba) {
+        memset(e.texture.surface.image, 0xff, e.texture.surface.imageSize);
+    } else {
+        const bool indexed = fmt >= 8 && fmt <= 10;
+        const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
+        gx2DecodeTexture(source, fmt, w, h, tlutPtr, tlutFmt, rgba);
+        uint8_t* dst = static_cast<uint8_t*>(e.texture.surface.image);
+        for (uint32_t y = 0; y < h; ++y)
+            memcpy(dst + size_t(y) * e.texture.surface.pitch * 4, rgba + size_t(y) * w * 4, size_t(w) * 4);
+        MEMFreeToDefaultHeap(rgba);
+    }
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, e.texture.surface.image, e.texture.surface.imageSize);
+}
+
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!dest || !cb || !w || !h) return;
@@ -714,6 +741,8 @@ static TextureEntry* getTexture(int map) {
     const uint32_t tlut = indexed ? (tlutReg & 0x3ff) : 0;
     const uint32_t tlutFmt = indexed ? ((tlutReg >> 10) & 3) : 0;
     const uint8_t* source = g.texImage[map];
+    const uint32_t srcBytes = gx2TexLevelBytes(fmt, w, h);
+    const bool readable = textureSourceReadable(source, srcBytes);
     if (TextureEntry* c = copyTexture(source)) {
         GX2InitSampler(&c->sampler, GX2_TEX_CLAMP_MODE_CLAMP,
                        (mode0 & 0x20) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT);
@@ -724,7 +753,16 @@ static TextureEntry* getTexture(int map) {
     for (size_t i = 0; i < s_textures.size(); ++i) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.source == source && e.fmt == fmt && e.width == w && e.height == h &&
-            e.tlut == tlut && e.tlutFmt == tlutFmt) return &e;
+            e.tlut == tlut && e.tlutFmt == tlutFmt) {
+            if (readable && g_displayFrames - e.checkedFrame >= 8) {
+                const uint64_t sourceHash = hashBytes(source, srcBytes);
+                if (sourceHash != e.sourceHash)
+                    decodeTextureEntry(e, source, fmt, w, h, tlut, tlutFmt, true);
+                e.sourceHash = sourceHash;
+                e.checkedFrame = g_displayFrames;
+            }
+            return &e;
+        }
     }
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
@@ -750,30 +788,9 @@ static TextureEntry* getTexture(int map) {
     GX2InitSamplerClamping(&e.sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
                            GX2_TEX_CLAMP_MODE_WRAP);
 
-    // Decode through an explicitly checked buffer: a failed std::vector
-    // allocation returns null here (no exceptions), and the decoder then wrote
-    // megabytes from address 0 and corrupted newlib's heap.
-    uint8_t* rgba = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64));
-    // A texture address that did not survive the 30-bit GX physical address
-    // (outside the main heap) must not be read: in Cemu that kills the title.
-    const uint32_t srcBytes = gx2TexLevelBytes(fmt, w, h);
-    // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
-    // texture came out white), so check the app's MEM2/MEM1 ranges directly.
-    const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
-    const bool readable = source && srcBytes && a1 > a0 &&
-        ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
-    if (!readable && rgba) { MEMFreeToDefaultHeap(rgba); rgba = nullptr; }
-    if (!rgba) {
-        memset(e.texture.surface.image, 0xff, e.texture.surface.imageSize);
-    } else {
-        const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
-        gx2DecodeTexture(source, fmt, w, h, tlutPtr, tlutFmt, rgba);
-        uint8_t* dst = static_cast<uint8_t*>(e.texture.surface.image);
-        for (uint32_t y = 0; y < h; ++y)
-            memcpy(dst + size_t(y) * e.texture.surface.pitch * 4, rgba + size_t(y) * w * 4, size_t(w) * 4);
-        MEMFreeToDefaultHeap(rgba);
-    }
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, e.texture.surface.image, e.texture.surface.imageSize);
+    decodeTextureEntry(e, source, fmt, w, h, tlut, tlutFmt, readable);
+    e.sourceHash = readable ? hashBytes(source, srcBytes) : 0;
+    e.checkedFrame = g_displayFrames;
     e.valid = true;
     return &e;
 }
