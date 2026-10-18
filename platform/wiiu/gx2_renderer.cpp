@@ -626,6 +626,7 @@ static float s_tvW = 1280.0f, s_tvH = 720.0f, s_gameScale = 1.5f, s_gameX = 160.
 struct CopyEntry {
     const void* dest = nullptr;
     TextureEntry tex;
+    uint32_t sourceX = 0, sourceY = 0, sourceW = 0, sourceH = 0;
 };
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
 static std::vector<CopyEntry>* s_copyObject;
@@ -638,6 +639,17 @@ static TextureEntry* copyTexture(const void* source) {
         if (c.dest == source && c.tex.valid) return &c.tex;
     return nullptr;
 }
+static const CopyEntry* copyEntryForTexture(const TextureEntry* texture) {
+    for (const CopyEntry& c : copyCache())
+        if (&c.tex == texture && c.tex.valid) return &c;
+    return nullptr;
+}
+static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
+    const CopyEntry* e = copyEntryForTexture(texture);
+    if (!e || !e->sourceW || !e->sourceH) return;
+    *u = (float(e->sourceX) + *u * float(e->sourceW)) / s_tvW;
+    *v = (float(e->sourceY) + *v * float(e->sourceH)) / s_tvH;
+}
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!dest || !cb || !w || !h) return;
@@ -649,19 +661,25 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     CopyEntry* e = nullptr;
     for (CopyEntry& c : copyCache())
         if (c.dest == dest) { e = &c; break; }
-    if (e && (e->tex.width != tw || e->tex.height != th)) {
+    // Cemu's GX2CopySurfaceEx implementation only handles a full-surface
+    // copy. Keep the backing texture the size of the TV target, copy that
+    // surface in one operation, and apply the source rectangle in the
+    // texture coordinates sent to the shader below.
+    const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
+    if (e && (e->tex.width != fullW || e->tex.height != fullH)) {
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
         e->tex.valid = false;
     }
     if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
+    e->sourceX = tx; e->sourceY = ty; e->sourceW = tw; e->sourceH = th;
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
-        t.width = tw; t.height = th;
+        t.width = fullW; t.height = fullH;
         t.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
         t.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
-        t.texture.surface.width = tw;
-        t.texture.surface.height = th;
+        t.texture.surface.width = fullW;
+        t.texture.surface.height = fullH;
         t.texture.surface.depth = 1;
         t.texture.surface.mipLevels = 1;
         t.texture.surface.format = cb->surface.format;
@@ -676,9 +694,9 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         GX2InitTextureRegs(&t.texture);
         t.valid = true;
     }
-    GX2Rect rect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
-    GX2Point point = {0, 0};
-    GX2CopySurfaceEx(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0, 1, &rect, &point);
+    GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE,
+                  e->tex.texture.surface.image, e->tex.texture.surface.imageSize);
 }
 
 static TextureEntry* getTexture(int map) {
@@ -1057,7 +1075,7 @@ static void transformPosition(const HostVertex& in, float* out) {
     out[3] = cw;
 }
 
-static void transform(const HostVertex& in, float* out, int texCoord, bool textured) {
+static void transform(const HostVertex& in, float* out, int texCoord, bool textured, TextureEntry* texture) {
     transformPosition(in, out);
     // Layout as the fetch shader declares it: pos(4) [uv(2)] colour(4).
     evalTev(in, out + (textured ? 6 : 4), nullptr);
@@ -1068,11 +1086,12 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
             const uint32_t ts = g.bp[BP_SU_SSIZE + texCoord * 2 + 1] & 0xffff;
             u *= float(ss + 1); v *= float(ts + 1);
         }
+        adjustCopyUv(texture, &u, &v);
         out[4] = u; out[5] = v;
     }
 }
 
-static void transformTev(const HostVertex& in, float* out) {
+static void transformTev(const HostVertex& in, float* out, const TevKey& key, TextureEntry* const* textures) {
     transformPosition(in, out);
     for (int coord = 0; coord < 8; ++coord) {
         float u = in.tex[coord][0], v = in.tex[coord][1];
@@ -1081,6 +1100,15 @@ static void transformTev(const HostVertex& in, float* out) {
             const uint32_t ts = g.bp[BP_SU_SSIZE + coord * 2 + 1] & 0xffff;
             u *= float(ss + 1);
             v *= float(ts + 1);
+        }
+        for (uint32_t stage = 0; stage < key.stages; ++stage) {
+            const uint32_t order = key.order[stage];
+            if (!((order >> 6) & 1)) continue;
+            const uint32_t map = order & 7;
+            if (((order >> 3) & 7) == uint32_t(coord) && textures[map]) {
+                adjustCopyUv(textures[map], &u, &v);
+                break;
+            }
         }
         out[4 + coord * 2] = u;
         out[5 + coord * 2] = v;
@@ -1230,8 +1258,8 @@ void flushBatch() {
         unpackVertex(s_batch.fmt, packed, defaults, hv);
         const size_t at = vbo.size();
         vbo.resize(at + vertexFloats);
-        if (tevPath) transformTev(hv, vbo.data() + at);
-        else transform(hv, vbo.data() + at, coord, useTex);
+        if (tevPath) transformTev(hv, vbo.data() + at, tevKey, tevTextures);
+        else transform(hv, vbo.data() + at, coord, useTex, texture);
         { const float* o = vbo.data() + at; ++s_dbgVerts;
           if (o[3] > 0 && fabsf(o[0]) <= o[3] && fabsf(o[1]) <= o[3] && o[2] >= 0 && o[2] <= o[3]) ++s_dbgIn;
           else if (o[3] <= 0) ++s_dbgBehind; else if (o[2] < 0 || o[2] > o[3]) ++s_dbgZ; }
@@ -1268,6 +1296,10 @@ void flushBatch() {
                             (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[co], o[co + 1], o[co + 2], o[co + 3]);
                 }
                 if (texture) { const uint8_t* t = static_cast<const uint8_t*>(texture->texture.surface.image); fprintf(s_dbg, "  src %p base %p image0 %08x image3 %08x\n", (const void*)texture->source, physToPtr(0x20), (unsigned)g.bp[BP_TX_IMAGE0], (unsigned)g.bp[BP_TX_IMAGE3]); fprintf(s_dbg, "  tex %ux%u fmt %u texel0 %u %u %u %u mid %u %u %u %u\n", (unsigned)texture->width, (unsigned)texture->height, (unsigned)texture->fmt, t[0], t[1], t[2], t[3], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+1], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+2], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+3]); }
+                for (const CopyEntry& c : copyCache())
+                    fprintf(s_dbg, "  copycache dest %p tex %ux%u crop %u,%u %ux%u\n", c.dest,
+                            (unsigned)c.tex.width, (unsigned)c.tex.height, (unsigned)c.sourceX,
+                            (unsigned)c.sourceY, (unsigned)c.sourceW, (unsigned)c.sourceH);
                 if (++s_dbgDraws == 120) { fclose(s_dbg); s_dbg = nullptr; }
             }
         }
