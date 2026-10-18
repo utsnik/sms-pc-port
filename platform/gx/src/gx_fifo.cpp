@@ -1,4 +1,9 @@
 // Register file, command-stream parser and vertex loader.
+#ifdef __WIIU__
+#include "../../wiiu/port_heap.h"
+#else
+#define SMS_PORT_HEAP_SCOPE() ((void)0)
+#endif
 #include "gx_internal.h"
 #include <time.h>
 #ifdef __APPLE__
@@ -197,7 +202,13 @@ static inline uint32_t be32(const uint8_t* p) {
 }
 
 // ------------------------------------------------------------------ register writes
+// On a big-endian host (Wii U) disc data and game-built arrays are both
+// big-endian; reading them as host-LE byte-swapped every s16 position.
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+bool g_defaultArrayBE = true;
+#else
 bool g_defaultArrayBE = false;
+#endif
 uint32_t g_arrayGen = 1;
 #define s_defaultArrayBE g_defaultArrayBE
 
@@ -219,7 +230,7 @@ void resetState() {
     (void)be;
 }
 
-void writeBP(uint32_t value) {
+void writeBP(uint32_t value) { SMS_PORT_HEAP_SCOPE();
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
     if (reg == BP_MASK) {
@@ -284,7 +295,7 @@ void writeBP(uint32_t value) {
     }
 }
 
-void writeCP(uint8_t reg, uint32_t value) {
+void writeCP(uint8_t reg, uint32_t value) { SMS_PORT_HEAP_SCOPE();
     switch (reg & 0xF0) {
     case CP_MATIDX_A: g.cpMatA = value; break;
     case CP_MATIDX_B: g.cpMatB = value; break;
@@ -324,7 +335,7 @@ void writeCP(uint8_t reg, uint32_t value) {
     }
 }
 
-void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
+void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) { SMS_PORT_HEAP_SCOPE();
     for (uint32_t i = 0; i < count; i++, addr++) {
         uint32_t v = words[i];
         if (addr < XF_MEM_WORDS) {
@@ -515,7 +526,7 @@ extern double g_flushSeconds;
 // enables (position always); the renderer feeds the others as constant
 // vertex attributes. Layout: pos f32x3 | nrm f32x3 | bin, tan f32x3 (NBT) |
 // clr0 u8x4 | clr1 u8x4 | tex0..7 f32x2 | matrix indices u8x12.
-const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) {
+const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) { SMS_PORT_HEAP_SCOPE();
     static std::unordered_map<uint32_t, VtxFmtLayout> cache;
     auto it = cache.find(fmt);
     if (it != cache.end()) return it->second;
@@ -994,7 +1005,7 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
     return uint32_t(p - start);
 }
 
-void runCommands(const uint8_t* data, uint32_t size) {
+void runCommands(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
     uint32_t need = 0;
     uint32_t used = parse(data, size, &need);
     if (used < size) logmsg("display list ends inside a command (%u of %u bytes used)", used, size);
@@ -1110,6 +1121,9 @@ FILE* traceFile();
 enum { kDlRecheckFrames = 30 };
 
 static bool dlCacheEnabled() {
+#ifdef __WIIU__
+    return false;  // TEMP: decode every list while the GX2 renderer is brought up
+#endif
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("SMS_GX_DL_CACHE");
@@ -1257,7 +1271,7 @@ static void dlReplayState(const DlEntry& e) {
     }
 }
 
-void callDisplayList(const uint8_t* data, uint32_t size) {
+void callDisplayList(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
         runCommands(data, size);
         return;
@@ -1419,7 +1433,7 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n) {
     if (s_pipeLen >= s_pipeNeed) pipeRun();
 }
 
-void pipeWrite(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
+void pipeWrite(const uint8_t* bytes, uint32_t n) { SMS_PORT_HEAP_SCOPE(); pipePut(bytes, n); }
 
 }  // namespace gx
 

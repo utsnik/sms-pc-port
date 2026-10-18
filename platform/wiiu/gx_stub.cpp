@@ -27,6 +27,7 @@ bool s_frame_open;
 extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
+extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
 
 void log_active_once()
 {
@@ -100,6 +101,9 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
 	}
+	/* Retraces with nothing drawn keep the last picture on screen. */
+	if (!sms_wiiu_gx2_renderer_has_draws())
+		return;
 	sms_wiiu_gx2_renderer_end();
 	WHBGfxFinishRenderTV();
 	WHBGfxBeginRenderDRC();

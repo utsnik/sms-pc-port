@@ -221,7 +221,11 @@ void sms_wiiu_runtime_init(void)
 	}
 	sms_wiiu_mem2_base = reinterpret_cast<uint8_t*>(arena);
 	sms_wiiu_mem2_size = kGameArenaBytes;
-	GXPC_SetMemoryWindow(sms_wiiu_mem2_base, sms_wiiu_mem2_size);
+	/* Window at address 0: GX "physical" addresses are then the pointers
+	 * themselves. J3DLoadArrayBasePtr and others write (u32)ptr straight into
+	 * the FIFO, so an arena-relative window sent every J3D vertex array to the
+	 * wrong place. The Wii U heap (0x1xxxxxxx) fits the decoder's 30-bit mask. */
+	GXPC_SetMemoryWindow(nullptr, 0x40000000u);
 	resolve_app_root();
 	std::strncpy(s_files_root, kAppRootCandidates[kAppRootIndex],
 	             sizeof(s_files_root));
