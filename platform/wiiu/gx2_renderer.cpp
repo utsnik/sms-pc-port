@@ -1185,9 +1185,6 @@ static void transformTev(const HostVertex& in, float* out, const TevKey& key, Te
         out[4 + coord * 2] = u;
         out[5 + coord * 2] = v;
     }
-    int ras0[4], ras1[4];
-    chanColor(in, 0, ras0);
-    chanColor(in, 1, ras1);
     for (int i = 0; i < 4; ++i) {
         out[20 + i] = float(ras0[i]) / 255.0f;
         out[24 + i] = float(ras1[i]) / 255.0f;
