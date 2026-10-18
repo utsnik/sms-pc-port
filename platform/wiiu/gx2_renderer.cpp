@@ -314,11 +314,10 @@ static bool tevSupported(const TevKey& k) {
         if (((k.order[s] >> 6) & 1) && (k.order[s] & 7) >= 8) return false;
         if (((k.colorEnv[s] >> 16) & 3) == 3 || ((k.alphaEnv[s] >> 16) & 3) == 3) return false;
     }
-    // Alpha compare is not yet emitted in the GX2 pixel program, but keeping
-    // the TEV shader active for the title's two-reference compare is important:
-    // the old fallback uses white in place of the texture sample and turns the
-    // sky into wedges.
-    return true;
+    // The title screen uses the always form.  Keep other alpha compares on
+    // the fallback until the two-reference compare is emitted in ALU.
+    const uint32_t c0 = (k.alphaCompare >> 16) & 7, c1 = (k.alphaCompare >> 19) & 7;
+    return c0 == 7 && c1 == 7;
 }
 
 struct TevSource {
