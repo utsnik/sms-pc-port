@@ -490,21 +490,20 @@ static bool initTevVertex() {
 }
 
 static bool initTevPixel(TevShader& shader) {
-    std::vector<uint64_t> program(4096, 0);
-    size_t offset = 32;
+    std::vector<uint64_t> program(32, 0);
     const uint32_t textureMask = shader.textureMask;
-    const size_t texOffset = offset;
+    const size_t texOffset = program.size();
     uint32_t texCount = 0;
     for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
         const uint32_t order = shader.key.order[stage];
         if (!((order >> 6) & 1)) continue;
         const uint32_t map = order & 7, coord = (order >> 3) & 7;
         uint64_t sample[2] = {TEX_SAMPLE(_R(20 + stage), _x, _y, _z, _w, _R(1 + coord), _x, _y, _0, _x, map, map)};
-        program[offset++] = sample[0];
-        program[offset++] = sample[1];
+        program.push_back(sample[0]);
+        program.push_back(sample[1]);
         ++texCount;
     }
-    const size_t aluOffset = offset;
+    const size_t aluOffset = program.size();
     uint32_t lastColor = 0, lastAlpha = 0;
     for (uint32_t reg = 0; reg < 4; ++reg)
         for (uint32_t ch = 0; ch < 4; ++ch)
@@ -533,12 +532,12 @@ static bool initTevPixel(TevShader& shader) {
     }
     if (lastColor != lastAlpha)
         tevEmitAlu(program, {ALU_MOV(_R(12 + lastColor), _w, _R(12 + lastAlpha), _w)});
-    const size_t aluCount = offset - aluOffset;
+    const size_t aluCount = program.size() - aluOffset;
     size_t cf = 0;
     if (texCount) program[cf++] = TEX(texOffset, texCount) VALID_PIX;
     if (aluCount) program[cf++] = ALU(aluOffset, aluCount);
     program[cf++] = EXP_DONE(PIX0, _R(12 + lastColor), _x, _y, _z, _w) END_OF_PROGRAM;
-    const size_t programSize = offset * sizeof(uint64_t);
+    const size_t programSize = program.size() * sizeof(uint64_t);
     shader.psProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, programSize);
     if (!shader.psProgram) return false;
     memcpy(shader.psProgram, program.data(), programSize);
