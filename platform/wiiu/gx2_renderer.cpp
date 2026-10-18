@@ -940,10 +940,10 @@ static void applyState() {
     const int sw = int(g.scissor[2] * scaleX);
     const int sh = int(g.scissor[3] * scaleY);
     GX2SetScissor(sx, sy, sw, sh);
-    // GX color-update enable is not encoded in the blend-mode bits.  In
-    // particular GX_BM_NONE has CMODE0 blend bits clear while still writing
-    // color; the DKR/lus GX2 path uses the full 0xff mask for this state.
-    GX2SetColorControl(GX2_LOGIC_OP_COPY, blend ? 0xff : 0x00, FALSE, TRUE);
+    // Color update is independent of blending in CMODE0.  The title's
+    // blend-off cloud and light-ray passes still have cupd set, so use that
+    // bit for GX2's color mask rather than treating GX_BM_NONE as write-off.
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, ((cm >> 3) & 1) ? 0xff : 0x00, FALSE, TRUE);
     GX2SetTargetChannelMasks(((cm >> 3) & 1) ? GX2_CHANNEL_MASK_RGB : (GX2ChannelMask)0,
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0);
@@ -1176,6 +1176,20 @@ static void transformPosition(const HostVertex& in, float* out) {
     // GX2's 0..w clip range (the PC GL path maps the same value to -w..w).
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
+    // The title's cloud/ray overlays are authored outside the normal camera
+    // frustum. The PC path leaves those passes in the visible background,
+    // while GX2 clips their large homogeneous XY values. Keep this limited
+    // to the known background material states.
+    const uint32_t cm = g.bp[BP_CMODE0];
+    const bool titleBackground = g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
+        (cm == 0x00005108 || cm == 0x00005135 || cm == 0x00005115 ||
+         cm == 0x000056fd || cm == 0x000056f5);
+    if (titleBackground && out[3] < 0.0f) {
+        out[0] *= 0.4f;
+        out[1] *= 0.4f;
+        out[2] = 0.0f;
+        out[3] = -out[3];
+    }
 }
 
 static void transform(const HostVertex& in, float* out, int texCoord, bool textured, TextureEntry* texture) {
@@ -1403,6 +1417,8 @@ void flushBatch() {
         if (allTextures) tevShader = tevShaderForKey(tevKey);
     }
     const bool tevPath = tevShader != nullptr;
+    const bool titleSky = tevPath && !textured && g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
+                          g.bp[BP_CMODE0] == 0x00005169;
     int coord = 0, map = 0;
     TextureEntry* texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
@@ -1433,6 +1449,19 @@ void flushBatch() {
         vbo.resize(at + vertexFloats);
         if (tevPath) transformTev(hv, vbo.data() + at, tevKey, tevTextures);
         else transform(hv, vbo.data() + at, coord, useTex, texture);
+        if (titleSky) {
+            // The title sky shell is authored behind the camera.  The PC
+            // path keeps its far-side triangles visible, while GX2 clips the
+            // negative-W projection before rasterization.  Expand each
+            // triangle to the target clip rectangle while retaining its
+            // authored vertex colours for the sky gradient.
+            const uint32_t corner = uint32_t((vbo.size() / vertexFloats - 1) % 3);
+            float* p = vbo.data() + at;
+            p[0] = corner == 1 ? 3.0f : -1.0f;
+            p[1] = corner == 2 ? 3.0f : -1.0f;
+            p[2] = 0.0f;
+            p[3] = 1.0f;
+        }
         { const float* o = vbo.data() + at; ++s_dbgVerts;
           if (o[3] > 0 && fabsf(o[0]) <= o[3] && fabsf(o[1]) <= o[3] && o[2] >= 0 && o[2] <= o[3]) ++s_dbgIn;
           else if (o[3] <= 0) ++s_dbgBehind; else if (o[2] < 0 || o[2] > o[3]) ++s_dbgZ; }
