@@ -1147,7 +1147,10 @@ static void transformTev(const HostVertex& in, float* out, const TevKey& key, Te
         float t[3] = {0, 0, 1};
         if (type == 0) {
             const uint32_t matrix = in.mtx[coord + 1] & 63;
-            const float* m = reinterpret_cast<const float*>(&g.xfMem[0x500 + matrix * 4]);
+            // GX_TEXMTX0..GX_IDENTITY (30..60) share the position-matrix
+            // block.  Only GX_PTTEXMTX entries live at XF 0x500; the
+            // six-bit vertex matrix index cannot select those entries.
+            const float* m = reinterpret_cast<const float*>(&g.xfMem[matrix * 4]);
             for (int r = 0; r < 3; ++r)
                 t[r] = m[r * 4 + 0] * source[0] + m[r * 4 + 1] * source[1] +
                        m[r * 4 + 2] * source[2] + m[r * 4 + 3] * source[3];
