@@ -193,8 +193,11 @@ void sms_wiiu_runtime_init(void)
 
 	uint32_t mem1_address = 0;
 	uint32_t mem1_bytes = 0;
-	if (OSGetMemBound(OS_MEM1, &mem1_address, &mem1_bytes) != 0 ||
-	    mem1_bytes <= kMem1Reserve) {
+	/* Judge by the bound it reports, not the return code: Cemu 2.6 fills in
+	 * MEM1 (0xF4000000, 32 MiB) but returns non-zero, and bailing out here
+	 * left the game running with no arena. */
+	OSGetMemBound(OS_MEM1, &mem1_address, &mem1_bytes);
+	if (mem1_bytes <= kMem1Reserve) {
 		WHBLogPrintf("SMS Wii U: OSGetMemBound(MEM1) failed");
 		WHBProcStopRunning();
 		return;
