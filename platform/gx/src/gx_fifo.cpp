@@ -1,6 +1,7 @@
 // Register file, command-stream parser and vertex loader.
 #ifdef __WIIU__
 #include "../../wiiu/port_heap.h"
+#include "../../port_os.h"
 #else
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
@@ -114,11 +115,28 @@ static uint32_t s_memSize = 0x01800000;
 void* physToPtr(uint32_t phys) {
     phys &= 0x3FFFFFFF;
     if (!phys) return nullptr;
+#ifdef __WIIU__
+    // GX physical addresses below MEM2 are MEM1 offsets.  The Wii U runtime
+    // uses an address-zero memory window for MEM2, but MEM1 remains exposed at
+    // its OS virtual address, so translate the former explicitly.
+    constexpr uint32_t kMem1Reserve = 0x10000u;
+    if (!s_memBase && port_mem1_base && phys >= kMem1Reserve &&
+        phys < kMem1Reserve + port_mem1_size)
+        return port_mem1_base + (phys - kMem1Reserve);
+#endif
     return s_memBase + phys;
 }
 
 uint32_t ptrToPhys(const void* p) {
     if (!p) return 0;
+#ifdef __WIIU__
+    constexpr uint32_t kMem1Reserve = 0x10000u;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+    const uintptr_t mem1 = reinterpret_cast<uintptr_t>(port_mem1_base);
+    if (!s_memBase && port_mem1_base && a >= mem1 &&
+        a < mem1 + port_mem1_size)
+        return kMem1Reserve + static_cast<uint32_t>(a - mem1);
+#endif
     uintptr_t off = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_memBase);
     return static_cast<uint32_t>(off);
 }
