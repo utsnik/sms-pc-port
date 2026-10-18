@@ -841,18 +841,89 @@ static inline int sext11(uint32_t v) { return int(v << 21) >> 21; }
 static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 static inline int lerpTev(int a, int b, int c) { return (a * (255 - c) + b * c + 127) / 255; }
 
+static void packedColor(uint32_t value, float out[4]) {
+    out[0] = float((value >> 24) & 255) / 255.0f;
+    out[1] = float((value >> 16) & 255) / 255.0f;
+    out[2] = float((value >> 8) & 255) / 255.0f;
+    out[3] = float(value & 255) / 255.0f;
+}
+
+static void modelPosition(const HostVertex& in, float out[3]) {
+    const float* m = reinterpret_cast<const float*>(&g.xfMem[(in.mtx[0] & 63) * 4]);
+    for (int i = 0; i < 3; ++i)
+        out[i] = m[i * 4 + 0] * in.pos[0] + m[i * 4 + 1] * in.pos[1] + m[i * 4 + 2] * in.pos[2] + m[i * 4 + 3];
+}
+
 static void chanColor(const HostVertex& in, int c, int out[4]) {
     const uint32_t numChans = g.xfReg[XFR_NUMCHANS] & 3;
     if (uint32_t(c) >= numChans) { out[0] = out[1] = out[2] = out[3] = 0; return; }
-    for (int part = 0; part < 2; part++) {
-        const uint32_t ctrl = g.xfReg[(part ? XFR_ALPHA0CTRL : XFR_COLOR0CTRL) + c];
-        const uint32_t mreg = g.xfReg[XFR_MAT0 + c];
-        int mat[4];
-        if (ctrl & 1) for (int k = 0; k < 4; k++) mat[k] = in.clr[c][k];
-        else { mat[0] = (mreg >> 24) & 255; mat[1] = (mreg >> 16) & 255; mat[2] = (mreg >> 8) & 255; mat[3] = mreg & 255; }
-        if (part) out[3] = mat[3];
-        else { out[0] = mat[0]; out[1] = mat[1]; out[2] = mat[2]; }
-    }
+    const uint32_t colorCtrl = g.xfReg[XFR_COLOR0CTRL + c];
+    const uint32_t alphaCtrl = g.xfReg[XFR_ALPHA0CTRL + c];
+
+    float normal[3] = {0.0f, 0.0f, 1.0f}, position[3];
+    const uint32_t matrix = in.mtx[0] & 63;
+    const float* nm = reinterpret_cast<const float*>(&g.xfMem[256 + matrix * 3]);
+    normal[0] = nm[0] * in.nrm[0] + nm[1] * in.nrm[1] + nm[2] * in.nrm[2];
+    normal[1] = nm[3] * in.nrm[0] + nm[4] * in.nrm[1] + nm[5] * in.nrm[2];
+    normal[2] = nm[6] * in.nrm[0] + nm[7] * in.nrm[1] + nm[8] * in.nrm[2];
+    const float nl = sqrtf(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]);
+    if (nl > 0.0f) for (float& v : normal) v /= nl;
+    else normal[2] = 1.0f;
+    modelPosition(in, position);
+
+    auto litPart = [&](uint32_t ctrl, int channel, bool alpha) {
+        float materialColor[4];
+        if (ctrl & 1) for (int k = 0; k < 4; ++k) materialColor[k] = float(in.clr[c][k]) / 255.0f;
+        else packedColor(g.xfReg[XFR_MAT0 + c], materialColor);
+        const float material = materialColor[alpha ? 3 : channel];
+        if (!(ctrl & 2)) return material;
+        float ambient[4];
+        if (ctrl & 64) for (int k = 0; k < 4; ++k) ambient[k] = float(in.clr[c][k]) / 255.0f;
+        else packedColor(g.xfReg[(alpha ? XFR_AMB0 : XFR_AMB0) + c], ambient);
+        float sum = ambient[alpha ? 3 : channel];
+        const uint32_t mask = ((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4);
+        const uint32_t diff = (ctrl >> 7) & 3;
+        for (uint32_t light = 0; light < 8; ++light) {
+            if (!(mask & (1u << light))) continue;
+            const uint32_t base = 608 + light * 16;
+            float lightCol[4]; packedColor(g.xfMem[base + 3], lightCol);
+            const float* a = reinterpret_cast<const float*>(&g.xfMem[base + 4]);
+            const float* k = reinterpret_cast<const float*>(&g.xfMem[base + 7]);
+            const float* lp = reinterpret_cast<const float*>(&g.xfMem[base + 10]);
+            const float* ld = reinterpret_cast<const float*>(&g.xfMem[base + 13]);
+            float l[3], factor = 1.0f;
+            const bool atten = (ctrl >> 9) & 1, spot = (ctrl >> 10) & 1;
+            if (!atten || spot) {
+                l[0] = lp[0] - position[0]; l[1] = lp[1] - position[1]; l[2] = lp[2] - position[2];
+                if (!spot) { /* positional, unattenuated */ }
+            } else {
+                l[0] = lp[0]; l[1] = lp[1]; l[2] = lp[2];
+            }
+            const float len = sqrtf(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+            if (len > 0.0f) { l[0] /= len; l[1] /= len; l[2] /= len; }
+            if (atten) {
+                if (spot) {
+                    const float cs = std::max(l[0] * ld[0] + l[1] * ld[1] + l[2] * ld[2], 0.0f);
+                    const float d = len, d2 = d * d;
+                    factor = std::max(a[0] + a[1] * cs + a[2] * cs * cs, 0.0f) /
+                             std::max(k[0] + k[1] * d + k[2] * d2, 1e-30f);
+                } else {
+                    const float nd = normal[0] * l[0] + normal[1] * l[1] + normal[2] * l[2];
+                    const float t = nd > 0.0f ? std::max(normal[0] * ld[0] + normal[1] * ld[1] + normal[2] * ld[2], 0.0f) : 0.0f;
+                    factor = std::max(a[0] + a[1] * t + a[2] * t * t, 0.0f) /
+                             std::max(k[0] + k[1] * t + k[2] * t * t, 1e-30f);
+                }
+            }
+            float diffuse = 1.0f;
+            if (diff == 1) diffuse = normal[0] * l[0] + normal[1] * l[1] + normal[2] * l[2];
+            else if (diff >= 2) diffuse = std::max(normal[0] * l[0] + normal[1] * l[1] + normal[2] * l[2], 0.0f);
+            sum += factor * diffuse * lightCol[alpha ? 3 : channel];
+        }
+        return material * std::max(0.0f, std::min(sum, 1.0f));
+    };
+    for (int channel = 0; channel < 3; ++channel)
+        out[channel] = clampi(int(litPart(colorCtrl, channel, false) * 255.0f + 0.5f), 0, 255);
+    out[3] = clampi(int(litPart(alphaCtrl, 0, true) * 255.0f + 0.5f), 0, 255);
 }
 
 static bool evalTev(const HostVertex& in, float* rgba, bool* usesTex) {
