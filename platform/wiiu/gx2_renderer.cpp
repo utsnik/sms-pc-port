@@ -308,16 +308,13 @@ static uint32_t tevTextureMask(const TevKey& k) {
 static bool tevSupported(const TevKey& k) {
     // Indirect texturing changes the coordinates between stages and remains
     // on the old path until its Latte implementation is added.  Comparison
-    // forms (bias=3) need predicate ALU and are also a deliberate fallback.
+    // forms (bias=3) still use the fixed-function fallback.
     if (((k.genmode >> 16) & 7) != 0) return false;
     for (uint32_t s = 0; s < k.stages; ++s) {
         if (((k.order[s] >> 6) & 1) && (k.order[s] & 7) >= 8) return false;
         if (((k.colorEnv[s] >> 16) & 3) == 3 || ((k.alphaEnv[s] >> 16) & 3) == 3) return false;
     }
-    // The title screen uses the always form.  Keep other alpha compares on
-    // the fallback until the two-reference compare is emitted in ALU.
-    const uint32_t c0 = (k.alphaCompare >> 16) & 7, c1 = (k.alphaCompare >> 19) & 7;
-    return c0 == 7 && c1 == 7;
+    return true;
 }
 
 struct TevSource {
@@ -397,8 +394,11 @@ static uint64_t tevClamp(uint64_t op, bool clamp) {
 static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32_t channel,
                            TevSource a, TevSource b, TevSource c, TevSource d,
                            uint32_t bias, uint32_t op, uint32_t scale, bool clamp) {
-    tevEmitAlu(program, {ALU_ADD(_R(16), channel, a.sel, a.chan, b.sel, b.chan _NEG)});
+    tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel, a.chan _NEG)});
     tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
+    // GX's regular TEV equation is D +/- lerp(A, B, C), not merely D +/-
+    // (B-A)*C.  Keep A in the temporary before applying the final D/op.
+    tevEmitAlu(program, {ALU_ADD(_R(16), channel, ALU_SRC_PV, channel, a.sel, a.chan)});
     uint64_t result = op ? ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel _NEG)
                          : ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel);
     tevEmitAlu(program, {result});
@@ -489,6 +489,88 @@ static bool initTevVertex() {
     return true;
 }
 
+static void tevEmitLiteral(std::vector<uint64_t>& program, uint64_t op, float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    program.push_back(op | to_QWORD(to_LE(1ull << 31), 0));
+    program.push_back(to_QWORD(to_LE(bits), 0));
+}
+
+// Write the result of one GX alpha comparison as 0.0 or 1.0.  The alpha
+// register is normalized in the pixel shader, while BP_ALPHACOMPARE stores
+// its references as 8-bit values.
+static void tevEmitCompare(std::vector<uint64_t>& program, uint32_t dst, uint32_t func,
+                           uint32_t ref, uint32_t alphaSel, uint32_t alphaChan) {
+    const float threshold = float(ref) / 255.0f;
+    switch (func) {
+    case 0: // GX_COMPARE_FALSE
+        tevEmitAlu(program, {ALU_MOV(_R(dst), _x, ALU_SRC_0, _x)});
+        break;
+    case 1: // GX_LESS: ref > alpha
+        tevEmitLiteral(program, ALU_SETGT(_R(dst), _x, ALU_SRC_LITERAL, _x,
+                                          alphaSel, alphaChan), threshold);
+        break;
+    case 2: // GX_EQUAL
+        tevEmitLiteral(program, ALU_SETE(_R(dst), _x, alphaSel, alphaChan,
+                                        ALU_SRC_LITERAL, _x), threshold);
+        break;
+    case 3: // GX_LEQUAL: ref >= alpha
+        tevEmitLiteral(program, ALU_SETGE(_R(dst), _x, ALU_SRC_LITERAL, _x,
+                                          alphaSel, alphaChan), threshold);
+        break;
+    case 4: // GX_GREATER: alpha > ref
+        tevEmitLiteral(program, ALU_SETGT(_R(dst), _x, alphaSel, alphaChan,
+                                          ALU_SRC_LITERAL, _x), threshold);
+        break;
+    case 5: // GX_NEQUAL
+        tevEmitLiteral(program, ALU_SETNE(_R(dst), _x, alphaSel, alphaChan,
+                                          ALU_SRC_LITERAL, _x), threshold);
+        break;
+    case 6: // GX_GEQUAL: alpha >= ref
+        tevEmitLiteral(program, ALU_SETGE(_R(dst), _x, alphaSel, alphaChan,
+                                          ALU_SRC_LITERAL, _x), threshold);
+        break;
+    default: // GX_COMPARE_TRUE
+        tevEmitAlu(program, {ALU_MOV(_R(dst), _x, ALU_SRC_1, _x)});
+        break;
+    }
+}
+
+// Emit the two BP_ALPHACOMPARE tests, combine them, and discard failing
+// pixels.  KILLGT(.5, result) is the normalized 0/1 equivalent of KILLE(0,
+// result), and is the floating KILL form emitted by lus-rebase.
+static bool tevEmitAlphaCompare(std::vector<uint64_t>& program, uint32_t compare,
+                                uint32_t alphaSel, uint32_t alphaChan) {
+    const uint32_t ref0 = compare & 0xff;
+    const uint32_t ref1 = (compare >> 8) & 0xff;
+    const uint32_t func0 = (compare >> 16) & 7;
+    const uint32_t func1 = (compare >> 19) & 7;
+    const uint32_t op = (compare >> 22) & 3;
+    if (func0 == 7 && func1 == 7 && op != 2) return false;
+
+    tevEmitCompare(program, 16, func0, ref0, alphaSel, alphaChan);
+    tevEmitCompare(program, 17, func1, ref1, alphaSel, alphaChan);
+    switch (op) {
+    case 0: // AND
+        tevEmitAlu(program, {ALU_MIN(_R(16), _x, _R(16), _x, _R(17), _x)});
+        break;
+    case 1: // OR
+        tevEmitAlu(program, {ALU_MAX(_R(16), _x, _R(16), _x, _R(17), _x)});
+        break;
+    case 2: // XOR: the sum is one exactly when one input is true.
+        tevEmitAlu(program, {ALU_ADD(_R(18), _x, _R(16), _x, _R(17), _x)});
+        tevEmitAlu(program, {ALU_SETE(_R(16), _x, _R(18), _x, ALU_SRC_1, _x)});
+        break;
+    default: // XNOR
+        tevEmitAlu(program, {ALU_ADD(_R(18), _x, _R(16), _x, _R(17), _x)});
+        tevEmitAlu(program, {ALU_SETE(_R(16), _x, _R(18), _x, ALU_SRC_1, _x)});
+        tevEmitAlu(program, {ALU_ADD(_R(16), _x, ALU_SRC_1, _x, _R(16), _x _NEG)});
+        break;
+    }
+    tevEmitAlu(program, {ALU_KILLGT(__, _x, ALU_SRC_0_5, _x, _R(16), _x)});
+    return true;
+}
+
 static bool initTevPixel(TevShader& shader) {
     std::vector<uint64_t> program(32, 0);
     const uint32_t textureMask = shader.textureMask;
@@ -533,10 +615,17 @@ static bool initTevPixel(TevShader& shader) {
     if (lastColor != lastAlpha)
         tevEmitAlu(program, {ALU_MOV(_R(12 + lastColor), _w, _R(12 + lastAlpha), _w)});
     const size_t aluCount = program.size() - aluOffset;
+    const size_t compareOffset = program.size();
+    const bool killed = tevEmitAlphaCompare(program, shader.key.alphaCompare,
+                                            _R(12 + lastColor), _w);
+    const size_t compareCount = program.size() - compareOffset;
     size_t cf = 0;
     if (texCount) program[cf++] = TEX(texOffset, texCount) VALID_PIX;
     if (aluCount) program[cf++] = ALU(aluOffset, aluCount);
-    program[cf++] = EXP_DONE(PIX0, _R(12 + lastColor), _x, _y, _z, _w) END_OF_PROGRAM;
+    if (compareCount) program[cf++] = ALU(compareOffset, compareCount);
+    uint64_t exportOp = EXP_DONE(PIX0, _R(12 + lastColor), _x, _y, _z, _w);
+    if (killed) exportOp |= to_QWORD(0, to_LE(1u << 22));
+    program[cf++] = exportOp END_OF_PROGRAM;
     const size_t programSize = program.size() * sizeof(uint64_t);
     shader.psProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, programSize);
     if (!shader.psProgram) return false;
