@@ -21,12 +21,16 @@ namespace {
 /* "/fs/vol/external01/..." is the FTP server's view and fails silently in the
  * app's stdio. Probe the forms that can work and keep the first that opens
  * sys/fst.bin (wut devoptab first, then cwd-relative for an SD-root cwd). */
-const char* const kAppRootCandidates[] = {
+/* Keep these as character arrays, rather than an array of pointers.  Cemu 2.6
+ * does not apply RPX R_PPC_ADDR32 relocations from writable .data slots to
+ * .rodata, even though Cafe's loader does.  A pointer here would therefore
+ * be NULL before the first DVD call. */
+const char kAppRootCandidates[][128] = {
 	"fs:/vol/external01/wiiu/apps/sms/",
 	"wiiu/apps/sms/",
 	"/vol/external01/wiiu/apps/sms/",
 };
-const char* kAppRoot = kAppRootCandidates[0];
+unsigned kAppRootIndex;
 const uint32_t kMem1Reserve = 0x10000u;
 const uint32_t kGameArenaBytes = 96u * 1024u * 1024u;
 const uint32_t kLogBufferBytes = 64u * 1024u;
@@ -57,18 +61,20 @@ uint32_t default_heap_free()
 
 void resolve_app_root()
 {
-	for (const char* root : kAppRootCandidates) {
+	for (unsigned i = 0; i < sizeof(kAppRootCandidates) / sizeof(kAppRootCandidates[0]); ++i) {
+		const char* root = kAppRootCandidates[i];
 		char probe[160];
 		std::snprintf(probe, sizeof(probe), "%ssys/fst.bin", root);
 		FILE* file = std::fopen(probe, "rb");
 		WHBLogPrintf("SMS Wii U: app root probe %s -> %s", root, file ? "ok" : "missing");
 		if (file) {
 			std::fclose(file);
-			kAppRoot = root;
+			kAppRootIndex = i;
 			return;
 		}
 	}
-	WHBLogPrintf("SMS Wii U: no app root holds sys/fst.bin; keeping %s", kAppRoot);
+	WHBLogPrintf("SMS Wii U: no app root holds sys/fst.bin; keeping %s",
+	             kAppRootCandidates[kAppRootIndex]);
 }
 
 void open_log()
@@ -78,7 +84,8 @@ void open_log()
 	 * Aroma file that way). Logs go over UDP only. */
 	return;
 	char path[160];
-	std::snprintf(path, sizeof(path), "%sstage2.log", kAppRoot);
+	std::snprintf(path, sizeof(path), "%sstage2.log",
+	              kAppRootCandidates[kAppRootIndex]);
 	s_log = std::fopen(path, "wb");
 	if (s_log) {
 		/* Wii U stdio is allowed here, but the buffer must be real storage. */
@@ -160,7 +167,7 @@ int port_draw_hd_thp(uint8_t*, uint8_t*, uint8_t*, int16_t, int16_t,
 const char* port_hd_cutscene_directory(void) { return nullptr; }
 /* __DSP_boot_task comes from platform/audio/dsp_hle.cpp (DSP HLE). */
 
-const char* sms_wiiu_app_root(void) { return kAppRoot; }
+const char* sms_wiiu_app_root(void) { return kAppRootCandidates[kAppRootIndex]; }
 
 uint32_t sms_wiiu_heap_free(void) { return default_heap_free(); }
 
@@ -211,7 +218,8 @@ void sms_wiiu_runtime_init(void)
 	sms_wiiu_mem2_base = reinterpret_cast<uint8_t*>(arena);
 	sms_wiiu_mem2_size = kGameArenaBytes;
 	resolve_app_root();
-	std::strncpy(s_files_root, kAppRoot, sizeof(s_files_root));
+	std::strncpy(s_files_root, kAppRootCandidates[kAppRootIndex],
+	             sizeof(s_files_root));
 	std::strncat(s_files_root, "files/", sizeof(s_files_root) -
 	                                      std::strlen(s_files_root) - 1);
 	port_disc_root = s_files_root;
@@ -225,7 +233,8 @@ void sms_wiiu_runtime_init(void)
 	         "default_free_after=%u\n",
 	         sms_wiiu_mem2_base, sms_wiiu_mem2_size, before,
 	         default_heap_free());
-	port_log("SMS Wii U: app root=%s data root=%s\n", kAppRoot,
+	port_log("SMS Wii U: app root=%s data root=%s\n",
+	         kAppRootCandidates[kAppRootIndex],
 	         s_files_root);
 }
 
