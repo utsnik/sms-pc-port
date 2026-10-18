@@ -14,6 +14,7 @@
 #include <atomic>
 #include <deque>
 #include <map>
+#include <new>
 #include <unordered_map>
 
 namespace gx {
@@ -164,16 +165,25 @@ bool unwrittenSince(const void* p, size_t n, uint32_t since) {
 // ------------------------------------------------------------------ big-endian ranges
 // Memory holding data in its on-disc byte order (resource files loaded in
 // place).  Vertex arrays that start inside such a range are read big-endian.
-static std::map<uintptr_t, uintptr_t> s_beRanges;  // start -> end
+// Do not construct STL containers during Wii U static initialization.  Cemu
+// enters the PPC image before the game's heap/runtime is ready; lazy creation
+// also keeps the PC build's behavior unchanged after the first API call.
+static std::map<uintptr_t, uintptr_t>* s_beRanges = nullptr;  // start -> end
+static unsigned char s_beRangesStorage[sizeof(std::map<uintptr_t, uintptr_t>)] __attribute__((aligned(8)));
 static uint32_t s_beGen = 1;                        // bumped when s_beRanges changes
 static uintptr_t s_beHitLo = 1, s_beHitHi = 0;      // the range the last lookup found
 
+static void ensureBeRanges() {
+    if (!s_beRanges)
+        s_beRanges = new (s_beRangesStorage) std::map<uintptr_t, uintptr_t>();
+}
+
 bool isBigEndianData(const void* p) {
-    if (s_beRanges.empty() || !p) return false;
+    if (!s_beRanges || s_beRanges->empty() || !p) return false;
     uintptr_t a = reinterpret_cast<uintptr_t>(p);
     if (a >= s_beHitLo && a < s_beHitHi) return true;  // array bases cluster in one resource
-    auto it = s_beRanges.upper_bound(a);
-    if (it == s_beRanges.begin()) return false;
+    auto it = s_beRanges->upper_bound(a);
+    if (it == s_beRanges->begin()) return false;
     --it;
     if (a >= it->second) return false;
     s_beHitLo = it->first;
@@ -1048,39 +1058,49 @@ struct DlEntry {
 };
 // The entries (stable addresses) and an open-addressing index of them by
 // list address (a thousand lookups a frame).
-static std::deque<DlEntry> s_dlEntries;
-static std::vector<std::pair<const void*, DlEntry*>> s_dlIndex;
+static std::deque<DlEntry>* s_dlEntries = nullptr;
+static std::vector<std::pair<const void*, DlEntry*>>* s_dlIndex = nullptr;
+static unsigned char s_dlEntriesStorage[sizeof(std::deque<DlEntry>)] __attribute__((aligned(8)));
+static unsigned char s_dlIndexStorage[sizeof(std::vector<std::pair<const void*, DlEntry*>>)] __attribute__((aligned(8)));
 static size_t s_dlCacheBytes = 0;
 
+static void ensureDlCache() {
+    if (!s_dlEntries)
+        s_dlEntries = new (s_dlEntriesStorage) std::deque<DlEntry>();
+    if (!s_dlIndex)
+        s_dlIndex = new (s_dlIndexStorage) std::vector<std::pair<const void*, DlEntry*>>();
+}
+
 static DlEntry& dlLookup(const void* key) {
-    if (s_dlIndex.empty()) s_dlIndex.assign(4096, {nullptr, nullptr});
-    size_t mask = s_dlIndex.size() - 1;
+    ensureDlCache();
+    if (s_dlIndex->empty()) s_dlIndex->assign(4096, {nullptr, nullptr});
+    size_t mask = s_dlIndex->size() - 1;
     size_t i = size_t((uint64_t(reinterpret_cast<uintptr_t>(key)) * 0x9E3779B97F4A7C15ull) >> 32) & mask;
     for (;; i = (i + 1) & mask) {
-        if (s_dlIndex[i].first == key) return *s_dlIndex[i].second;
-        if (!s_dlIndex[i].first) break;
+        if ((*s_dlIndex)[i].first == key) return *(*s_dlIndex)[i].second;
+        if (!(*s_dlIndex)[i].first) break;
     }
-    if (s_dlEntries.size() * 2 >= s_dlIndex.size()) {  // grow, then insert into the new index
+    if (s_dlEntries->size() * 2 >= s_dlIndex->size()) {  // grow, then insert into the new index
         std::vector<std::pair<const void*, DlEntry*>> old;
-        old.swap(s_dlIndex);
-        s_dlIndex.assign(old.size() * 2, {nullptr, nullptr});
+        old.swap(*s_dlIndex);
+        s_dlIndex->assign(old.size() * 2, {nullptr, nullptr});
         for (auto& kv : old)
             if (kv.first) {
-                size_t m = s_dlIndex.size() - 1;
+                size_t m = s_dlIndex->size() - 1;
                 size_t j = size_t((uint64_t(reinterpret_cast<uintptr_t>(kv.first)) * 0x9E3779B97F4A7C15ull) >> 32) & m;
-                while (s_dlIndex[j].first) j = (j + 1) & m;
-                s_dlIndex[j] = kv;
+                while ((*s_dlIndex)[j].first) j = (j + 1) & m;
+                (*s_dlIndex)[j] = kv;
             }
         return dlLookup(key);
     }
-    s_dlEntries.emplace_back();
-    s_dlIndex[i] = {key, &s_dlEntries.back()};
-    return s_dlEntries.back();
+    s_dlEntries->emplace_back();
+    (*s_dlIndex)[i] = {key, &s_dlEntries->back()};
+    return s_dlEntries->back();
 }
 
 static void dlClear() {
-    s_dlEntries.clear();
-    s_dlIndex.clear();
+    if (s_dlEntries) s_dlEntries->clear();
+    if (s_dlIndex) s_dlIndex->clear();
     s_dlCacheBytes = 0;
 }
 static uint32_t s_dlLo[16], s_dlHi[16], s_dlElem[16];  // while recording: index range per array
@@ -1411,20 +1431,22 @@ extern "C" {
 void GXPC_SetMemoryWindow(void* base, uint32_t size) {
     s_memBase = static_cast<uint8_t*>(base);
     s_memSize = size;
+    ensureBeRanges();
 }
 
 void GXPC_MemoryWritten(const void* p, uint32_t size) { memoryWritten(p, size); }
 
 void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
     if (!p || !size) return;
+    ensureBeRanges();
     uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    s_beRanges[a] = a + size;
+    (*s_beRanges)[a] = a + size;
     s_beGen++;
     s_beHitLo = 1;
     s_beHitHi = 0;
 }
 void GXPC_RemoveBigEndianRange(const void* p) {
-    s_beRanges.erase(reinterpret_cast<uintptr_t>(p));
+    if (s_beRanges) s_beRanges->erase(reinterpret_cast<uintptr_t>(p));
     s_beGen++;
     s_beHitLo = 1;
     s_beHitHi = 0;
