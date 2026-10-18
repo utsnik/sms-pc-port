@@ -1383,10 +1383,15 @@ void flushBatch() {
                 if (texture) {
                     const uint8_t* t = static_cast<const uint8_t*>(texture->texture.surface.image);
                     const uint8_t* raw = texture->source;
+                    const uint32_t rawBytes = gx2TexLevelBytes(texture->fmt, texture->width, texture->height);
+                    const uintptr_t rawAddr = reinterpret_cast<uintptr_t>(raw);
+                    const bool rawReadable = raw && rawBytes && rawAddr + rawBytes > rawAddr &&
+                        ((rawAddr >= 0x10000000u && rawAddr + rawBytes <= 0x50000000u) ||
+                         (rawAddr >= 0xF4000000u && rawAddr + rawBytes <= 0xF6000000u));
                     fprintf(s_dbg, "  src %p base %p image0 %08x image3 %08x raw %02x%02x%02x%02x%02x%02x%02x%02x\n",
                             (const void*)texture->source, physToPtr(0x20), (unsigned)g.bp[BP_TX_IMAGE0], (unsigned)g.bp[BP_TX_IMAGE3],
-                            raw ? raw[0] : 0, raw ? raw[1] : 0, raw ? raw[2] : 0, raw ? raw[3] : 0,
-                            raw ? raw[4] : 0, raw ? raw[5] : 0, raw ? raw[6] : 0, raw ? raw[7] : 0);
+                            rawReadable ? raw[0] : 0, rawReadable ? raw[1] : 0, rawReadable ? raw[2] : 0, rawReadable ? raw[3] : 0,
+                            rawReadable ? raw[4] : 0, rawReadable ? raw[5] : 0, rawReadable ? raw[6] : 0, rawReadable ? raw[7] : 0);
                     fprintf(s_dbg, "  tex %ux%u fmt %u pitch %u texel0 %u %u %u %u mid %u %u %u %u\n", (unsigned)texture->width, (unsigned)texture->height, (unsigned)texture->fmt,
                             (unsigned)texture->texture.surface.pitch, t[0], t[1], t[2], t[3], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+1], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+2], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+3]);
                 }
