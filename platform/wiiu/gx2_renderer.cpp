@@ -685,10 +685,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         t.texture.surface.mipLevels = 1;
         t.texture.surface.format = cb->surface.format;
         t.texture.surface.aa = GX2_AA_MODE1X;
-        // LINEAR_SPECIAL makes Cemu complete the color-buffer copy through
-        // its synchronous CPU path; the texture coordinates below still
-        // select the logical EFB rectangle from this full-size backing store.
-        t.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_SPECIAL;
+        t.texture.surface.tileMode = GX2_TILE_MODE_DEFAULT;
         t.texture.viewNumMips = 1;
         t.texture.viewNumSlices = 1;
         t.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
