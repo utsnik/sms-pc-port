@@ -1368,9 +1368,12 @@ void flushBatch() {
                     HostVertex hv; const uint8_t d9[9] = {0};
                     unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, d9, hv);
                     const size_t co = tevPath ? 20 : (useTex ? 6 : 4);
-                    fprintf(s_dbg, "  in %g %g %g mtx %u -> %g %g %g %g col %g %g %g %g uv %g,%g %g,%g\n", hv.pos[0], hv.pos[1], hv.pos[2],
-                            (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[co], o[co + 1], o[co + 2], o[co + 3],
-                            tevPath ? o[4] : 0.0f, tevPath ? o[5] : 0.0f, tevPath ? o[6] : 0.0f, tevPath ? o[7] : 0.0f);
+                    const float* tm0 = reinterpret_cast<const float*>(&g.xfMem[0x500 + 60 * 4]);
+                    fprintf(s_dbg, "  in %g %g %g mtx %u tc %g,%g %g,%g tm60 %g,%g,%g,%g|%g,%g,%g,%g|%g,%g,%g,%g -> %g %g %g %g col %g %g %g %g uv %g,%g %g,%g\n", hv.pos[0], hv.pos[1], hv.pos[2],
+                            (unsigned)hv.mtx[0], hv.tex[0][0], hv.tex[0][1], hv.tex[1][0], hv.tex[1][1], tm0[0], tm0[1], tm0[2], tm0[3],
+                            tm0[4], tm0[5], tm0[6], tm0[7], tm0[8], tm0[9], tm0[10], tm0[11], o[0], o[1], o[2], o[3],
+                            o[co], o[co + 1], o[co + 2], o[co + 3], tevPath ? o[4] : 0.0f, tevPath ? o[5] : 0.0f,
+                            tevPath ? o[6] : 0.0f, tevPath ? o[7] : 0.0f);
                 }
                 if (texture) { const uint8_t* t = static_cast<const uint8_t*>(texture->texture.surface.image); fprintf(s_dbg, "  src %p base %p image0 %08x image3 %08x\n", (const void*)texture->source, physToPtr(0x20), (unsigned)g.bp[BP_TX_IMAGE0], (unsigned)g.bp[BP_TX_IMAGE3]); fprintf(s_dbg, "  tex %ux%u fmt %u texel0 %u %u %u %u mid %u %u %u %u\n", (unsigned)texture->width, (unsigned)texture->height, (unsigned)texture->fmt, t[0], t[1], t[2], t[3], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+1], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+2], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+3]); }
                 for (const CopyEntry& c : copyCache())
