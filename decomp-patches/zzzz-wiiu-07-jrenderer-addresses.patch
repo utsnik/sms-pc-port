@@ -1,0 +1,48 @@
+Reason: wiiu: J3DGDSetTexImgPtr and J3DGDLoadTlut call OSPhysicalToCached
+with already-cached Wii U heap pointers. The GameCube conversion adds
+0x80000000 to 0x1xxxxxxx addresses before the texture command is emitted;
+call the Wii U cached-to-physical adapter instead, while preserving the
+retail/desktop path.
+--- a/libs/JSystem/src/JRenderer.cpp
++++ b/libs/JSystem/src/JRenderer.cpp
+@@ -2,6 +2,10 @@
+ #include <dolphin/gd/GDTransform.h>
+ #include <dolphin/os.h>
+ 
++#ifdef TARGET_WIIU
++#undef OSCachedToPhysical
++#endif
++
+ void J3DGDLoadTexMtxImm(MtxPtr mtx, u32 i, GXTexMtxType type)
+ {
+ 	u16 cmd;
+@@ -280,7 +284,13 @@
+ {
+ 	// clang-format off
+ 	u32 reg =
+-		(u32) ((u32)OSPhysicalToCached(image) >> 5) |
++		(u32) ((u32)
++#ifdef TARGET_WIIU
++			OSCachedToPhysical(image)
++#else
++			OSPhysicalToCached(image)
++#endif
++			>> 5) |
+		(u32) GXTexImage3Ids[map] << 24;
+	// clang-format on
+
+@@ -316,7 +326,13 @@
+ 	GDOverflowCheck(5);
+ 	// clang-format off
+ 	J3DGDWriteBPCmd(
+-		(u32) ((u32)OSPhysicalToCached(tlut) >> 5) |
++		(u32) ((u32)
++#ifdef TARGET_WIIU
++			OSCachedToPhysical(tlut)
++#else
++			OSPhysicalToCached(tlut)
++#endif
++			>> 5) |
+ 		(u32) 0x64 << 24
+ 	);
+ 	// clang-format on
