@@ -651,7 +651,7 @@ static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     *u = (float(e->sourceX) + *u * float(e->sourceW)) / s_tvW;
     *v = (float(e->sourceY) + *v * float(e->sourceH)) / s_tvH;
 }
-static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half) {
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!dest || !cb || !w || !h) return;
     const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
@@ -667,16 +667,19 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     // surface in one operation, and apply the source rectangle in the
     // texture coordinates sent to the shader below.
     const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
-    if (e && (e->tex.width != fullW || e->tex.height != fullH)) {
+    const uint32_t logicalW = half ? (w + 1) / 2 : w, logicalH = half ? (h + 1) / 2 : h;
+    if (e && (e->tex.texture.surface.width != fullW || e->tex.texture.surface.height != fullH)) {
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
         e->tex.valid = false;
     }
     if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
+    e->tex.width = logicalW;
+    e->tex.height = logicalH;
     e->sourceX = tx; e->sourceY = ty; e->sourceW = tw; e->sourceH = th;
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
-        t.width = fullW; t.height = fullH;
+        t.width = logicalW; t.height = logicalH;
         t.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
         t.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
         t.texture.surface.width = fullW;
@@ -1403,7 +1406,8 @@ void executeCopy(uint32_t ctrl) {
     if (disp || !s_frameActive || !ProcUIInForeground()) return;
     {
         const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
-        copyToTexture(g.copyDest, src & 0x3ff, (src >> 10) & 0x3ff, (size & 0x3ff) + 1, ((size >> 10) & 0x3ff) + 1);
+        copyToTexture(g.copyDest, src & 0x3ff, (src >> 10) & 0x3ff, (size & 0x3ff) + 1,
+                      ((size >> 10) & 0x3ff) + 1, (ctrl >> 9) & 1);
         if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650) {
             static uint32_t s_dbgCopies;
             if (s_dbgCopies < 16) {
