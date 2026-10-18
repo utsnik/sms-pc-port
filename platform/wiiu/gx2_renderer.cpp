@@ -1239,10 +1239,21 @@ void flushBatch() {
         if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_dbgDraws < 120) {
             if (!s_dbg) s_dbg = fopen("fs:/vol/external01/gx2dbg.txt", "w");
             if (s_dbg) {
-                fprintf(s_dbg, "draw %d frame %u fmt %x n %u tex %d vp %g %g %g %g proj %g %g %g %g %g %g %g\n", s_dbgDraws,
+                fprintf(s_dbg, "draw %d frame %u fmt %x n %u tex %d tev %d stages %u mask %02x gen %08x vp %g %g %g %g proj %g %g %g %g %g %g %g\n", s_dbgDraws,
                         (unsigned)g_displayFrames, (unsigned)s_batch.fmt, (unsigned)s_batch.indices.size(), (int)textured,
+                        (int)tevPath, (unsigned)tevKey.stages, (unsigned)tevTextureMask(tevKey), (unsigned)tevKey.genmode,
                         g.viewport[0], g.viewport[1], g.viewport[2], g.viewport[3], g.projection[0], g.projection[1],
                         g.projection[2], g.projection[3], g.projection[4], g.projection[5], g.projection[6]);
+                fprintf(s_dbg, "  state cm %08x blend %u cupd %u aupd %u z %08x ztest %u zwrite %u pe %08x ac %08x copy %08x\n",
+                        (unsigned)g.bp[BP_CMODE0], (unsigned)(g.bp[BP_CMODE0] & 1), (unsigned)((g.bp[BP_CMODE0] >> 3) & 1),
+                        (unsigned)((g.bp[BP_CMODE0] >> 4) & 1), (unsigned)g.bp[BP_ZMODE], (unsigned)(g.bp[BP_ZMODE] & 1),
+                        (unsigned)((g.bp[BP_ZMODE] >> 4) & 1), (unsigned)g.bp[BP_PE_CONTROL], (unsigned)g.bp[BP_ALPHACOMPARE],
+                        (unsigned)g.bp[BP_COPY_EXEC]);
+                fprintf(s_dbg, "  tev");
+                for (uint32_t st = 0; st < tevKey.stages && st < 4; ++st)
+                    fprintf(s_dbg, " %u/%06x/%06x/%03x", (unsigned)st, (unsigned)tevKey.order[st],
+                            (unsigned)tevKey.colorEnv[st], (unsigned)tevKey.alphaEnv[st]);
+                fputc('\n', s_dbg);
                 { const uint8_t* ab = g.arrayBase[0]; fprintf(s_dbg, "  arr0 %p stride %u be %d vcd %08x/%08x vatA0 %08x bytes %02x%02x %02x%02x %02x%02x\n", (const void*)ab, (unsigned)g.arrayStride[0], (int)g.arrayBigEndian[0], (unsigned)g.cpVcdLo, (unsigned)g.cpVcdHi, (unsigned)g.cpVatA[0], ab?ab[0]:0, ab?ab[1]:0, ab?ab[2]:0, ab?ab[3]:0, ab?ab[4]:0, ab?ab[5]:0); }
                 { const float* m = reinterpret_cast<const float*>(&g.xfMem[0]); fprintf(s_dbg, "  m0 %g %g %g %g | %g %g %g %g | %g %g %g %g matA %08x cpA %08x\n", m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11], (unsigned)g.xfReg[XFR_MATIDX_A], (unsigned)g.cpMatA); }
                 const size_t st = vertexFloats;
