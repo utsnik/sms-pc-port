@@ -433,7 +433,7 @@ static bool initTevVertex() {
     if (!s_tevVertexProgram) return false;
     memcpy(s_tevVertexProgram, program.data(), program.size() * sizeof(uint64_t));
     memset(&s_tevVertex, 0, sizeof(s_tevVertex));
-    s_tevVertex.regs.sq_pgm_resources_vs = 12;
+    s_tevVertex.regs.sq_pgm_resources_vs = 12 | (1u << 8);
     s_tevVertex.regs.spi_vs_out_config = 9 << 1;
     s_tevVertex.regs.num_spi_vs_out_id = 3;
     memset(s_tevVertex.regs.spi_vs_out_id, 0xff, sizeof(s_tevVertex.regs.spi_vs_out_id));
@@ -503,6 +503,9 @@ static bool initTevPixel(TevShader& shader) {
     }
     const size_t aluOffset = offset;
     uint32_t lastColor = 0, lastAlpha = 0;
+    for (uint32_t reg = 0; reg < 4; ++reg)
+        for (uint32_t ch = 0; ch < 4; ++ch)
+            tevEmitAlu(program, {ALU_MOV(_R(12 + reg), ch, _GX2_C(4 * reg), ch)});
     for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
         const uint32_t ce = shader.key.colorEnv[stage], ae = shader.key.alphaEnv[stage];
         const uint32_t colorDest = (ce >> 22) & 3, alphaDest = (ae >> 22) & 3;
@@ -604,7 +607,7 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures) {
     params[32 + 12] = 1.0f;
     params[32 + 13] = 128.0f / 255.0f;
     params[32 + 15] = 0.0f;
-    GX2SetPixelUniformReg(shader.uniform.offset, 64, params);
+    GX2SetPixelUniformReg(0, 64, params);
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
         GX2SetPixelTexture(&textures[map]->texture, map);
