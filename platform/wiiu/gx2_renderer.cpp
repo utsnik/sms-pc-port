@@ -695,8 +695,10 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         t.valid = true;
     }
     GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0);
-    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER | GX2_INVALIDATE_MODE_TEXTURE,
-                  e->tex.texture.surface.image, e->tex.texture.surface.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, e->tex.texture.surface.image,
+                  e->tex.texture.surface.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e->tex.texture.surface.image,
+                  e->tex.texture.surface.imageSize);
 }
 
 static TextureEntry* getTexture(int map) {
