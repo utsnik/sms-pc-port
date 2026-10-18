@@ -50,6 +50,7 @@ extern "C" void sms_wiiu_gfx_init(void)
 	else {
 		WHBGfxBeginRender();
 		WHBGfxBeginRenderTV();
+		WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
 	}
@@ -95,6 +96,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	if (!s_frame_open) {
 		WHBGfxBeginRender();
 		WHBGfxBeginRenderTV();
+		WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
 	}
@@ -106,6 +108,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	WHBGfxFinishRender();
 	WHBGfxBeginRender();
 	WHBGfxBeginRenderTV();
+	WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
 	sms_wiiu_gx2_renderer_begin();
 	s_frame_open = true;
 }
