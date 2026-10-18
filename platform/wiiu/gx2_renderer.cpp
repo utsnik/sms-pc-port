@@ -1,7 +1,7 @@
 #include <cstdio>
 #include "port_heap.h"
 #ifndef SMS_GX2_DEBUG_DUMP
-#define SMS_GX2_DEBUG_DUMP 0
+#define SMS_GX2_DEBUG_DUMP 1
 #endif
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/memorymap.h>
@@ -234,6 +234,70 @@ static GX2TexClampMode clampMode(uint32_t value) {
     return (value & 1) ? GX2_TEX_CLAMP_MODE_MIRROR : GX2_TEX_CLAMP_MODE_WRAP;
 }
 
+static float s_tvW = 1280.0f, s_tvH = 720.0f, s_gameScale = 1.5f, s_gameX = 160.0f;
+
+// EFB copies to textures (GXCopyTex): the game renders a pass, copies the
+// frame into a texture and draws it back (water, heat haze, shadows). The
+// copy lives in a GX2 texture keyed by its destination address; lookups of
+// that address use it instead of decoding RAM the copy never wrote.
+struct CopyEntry {
+    const void* dest = nullptr;
+    TextureEntry tex;
+};
+static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
+static std::vector<CopyEntry>* s_copyObject;
+static std::vector<CopyEntry>& copyCache() {
+    if (!s_copyObject) s_copyObject = new (s_copyStorage) std::vector<CopyEntry>();
+    return *s_copyObject;
+}
+static TextureEntry* copyTexture(const void* source) {
+    for (CopyEntry& c : copyCache())
+        if (c.dest == source && c.tex.valid) return &c.tex;
+    return nullptr;
+}
+static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
+    if (!dest || !cb || !w || !h) return;
+    const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
+    uint32_t tw = uint32_t(float(w) * s_gameScale), th = uint32_t(float(h) * s_gameScale);
+    if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
+    if (ty + th > cb->surface.height) th = cb->surface.height - ty;
+    if (!tw || !th) return;
+    CopyEntry* e = nullptr;
+    for (CopyEntry& c : copyCache())
+        if (c.dest == dest) { e = &c; break; }
+    if (e && (e->tex.width != tw || e->tex.height != th)) {
+        MEMFreeToDefaultHeap(e->tex.texture.surface.image);
+        e->tex.valid = false;
+    }
+    if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
+    if (!e->tex.valid) {
+        TextureEntry& t = e->tex;
+        memset(&t.texture, 0, sizeof(t.texture));
+        t.width = tw; t.height = th;
+        t.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
+        t.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        t.texture.surface.width = tw;
+        t.texture.surface.height = th;
+        t.texture.surface.depth = 1;
+        t.texture.surface.mipLevels = 1;
+        t.texture.surface.format = cb->surface.format;
+        t.texture.surface.aa = GX2_AA_MODE1X;
+        t.texture.surface.tileMode = GX2_TILE_MODE_DEFAULT;
+        t.texture.viewNumMips = 1;
+        t.texture.viewNumSlices = 1;
+        t.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+        GX2CalcSurfaceSizeAndAlignment(&t.texture.surface);
+        t.texture.surface.image = alignedZero(t.texture.surface.alignment, t.texture.surface.imageSize);
+        if (!t.texture.surface.image) return;
+        GX2InitTextureRegs(&t.texture);
+        t.valid = true;
+    }
+    GX2Rect rect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
+    GX2Point point = {0, 0};
+    GX2CopySurfaceEx(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0, 1, &rect, &point);
+}
+
 static TextureEntry* getTexture(int map) {
     SMS_PORT_HEAP_SCOPE();
     const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
@@ -246,6 +310,13 @@ static TextureEntry* getTexture(int map) {
     const uint32_t tlut = indexed ? (tlutReg & 0x3ff) : 0;
     const uint32_t tlutFmt = indexed ? ((tlutReg >> 10) & 3) : 0;
     const uint8_t* source = g.texImage[map];
+    if (TextureEntry* c = copyTexture(source)) {
+        GX2InitSampler(&c->sampler, GX2_TEX_CLAMP_MODE_CLAMP,
+                       (mode0 & 0x20) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT);
+        GX2InitSamplerClamping(&c->sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
+                               GX2_TEX_CLAMP_MODE_WRAP);
+        return c;
+    }
     for (size_t i = 0; i < s_textures.size(); ++i) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.source == source && e.fmt == fmt && e.width == w && e.height == h &&
@@ -315,7 +386,6 @@ static void setShader(FixedShader& shader, TextureEntry* texture) {
 
 // TV target size (WHBGfx picks 720p or 1080p) and the 4:3 game rectangle in it:
 // the 640x480 EFB scaled to the target's height and centred.
-static float s_tvW = 1280.0f, s_tvH = 720.0f, s_gameScale = 1.5f, s_gameX = 160.0f;
 static void updateTarget() {
     const GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (cb && cb->surface.width && cb->surface.height) {
@@ -527,7 +597,8 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
     // GX2's 0..w clip range (the PC GL path maps the same value to -w..w).
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
-    evalTev(in, out + 4, nullptr);
+    // Layout as the fetch shader declares it: pos(4) [uv(2)] colour(4).
+    evalTev(in, out + (textured ? 6 : 4), nullptr);
     if (textured) {
         float u = in.tex[texCoord][0], v = in.tex[texCoord][1];
         if (g.tcManual[texCoord]) {
@@ -535,7 +606,7 @@ static void transform(const HostVertex& in, float* out, int texCoord, bool textu
             const uint32_t ts = g.bp[BP_SU_SSIZE + texCoord * 2 + 1] & 0xffff;
             u *= float(ss + 1); v *= float(ts + 1);
         }
-        out[8] = u; out[9] = v;
+        out[4] = u; out[5] = v;
     }
 }
 
@@ -660,7 +731,7 @@ void flushBatch() {
     }
     { // TEMP debug dump
         static int s_dbgDraws = 0; static FILE* s_dbg = nullptr;
-        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 1450 && s_dbgDraws < 80) {
+        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 1350 && s_dbgDraws < 120) {
             if (!s_dbg) s_dbg = fopen("fs:/vol/external01/gx2dbg.txt", "w");
             if (s_dbg) {
                 fprintf(s_dbg, "draw %d frame %u fmt %x n %u tex %d vp %g %g %g %g proj %g %g %g %g %g %g %g\n", s_dbgDraws,
@@ -678,7 +749,7 @@ void flushBatch() {
                             (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[4], o[5], o[6], o[7]);
                 }
                 if (texture) { const uint8_t* t = static_cast<const uint8_t*>(texture->texture.surface.image); fprintf(s_dbg, "  src %p base %p image0 %08x image3 %08x\n", (const void*)texture->source, physToPtr(0x20), (unsigned)g.bp[BP_TX_IMAGE0], (unsigned)g.bp[BP_TX_IMAGE3]); fprintf(s_dbg, "  tex %ux%u fmt %u texel0 %u %u %u %u mid %u %u %u %u\n", (unsigned)texture->width, (unsigned)texture->height, (unsigned)texture->fmt, t[0], t[1], t[2], t[3], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+1], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+2], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+3]); }
-                if (++s_dbgDraws == 80) { fclose(s_dbg); s_dbg = nullptr; }
+                if (++s_dbgDraws == 120) { fclose(s_dbg); s_dbg = nullptr; }
             }
         }
     }
@@ -705,7 +776,13 @@ void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
     flushBatch();
     const bool clear = (ctrl >> 11) & 1, disp = (ctrl >> 14) & 1;
-    if (!clear || disp || !s_frameActive || !ProcUIInForeground()) return;
+    if (disp || !s_frameActive || !ProcUIInForeground()) return;
+    {
+        const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
+        copyToTexture(g.copyDest, src & 0x3ff, (src >> 10) & 0x3ff, (size & 0x3ff) + 1, ((size >> 10) & 0x3ff) + 1);
+        rebindTvTarget();  // GX2CopySurface leaves its destination bound
+    }
+    if (!clear) return;
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
     if ((g.bp[BP_CMODE0] >> 3) & 1)
         GX2ClearColor(WHBGfxGetTVColourBuffer(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
@@ -769,6 +846,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
       s_dbgPrim = s_dbgApp = 0; }
     GX2Flush();
     s_frameActive = false;
+    s_drawsThisFrame = 0;
     ++g_displayFrames;
 }
 
