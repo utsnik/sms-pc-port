@@ -885,7 +885,9 @@ static void chanColor(const HostVertex& in, int c, int out[4]) {
         const uint32_t diff = (ctrl >> 7) & 3;
         for (uint32_t light = 0; light < 8; ++light) {
             if (!(mask & (1u << light))) continue;
-            const uint32_t base = 608 + light * 16;
+            // g.xfMem is the raw XF address space; light records begin at
+            // 0x600 (the PC shader packs that block down to word 608).
+            const uint32_t base = 0x600 + light * 16;
             float lightCol[4]; packedColor(g.xfMem[base + 3], lightCol);
             const float* a = reinterpret_cast<const float*>(&g.xfMem[base + 4]);
             const float* k = reinterpret_cast<const float*>(&g.xfMem[base + 7]);
