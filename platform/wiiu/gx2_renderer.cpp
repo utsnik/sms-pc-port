@@ -1299,6 +1299,25 @@ void executeCopy(uint32_t ctrl) {
     {
         const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
         copyToTexture(g.copyDest, src & 0x3ff, (src >> 10) & 0x3ff, (size & 0x3ff) + 1, ((size >> 10) & 0x3ff) + 1);
+        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650) {
+            static uint32_t s_dbgCopies;
+            if (s_dbgCopies < 16) {
+                FILE* f = fopen("fs:/vol/external01/gx2dbg.txt", "a");
+                if (f) {
+                    fprintf(f, "copy frame %u ctrl %08x dest %p src %u,%u size %u,%u half %u\n",
+                            (unsigned)g_displayFrames, (unsigned)ctrl, g.copyDest, (unsigned)(src & 0x3ff),
+                            (unsigned)((src >> 10) & 0x3ff), (unsigned)((size & 0x3ff) + 1),
+                            (unsigned)(((size >> 10) & 0x3ff) + 1), (unsigned)((ctrl >> 9) & 1));
+                    for (uint32_t map = 0; map < 8; ++map) {
+                        if (TextureEntry* e = copyTexture(g.texImage[map]))
+                            fprintf(f, "  cache map %u source %p size %u,%u\n", (unsigned)map,
+                                    (const void*)g.texImage[map], (unsigned)e->width, (unsigned)e->height);
+                    }
+                    fclose(f);
+                }
+                ++s_dbgCopies;
+            }
+        }
         rebindTvTarget();  // GX2CopySurface leaves its destination bound
     }
     if (!clear) return;
