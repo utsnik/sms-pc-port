@@ -1093,17 +1093,6 @@ static void transformPosition(const HostVertex& in, float* out) {
     // GX2's 0..w clip range (the PC GL path maps the same value to -w..w).
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
-    static uint32_t s_tpDebug;
-    if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_tpDebug < 3) {
-        FILE* f = fopen("fs:/vol/external01/gx2dbg.txt", "a");
-        if (f) {
-            fprintf(f, "tp mtx %u m %g %g %g %g | %g %g %g %g | %g %g %g %g xyz %g %g %g clip %g %g %g %g out %g %g %g %g\n",
-                    (unsigned)matrix, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11],
-                    x, y, z, cx, cy, cz, cw, out[0], out[1], out[2], out[3]);
-            fclose(f);
-        }
-        ++s_tpDebug;
-    }
 }
 
 static void transform(const HostVertex& in, float* out, int texCoord, bool textured, TextureEntry* texture) {
