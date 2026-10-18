@@ -1373,15 +1373,11 @@ void flushBatch() {
                 fputc('\n', s_dbg);
                 { const uint8_t* ab = g.arrayBase[0]; fprintf(s_dbg, "  arr0 %p stride %u be %d vcd %08x/%08x vatA0 %08x bytes %02x%02x %02x%02x %02x%02x\n", (const void*)ab, (unsigned)g.arrayStride[0], (int)g.arrayBigEndian[0], (unsigned)g.cpVcdLo, (unsigned)g.cpVcdHi, (unsigned)g.cpVatA[0], ab?ab[0]:0, ab?ab[1]:0, ab?ab[2]:0, ab?ab[3]:0, ab?ab[4]:0, ab?ab[5]:0); }
                 { const float* m = reinterpret_cast<const float*>(&g.xfMem[0]); fprintf(s_dbg, "  m0 %g %g %g %g | %g %g %g %g | %g %g %g %g matA %08x cpA %08x\n", m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11], (unsigned)g.xfReg[XFR_MATIDX_A], (unsigned)g.cpMatA); }
-                const uint32_t maDbg = g.xfReg[XFR_MATIDX_A], mbDbg = g.xfReg[XFR_MATIDX_B];
-                const uint8_t defaultsDbg[9] = {uint8_t(maDbg & 63), uint8_t((maDbg >> 6) & 63), uint8_t((maDbg >> 12) & 63),
-                                                uint8_t((maDbg >> 18) & 63), uint8_t((maDbg >> 24) & 63), uint8_t(mbDbg & 63),
-                                                uint8_t((mbDbg >> 6) & 63), uint8_t((mbDbg >> 12) & 63), uint8_t((mbDbg >> 18) & 63)};
                 const size_t st = vertexFloats;
                 for (size_t k = 0; k < 3 && k * st < vbo.size(); k++) {
                     const float* o = vbo.data() + k * st;
                     HostVertex hv;
-                    unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, defaultsDbg, hv);
+                    unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, defaults, hv);
                     const size_t co = tevPath ? 20 : (useTex ? 6 : 4);
                     fprintf(s_dbg, "  in %g %g %g mtx %u -> %g %g %g %g col %g %g %g %g\n", hv.pos[0], hv.pos[1], hv.pos[2],
                             (unsigned)hv.mtx[0], o[0], o[1], o[2], o[3], o[co], o[co + 1], o[co + 2], o[co + 3]);
