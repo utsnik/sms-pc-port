@@ -82,12 +82,17 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	const float r = loaded ? 0.02f : 0.0f;
 	const float g = loaded ? 0.18f : 0.02f;
 	const float b = loaded ? 0.03f : 0.16f;
+	/* BeginRender/FinishRender only wait for and swap the scan buffers; each
+	 * screen needs its own Begin/Finish pair or it is never drawn (the TV
+	 * stayed black in Cemu). */
 	WHBGfxBeginRender();
+	WHBGfxBeginRenderTV();
 	WHBGfxClearColor(r, g, b, 1.0f);
-	WHBGfxFinishRender();
+	WHBGfxFinishRenderTV();
 	WHBGfxBeginRenderDRC();
 	WHBGfxClearColor(r, g, b, 1.0f);
 	WHBGfxFinishRenderDRC();
+	WHBGfxFinishRender();
 }
 
 extern "C" {
