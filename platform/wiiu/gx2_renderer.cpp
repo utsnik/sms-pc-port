@@ -4,7 +4,6 @@
 #define SMS_GX2_DEBUG_DUMP 1
 #endif
 #include <coreinit/memdefaultheap.h>
-#include <coreinit/memorymap.h>
 /* Small GX2 host for the shared GX register decoder.
  *
  * The decoder still sees the original GameCube BP/CP/XF stream.  This file is
@@ -353,9 +352,11 @@ static TextureEntry* getTexture(int map) {
     // A texture address that did not survive the 30-bit GX physical address
     // (outside the main heap) must not be read: in Cemu that kills the title.
     const uint32_t srcBytes = gx2TexLevelBytes(fmt, w, h);
-    const bool readable = source && srcBytes &&
-        OSIsAddressValid(reinterpret_cast<uint32_t>(source)) &&
-        OSIsAddressValid(reinterpret_cast<uint32_t>(source) + srcBytes - 1);
+    // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
+    // texture came out white), so check the app's MEM2/MEM1 ranges directly.
+    const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
+    const bool readable = source && srcBytes && a1 > a0 &&
+        ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
     if (!readable && rgba) { MEMFreeToDefaultHeap(rgba); rgba = nullptr; }
     if (!rgba) {
         memset(e.texture.surface.image, 0xff, e.texture.surface.imageSize);
@@ -731,7 +732,7 @@ void flushBatch() {
     }
     { // TEMP debug dump
         static int s_dbgDraws = 0; static FILE* s_dbg = nullptr;
-        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 1350 && s_dbgDraws < 120) {
+        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_dbgDraws < 120) {
             if (!s_dbg) s_dbg = fopen("fs:/vol/external01/gx2dbg.txt", "w");
             if (s_dbg) {
                 fprintf(s_dbg, "draw %d frame %u fmt %x n %u tex %d vp %g %g %g %g proj %g %g %g %g %g %g %g\n", s_dbgDraws,
