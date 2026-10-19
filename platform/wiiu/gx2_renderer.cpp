@@ -1149,21 +1149,33 @@ static void applyState() {
     // alpha made the whole stage invisible. The EFB has no alpha channel, so
     // destination alpha reads as 1.
     const uint32_t cm = g.bp[BP_CMODE0];
+    // Pixel format 1 (RGBA6_Z24) keeps destination alpha: Sunshine's shadow
+    // volumes count into it with alpha-only passes and blend by it later.
+    // The other formats read destination alpha as 1.
+    const bool hasAlpha = (g.bp[BP_PE_CONTROL] & 7) == 1;
     static const GX2BlendMode kSrc[8] = {GX2_BLEND_MODE_ZERO, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_DST_COLOR,
                                          GX2_BLEND_MODE_INV_DST_COLOR, GX2_BLEND_MODE_SRC_ALPHA,
-                                         GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO};
+                                         GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_MODE_DST_ALPHA,
+                                         GX2_BLEND_MODE_INV_DST_ALPHA};
     static const GX2BlendMode kDst[8] = {GX2_BLEND_MODE_ZERO, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_SRC_COLOR,
                                          GX2_BLEND_MODE_INV_SRC_COLOR, GX2_BLEND_MODE_SRC_ALPHA,
-                                         GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO};
+                                         GX2_BLEND_MODE_INV_SRC_ALPHA, GX2_BLEND_MODE_DST_ALPHA,
+                                         GX2_BLEND_MODE_INV_DST_ALPHA};
+    auto noDstAlpha = [&](GX2BlendMode m) {
+        if (hasAlpha) return m;
+        return m == GX2_BLEND_MODE_DST_ALPHA ? GX2_BLEND_MODE_ONE
+             : m == GX2_BLEND_MODE_INV_DST_ALPHA ? GX2_BLEND_MODE_ZERO : m;
+    };
     const bool blend = (cm & 1) != 0;
     if (blend && ((cm >> 11) & 1))
         GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ONE,
-                           GX2_BLEND_COMBINE_MODE_REV_SUB, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO,
+                           GX2_BLEND_COMBINE_MODE_REV_SUB, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ONE,
+                           GX2_BLEND_COMBINE_MODE_REV_SUB);
+    else {
+        const GX2BlendMode sf = noDstAlpha(kSrc[(cm >> 8) & 7]), df = noDstAlpha(kDst[(cm >> 5) & 7]);
+        GX2SetBlendControl(GX2_RENDER_TARGET_0, sf, df, GX2_BLEND_COMBINE_MODE_ADD, FALSE, sf, df,
                            GX2_BLEND_COMBINE_MODE_ADD);
-    else
-        GX2SetBlendControl(GX2_RENDER_TARGET_0, kSrc[(cm >> 8) & 7], kDst[(cm >> 5) & 7],
-                           GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO,
-                           GX2_BLEND_COMBINE_MODE_ADD);
+    }
     GX2SetDepthOnlyControl(ztest, zwrite, ztest ? GX2_COMPARE_FUNC_LEQUAL : GX2_COMPARE_FUNC_ALWAYS);
     GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
     GX2SetPolygonOffset(0, 0, 0, 0, 0);
@@ -1186,8 +1198,10 @@ static void applyState() {
     // Color update is independent of blending in CMODE0.  The title's
     // blend-off cloud and light-ray passes still have cupd set, so use that
     // bit for GX2's color mask rather than treating GX_BM_NONE as write-off.
-    GX2SetColorControl(GX2_LOGIC_OP_COPY, ((cm >> 3) & 1) ? 0xff : 0x00, FALSE, TRUE);
-    GX2SetTargetChannelMasks(((cm >> 3) & 1) ? GX2_CHANNEL_MASK_RGB : (GX2ChannelMask)0,
+    const bool colourUpd = ((cm >> 3) & 1) != 0;
+    const bool alphaUpd = hasAlpha && ((cm >> 4) & 1) != 0;
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, blend ? 0xff : 0x00, FALSE, TRUE);
+    GX2SetTargetChannelMasks(GX2ChannelMask((colourUpd ? GX2_CHANNEL_MASK_RGB : 0) | (alphaUpd ? GX2_CHANNEL_MASK_A : 0)),
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0);
 }
@@ -1709,7 +1723,7 @@ void flushBatch() {
 // (shadow and reflection renders) rejected the whole main view. A display copy
 // is presented from the TV target, so its clear is deferred until next frame
 // start rather than being applied to the image that is about to be presented.
-static float s_frameClear[3];
+static float s_frameClear[4];
 static bool s_frameClearPending = false;
 static void rebindTvTarget() {
     GX2SetContextState(WHBGfxGetTVContextState());
@@ -1733,6 +1747,7 @@ void executeCopy(uint32_t ctrl) {
             s_frameClear[0] = float(ar & 255) / 255.0f;
             s_frameClear[1] = float((gb >> 8) & 255) / 255.0f;
             s_frameClear[2] = float(gb & 255) / 255.0f;
+            s_frameClear[3] = ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f;
             s_frameClearPending = ((g.bp[BP_CMODE0] >> 3) & 1) != 0;
         }
         return;
@@ -1747,7 +1762,8 @@ void executeCopy(uint32_t ctrl) {
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
     if ((g.bp[BP_CMODE0] >> 3) & 1)
         GX2ClearColor(WHBGfxGetTVColourBuffer(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
-                      float(gb & 255) / 255.0f, 1.0f);
+                      float(gb & 255) / 255.0f,
+                      ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f);
     if ((g.bp[BP_ZMODE] >> 4) & 1)
         GX2ClearDepthStencilEx(WHBGfxGetTVDepthBuffer(), float(z & 0xffffff) / 16777215.0f, 0,
                                GX2_CLEAR_FLAGS_DEPTH);
@@ -1787,7 +1803,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
     updateTarget();
     if (s_frameClearPending) {
-        GX2ClearColor(WHBGfxGetTVColourBuffer(), s_frameClear[0], s_frameClear[1], s_frameClear[2], 1.0f);
+        GX2ClearColor(WHBGfxGetTVColourBuffer(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]);
         s_frameClearPending = false;
         GX2SetContextState(WHBGfxGetTVContextState());
         GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
