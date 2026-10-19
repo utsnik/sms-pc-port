@@ -1531,16 +1531,17 @@ static void chanColor(const HostVertex& in, int c, int out[4]) {
     else normal[2] = 1.0f;
     modelPosition(in, position);
 
-    auto litPart = [&](uint32_t ctrl, int channel, bool alpha) {
+    // The light loop is the same for every component, so one pass yields
+    // all four (the colour control uses r/g/b, the alpha control a).
+    auto litAll = [&](uint32_t ctrl, float result[4]) {
         float materialColor[4];
         if (ctrl & 1) for (int k = 0; k < 4; ++k) materialColor[k] = float(in.clr[c][k]) / 255.0f;
         else packedColor(g.xfReg[XFR_MAT0 + c], materialColor);
-        const float material = materialColor[alpha ? 3 : channel];
-        if (!(ctrl & 2)) return material;
+        if (!(ctrl & 2)) { for (int k = 0; k < 4; ++k) result[k] = materialColor[k]; return; }
         float ambient[4];
         if (ctrl & 64) for (int k = 0; k < 4; ++k) ambient[k] = float(in.clr[c][k]) / 255.0f;
-        else packedColor(g.xfReg[(alpha ? XFR_AMB0 : XFR_AMB0) + c], ambient);
-        float sum = ambient[alpha ? 3 : channel];
+        else packedColor(g.xfReg[XFR_AMB0 + c], ambient);
+        float sum[4] = {ambient[0], ambient[1], ambient[2], ambient[3]};
         const uint32_t mask = ((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4);
         const uint32_t diff = (ctrl >> 7) & 3;
         for (uint32_t light = 0; light < 8; ++light) {
@@ -1579,13 +1580,18 @@ static void chanColor(const HostVertex& in, int c, int out[4]) {
             float diffuse = 1.0f;
             if (diff == 1) diffuse = normal[0] * l[0] + normal[1] * l[1] + normal[2] * l[2];
             else if (diff >= 2) diffuse = std::max(normal[0] * l[0] + normal[1] * l[1] + normal[2] * l[2], 0.0f);
-            sum += factor * diffuse * lightCol[alpha ? 3 : channel];
+            const float w = factor * diffuse;
+            for (int ch = 0; ch < 4; ++ch) sum[ch] += w * lightCol[ch];
         }
-        return material * std::max(0.0f, std::min(sum, 1.0f));
+        for (int ch = 0; ch < 4; ++ch) result[ch] = materialColor[ch] * std::max(0.0f, std::min(sum[ch], 1.0f));
     };
+    float colorLit[4], alphaLit[4];
+    litAll(colorCtrl, colorLit);
+    if (alphaCtrl == colorCtrl) alphaLit[3] = colorLit[3];
+    else litAll(alphaCtrl, alphaLit);
     for (int channel = 0; channel < 3; ++channel)
-        out[channel] = clampi(int(litPart(colorCtrl, channel, false) * 255.0f + 0.5f), 0, 255);
-    out[3] = clampi(int(litPart(alphaCtrl, 0, true) * 255.0f + 0.5f), 0, 255);
+        out[channel] = clampi(int(colorLit[channel] * 255.0f + 0.5f), 0, 255);
+    out[3] = clampi(int(alphaLit[3] * 255.0f + 0.5f), 0, 255);
 }
 
 static bool evalTev(const HostVertex& in, float* rgba, bool* usesTex) {
