@@ -11,6 +11,10 @@
 #include <cstdio>
 #include <cstring>
 
+/* Set when the port itself asks for the Menu; vi.cpp drains the GPU before the
+ * ProcUI pump that releases the foreground. */
+extern "C" volatile int sms_wiiu_menu_exit_pending = 0;
+
 namespace {
 
 PADStatus s_status[PAD_MAX_CONTROLLERS];
@@ -317,6 +321,7 @@ void sms_wiiu_input_poll(void)
 				s_marker_start = now;
 			else if (OSTicksToSeconds(now - s_marker_start) >= 180) {
 				s_exit_requested = true;
+				sms_wiiu_menu_exit_pending = 1;
 				port_log("[pad] autopress run over (180 s): returning to the Menu\n");
 				SYSLaunchMenu();
 			}
