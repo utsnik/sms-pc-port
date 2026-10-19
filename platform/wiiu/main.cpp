@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include <whb/log.h>
+#include <whb/log_cafe.h>
 #include <whb/log_udp.h>
 #include <whb/proc.h>
 
@@ -14,6 +15,8 @@ static void (*volatile s_game_entry)(void) = SMS_main;
 int main(int argc, char** argv)
 {
 	WHBLogUdpInit();
+	/* OSConsole too: Cemu writes it to log.txt (UDP does not reach a listener there). */
+	WHBLogCafeInit();
 	WHBLogPrint("SMS Wii U: main start (global constructors done)");
 	sms_wiiu_install_exception_handlers();
 	WHBProcInit();
