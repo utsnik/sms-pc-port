@@ -5,6 +5,8 @@
 // (the file's bytes, exactly as the game wrote them, i.e. big-endian save
 // data) plus <name>.stat (the CARDStat the game set). Emulates a 59-block
 // card (4 Mbit, 8 KiB sectors). All operations complete synchronously.
+// On Wii U the directory is the app's SD root plus card-a; the runtime has
+// already selected the path form that works for the current SD/devoptab.
 //
 // As on hardware, a file belongs to the game that made it: its CARDStat keeps
 // the game code and maker of the running disc (DVDGetCurrentDiskID), and a
@@ -28,9 +30,17 @@
 #include <string>
 #include <vector>
 #include <sys/stat.h>
+#ifdef TARGET_WIIU
+static int card_mkdir(const char* path, int mode) { return mkdir(path, mode); }
+#else
 #include "port_host.h"
+#define card_mkdir port_mkdir
+#endif
 #include <errno.h>
 #include <dolphin/dvd.h>
+#ifdef TARGET_WIIU
+#include "../wiiu/runtime.h"
+#endif
 
 namespace {
 
@@ -54,13 +64,16 @@ void mkdirs(const std::string& p)
 {
 	for (size_t i = 1; i <= p.size(); i++)
 		if (i == p.size() || p[i] == '/')
-			port_mkdir(p.substr(0, i).c_str(), 0755);
+			card_mkdir(p.substr(0, i).c_str(), 0755);
 }
 
 std::string card_dir()
 {
 	if (!g_dir.empty())
 		return g_dir;
+#ifdef TARGET_WIIU
+	g_dir = std::string(sms_wiiu_app_root()) + "card-a";
+#else
 	if (const char* d = getenv("SMS_SAVE_DIR"))
 		g_dir = d;
 	else if (const char* x = getenv("XDG_DATA_HOME"))
@@ -71,6 +84,7 @@ std::string card_dir()
 #endif
 	else
 		g_dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.local/share/sms-port/card-a";
+#endif
 	mkdirs(g_dir);
 	port_log("[card] slot A: %s\n", g_dir.c_str());
 	return g_dir;
