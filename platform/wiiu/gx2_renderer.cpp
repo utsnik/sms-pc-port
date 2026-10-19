@@ -418,7 +418,11 @@ static void tevEmitTevCompare(std::vector<uint64_t>& program, uint32_t channel,
     auto B = [&](uint32_t comp) { return src.get(true, comp); };
     if (mode < 2 || mode >= 6) {
         const uint32_t component = mode < 2 ? 0 : channel;
-        tevEmitCompareOp(program, 17, (mode & 1) != 0, A(component), 0, B(component), 0);
+        // The one-component forms feed the compare result directly into the
+        // bias-3 equation below, whose C operand is the current channel of
+        // R16.  Keep the producer and consumer on the same register; R17 is
+        // reserved for the intermediate components of 16/24-bit compares.
+        tevEmitCompareOp(program, 16, (mode & 1) != 0, A(component), 0, B(component), 0);
         return;
     }
 
