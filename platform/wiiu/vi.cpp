@@ -5,9 +5,13 @@
 
 #include <dolphin/vi.h>
 #include <whb/proc.h>
+#include <gx2/event.h>
+#include <whb/log.h>
 
 #include <cstdint>
 #include <cstring>
+
+extern "C" volatile int sms_wiiu_menu_exit_pending;
 
 extern "C" {
 void sms_wiiu_gfx_frame(void);
@@ -86,6 +90,18 @@ void sms_wiiu_frame_boundary(void)
 		sms_wiiu_profiler_stop();
 		sms_wiiu_crash_return_to_menu();
 		return;
+	}
+	/* A Menu exit froze the console once (2026-10-19 21:49) during the
+	 * foreground release inside the pump. Drain the GPU first and log each
+	 * step: a hang inside GX2DrawDone means a draw had already hung the GPU. */
+	if (sms_wiiu_menu_exit_pending == 1) {
+		sms_wiiu_menu_exit_pending = 2;
+		WHBLogPrintf("SMS Wii U: exit drain: submitted=%llu retired=%llu",
+		             (unsigned long long)GX2GetLastSubmittedTimeStamp(),
+		             (unsigned long long)GX2GetRetiredTimeStamp());
+		GX2DrawDone();
+		WHBLogPrintf("SMS Wii U: exit drain: done retired=%llu; pumping ProcUI",
+		             (unsigned long long)GX2GetRetiredTimeStamp());
 	}
 	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
 	if (!WHBProcIsRunning()) {

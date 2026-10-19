@@ -427,13 +427,18 @@ extern "C" void sms_wiiu_exit(void)
 {
 	/* Stop the audio pacer and close SDL audio before the foreground and AX
 	 * go away. */
+	/* Step logs: an exit to the Menu froze once (2026-10-19 21:49) with no
+	 * "exiting" line, so a repeat must show which step never returned. */
+	WHBLogPrintf("SMS Wii U: exit: audio shutdown");
 	sms_wiiu_audio_shutdown();
 	if (s_gfx_initialized) {
 		if (s_frame_open) {
+			WHBLogPrintf("SMS Wii U: exit: renderer end");
 			sms_wiiu_gx2_renderer_end();
 			s_frame_open = false;
 		}
 		s_gfx_initialized = false;
+		WHBLogPrintf("SMS Wii U: exit: WHBGfxShutdown");
 		WHBGfxShutdown();
 	}
 	WHBLogPrintf("SMS Wii U: exiting");
