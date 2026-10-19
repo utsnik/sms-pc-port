@@ -263,15 +263,14 @@ void port_init(int, char**)
 	port_os_threads_init();
 	s_heap_ready = true;
 	port_dvd_init();
-	/* Stage 2 is silent: the AI DMA engine is not emulated yet, and JAudio's
-	 * real path waits on its interrupt forever. SMS_NO_AUDIO gives JAudio the
-	 * PC port's empty sound configuration and leaves DMA idle. */
-	setenv("SMS_NO_AUDIO", "1", 1);
+	/* Sound: the DSP HLE (platform/audio) mixes on JAudio's audio thread and
+	 * audio.cpp plays the DAC blocks through SDL2. SMS_NO_AUDIO=1 in the
+	 * environment still selects the empty sound configuration. */
 	port_noaudio_init();
 	sms_wiiu_gfx_init();
 	port_vi_init();
 	port_pad_init();
-	port_log("SMS Wii U: target OS, threads, FST/DV, silent audio, VI, "
+	port_log("SMS Wii U: target OS, threads, FST/DV, audio, VI, "
 	         "and input initialized\n");
 	port_stub_report();
 }
