@@ -38,6 +38,7 @@ extern "C" int port_audio_dsp_frame_pending(void);
 extern "C" int sms_wiiu_sdl_audio_open(int rate);
 extern "C" void sms_wiiu_sdl_audio_queue(const void* data, uint32_t bytes);
 extern "C" uint32_t sms_wiiu_sdl_audio_queued(void);
+extern "C" void sms_wiiu_sdl_audio_close(void);
 extern "C" u64 port_audio_dsp_subframes(void);
 
 extern "C" {
@@ -62,6 +63,8 @@ struct Ai {
 	bool inited;
 	bool enabled; // not SMS_NO_AUDIO
 	volatile bool running;
+	volatile bool quit;    // shutdown requested
+	volatile bool stopped; // the pacer has left its loop
 	u32 start, length;
 	u32 latchedStart, latchedLen;
 	AIDCallback cb;
@@ -176,8 +179,10 @@ void* pacer(void*)
 		port_log("[audio] no audio device: pacing AI DMA from the system clock\n");
 	g.statsSince = sms_wiiu_audio_system_time();
 	g.minQueued  = 0xFFFFFFFFu;
-	for (;;) {
+	while (!g.quit) {
 		sms_wiiu_audio_sleep_ticks(kPollTicks);
+		if (g.quit)
+			break;
 		int64_t now = sms_wiiu_audio_system_time();
 		log_stats(now);
 		if (!g.running) {
@@ -248,10 +253,30 @@ void* pacer(void*)
 		}
 		g.queuedAfter = queued;
 	}
+	g.stopped = true;
 	return NULL;
 }
 
 } // namespace
+
+// Called from the main thread on exit to the Menu: stop block generation,
+// wait (bounded) for the pacer to leave its loop, then close the SDL device.
+// If the pacer does not stop in time the device is left open (the process is
+// about to end anyway) rather than closed under a live SDL_QueueAudio.
+extern "C" void sms_wiiu_audio_shutdown(void)
+{
+	if (!g.inited || !g.enabled)
+		return;
+	g.running = false;
+	g.quit    = true;
+	for (int i = 0; i < 100 && !g.stopped; i++)
+		sms_wiiu_audio_sleep_ticks(kTicksPerSec / 100); // up to 1 s
+	if (g.stopped) {
+		g.dev = false;
+		sms_wiiu_sdl_audio_close();
+	}
+	port_log("[audio] shut down (pacer %s)\n", g.stopped ? "stopped, SDL closed" : "did not stop; SDL left open");
+}
 
 extern "C" void AIInit(u8*)
 {

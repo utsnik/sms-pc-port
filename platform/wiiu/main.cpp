@@ -7,6 +7,7 @@
 
 extern void SMS_main(void);
 extern "C" void sms_wiiu_install_exception_handlers(void);
+extern "C" void sms_wiiu_audio_shutdown(void);
 
 /* Keep the entry point in volatile storage so the target link retains the
  * complete game while still making the runtime hand-off explicit. */
@@ -25,6 +26,7 @@ int main(int argc, char** argv)
 	s_game_entry();
 	port_log("SMS Wii U: SMS_main returned; shutting down\n");
 
+	sms_wiiu_audio_shutdown();
 	WHBProcShutdown();
 	return 0;
 }

@@ -20,6 +20,7 @@
 extern "C" void* sms_wiiu_vi_owner_thread(void);
 extern "C" void sms_wiiu_crash_return_to_menu(void);
 extern "C" void sms_wiiu_exit(void);
+extern "C" void sms_wiiu_audio_shutdown(void);
 extern "C" volatile int sms_wiiu_crash_pending;
 volatile int sms_wiiu_crash_pending;
 
@@ -125,6 +126,7 @@ extern "C" void sms_wiiu_crash_return_to_menu(void)
 {
 	OSSetThreadPriority(OSGetCurrentThread(), 0);
 	WHBLogPrint("[crash] returning to the Wii U Menu");
+	sms_wiiu_audio_shutdown();
 	SYSLaunchMenu();
 	for (;;) {
 		ProcUIStatus status = ProcUIProcessMessages(TRUE);
