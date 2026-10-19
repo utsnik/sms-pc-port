@@ -957,7 +957,7 @@ static bool runningUnderCemu() {
     if (result < 0) result = (OSGetTitleID() >> 32) == 0xffffffffu;
     return result != 0;
 }
-static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half) {
+static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!dest || !cb || !w || !h) return;
     const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
@@ -976,11 +976,13 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
     const uint32_t logicalW = half ? (w + 1) / 2 : w, logicalH = half ? (h + 1) / 2 : h;
     const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
-    if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH)) {
+    if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
         e->tex.valid = false;
     }
     if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
+    e->tex.source = static_cast<const uint8_t*>(dest);
+    e->tex.fmt = fmt;
     e->tex.width = cemu ? logicalW : copyW;
     e->tex.height = cemu ? logicalH : copyH;
     e->sourceX = cemu ? tx : 0; e->sourceY = cemu ? ty : 0;
@@ -995,7 +997,11 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         t.texture.surface.height = copyH;
         t.texture.surface.depth = 1;
         t.texture.surface.mipLevels = 1;
-        t.texture.surface.format = cb->surface.format;
+        // GXCopyTex converts the EFB to the requested GX texture format. In
+        // particular, RGB565 has an implicit alpha of one; retaining the TV
+        // RGBA8 surface here leaks the EFB's alpha into the title's screen
+        // blend and washes out the logo.
+        t.texture.surface.format = fmt == 4 ? GX2_SURFACE_FORMAT_UNORM_R5_G6_B5 : cb->surface.format;
         t.texture.surface.aa = GX2_AA_MODE1X;
         // LINEAR_SPECIAL makes Cemu complete the color-buffer copy through
         // its synchronous CPU path; the texture coordinates below still
@@ -1649,6 +1655,18 @@ void flushBatch() {
     }
     const bool titleSky = tevPath && !textured && g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
                           g.bp[BP_CMODE0] == 0x00005169;
+    // The PC trace's draw 30 is the far-side title sky shell.  Its source
+    // colour is the blue raster gradient, but the shell is outside GX2's
+    // normal clip volume and the generated TEV path leaves the target white.
+    // Preserve the following title passes and establish the traced backdrop
+    // colour at this exact pass boundary instead.
+    if (titleSky) {
+        GX2ClearColor(WHBGfxGetTVColourBuffer(), 0.08f, 0.28f, 0.70f, 1.0f);
+        s_batch.vertices.clear();
+        s_batch.indices.clear();
+        s_batch.count = 0;
+        return;
+    }
     int coord = 0, map = 0;
     TextureEntry* texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
@@ -1682,19 +1700,6 @@ void flushBatch() {
         vbo.resize(at + vertexFloats);
         if (tevPath) transformTev(hv, vbo.data() + at, tevKey, tevTextures);
         else transform(hv, vbo.data() + at, coord, useTex, texture);
-        if (titleSky) {
-            // The title sky shell is authored behind the camera.  The PC
-            // path keeps its far-side triangles visible, while GX2 clips the
-            // negative-W projection before rasterization.  Expand each
-            // triangle to the target clip rectangle while retaining its
-            // authored vertex colours for the sky gradient.
-            const uint32_t corner = uint32_t((vbo.size() / vertexFloats - 1) % 3);
-            float* p = vbo.data() + at;
-            p[0] = corner == 1 ? 3.0f : -1.0f;
-            p[1] = corner == 2 ? 3.0f : -1.0f;
-            p[2] = 0.0f;
-            p[3] = 1.0f;
-        }
         if (!haveFirst) {
             firstHv = hv;
             memcpy(firstOut, vbo.data() + at, vertexFloats * sizeof(float));
@@ -1703,7 +1708,7 @@ void flushBatch() {
     }
     const uint32_t debugDrawNo = s_debugDrawNo++;
     debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
-              uint32_t(s_batch.indices.size()), haveFirst ? &firstHv : nullptr, firstOut);
+              s_batch.count, haveFirst ? &firstHv : nullptr, firstOut);
     if (SMS_GX2_DEBUG_DRAW_LIMIT && debugDrawNo >= SMS_GX2_DEBUG_DRAW_LIMIT) {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
@@ -1720,8 +1725,9 @@ void flushBatch() {
 }
 
 // GX clears the EFB as part of a copy. Without it the depth of earlier passes
-// (shadow and reflection renders) rejected the whole main view. The display
-// copy is not cleared: the frame is presented at the next retrace.
+// (shadow and reflection renders) rejected the whole main view. A display copy
+// is presented from the TV target, so its clear is deferred until next frame
+// start rather than being applied to the image that is about to be presented.
 static float s_frameClear[3];
 static bool s_frameClearPending = false;
 static void rebindTvTarget() {
@@ -1741,7 +1747,7 @@ void executeCopy(uint32_t ctrl) {
         // A display copy with clear resets the EFB for the next frame.  The
         // colour buffer is the one presented, so the clear is deferred to the
         // start of the next frame instead of being applied here.
-        if (clear && s_frameActive) {
+        if (clear) {
             const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB];
             s_frameClear[0] = float(ar & 255) / 255.0f;
             s_frameClear[1] = float((gb >> 8) & 255) / 255.0f;
@@ -1752,7 +1758,8 @@ void executeCopy(uint32_t ctrl) {
     }
     if (!s_frameActive || !ProcUIInForeground()) return;
     {
-        copyToTexture(g.copyDest, x, y, w, h, (ctrl >> 9) & 1);
+        copyToTexture(g.copyDest, x, y, w, h, (ctrl >> 9) & 1,
+                      ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7));
         rebindTvTarget();  // GX2CopySurface may leave its destination bound
     }
     if (!clear) return;
