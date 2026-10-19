@@ -10,7 +10,23 @@
 #include <whb/proc.h>
 #include <proc_ui/procui.h>
 #include <cstdlib>
+#include <cstdio>
+#include <malloc.h>
+#include <sys/stat.h>
 #include <whb/gfx.h>
+#include <coreinit/memdefaultheap.h>
+#include <gx2/clear.h>
+#include <gx2/display.h>
+#include <gx2/event.h>
+#include <gx2/state.h>
+#include <gx2/surface.h>
+#include <gx2/swap.h>
+#include <gx2/texture.h>
+#include <coreinit/cache.h>
+#include <coreinit/memory.h>
+#include <coreinit/memexpheap.h>
+#include <coreinit/memheap.h>
+#include <gx2/mem.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -37,7 +53,350 @@ void log_active_once()
 	}
 }
 
+/* ---- GamePad output and display diagnostics ------------------------------
+ * The GamePad shows the TV image: the finished TV colour buffer is copied to
+ * the DRC scan buffer too (GX2CopyColorBufferToScanBuffer resizes; the DRC
+ * scale is set to the source size, as the LUS and DKR ports do on hardware).
+ * The 16:9 TV target keeps the 4:3 pillarbox on the 854x480 panel.
+ *
+ * WHBGfx's own DRC colour buffer is then unused; it is filled once with a
+ * sentinel and checked later as a MEM1 canary (anything writing into the
+ * WHBGfx MEM1 heap shows up as a changed word).  GX2GetLastFrame samples
+ * show what the TV and DRC scan buffers actually hold. */
+constexpr float kCanary[4] = {0x5a / 255.0f, 0x3c / 255.0f, 0x96 / 255.0f, 0x12 / 255.0f};
+uint32_t s_canary_word;
+bool s_canary_armed;
+bool s_was_foreground = true;
+uint32_t s_presented;
+
+void log_surface(const char* tag, const GX2Surface& s)
+{
+	port_log("[drc] %s image=%p bytes=%u %ux%u fmt=0x%x tile=%u pitch=%u swizzle=0x%x use=0x%x aa=%u\n",
+	         tag, s.image, unsigned(s.imageSize), unsigned(s.width), unsigned(s.height),
+	         unsigned(s.format), unsigned(s.tileMode), unsigned(s.pitch), unsigned(s.swizzle),
+	         unsigned(s.use), unsigned(s.aa));
+}
+
+/* Eight words spread over the image, read by the CPU after a GX2DrawDone. */
+void log_words(const char* tag, const void* image, uint32_t bytes)
+{
+	if (!image || bytes < 64) {
+		port_log("[drc] %s words: no image\n", tag);
+		return;
+	}
+	DCInvalidateRange(const_cast<void*>(image), bytes);
+	const uint32_t* w = static_cast<const uint32_t*>(image);
+	const uint32_t n = bytes / 4;
+	uint32_t v[8];
+	for (uint32_t i = 0; i < 8; ++i)
+		v[i] = w[uint32_t(uint64_t(n) * (2 * i + 1) / 16)];
+	port_log("[drc] %s words %08x %08x %08x %08x %08x %08x %08x %08x\n", tag,
+	         unsigned(v[0]), unsigned(v[1]), unsigned(v[2]), unsigned(v[3]),
+	         unsigned(v[4]), unsigned(v[5]), unsigned(v[6]), unsigned(v[7]));
+}
+
+/* WHBGfxInit sizes and registers the DRC scan buffer with GX2GetSystemDRCMode(),
+ * which returned 0 (DISABLED) on hardware: a 512-byte buffer in a disabled
+ * mode, so the GamePad kept the system launch screen.  The LUS and DKR ports
+ * use GX2GetSystemDRCScanMode() (1 = SINGLE).  Register a real DRC scan buffer
+ * in that mode, allocated from WHBGfx's own foreground heap (found from the
+ * TV scan buffer it holds), so WHBGfx's release callback frees it with the
+ * heap; redone after every foreground acquire. */
+bool s_drc_registered;
+uint32_t s_drc_attempts;
+void* s_drc_scan;
+
+void drc_register_scan_buffer()
+{
+	if (s_drc_registered || s_drc_attempts >= 10)
+		return;
+	++s_drc_attempts;
+	GX2DrcRenderMode mode = GX2GetSystemDRCScanMode();
+	if (mode == GX2_DRC_RENDER_MODE_DISABLED)
+		mode = GX2_DRC_RENDER_MODE_SINGLE;
+	uint32_t bytes = 0, unk = 0;
+	GX2CalcDRCSize(mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE, &bytes, &unk);
+	uint32_t fga = 0, fgs = 0;
+	OSGetForegroundBucket(&fga, &fgs);
+	GX2Texture last;
+	std::memset(&last, 0, sizeof(last));
+	const BOOL ok = GX2GetLastFrame(GX2_SCAN_TARGET_TV, &last);
+	const uint32_t tvScan = reinterpret_cast<uint32_t>(last.surface.image);
+	const bool inForeground = ok && tvScan >= fga && tvScan - fga < fgs;
+	/* WHBGfx's foreground expanded heap spans the whole foreground frame heap,
+	 * so any address inside the bucket's tail finds it; only an EXPH heap is
+	 * used (an exp-heap call on the frame heap itself would corrupt it). */
+	void* probes[3] = {inForeground ? last.surface.image : nullptr,
+	                   reinterpret_cast<void*>(fga + fgs - 256), reinterpret_cast<void*>(fga + fgs / 2)};
+	MEMHeapHandle heap = nullptr;
+	for (void* probe : probes) {
+		if (!probe || !fgs)
+			continue;
+		MEMHeapHandle h = MEMFindContainHeap(probe);
+		const uint32_t tag = h ? *reinterpret_cast<const uint32_t*>(h) : 0;
+		port_log("[drc] probe %p -> heap %p tag=%08x\n", probe, static_cast<void*>(h), unsigned(tag));
+		if (h && tag == 0x45585048u) { /* 'EXPH' */
+			heap = h;
+			break;
+		}
+	}
+	const char* from = "foreground";
+	if (!heap && s_drc_attempts >= 10) {
+		/* Last resort: WHBGfx's MEM1 heap (holds its colour buffers). */
+		heap = MEMFindContainHeap(WHBGfxGetDRCColourBuffer()->surface.image);
+		from = "MEM1";
+	}
+	port_log("[drc] scan register try=%u mode=%d bytes=%u tvScan ok=%d %p inFG=%d heap=%p (%s)\n",
+	         unsigned(s_drc_attempts), int(mode), unsigned(bytes), int(ok), last.surface.image,
+	         int(inForeground), static_cast<void*>(heap), from);
+	if (!heap || !bytes)
+		return;
+	s_drc_scan = MEMAllocFromExpHeapEx(heap, bytes, GX2_SCAN_BUFFER_ALIGNMENT);
+	if (!s_drc_scan) {
+		port_log("[drc] scan register: alloc of %u bytes failed (free %u)\n", unsigned(bytes),
+		         unsigned(MEMGetAllocatableSizeForExpHeapEx(heap, GX2_SCAN_BUFFER_ALIGNMENT)));
+		return;
+	}
+	GX2Invalidate(GX2_INVALIDATE_MODE_CPU, s_drc_scan, bytes);
+	GX2SetDRCBuffer(s_drc_scan, bytes, mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE);
+	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+	GX2SetDRCScale(tv->surface.width, tv->surface.height);
+	GX2SetDRCEnable(TRUE);
+	s_drc_registered = true;
+	port_log("[drc] DRC scan buffer registered: %p+%u mode=%d scale %ux%u\n", s_drc_scan,
+	         unsigned(bytes), int(mode), unsigned(tv->surface.width), unsigned(tv->surface.height));
+}
+
+void drc_setup(bool first)
+{
+	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+	GX2SetDRCScale(tv->surface.width, tv->surface.height);
+	if (!first) {
+		port_log("[drc] foreground regained; DRC scale %ux%u\n",
+		         unsigned(tv->surface.width), unsigned(tv->surface.height));
+		s_canary_armed = false;
+		/* WHBGfx's release callback destroyed its foreground heap (and our
+		 * buffer); its acquire callback registered its disabled one again. */
+		s_drc_registered = false;
+		s_drc_attempts = 0;
+		s_drc_scan = nullptr;
+		return;
+	}
+	uint32_t drcBytes = 0, unk = 0;
+	const GX2DrcRenderMode drcMode = GX2GetSystemDRCMode();
+	GX2CalcDRCSize(drcMode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE, &drcBytes, &unk);
+	uint32_t m1a = 0, m1s = 0, fga = 0, fgs = 0;
+	OSGetMemBound(OS_MEM1, &m1a, &m1s);
+	OSGetForegroundBucket(&fga, &fgs);
+	port_log("[drc] init tvScan=%d aspect=%d drcMode=%d drcScanMode=%d drcScanBytes=%u "
+	         "MEM1=%08x+%u foreground=%08x+%u\n",
+	         int(GX2GetSystemTVScanMode()), int(GX2GetSystemTVAspectRatio()), int(drcMode),
+	         int(GX2GetSystemDRCScanMode()), unsigned(drcBytes), unsigned(m1a), unsigned(m1s),
+	         unsigned(fga), unsigned(fgs));
+	log_surface("tvColour", tv->surface);
+	log_surface("tvDepth", WHBGfxGetTVDepthBuffer()->surface);
+	GX2ColorBuffer* drc = WHBGfxGetDRCColourBuffer();
+	log_surface("drcColour", drc->surface);
+	log_surface("drcDepth", WHBGfxGetDRCDepthBuffer()->surface);
+	port_log("[drc] contexts tv=%p drc=%p\n", static_cast<void*>(WHBGfxGetTVContextState()),
+	         static_cast<void*>(WHBGfxGetDRCContextState()));
+	if (drc->surface.image && drc->surface.imageSize >= 64) {
+		GX2ClearColor(drc, kCanary[0], kCanary[1], kCanary[2], kCanary[3]);
+		GX2SetContextState(WHBGfxGetTVContextState());
+		GX2DrawDone();
+		DCInvalidateRange(drc->surface.image, drc->surface.imageSize);
+		s_canary_word = static_cast<const uint32_t*>(drc->surface.image)[drc->surface.imageSize / 8];
+		s_canary_armed = true;
+		port_log("[drc] canary armed in WHBGfx DRC colour buffer: word=%08x\n", unsigned(s_canary_word));
+	}
+}
+
+void canary_check()
+{
+	GX2ColorBuffer* drc = WHBGfxGetDRCColourBuffer();
+	if (!s_canary_armed || !drc->surface.image)
+		return;
+	DCInvalidateRange(drc->surface.image, drc->surface.imageSize);
+	const uint32_t* w = static_cast<const uint32_t*>(drc->surface.image);
+	const uint32_t n = drc->surface.imageSize / 4;
+	uint32_t bad = 0, first = n, last = 0;
+	for (uint32_t i = 0; i < n; ++i) {
+		if (w[i] != s_canary_word) {
+			if (first == n) first = i;
+			last = i;
+			++bad;
+		}
+	}
+	if (!bad)
+		port_log("[drc] canary intact (%u words)\n", unsigned(n));
+	else
+		port_log("[drc] CANARY HIT: %u of %u words changed, first %p=%08x last %p\n",
+		         unsigned(bad), unsigned(n), static_cast<const void*>(w + first),
+		         unsigned(w[first]), static_cast<const void*>(w + last));
+}
+
+/* ---- Self-screenshots ------------------------------------------------------
+ * Only when "<app root>shots" (a directory) exists.  At a few presents the TV
+ * colour buffer (2x downscaled) and the GamePad scan buffer are copied into
+ * linear surfaces (GX2CopySurface), the GPU is drained, and both are written
+ * as 24-bit BMPs to "<app root>shots/shotNN-{tv,drc}.bmp".  Runs on the
+ * presenting thread between frames (rare, <= 10 times); every file is closed
+ * before returning. */
+int s_shots_marker = -1;
+uint32_t s_shots_written;
+constexpr uint32_t kShotsMax = 10;
+
+bool shots_wanted(uint32_t p)
+{
+	if (s_shots_marker < 0) {
+		char path[192];
+		std::snprintf(path, sizeof(path), "%sshots", sms_wiiu_app_root());
+		struct stat st;
+		s_shots_marker = (stat(path, &st) == 0) ? 1 : 0;
+		port_log("[shots] marker %s\n", s_shots_marker ? "present: screenshots ON" : "absent: off");
+	}
+	if (!s_shots_marker || s_shots_written >= kShotsMax)
+		return false;
+	return p == 120 || p == 600 || p == 1800 || (p >= 3600 && p % 3600 == 0);
+}
+
+void put32(uint8_t* d, uint32_t v) { d[0] = v; d[1] = v >> 8; d[2] = v >> 16; d[3] = v >> 24; }
+
+/* img is a linear RGBA8 image; writes it downscaled by `shrink` as a BMP. */
+bool write_bmp(const char* path, const uint8_t* img, uint32_t w, uint32_t h, uint32_t pitchPx, uint32_t shrink)
+{
+	const uint32_t ow = w / shrink, oh = h / shrink;
+	const uint32_t rowBytes = (ow * 3 + 3) & ~3u;
+	uint8_t hdr[54] = {'B', 'M'};
+	put32(hdr + 2, 54 + rowBytes * oh);
+	put32(hdr + 10, 54);
+	put32(hdr + 14, 40);
+	put32(hdr + 18, ow);
+	put32(hdr + 22, oh); /* positive = bottom-up */
+	hdr[26] = 1;
+	hdr[28] = 24;
+	put32(hdr + 34, rowBytes * oh);
+	FILE* f = std::fopen(path, "wb");
+	if (!f)
+		return false;
+	static uint8_t row[1920 * 3 + 4];
+	bool ok = std::fwrite(hdr, 1, 54, f) == 54;
+	for (uint32_t y = 0; ok && y < oh; ++y) {
+		const uint8_t* src = img + size_t(oh - 1 - y) * shrink * pitchPx * 4;
+		std::memset(row, 0, rowBytes);
+		for (uint32_t x = 0; x < ow; ++x) {
+			unsigned r = 0, g = 0, b = 0;
+			for (uint32_t dy = 0; dy < shrink; ++dy)
+				for (uint32_t dx = 0; dx < shrink; ++dx) {
+					const uint8_t* px = src + (size_t(dy) * pitchPx + x * shrink + dx) * 4;
+					r += px[0]; g += px[1]; b += px[2];
+				}
+			const unsigned n = shrink * shrink;
+			row[x * 3 + 0] = b / n; row[x * 3 + 1] = g / n; row[x * 3 + 2] = r / n;
+		}
+		ok = std::fwrite(row, 1, rowBytes, f) == rowBytes;
+	}
+	if (std::fclose(f) != 0)
+		ok = false;
+	return ok;
+}
+
+/* Copies `src` (any tiling) into a freshly allocated linear surface, waits for
+ * the GPU, writes the BMP, frees. */
+void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
+{
+	if (!src.image || src.width > 1920 || src.height > 1080 ||
+	    (src.format & 0x3ff) != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8) {
+		port_log("[shots] skip %s: unsupported source (image=%p %ux%u fmt=0x%x)\n", path, src.image,
+		         unsigned(src.width), unsigned(src.height), unsigned(src.format));
+		return;
+	}
+	GX2Surface dst;
+	std::memset(&dst, 0, sizeof(dst));
+	dst.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+	dst.width = src.width;
+	dst.height = src.height;
+	dst.depth = 1;
+	dst.mipLevels = 1;
+	dst.format = src.format;
+	dst.aa = GX2_AA_MODE1X;
+	dst.use = GX2_SURFACE_USE_TEXTURE;
+	dst.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+	GX2CalcSurfaceSizeAndAlignment(&dst);
+	dst.image = MEMAllocFromDefaultHeapEx(dst.imageSize, dst.alignment);
+	if (!dst.image) {
+		port_log("[shots] skip %s: out of memory (%u bytes)\n", path, unsigned(dst.imageSize));
+		return;
+	}
+	std::memset(dst.image, 0, dst.imageSize);
+	DCFlushRange(dst.image, dst.imageSize);
+	GX2CopySurface(const_cast<GX2Surface*>(&src), 0, 0, &dst, 0, 0);
+	GX2Flush();
+	GX2DrawDone();
+	DCInvalidateRange(dst.image, dst.imageSize);
+	const bool ok = write_bmp(path, static_cast<const uint8_t*>(dst.image), dst.width, dst.height, dst.pitch, shrink);
+	port_log("[shots] %s %s (%ux%u)\n", ok ? "wrote" : "FAILED", path, unsigned(dst.width / shrink),
+	         unsigned(dst.height / shrink));
+	MEMFreeToDefaultHeap(dst.image);
+}
+
+void take_shots(uint32_t p)
+{
+	if (!shots_wanted(p))
+		return;
+	char dir[192], path[224];
+	std::snprintf(dir, sizeof(dir), "%sshots", sms_wiiu_app_root());
+	mkdir(dir, 0777);
+	const uint32_t n = s_shots_written++;
+	std::snprintf(path, sizeof(path), "%s/shot%02u-tv.bmp", dir, unsigned(n));
+	shot_surface(WHBGfxGetTVColourBuffer()->surface, path, 2);
+	GX2Texture last;
+	std::memset(&last, 0, sizeof(last));
+	if (GX2GetLastFrame(GX2_SCAN_TARGET_DRC, &last)) {
+		std::snprintf(path, sizeof(path), "%s/shot%02u-drc.bmp", dir, unsigned(n));
+		shot_surface(last.surface, path, 1);
+	} else {
+		port_log("[shots] DRC GX2GetLastFrame failed\n");
+	}
+}
+
+/* Called after WHBGfxFinishRender (its GX2DrawDone has completed the frame). */
+void present_diagnostics()
+{
+	++s_presented;
+	const uint32_t p = s_presented;
+	take_shots(p);
+	if (!(p == 2 || p == 120 || p == 1800 || p == 3600 || p % 18000 == 0))
+		return;
+	uint32_t swaps = 0, flips = 0;
+	OSTime lastFlip = 0, lastVsync = 0;
+	GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+	port_log("[drc] present=%u swaps=%u flips=%u retrace=%u\n", unsigned(p), unsigned(swaps),
+	         unsigned(flips), unsigned(sms_wiiu_frame_count()));
+	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+	/* WHBGfx's buffer descriptors live in our .bss: a stray write shows here. */
+	log_surface("tvColour", tv->surface);
+	log_surface("drcColour", WHBGfxGetDRCColourBuffer()->surface);
+	log_words("tvColour", tv->surface.image, tv->surface.imageSize);
+	static const struct { GX2ScanTarget target; const char* name; } kScans[] = {
+		{GX2_SCAN_TARGET_TV, "tvScan"}, {GX2_SCAN_TARGET_DRC, "drcScan"}};
+	for (const auto& scan : kScans) {
+		GX2Texture last;
+		std::memset(&last, 0, sizeof(last));
+		const BOOL ok = GX2GetLastFrame(scan.target, &last);
+		port_log("[drc] %s GX2GetLastFrame=%d\n", scan.name, int(ok));
+		if (ok) {
+			log_surface(scan.name, last.surface);
+			log_words(scan.name, last.surface.image, last.surface.imageSize);
+		}
+	}
+	canary_check();
+}
+
 } // namespace
+
+/* 1 forces the renderer's full-surface EFB copy (the Cemu path) on hardware. */
+extern "C" const int sms_wiiu_efb_full_copy = 0;
 
 extern "C" void sms_wiiu_gfx_init(void)
 {
@@ -49,6 +408,7 @@ extern "C" void sms_wiiu_gfx_init(void)
 	else if (!sms_wiiu_gx2_renderer_init())
 		WHBLogPrintf("SMS Wii U: GX2 renderer setup failed");
 	else {
+		drc_setup(true);
 		WHBGfxBeginRender();
 		WHBGfxBeginRenderTV();
 		WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
@@ -93,12 +453,16 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	log_active_once();
 	/* After RELEASE_FOREGROUND, WHBProcIsRunning still returns true while the app
 	 * runs in the background; any GX2 call then freezes the console (DKR). */
-	if (!s_gfx_initialized || !ProcUIInForeground())
+	if (!s_gfx_initialized)
 		return;
-	const bool loaded = std::strcmp(sms_wiiu_stage_path(), "unknown") != 0;
-	const float r = loaded ? 0.02f : 0.0f;
-	const float g = loaded ? 0.18f : 0.02f;
-	const float b = loaded ? 0.03f : 0.16f;
+	if (!ProcUIInForeground()) {
+		s_was_foreground = false;
+		return;
+	}
+	if (!s_was_foreground) {
+		s_was_foreground = true;
+		drc_setup(false);
+	}
 	if (!s_frame_open) {
 		WHBGfxBeginRender();
 		WHBGfxBeginRenderTV();
@@ -111,10 +475,10 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		return;
 	sms_wiiu_gx2_renderer_end();
 	WHBGfxFinishRenderTV();
-	WHBGfxBeginRenderDRC();
-	WHBGfxClearColor(r, g, b, 1.0f);
-	WHBGfxFinishRenderDRC();
+	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_DRC);
 	WHBGfxFinishRender();
+	drc_register_scan_buffer();
+	present_diagnostics();
 	WHBGfxBeginRender();
 	WHBGfxBeginRenderTV();
 	WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
