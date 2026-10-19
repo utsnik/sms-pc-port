@@ -330,7 +330,6 @@ static TevSource tevFixed(uint32_t value) {
 
 static TevSource tevKonst(const TevKey& k, uint32_t sel, uint32_t chan, bool alpha = false) {
     if (sel < 8) return tevFixed(sel);
-    if (alpha) return tevFixed(12);
     if (sel >= 12 && sel < 16) return {_GX2_C(4 + sel - 12), chan};
     if (sel >= 16) return {_GX2_C(4 + (sel & 3)), (sel - 16) >> 2};
     return tevFixed(12);
@@ -467,12 +466,12 @@ static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32
             tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, _R(16), channel), true)});
         return;
     }
-    tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel, a.chan _NEG)});
+    tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel _NEG, a.chan)});
     tevEmitAlu(program, {ALU_MUL(_R(16), channel, _R(16), channel, c.sel, c.chan)});
     // GX's regular TEV equation is D +/- lerp(A, B, C), not merely D +/-
     // (B-A)*C.  Keep A in the temporary before applying the final D/op.
     tevEmitAlu(program, {ALU_ADD(_R(16), channel, _R(16), channel, a.sel, a.chan)});
-    uint64_t result = op ? ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel _NEG)
+    uint64_t result = op ? ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV _NEG, channel)
                          : ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel);
     tevEmitAlu(program, {result});
     if (bias == 1 || bias == 2) {
@@ -637,7 +636,7 @@ static bool tevEmitAlphaCompare(std::vector<uint64_t>& program, uint32_t compare
     default: // XNOR
         tevEmitAlu(program, {ALU_ADD(_R(18), _x, _R(16), _x, _R(17), _x)});
         tevEmitAlu(program, {ALU_SETE(_R(16), _x, _R(18), _x, ALU_SRC_1, _x)});
-        tevEmitAlu(program, {ALU_ADD(_R(16), _x, ALU_SRC_1, _x, _R(16), _x _NEG)});
+        tevEmitAlu(program, {ALU_ADD(_R(16), _x, ALU_SRC_1, _x, _R(16) _NEG, _x)});
         break;
     }
     tevEmitAlu(program, {ALU_KILLGT(__, _x, ALU_SRC_0_5, _x, _R(16), _x)});
