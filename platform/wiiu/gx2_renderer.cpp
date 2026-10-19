@@ -162,7 +162,8 @@ static Batch& batchObject() {
 
 struct TextureEntry {
     const uint8_t* source = nullptr;
-    uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0;
+    uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0, levels = 1;
+    bool arbitraryMips = false;
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
@@ -287,15 +288,31 @@ static GX2TexClampMode clampMode(uint32_t value) {
 
 // TX_MODE0: bit 4 is the magnification filter (linear when set); bits 5-7
 // the minification filter, whose bit 2 selects linear and whose low bits the
-// mip filter. Only level 0 is uploaded, so mipmapping is off.
-static void initSampler(GX2Sampler* sampler, uint32_t mode0) {
+// mip filter (1 nearest, 2 linear); bits 9-16 a signed LOD bias in 1/32.
+// TX_MODE1 holds the min and max LOD in 1/16. Textures whose small levels
+// are an effect sample the GameCube's level of detail: the bias makes up for
+// the TV target's scale over the 640x480 EFB.
+static float s_lodScale = 1.5f;
+static void initSampler(GX2Sampler* sampler, uint32_t mode0, uint32_t mode1, uint32_t levels, bool arbitraryMips) {
     GX2InitSampler(sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
     GX2InitSamplerClamping(sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
                            GX2_TEX_CLAMP_MODE_WRAP);
     const GX2TexXYFilterMode mag = ((mode0 >> 4) & 1) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
     const GX2TexXYFilterMode min = ((mode0 >> 7) & 1) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
     GX2InitSamplerXYFilter(sampler, mag, min, GX2_TEX_ANISO_RATIO_NONE);
-    GX2InitSamplerZMFilter(sampler, GX2_TEX_Z_FILTER_MODE_NONE, GX2_TEX_MIP_FILTER_MODE_NONE);
+    const uint32_t mip = (mode0 >> 5) & 3;
+    if (levels <= 1 || mip == 0) {
+        GX2InitSamplerZMFilter(sampler, GX2_TEX_Z_FILTER_MODE_NONE, GX2_TEX_MIP_FILTER_MODE_NONE);
+        GX2InitSamplerLOD(sampler, 0.0f, 0.0f, 0.0f);
+        return;
+    }
+    GX2InitSamplerZMFilter(sampler, GX2_TEX_Z_FILTER_MODE_NONE,
+                           mip == 1 ? GX2_TEX_MIP_FILTER_MODE_POINT : GX2_TEX_MIP_FILTER_MODE_LINEAR);
+    float bias = float(int8_t((mode0 >> 9) & 0xff)) / 32.0f;
+    if (arbitraryMips) bias += log2f(s_lodScale);
+    const float minLod = float(mode1 & 0xff) / 16.0f;
+    const float maxLod = std::min(float((mode1 >> 8) & 0xff) / 16.0f, float(levels - 1));
+    GX2InitSamplerLOD(sampler, minLod, maxLod, bias);
 }
 
 static int tevSext11(uint32_t v) { return int(v << 21) >> 21; }
@@ -1146,9 +1163,50 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
                   e->tex.texture.surface.imageSize);
 }
 
+// Mip levels present: GX has no explicit count, so it follows the max LOD of
+// a mipmapping filter, as the PC renderer derives it.
+static uint32_t textureLevels(uint32_t mode0, uint32_t mode1, uint32_t w, uint32_t h) {
+    uint32_t levels = 1;
+    if (((mode0 >> 5) & 3) != 0) {
+        const uint32_t maxLod = ((mode1 >> 8) & 0xff) / 16;
+        const uint32_t m = w > h ? w : h;
+        while (levels <= maxLod && (m >> levels) >= 1) levels++;
+        if (levels > 11) levels = 11;
+    }
+    return levels;
+}
+
+// How far a decoded level is from a 2x2 box reduction of the level above it
+// (mean difference per channel, 0..255). Textures whose smaller levels are an
+// effect rather than reductions (the sea's sparkle map: a dark level 0 with
+// sparse sparkles, brighter pictures below) must sample the GameCube's level
+// of detail, which at the TV's resolution means a bias of log2(scale); the
+// PC renderer detects them the same way (kArbitraryMipThreshold).
+static float mipLevelDiff(const uint8_t* prev, uint32_t pw, uint32_t ph, const uint8_t* cur, uint32_t w, uint32_t h) {
+    uint64_t sum = 0;
+    for (uint32_t y = 0; y < h; y++) {
+        const uint32_t y0 = std::min(2 * y, ph - 1), y1 = std::min(2 * y + 1, ph - 1);
+        for (uint32_t x = 0; x < w; x++) {
+            const uint32_t x0 = std::min(2 * x, pw - 1), x1 = std::min(2 * x + 1, pw - 1);
+            const uint8_t* a = prev + (size_t(y0) * pw + x0) * 4;
+            const uint8_t* b = prev + (size_t(y0) * pw + x1) * 4;
+            const uint8_t* c = prev + (size_t(y1) * pw + x0) * 4;
+            const uint8_t* d = prev + (size_t(y1) * pw + x1) * 4;
+            const uint8_t* o = cur + (size_t(y) * w + x) * 4;
+            for (int i = 0; i < 4; i++) {
+                const int diff = (a[i] + b[i] + c[i] + d[i] + 2) / 4 - int(o[i]);
+                sum += uint32_t(diff < 0 ? -diff : diff);
+            }
+        }
+    }
+    return float(double(sum) / (double(w) * h * 4));
+}
+static const float kArbitraryMipThreshold = 14.0f;
+
 static TextureEntry* getTexture(int map) {
     SMS_PORT_HEAP_SCOPE();
     const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
+    const uint32_t mode1 = g.bp[bpTexReg(BP_TX_MODE1, map)];
     const uint32_t image0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)];
     const uint32_t tlutReg = g.bp[bpTexReg(BP_TX_TLUT, map)];
     const uint32_t w = (image0 & 0x3ff) + 1;
@@ -1159,64 +1217,123 @@ static TextureEntry* getTexture(int map) {
     const uint32_t tlutFmt = indexed ? ((tlutReg >> 10) & 3) : 0;
     const uint8_t* source = g.texImage[map];
     if (TextureEntry* c = copyTexture(source)) {
-        initSampler(&c->sampler, mode0);
+        initSampler(&c->sampler, mode0, mode1, 1, false);
         return c;
     }
+    const uint32_t levels = textureLevels(mode0, mode1, w, h);
     for (size_t i = 0; i < s_textures.size(); ++i) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.source == source && e.fmt == fmt && e.width == w && e.height == h &&
-            e.tlut == tlut && e.tlutFmt == tlutFmt) {
+            e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
             // The sampler state belongs to the texmap, not the image: the same
             // texture may be bound with other wrap or filter modes.
-            initSampler(&e.sampler, mode0);
+            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips);
             return &e;
         }
     }
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
     e.source = source; e.fmt = fmt; e.width = w; e.height = h; e.tlut = tlut; e.tlutFmt = tlutFmt;
+    e.levels = levels;
     e.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
     e.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
     e.texture.surface.width = w;
     e.texture.surface.height = h;
     e.texture.surface.depth = 1;
-    e.texture.surface.mipLevels = 1;
+    e.texture.surface.mipLevels = levels;
     e.texture.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.texture.surface.aa = GX2_AA_MODE1X;
     e.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
-    e.texture.viewNumMips = 1;
+    GX2CalcSurfaceSizeAndAlignment(&e.texture.surface);
+    // Level l (l >= 1) is at mipPtr + offset, offset 0 for level 1 and
+    // mipLevelOffset[l - 1] after it; a LINEAR_ALIGNED 32-bit level's pitch is
+    // its width aligned to 64 texels. Keep only level 0 if GX2's layout does
+    // not agree with that.
+    GX2Surface& surf = e.texture.surface;
+    uint32_t mipOffset[12] = {};
+    uint32_t mipPitch[12] = {};
+    mipPitch[0] = surf.pitch;
+    if (surf.mipLevels > 1) {
+        bool agrees = surf.pitch == ((w + 63) & ~63u);
+        uint32_t end = 0;
+        for (uint32_t l = 1; l < surf.mipLevels && agrees; ++l) {
+            const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
+            mipPitch[l] = (lw + 63) & ~63u;
+            mipOffset[l] = l == 1 ? 0 : surf.mipLevelOffset[l - 1];
+            if (mipOffset[l] < end) agrees = false;
+            end = mipOffset[l] + mipPitch[l] * lh * 4;
+        }
+        if (agrees && end > surf.mipmapSize) agrees = false;
+        if (!agrees) {
+            static bool logged;
+            if (!logged) {
+                logged = true;
+                WHBLogPrintf("SMS Wii U: unexpected GX2 mip layout %ux%u levels=%u pitch=%u mipSize=%u off1=%u",
+                             (unsigned)w, (unsigned)h, (unsigned)surf.mipLevels, (unsigned)surf.pitch,
+                             (unsigned)surf.mipmapSize, (unsigned)surf.mipLevelOffset[1]);
+            }
+            surf.mipLevels = 1;
+            GX2CalcSurfaceSizeAndAlignment(&surf);
+        }
+    }
+    e.texture.viewNumMips = surf.mipLevels;
     e.texture.viewNumSlices = 1;
     e.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
-    GX2CalcSurfaceSizeAndAlignment(&e.texture.surface);
-    e.texture.surface.image = alignedZero(e.texture.surface.alignment, e.texture.surface.imageSize);
-    if (!e.texture.surface.image) return nullptr;
+    surf.image = alignedZero(surf.alignment, surf.imageSize);
+    if (!surf.image) return nullptr;
+    if (surf.mipLevels > 1) {
+        surf.mipmaps = alignedZero(surf.alignment, surf.mipmapSize);
+        if (!surf.mipmaps) {
+            MEMFreeToDefaultHeap(surf.image);
+            surf.image = nullptr;
+            return nullptr;
+        }
+    }
     GX2InitTextureRegs(&e.texture);
-    initSampler(&e.sampler, mode0);
 
-    // Decode through an explicitly checked buffer: a failed std::vector
-    // allocation returns null here (no exceptions), and the decoder then wrote
-    // megabytes from address 0 and corrupted newlib's heap.
-    uint8_t* rgba = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64));
+    // Decode through explicitly checked buffers: a failed allocation returns
+    // null here (no exceptions), and the decoder then wrote megabytes from
+    // address 0 and corrupted newlib's heap.
+    uint32_t srcBytes = 0;
+    for (uint32_t l = 0; l < surf.mipLevels; ++l)
+        srcBytes += gx2TexLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
     // A texture address that did not survive the 30-bit GX physical address
     // (outside the main heap) must not be read: in Cemu that kills the title.
-    const uint32_t srcBytes = gx2TexLevelBytes(fmt, w, h);
     // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
     // texture came out white), so check the app's MEM2/MEM1 ranges directly.
     const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
     const bool readable = source && srcBytes && a1 > a0 &&
         ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
-    if (!readable && rgba) { MEMFreeToDefaultHeap(rgba); rgba = nullptr; }
-    if (!rgba) {
-        memset(e.texture.surface.image, 0xff, e.texture.surface.imageSize);
+    uint8_t* rgba = readable ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
+    uint8_t* prev = (readable && surf.mipLevels > 1)
+        ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
+    if (!rgba || (surf.mipLevels > 1 && !prev)) {
+        memset(surf.image, 0xff, surf.imageSize);
+        if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
     } else {
         const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
-        gx2DecodeTexture(source, fmt, w, h, tlutPtr, tlutFmt, rgba);
-        uint8_t* dst = static_cast<uint8_t*>(e.texture.surface.image);
-        for (uint32_t y = 0; y < h; ++y)
-            memcpy(dst + size_t(y) * e.texture.surface.pitch * 4, rgba + size_t(y) * w * 4, size_t(w) * 4);
-        MEMFreeToDefaultHeap(rgba);
+        const uint8_t* src = source;
+        float mipDiff = 0.0f;
+        uint32_t pw = w, ph = h;
+        for (uint32_t l = 0; l < surf.mipLevels; ++l) {
+            const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
+            gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
+            uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
+                                  : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
+            for (uint32_t y = 0; y < lh; ++y)
+                memcpy(dst + size_t(y) * mipPitch[l] * 4, rgba + size_t(y) * lw * 4, size_t(lw) * 4);
+            if (l > 0) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
+            if (prev) std::swap(prev, rgba);
+            pw = lw; ph = lh;
+            src += gx2TexLevelBytes(fmt, lw, lh);
+        }
+        e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
     }
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, e.texture.surface.image, e.texture.surface.imageSize);
+    if (rgba) MEMFreeToDefaultHeap(rgba);
+    if (prev) MEMFreeToDefaultHeap(prev);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
+    if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
+    initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
     e.valid = true;
     return &e;
 }
@@ -1242,6 +1359,7 @@ static void updateTarget() {
         s_tvH = float(cb->surface.height);
     }
     s_gameScale = s_tvH / 480.0f;
+    s_lodScale = s_gameScale;
     s_gameX = (s_tvW - 640.0f * s_gameScale) * 0.5f;
 }
 
