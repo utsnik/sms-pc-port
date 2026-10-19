@@ -2209,57 +2209,60 @@ void flushBatch() {
     applyState();
     if (tevPath) setTevShader(*tevShader, tevTextures);
     else setShader(shader, texture);
-    // GX2DrawEx is the well-tested path on Wii U (and avoids relying on the
-    // lifetime/placement rules of a CPU-side index pointer).  Expand the
-    // already-decoded index list into a contiguous vertex stream for stage 1.
+    // Indexed draw over the batch's unique vertices: each is transformed once,
+    // straight into the arena, and the GPU reuses it per index (expanding the
+    // index list copied ~112 bytes per index and was the top CPU cost).  The
+    // vertices, one zeroed slot for out-of-range indices and the index list
+    // share ONE arena block: an overflow between two allocations would recycle
+    // the vertices before their draw is submitted.
     const size_t vertexFloats = tevPath ? 28 : (useTex ? 10 : 8);
     const uint32_t vertexStride = uint32_t(vertexFloats * sizeof(float));
-    const uint32_t vboBytes = uint32_t(s_batch.indices.size() * vertexFloats * sizeof(float));
-    float* vbo = allocVertices(vboBytes);
-    if (!vbo) {
+    const size_t vertexCount = s_batch.stride ? s_batch.vertices.size() / s_batch.stride : 0;
+    const uint32_t indexCount = uint32_t(s_batch.indices.size());
+    const uint32_t vboBytes = uint32_t((vertexCount + 1) * vertexStride);
+    const uint32_t iboOffset = (vboBytes + 255) & ~255u;
+    const uint32_t blockBytes = iboOffset + indexCount * uint32_t(sizeof(uint32_t));
+    uint8_t* block = reinterpret_cast<uint8_t*>(allocVertices(blockBytes));
+    if (!block) {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
     }
-    size_t vboFloats = 0;
+    float* vbo = reinterpret_cast<float*>(block);
+    uint32_t* ibo = reinterpret_cast<uint32_t*>(block + iboOffset);
+    memset(vbo + vertexCount * vertexFloats, 0, vertexStride);
     OSTime perfXform0 = OSGetTime();
     HostVertex firstHv;
     float firstOut[28] = {};
     bool haveFirst = false;
-    // Strips and fans reuse each vertex several times: transform every
-    // vertex of the batch once, then copy its output for each index.
-    static std::vector<float> s_unique;
     static std::vector<uint8_t> s_uniqueDone;
-    const size_t vertexCount = s_batch.stride ? s_batch.vertices.size() / s_batch.stride : 0;
-    if (s_unique.size() < vertexCount * vertexFloats) s_unique.resize(vertexCount * vertexFloats);
     s_uniqueDone.assign(vertexCount, 0);
     // Vertices without per-vertex indices use the current matrix registers.
     const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
     const uint8_t defaults[9] = {uint8_t(ma & 63), uint8_t((ma >> 6) & 63), uint8_t((ma >> 12) & 63),
                                  uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
                                  uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
-    for (uint32_t index : s_batch.indices) {
-        const size_t at = vboFloats;
-        vboFloats += vertexFloats;
-        float* cached = s_unique.data() + size_t(index) * vertexFloats;
+    for (uint32_t i = 0; i < indexCount; ++i) {
+        const uint32_t index = s_batch.indices[i];
         if (index >= vertexCount) {
-            memset(vbo + at, 0, vertexFloats * sizeof(float));
+            ibo[i] = uint32_t(vertexCount);
             continue;
         }
+        ibo[i] = index;
         if (!s_uniqueDone[index]) {
             HostVertex hv;
+            float* out = vbo + size_t(index) * vertexFloats;
             const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
             unpackVertex(s_batch.fmt, packed, defaults, hv);
-            if (tevPath) transformTev(hv, cached, tevKey, tevTextures);
-            else transform(hv, cached, coord, useTex, texture);
+            if (tevPath) transformTev(hv, out, tevKey, tevTextures);
+            else transform(hv, out, coord, useTex, texture);
             s_uniqueDone[index] = 1;
             ++s_perfUnique;
             if (!haveFirst) {
                 firstHv = hv;
-                memcpy(firstOut, cached, vertexFloats * sizeof(float));
+                memcpy(firstOut, out, vertexFloats * sizeof(float));
                 haveFirst = true;
             }
         }
-        memcpy(vbo + at, cached, vertexFloats * sizeof(float));
     }
     s_perfXform += OSGetTime() - perfXform0;
     ++s_perfDraws;
@@ -2269,7 +2272,9 @@ void flushBatch() {
     if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) == SMS_GX2_DEBUG_PIXEL_TRACE - 1 && g_displayFrames >= 1000 && tevPath) {
         float lo[5] = {9, 9, 9, 1e30f, 9}, hi[5] = {-9, -9, -9, -1e30f, -9};
         uint32_t neg = 0;
-        for (size_t at = 0; at + 28 <= vboFloats; at += 28) {
+        for (size_t v = 0; v < vertexCount; ++v) {
+            if (!s_uniqueDone[v]) continue;
+            const size_t at = v * 28;
             for (int c = 0; c < 3; ++c) { lo[c] = std::min(lo[c], vbo[at + 20 + c]); hi[c] = std::max(hi[c], vbo[at + 20 + c]); }
             lo[3] = std::min(lo[3], vbo[at + 3]); hi[3] = std::max(hi[3], vbo[at + 3]);
             if (vbo[at + 3] <= 0.0f) ++neg;
@@ -2278,7 +2283,7 @@ void flushBatch() {
                      (unsigned)g_displayFrames, (unsigned)debugDrawNo, (unsigned)tevKey.stages,
                      (unsigned)tevKey.colorEnv[0], (unsigned)tevKey.alphaEnv[0], (unsigned)tevKey.order[0],
                      (unsigned)g.bp[BP_CMODE0], (unsigned)(g.bp[BP_ZMODE] & 0xff), (unsigned)g.xfReg[0x05],
-                     (unsigned)(vboFloats / 28), lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3], (unsigned)neg);
+                     (unsigned)indexCount, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3], (unsigned)neg);
     }
 #endif
     debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
@@ -2290,11 +2295,11 @@ void flushBatch() {
     // Only the CPU cache per draw: the GPU's vertex cache was invalidated for
     // the whole arena when the frame began (a GPU invalidate per draw stalls
     // the pipeline).
-    DCFlushRange(vbo, vboBytes);
+    DCFlushRange(block, blockBytes);
     GX2SetAttribBuffer(0, vboBytes, tevPath ? vertexStride : shader.stride, vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
-    GX2DrawEx(mode, uint32_t(s_batch.indices.size()), 0, 1);
+    GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
     ++s_drawsThisFrame;
     {
         GpuDrawInfo info = {};
@@ -2309,7 +2314,9 @@ void flushBatch() {
         if (t0) { info.texW = t0->width; info.texH = t0->height; }
         // Screen-space bounding box of the draw (clip -> TV pixels).
         float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-        for (size_t at = 0; at + vertexFloats <= vboFloats; at += vertexFloats) {
+        for (size_t v = 0; v < vertexCount; ++v) {
+            if (!s_uniqueDone[v]) continue;
+            const size_t at = v * vertexFloats;
             const float w = vbo[at + 3];
             if (w <= 0.00001f) continue;
             const float x = vbo[at] / w, y = vbo[at + 1] / w;
