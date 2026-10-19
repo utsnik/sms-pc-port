@@ -1138,7 +1138,12 @@ static void applyState() {
     const uint32_t zmode = g.bp[BP_ZMODE];
     const bool ztest = (zmode & 1) != 0;
     const bool zwrite = (zmode & 16) != 0;
-    GX2SetRasterizerClipControlHalfZ(TRUE, FALSE, TRUE);
+    // GX_CLIP_ENABLE is zero in XF register 5.  The PC backend uses this
+    // same per-draw bit to select near/far clipping or depth clamping.  XF
+    // writes flush the queued batch before changing the register, so this is
+    // safe to apply once for every submitted draw.
+    const bool zclip = g.xfReg[0x05] == 0;
+    GX2SetRasterizerClipControlHalfZ(TRUE, zclip, TRUE);
     // GX blend state (BP_CMODE0), as the PC renderer decodes it. Opaque 3D
     // materials have blending off and often alpha 0: always blending by source
     // alpha made the whole stage invisible. The EFB has no alpha channel, so
@@ -1414,20 +1419,6 @@ static void transformPosition(const HostVertex& in, float* out) {
     // GX2's 0..w clip range (the PC GL path maps the same value to -w..w).
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
-    // The title's cloud/ray overlays are authored outside the normal camera
-    // frustum. The PC path leaves those passes in the visible background,
-    // while GX2 clips their large homogeneous XY values. Keep this limited
-    // to the known background material states.
-    const uint32_t cm = g.bp[BP_CMODE0];
-    const bool titleBackground = g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
-        (cm == 0x00005108 || cm == 0x00005135 || cm == 0x00005115 ||
-         cm == 0x000056fd || cm == 0x000056f5);
-    if (titleBackground && out[3] < 0.0f) {
-        out[0] *= 0.4f;
-        out[1] *= 0.4f;
-        out[2] = 0.0f;
-        out[3] = -out[3];
-    }
 }
 
 static void transform(const HostVertex& in, float* out, int texCoord, bool textured, TextureEntry* texture) {
@@ -1657,8 +1648,6 @@ void flushBatch() {
         for (int debugMap = 0; debugMap < 8; ++debugMap)
             if (mask & (1u << debugMap)) tevTextures[debugMap] = getTexture(debugMap);
     }
-    const bool titleSky = tevPath && !textured && g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
-                          g.bp[BP_CMODE0] == 0x00005169;
     int coord = 0, map = 0;
     TextureEntry* texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
@@ -1692,18 +1681,6 @@ void flushBatch() {
         vbo.resize(at + vertexFloats);
         if (tevPath) transformTev(hv, vbo.data() + at, tevKey, tevTextures);
         else transform(hv, vbo.data() + at, coord, useTex, texture);
-        if (titleSky) {
-            // The PC backend keeps the far-side sky shell visible through its
-            // clip convention.  GX2 uses a positive half-Z clip volume, so
-            // retain the traced raster colours and place each source triangle
-            // in that same visible rectangle.
-            const uint32_t corner = uint32_t((vbo.size() / vertexFloats - 1) % 3);
-            float* p = vbo.data() + at;
-            p[0] = corner == 1 ? 3.0f : -1.0f;
-            p[1] = corner == 2 ? 3.0f : -1.0f;
-            p[2] = 0.0f;
-            p[3] = 1.0f;
-        }
         if (!haveFirst) {
             firstHv = hv;
             memcpy(firstOut, vbo.data() + at, vertexFloats * sizeof(float));
@@ -1820,7 +1797,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     GX2SetScissor(0, 0, uint32_t(s_tvW), uint32_t(s_tvH));
     s_frameActive = true;
-    GX2SetRasterizerClipControlHalfZ(TRUE, FALSE, TRUE);
+    GX2SetRasterizerClipControlHalfZ(TRUE, g.xfReg[0x05] == 0, TRUE);
 }
 // Sunshine runs at 30 fps and waits two retraces per game frame; presenting at
 // the second one showed a freshly cleared, empty frame half the time.
