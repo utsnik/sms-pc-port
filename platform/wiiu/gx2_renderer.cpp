@@ -198,6 +198,7 @@ static uint32_t s_vertexArenaIndex;
 static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
+static bool s_vertexArenaInvalidated;
 
 // GPU-read memory released mid-frame (linear texture staging) is freed once
 // the fence of the frame that queued it has retired.
@@ -218,6 +219,7 @@ static void deferFree(void* p) {
 static void beginVertexArena() {
     s_vertexArenaIndex = (s_vertexArenaIndex + 1) % kVertexArenas;
     s_vertexArenaUsed = 0;
+    s_vertexArenaInvalidated = false;
     if (s_vertexArenaFence[s_vertexArenaIndex]) {
         const OSTime t0 = OSGetTime();
         GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
@@ -240,8 +242,13 @@ static float* allocVertices(uint32_t bytes) {
     uint8_t*& arena = s_vertexArena[s_vertexArenaIndex];
     if (!arena) arena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kVertexArenaBytes, 256));
     if (!arena || bytes > kVertexArenaBytes) return nullptr;
+    if (!s_vertexArenaInvalidated) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, arena, kVertexArenaBytes);
+        s_vertexArenaInvalidated = true;
+    }
     if (s_vertexArenaUsed + bytes > kVertexArenaBytes) {
         GX2DrawDone();
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, arena, kVertexArenaBytes);
         s_vertexArenaUsed = 0;
         ++s_vertexArenaOverflows;
     }
@@ -1157,7 +1164,9 @@ static bool runningUnderCemu() {
     if (result < 0) result = sms_wiiu_efb_full_copy || (OSGetTitleID() >> 32) == 0xffffffffu;
     return result != 0;
 }
+static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
+    ++s_perfCopies;
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!dest || !cb || !w || !h) return;
     const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
@@ -2132,8 +2141,10 @@ void flushBatch() {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
     }
+    // Only the CPU cache per draw: the GPU's vertex cache was invalidated for
+    // the whole arena when the frame began (a GPU invalidate per draw stalls
+    // the pipeline).
     DCFlushRange(vbo, vboBytes);
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo, vboBytes);
     GX2SetAttribBuffer(0, vboBytes, tevPath ? vertexStride : shader.stride, vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
@@ -2194,6 +2205,7 @@ void executeCopy(uint32_t ctrl) {
     if (!clear) return;
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
     if ((g.bp[BP_CMODE0] >> 3) & 1)
+        ++s_perfClears;
         GX2ClearColor(WHBGfxGetTVColourBuffer(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
                       float(gb & 255) / 255.0f,
                       ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f);
@@ -2221,6 +2233,7 @@ void markXfMemDirty() { SMS_PORT_HEAP_SCOPE(); if (!s_batch.indices.empty()) flu
 static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
+    ++s_perfPeeks;
     GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
     if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
@@ -2383,10 +2396,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u arenaPeak=%u overflows=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)s_arenaPeak,
-                     (unsigned)s_vertexArenaOverflows);
+                     (unsigned)s_vertexArenaOverflows,
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears);
+        s_perfCopies = s_perfPeeks = s_perfClears = 0;
         s_vertexFenceWait = 0;
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
