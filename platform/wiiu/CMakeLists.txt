@@ -62,6 +62,7 @@ set(SMS_WIIU_COMMON_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/msl_math.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/msl_rand.c
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/sdk_data.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/card/card.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/sdk_stubs.cpp)
 
