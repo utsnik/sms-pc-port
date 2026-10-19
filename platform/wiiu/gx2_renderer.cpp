@@ -955,9 +955,10 @@ static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     *u = (float(e->sourceX) + *u * float(e->sourceW)) / s_tvW;
     *v = (float(e->sourceY) + *v * float(e->sourceH)) / s_tvH;
 }
+extern "C" const int sms_wiiu_efb_full_copy;  // gx_stub.cpp: 1 = full-surface copies on hardware too
 static bool runningUnderCemu() {
     static int result = -1;
-    if (result < 0) result = (OSGetTitleID() >> 32) == 0xffffffffu;
+    if (result < 0) result = sms_wiiu_efb_full_copy || (OSGetTitleID() >> 32) == 0xffffffffu;
     return result != 0;
 }
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
@@ -1018,6 +1019,13 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         if (!t.texture.surface.image) return;
         GX2InitTextureRegs(&t.texture);
         t.valid = true;
+        static unsigned s_copyEntryLogs;
+        if (s_copyEntryLogs++ < 24)
+            WHBLogPrintf("[efb] copy entry %s src=%u,%u %ux%u dst=%ux%u fmt=%u tile=%u pitch=%u bytes=%u img=%p",
+                         cemu ? "full" : "rect", unsigned(tx), unsigned(ty), unsigned(tw), unsigned(th),
+                         unsigned(copyW), unsigned(copyH), unsigned(t.texture.surface.format),
+                         unsigned(t.texture.surface.tileMode), unsigned(t.texture.surface.pitch),
+                         unsigned(t.texture.surface.imageSize), t.texture.surface.image);
     }
     if (cemu) {
         GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0);
