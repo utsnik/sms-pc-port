@@ -1759,7 +1759,13 @@ static void transformTev(const HostVertex& in, float* out, const TevKey& key, Te
     chanColor(in, 0, ras0);
     chanColor(in, 1, ras1);
     float texgen[8][3] = {};
-    for (int coord = 0; coord < 8; ++coord) {
+    // Only the enabled texgens produce coordinates; the rest are never sampled.
+    const int numTexGens = int(std::min<uint32_t>(g.xfReg[XFR_NUMTEXGENS] & 15, 8));
+    for (int coord = numTexGens; coord < 8; ++coord) {
+        out[4 + coord * 2] = 0.0f;
+        out[5 + coord * 2] = 0.0f;
+    }
+    for (int coord = 0; coord < numTexGens; ++coord) {
         const uint32_t tg = g.xfReg[XFR_TEXGEN + coord];
         const uint32_t proj = (tg >> 1) & 1, form = (tg >> 2) & 1;
         const uint32_t type = (tg >> 4) & 7, row = (tg >> 7) & 31;
@@ -1921,7 +1927,7 @@ static uint32_t s_drawsThisFrame;
 static uint32_t s_debugDrawNo;
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
-static uint32_t s_perfDraws, s_perfVerts, s_perfFrames;
+static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfFrames;
 struct PerfScope {
     OSTime& acc; OSTime t0;
     explicit PerfScope(OSTime& a) : acc(a), t0(OSGetTime()) {}
@@ -1988,24 +1994,41 @@ void flushBatch() {
     HostVertex firstHv;
     float firstOut[28] = {};
     bool haveFirst = false;
+    // Strips and fans reuse each vertex several times: transform every
+    // vertex of the batch once, then copy its output for each index.
+    static std::vector<float> s_unique;
+    static std::vector<uint8_t> s_uniqueDone;
+    const size_t vertexCount = s_batch.stride ? s_batch.vertices.size() / s_batch.stride : 0;
+    if (s_unique.size() < vertexCount * vertexFloats) s_unique.resize(vertexCount * vertexFloats);
+    s_uniqueDone.assign(vertexCount, 0);
+    // Vertices without per-vertex indices use the current matrix registers.
+    const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
+    const uint8_t defaults[9] = {uint8_t(ma & 63), uint8_t((ma >> 6) & 63), uint8_t((ma >> 12) & 63),
+                                 uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
+                                 uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
     for (uint32_t index : s_batch.indices) {
-        HostVertex hv;
-        const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
-        // Vertices without per-vertex indices use the current matrix registers.
-        const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
-        const uint8_t defaults[9] = {uint8_t(ma & 63), uint8_t((ma >> 6) & 63), uint8_t((ma >> 12) & 63),
-                                     uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
-                                     uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
-        unpackVertex(s_batch.fmt, packed, defaults, hv);
         const size_t at = vboFloats;
         vboFloats += vertexFloats;
-        if (tevPath) transformTev(hv, vbo + at, tevKey, tevTextures);
-        else transform(hv, vbo + at, coord, useTex, texture);
-        if (!haveFirst) {
-            firstHv = hv;
-            memcpy(firstOut, vbo + at, vertexFloats * sizeof(float));
-            haveFirst = true;
+        float* cached = s_unique.data() + size_t(index) * vertexFloats;
+        if (index >= vertexCount) {
+            memset(vbo + at, 0, vertexFloats * sizeof(float));
+            continue;
         }
+        if (!s_uniqueDone[index]) {
+            HostVertex hv;
+            const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
+            unpackVertex(s_batch.fmt, packed, defaults, hv);
+            if (tevPath) transformTev(hv, cached, tevKey, tevTextures);
+            else transform(hv, cached, coord, useTex, texture);
+            s_uniqueDone[index] = 1;
+            ++s_perfUnique;
+            if (!haveFirst) {
+                firstHv = hv;
+                memcpy(firstOut, cached, vertexFloats * sizeof(float));
+                haveFirst = true;
+            }
+        }
+        memcpy(vbo + at, cached, vertexFloats * sizeof(float));
     }
     s_perfXform += OSGetTime() - perfXform0;
     ++s_perfDraws;
@@ -2284,12 +2307,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u flush=%u tex=%u xform=%u draws=%u verts=%u arenaPeak=%u overflows=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u arenaPeak=%u overflows=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
-                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)s_arenaPeak,
+                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows);
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
-        s_perfDraws = s_perfVerts = s_perfFrames = 0;
+        s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
     }
     s_frameActive = false;
     s_drawsThisFrame = 0;
