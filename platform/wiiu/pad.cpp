@@ -48,59 +48,95 @@ bool autopress_marker_present()
 }
 #endif
 
-u16 map_vpad_buttons(uint32_t buttons)
+/* Sunshine reads R/L as analog (a half press squirts FLUDD while walking, a
+ * full press stops and aims). The Wii U pads have digital triggers, so the
+ * shoulder (L/R) is a full press and the trigger (ZL/ZR) a half press: analog
+ * ~0x80 with no digital bit. Stick clicks stand in for GameCube Z. */
+const u8 kHalfPress = 0x80;
+
+void set_triggers(PADStatus& out, bool full_l, bool half_l, bool full_r, bool half_r)
+{
+	if (full_l) {
+		out.button |= PAD_TRIGGER_L;
+		out.triggerLeft = 0xff;
+	} else if (half_l) {
+		out.triggerLeft = kHalfPress;
+	}
+	if (full_r) {
+		out.button |= PAD_TRIGGER_R;
+		out.triggerRight = 0xff;
+	} else if (half_r) {
+		out.triggerRight = kHalfPress;
+	}
+}
+
+u16 map_face_dpad(uint32_t buttons, uint32_t left, uint32_t right, uint32_t down, uint32_t up,
+                  uint32_t a, uint32_t b, uint32_t x, uint32_t y, uint32_t plus)
 {
 	u16 result = 0;
-	if (buttons & VPAD_BUTTON_LEFT) result |= PAD_BUTTON_LEFT;
-	if (buttons & VPAD_BUTTON_RIGHT) result |= PAD_BUTTON_RIGHT;
-	if (buttons & VPAD_BUTTON_DOWN) result |= PAD_BUTTON_DOWN;
-	if (buttons & VPAD_BUTTON_UP) result |= PAD_BUTTON_UP;
-	if (buttons & VPAD_BUTTON_A) result |= PAD_BUTTON_A;
-	if (buttons & VPAD_BUTTON_B) result |= PAD_BUTTON_B;
-	if (buttons & VPAD_BUTTON_X) result |= PAD_BUTTON_X;
-	if (buttons & VPAD_BUTTON_Y) result |= PAD_BUTTON_Y;
-	if (buttons & VPAD_BUTTON_PLUS) result |= PAD_BUTTON_START;
-	if (buttons & VPAD_BUTTON_ZL) result |= PAD_TRIGGER_Z;
-	if (buttons & VPAD_BUTTON_ZR) result |= PAD_TRIGGER_Z;
-	if (buttons & VPAD_BUTTON_L) result |= PAD_TRIGGER_L;
-	if (buttons & VPAD_BUTTON_R) result |= PAD_TRIGGER_R;
+	if (buttons & left) result |= PAD_BUTTON_LEFT;
+	if (buttons & right) result |= PAD_BUTTON_RIGHT;
+	if (buttons & down) result |= PAD_BUTTON_DOWN;
+	if (buttons & up) result |= PAD_BUTTON_UP;
+	if (buttons & a) result |= PAD_BUTTON_A;
+	if (buttons & b) result |= PAD_BUTTON_B;
+	if (buttons & x) result |= PAD_BUTTON_X;
+	if (buttons & y) result |= PAD_BUTTON_Y;
+	if (buttons & plus) result |= PAD_BUTTON_START;
 	return result;
 }
 
-u16 map_kpad_buttons(uint32_t buttons)
+void map_vpad(uint32_t b, PADStatus& out)
 {
-	u16 result = 0;
-	if (buttons & WPAD_BUTTON_LEFT) result |= PAD_BUTTON_LEFT;
-	if (buttons & WPAD_BUTTON_RIGHT) result |= PAD_BUTTON_RIGHT;
-	if (buttons & WPAD_BUTTON_DOWN) result |= PAD_BUTTON_DOWN;
-	if (buttons & WPAD_BUTTON_UP) result |= PAD_BUTTON_UP;
-	if (buttons & WPAD_BUTTON_A) result |= PAD_BUTTON_A;
-	if (buttons & WPAD_BUTTON_B) result |= PAD_BUTTON_B;
-	if (buttons & WPAD_BUTTON_1) result |= PAD_BUTTON_X;
-	if (buttons & WPAD_BUTTON_2) result |= PAD_BUTTON_Y;
-	if (buttons & WPAD_BUTTON_PLUS) result |= PAD_BUTTON_START;
-	if (buttons & WPAD_BUTTON_Z) result |= PAD_TRIGGER_Z;
-	if (buttons & WPAD_BUTTON_C) result |= PAD_TRIGGER_Z;
-	return result;
+	out.button = map_face_dpad(b, VPAD_BUTTON_LEFT, VPAD_BUTTON_RIGHT, VPAD_BUTTON_DOWN, VPAD_BUTTON_UP,
+	                           VPAD_BUTTON_A, VPAD_BUTTON_B, VPAD_BUTTON_X, VPAD_BUTTON_Y, VPAD_BUTTON_PLUS);
+	if (b & (VPAD_BUTTON_STICK_L | VPAD_BUTTON_STICK_R))
+		out.button |= PAD_TRIGGER_Z;
+	set_triggers(out, b & VPAD_BUTTON_L, b & VPAD_BUTTON_ZL, b & VPAD_BUTTON_R, b & VPAD_BUTTON_ZR);
 }
 
 /* Classic and Pro Controller buttons arrive in the extension's own hold word. */
-u16 map_ext_buttons(uint32_t b)
+void map_pro(uint32_t b, PADStatus& out)
 {
-	u16 result = 0;
-	if (b & WPAD_PRO_BUTTON_LEFT) result |= PAD_BUTTON_LEFT;
-	if (b & WPAD_PRO_BUTTON_RIGHT) result |= PAD_BUTTON_RIGHT;
-	if (b & WPAD_PRO_BUTTON_DOWN) result |= PAD_BUTTON_DOWN;
-	if (b & WPAD_PRO_BUTTON_UP) result |= PAD_BUTTON_UP;
-	if (b & WPAD_PRO_BUTTON_A) result |= PAD_BUTTON_A;
-	if (b & WPAD_PRO_BUTTON_B) result |= PAD_BUTTON_B;
-	if (b & WPAD_PRO_BUTTON_X) result |= PAD_BUTTON_X;
-	if (b & WPAD_PRO_BUTTON_Y) result |= PAD_BUTTON_Y;
-	if (b & WPAD_PRO_BUTTON_PLUS) result |= PAD_BUTTON_START;
-	if (b & (WPAD_PRO_BUTTON_ZL | WPAD_PRO_BUTTON_ZR)) result |= PAD_TRIGGER_Z;
-	if (b & WPAD_PRO_BUTTON_L) result |= PAD_TRIGGER_L;
-	if (b & WPAD_PRO_BUTTON_R) result |= PAD_TRIGGER_R;
+	out.button = map_face_dpad(b, WPAD_PRO_BUTTON_LEFT, WPAD_PRO_BUTTON_RIGHT, WPAD_PRO_BUTTON_DOWN,
+	                           WPAD_PRO_BUTTON_UP, WPAD_PRO_BUTTON_A, WPAD_PRO_BUTTON_B, WPAD_PRO_BUTTON_X,
+	                           WPAD_PRO_BUTTON_Y, WPAD_PRO_BUTTON_PLUS);
+	if (b & (WPAD_PRO_BUTTON_STICK_L | WPAD_PRO_BUTTON_STICK_R))
+		out.button |= PAD_TRIGGER_Z;
+	set_triggers(out, b & WPAD_PRO_BUTTON_L, b & WPAD_PRO_BUTTON_ZL, b & WPAD_PRO_BUTTON_R,
+	             b & WPAD_PRO_BUTTON_ZR);
+}
+
+/* The Classic Controller has analog L/R (taken as is) and digital ZL/ZR as Z. */
+u16 map_classic_buttons(uint32_t b)
+{
+	u16 result = map_face_dpad(b, WPAD_CLASSIC_BUTTON_LEFT, WPAD_CLASSIC_BUTTON_RIGHT, WPAD_CLASSIC_BUTTON_DOWN,
+	                           WPAD_CLASSIC_BUTTON_UP, WPAD_CLASSIC_BUTTON_A, WPAD_CLASSIC_BUTTON_B,
+	                           WPAD_CLASSIC_BUTTON_X, WPAD_CLASSIC_BUTTON_Y, WPAD_CLASSIC_BUTTON_PLUS);
+	if (b & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR)) result |= PAD_TRIGGER_Z;
+	if (b & WPAD_CLASSIC_BUTTON_L) result |= PAD_TRIGGER_L;
+	if (b & WPAD_CLASSIC_BUTTON_R) result |= PAD_TRIGGER_R;
 	return result;
+}
+
+/* Wii Remote, with or without a Nunchuk. With a Nunchuk there is no R/L, so
+ * B squirts (R), C is L and Minus takes over GameCube B; the D-pad also drives
+ * the C-stick (camera) while still acting as a D-pad for menus. */
+void map_remote(const KPADStatus& kpad, PADStatus& out)
+{
+	uint32_t b = kpad.hold;
+	const bool nunchuk = kpad.extensionType == WPAD_EXT_NUNCHUK;
+	if (nunchuk)
+		b |= kpad.nunchuk.hold;
+	out.button = map_face_dpad(b, WPAD_BUTTON_LEFT, WPAD_BUTTON_RIGHT, WPAD_BUTTON_DOWN, WPAD_BUTTON_UP,
+	                           WPAD_BUTTON_A, nunchuk ? WPAD_BUTTON_MINUS : WPAD_BUTTON_B, WPAD_BUTTON_1,
+	                           WPAD_BUTTON_2, WPAD_BUTTON_PLUS);
+	if (!nunchuk)
+		return;
+	if (b & (WPAD_BUTTON_Z | WPAD_NUNCHUK_BUTTON_Z)) out.button |= PAD_TRIGGER_Z;
+	set_triggers(out, b & WPAD_BUTTON_C, false, b & WPAD_BUTTON_B, false);
+	out.substickX = (b & WPAD_BUTTON_RIGHT ? 100 : 0) - (b & WPAD_BUTTON_LEFT ? 100 : 0);
+	out.substickY = (b & WPAD_BUTTON_UP ? 100 : 0) - (b & WPAD_BUTTON_DOWN ? 100 : 0);
 }
 
 /* Fill one GameCube pad from a Wii Remote channel; false if nothing new or
@@ -115,15 +151,13 @@ bool read_kpad(unsigned kchan, PADStatus& out)
 		return false;
 	std::memset(&out, 0, sizeof(out));
 	if (kpad.extensionType == WPAD_EXT_PRO_CONTROLLER) {
-		out.button = map_ext_buttons(kpad.pro.hold);
+		map_pro(kpad.pro.hold, out);
 		out.stickX = stick_value(kpad.pro.leftStick.x);
 		out.stickY = stick_value(kpad.pro.leftStick.y);
 		out.substickX = stick_value(kpad.pro.rightStick.x);
 		out.substickY = stick_value(kpad.pro.rightStick.y);
-		out.triggerLeft = (kpad.pro.hold & WPAD_PRO_BUTTON_L) ? 0xff : 0;
-		out.triggerRight = (kpad.pro.hold & WPAD_PRO_BUTTON_R) ? 0xff : 0;
 	} else if (kpad.extensionType == WPAD_EXT_CLASSIC) {
-		out.button = map_ext_buttons(kpad.classic.hold);
+		out.button = map_classic_buttons(kpad.classic.hold);
 		out.stickX = stick_value(kpad.classic.leftStick.x);
 		out.stickY = stick_value(kpad.classic.leftStick.y);
 		out.substickX = stick_value(kpad.classic.rightStick.x);
@@ -131,7 +165,7 @@ bool read_kpad(unsigned kchan, PADStatus& out)
 		out.triggerLeft = static_cast<u8>(kpad.classic.leftTrigger * 0xff);
 		out.triggerRight = static_cast<u8>(kpad.classic.rightTrigger * 0xff);
 	} else {
-		out.button = map_kpad_buttons(kpad.hold);
+		map_remote(kpad, out);
 		if (kpad.extensionType == WPAD_EXT_NUNCHUK) {
 			out.stickX = stick_value(kpad.nunchuk.stick.x);
 			out.stickY = stick_value(kpad.nunchuk.stick.y);
@@ -139,6 +173,25 @@ bool read_kpad(unsigned kchan, PADStatus& out)
 	}
 	out.err = PAD_ERR_NONE;
 	return true;
+}
+
+bool s_rumble[PAD_MAX_CONTROLLERS];
+unsigned s_rumble_age[PAD_MAX_CONTROLLERS];
+
+void apply_motor(unsigned chan, bool on)
+{
+	if (chan == 0) {
+		if (on) {
+			uint8_t pattern[120];
+			std::memset(pattern, 0xff, sizeof(pattern));
+			VPADControlMotor(VPAD_CHAN_0, pattern, sizeof(pattern));
+		} else {
+			VPADStopMotor(VPAD_CHAN_0);
+		}
+		WPADControlMotor(WPAD_CHAN_0, on ? TRUE : FALSE);
+	} else {
+		WPADControlMotor(static_cast<WPADChan>(chan), on ? TRUE : FALSE);
+	}
 }
 
 void log_error_transition(unsigned chan, int error)
@@ -193,15 +246,20 @@ void sms_wiiu_input_poll(void)
 	if (vpad_count > 0 && vpad_error == VPAD_READ_SUCCESS) {
 		PADStatus& out = s_status[0];
 		std::memset(&out, 0, sizeof(out));
-		out.button = map_vpad_buttons(vpad.hold);
+		map_vpad(vpad.hold, out);
 		out.stickX = stick_value(vpad.leftStick.x);
 		out.stickY = stick_value(vpad.leftStick.y);
 		out.substickX = stick_value(vpad.rightStick.x);
 		out.substickY = stick_value(vpad.rightStick.y);
-		out.triggerLeft = (vpad.hold & VPAD_BUTTON_L) ? 0xff : 0;
-		out.triggerRight = (vpad.hold & VPAD_BUTTON_R) ? 0xff : 0;
-		if (have_kpad0)
+		if (have_kpad0) {
 			out.button |= kpad0.button;
+			if (kpad0.triggerLeft > out.triggerLeft) out.triggerLeft = kpad0.triggerLeft;
+			if (kpad0.triggerRight > out.triggerRight) out.triggerRight = kpad0.triggerRight;
+			if (!out.substickX && !out.substickY) {
+				out.substickX = kpad0.substickX;
+				out.substickY = kpad0.substickY;
+			}
+		}
 		out.err = PAD_ERR_NONE;
 		if (!s_first_success) {
 			s_first_success = true;
@@ -249,6 +307,10 @@ void sms_wiiu_input_poll(void)
 		}
 	}
 #endif
+	if (s_rumble[0] && ++s_rumble_age[0] >= 600) { // re-arm the GamePad pattern
+		s_rumble_age[0] = 0;
+		apply_motor(0, true);
+	}
 	for (unsigned chan = 0; chan < PAD_MAX_CONTROLLERS; ++chan) {
 		if (s_status[chan].err == PAD_ERR_NONE)
 			connected |= 1u << chan;
@@ -277,15 +339,27 @@ BOOL PADRecalibrate(u32 mask)
 	(void)mask;
 	return TRUE;
 }
+/* Rumble: command PAD_MOTOR_RUMBLE keeps the motor on, STOP/STOP_HARD end it.
+ * Port 0 drives the GamePad and Wii Remote 1, ports 1-3 Wii Remotes 2-4. The
+ * GamePad pattern lasts a limited time, so it is re-armed from the poll. */
 void PADControlMotor(s32 chan, u32 command)
 {
-	static unsigned s_rumble_logged;
-	if (s_rumble_logged < 4) {
-		++s_rumble_logged;
-		port_log("[pad] rumble no-op channel=%d command=%u\n", chan, command);
-	}
+	if (chan < 0 || chan >= PAD_MAX_CONTROLLERS || !s_initialized)
+		return;
+	bool on = command == PAD_MOTOR_RUMBLE;
+	if (s_rumble[chan] == on)
+		return;
+	s_rumble[chan] = on;
+	s_rumble_age[chan] = 0;
+	apply_motor(chan, on);
 }
-void PADControlAllMotors(const u32*) {}
+void PADControlAllMotors(const u32* commands)
+{
+	if (!commands)
+		return;
+	for (s32 chan = 0; chan < PAD_MAX_CONTROLLERS; ++chan)
+		PADControlMotor(chan, commands[chan]);
+}
 void PADSetSamplingRate(unsigned long) {}
 void __PADTestSamplingRate(unsigned long) {}
 void PADSetSpec(u32) {}
