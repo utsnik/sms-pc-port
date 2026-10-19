@@ -45,3 +45,14 @@ extern "C" void sms_wiiu_sdl_audio_queue(const void* data, uint32_t bytes)
 }
 
 extern "C" uint32_t sms_wiiu_sdl_audio_queued(void) { return s_dev ? SDL_GetQueuedAudioSize(s_dev) : 0; }
+
+extern "C" void sms_wiiu_sdl_audio_close(void)
+{
+	if (!s_dev)
+		return;
+	SDL_PauseAudioDevice(s_dev, 1);
+	SDL_ClearQueuedAudio(s_dev);
+	SDL_CloseAudioDevice(s_dev);
+	s_dev = 0;
+	SDL_QuitSubSystem(SDL_INIT_AUDIO);
+}

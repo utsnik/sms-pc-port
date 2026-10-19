@@ -60,8 +60,13 @@ extern "C" void sms_wiiu_gfx_init(void)
 /* Orderly exit on the main thread after ProcUI reported EXITING: WHBGfx owns
  * its foreground-release handling; release it, then end the process like a
  * return from main. */
+extern "C" void sms_wiiu_audio_shutdown(void);
+
 extern "C" void sms_wiiu_exit(void)
 {
+	/* Stop the audio pacer and close SDL audio before the foreground and AX
+	 * go away. */
+	sms_wiiu_audio_shutdown();
 	if (s_gfx_initialized) {
 		if (s_frame_open) {
 			sms_wiiu_gx2_renderer_end();
