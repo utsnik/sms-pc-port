@@ -209,6 +209,15 @@ uint32_t pixMetricRead();
 // ---------------------------------------------------------------- textures (gx_texture.cpp)
 struct TexKey;
 unsigned bindTextureMap(int map, float* outW, float* outH);  // returns GL name
+struct TraceTextureInfo {
+    const void* source;
+    uint32_t fmt, width, height, tlut, tlutFmt;
+    uint64_t decodedHash;
+    bool fallback, efbCopy;
+    const void* copyDest;
+    uint32_t copyX, copyY, copyW, copyH, copyFmt;
+};
+bool traceTextureInfo(int map, TraceTextureInfo* out);
 // HDR output (gx_hdr.cpp). Presenting draws into g_presentFbo: 0 (the window),
 // or, while HDR is on, the texture Direct3D turns into the HDR picture.
 extern unsigned g_presentFbo;

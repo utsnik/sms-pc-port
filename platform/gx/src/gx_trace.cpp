@@ -125,7 +125,8 @@ void traceDraw(int prim, uint32_t nverts, uint32_t nidx, const HostVertex* v, in
     FILE* f = s_file;
     if (!f) return;
     static const char* kPrim[3] = {"TRIS", "LINES", "POINTS"};
-    fprintf(f, "\n== draw %u: %s, %u vertices, %u indices, program %d\n", s_drawNo++, kPrim[prim], nverts, nidx, progId);
+    const uint32_t drawNo = s_drawNo++;
+    fprintf(f, "\n== draw %u: %s, %u vertices, %u indices, program %d\n", drawNo, kPrim[prim], nverts, nidx, progId);
     if (s_beginBtN > 0) {
         char** names = backtrace_symbols(s_beginBt, s_beginBtN);
         fprintf(f, "  caller:");
@@ -253,6 +254,34 @@ void traceDraw(int prim, uint32_t nverts, uint32_t nidx, const HostVertex* v, in
         fprintf(f, "  array%d: %p stride %u %s bytes %02X %02X %02X %02X %02X %02X %02X %02X\n", a, (const void*)b,
                 g.arrayStride[a], g.arrayBigEndian[a] ? "BE" : "host", b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
     }
+    fprintf(f, "DIFF renderer=pcgl frame=%u draw=%u tex=", s_curFrame, drawNo);
+    bool firstTex = true;
+    for (int m = 0; m < 8; m++) {
+        if (!(used & (1u << m))) continue;
+        TraceTextureInfo ti;
+        if (!traceTextureInfo(m, &ti)) continue;
+        if (!firstTex) fputc(';', f);
+        firstTex = false;
+        fprintf(f, "m%d:f%u:%ux%u:src=%p:h=%016llx:tlut=%u/%u:%s", m, ti.fmt, ti.width, ti.height,
+                ti.source, (unsigned long long)ti.decodedHash, ti.tlut, ti.tlutFmt,
+                ti.fallback ? "fallback" : ti.efbCopy ? "efb" : "ram");
+    }
+    if (firstTex) fputs("none", f);
+    fprintf(f, " tev=gen%08x/st%u", gen, nst);
+    for (uint32_t s = 0; s < nst; s++) {
+        const uint32_t ord = (g.bp[BP_TREF + (s >> 1)] >> ((s & 1) * 12)) & 0x3ff;
+        const uint32_t ce = g.bp[BP_TEV_COLOR_ENV + 2 * s] & 0xffffff;
+        const uint32_t ae = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1] & 0xffffff;
+        fprintf(f, "/%03x:%06x:%06x", ord, ce, ae);
+    }
+    fprintf(f, " blend=%08x ac=%08x z=%08x verts=%u shader=per-tev", g.bp[BP_CMODE0], g.bp[BP_ALPHACOMPARE],
+            g.bp[BP_ZMODE], nverts);
+    if (nverts) {
+        const HostVertex& hv = v[0];
+        fprintf(f, " first=pos(%.6g,%.6g,%.6g):col(%u,%u,%u,%u):uv(%.6g,%.6g)", hv.pos[0], hv.pos[1], hv.pos[2],
+                hv.clr[0][0], hv.clr[0][1], hv.clr[0][2], hv.clr[0][3], hv.tex[0][0], hv.tex[0][1]);
+    }
+    fprintf(f, " efb=none\n");
     for (uint32_t i = 0; i < nverts && i < 3; i++) {
         const HostVertex& hv = v[i];
         fprintf(f, "  v%u: pos(%.3f %.3f %.3f) nrm(%.2f %.2f %.2f) c0(%u %u %u %u) t0(%.3f %.3f) t1(%.3f %.3f) mtx %u/%u\n", i,
@@ -302,6 +331,8 @@ void traceCopy(bool disp, int x, int y, int w, int h, const void* dest, uint32_t
     fprintf(f, "\n== %s copy src %d,%d %dx%d -> %p ctrl=%06X (fmt %u%s%s%s)\n", disp ? "display" : "texture", x, y, w, h,
             dest, ctrl, ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7), ((ctrl >> 15) & 3) == 3 ? " intensity" : "",
             (ctrl >> 9) & 1 ? " half" : "", (ctrl >> 11) & 1 ? " clear" : "");
+    fprintf(f, "DIFF renderer=pcgl copy=%s src=%d,%d:%dx%d dst=%p fmt=%u ctrl=%08x\n", disp ? "display" : "texture",
+            x, y, w, h, dest, ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7), ctrl);
     if ((ctrl >> 11) & 1)
         fprintf(f, "  clear writes: colour=%u alpha=%u depth=%u pixfmt=%u\n",
                 (g.bp[BP_CMODE0] >> 3) & 1, (g.bp[BP_CMODE0] >> 4) & 1,
