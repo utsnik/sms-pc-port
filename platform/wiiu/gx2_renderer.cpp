@@ -269,9 +269,27 @@ static bool usedTexture(int* coord, int* map) {
     return false;
 }
 
+// GX wrap modes (TX_MODE0 bits 0-1 / 2-3): 0 clamp, 1 repeat, 2 mirror; the
+// reserved 3 repeats, as the PC renderer treats it.
 static GX2TexClampMode clampMode(uint32_t value) {
-    if (value & 2) return (value & 1) ? GX2_TEX_CLAMP_MODE_MIRROR_ONCE : GX2_TEX_CLAMP_MODE_CLAMP;
-    return (value & 1) ? GX2_TEX_CLAMP_MODE_MIRROR : GX2_TEX_CLAMP_MODE_WRAP;
+    switch (value & 3) {
+    case 0: return GX2_TEX_CLAMP_MODE_CLAMP;
+    case 2: return GX2_TEX_CLAMP_MODE_MIRROR;
+    default: return GX2_TEX_CLAMP_MODE_WRAP;
+    }
+}
+
+// TX_MODE0: bit 4 is the magnification filter (linear when set); bits 5-7
+// the minification filter, whose bit 2 selects linear and whose low bits the
+// mip filter. Only level 0 is uploaded, so mipmapping is off.
+static void initSampler(GX2Sampler* sampler, uint32_t mode0) {
+    GX2InitSampler(sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
+    GX2InitSamplerClamping(sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
+                           GX2_TEX_CLAMP_MODE_WRAP);
+    const GX2TexXYFilterMode mag = ((mode0 >> 4) & 1) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
+    const GX2TexXYFilterMode min = ((mode0 >> 7) & 1) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
+    GX2InitSamplerXYFilter(sampler, mag, min, GX2_TEX_ANISO_RATIO_NONE);
+    GX2InitSamplerZMFilter(sampler, GX2_TEX_Z_FILTER_MODE_NONE, GX2_TEX_MIP_FILTER_MODE_NONE);
 }
 
 static int tevSext11(uint32_t v) { return int(v << 21) >> 21; }
@@ -1046,16 +1064,18 @@ static TextureEntry* getTexture(int map) {
     const uint32_t tlutFmt = indexed ? ((tlutReg >> 10) & 3) : 0;
     const uint8_t* source = g.texImage[map];
     if (TextureEntry* c = copyTexture(source)) {
-        GX2InitSampler(&c->sampler, GX2_TEX_CLAMP_MODE_CLAMP,
-                       (mode0 & 0x20) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT);
-        GX2InitSamplerClamping(&c->sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
-                               GX2_TEX_CLAMP_MODE_WRAP);
+        initSampler(&c->sampler, mode0);
         return c;
     }
     for (size_t i = 0; i < s_textures.size(); ++i) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.source == source && e.fmt == fmt && e.width == w && e.height == h &&
-            e.tlut == tlut && e.tlutFmt == tlutFmt) return &e;
+            e.tlut == tlut && e.tlutFmt == tlutFmt) {
+            // The sampler state belongs to the texmap, not the image: the same
+            // texture may be bound with other wrap or filter modes.
+            initSampler(&e.sampler, mode0);
+            return &e;
+        }
     }
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
@@ -1076,10 +1096,7 @@ static TextureEntry* getTexture(int map) {
     e.texture.surface.image = alignedZero(e.texture.surface.alignment, e.texture.surface.imageSize);
     if (!e.texture.surface.image) return nullptr;
     GX2InitTextureRegs(&e.texture);
-    GX2InitSampler(&e.sampler, GX2_TEX_CLAMP_MODE_CLAMP,
-                   (mode0 & 0x20) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT);
-    GX2InitSamplerClamping(&e.sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
-                           GX2_TEX_CLAMP_MODE_WRAP);
+    initSampler(&e.sampler, mode0);
 
     // Decode through an explicitly checked buffer: a failed std::vector
     // allocation returns null here (no exceptions), and the decoder then wrote
