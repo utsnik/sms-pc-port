@@ -24,6 +24,9 @@
 #include <gx2/texture.h>
 #include <coreinit/cache.h>
 #include <coreinit/memory.h>
+#include <coreinit/memexpheap.h>
+#include <coreinit/memheap.h>
+#include <gx2/mem.h>
 
 #include <cstddef>
 #include <cstdint>
@@ -92,6 +95,78 @@ void log_words(const char* tag, const void* image, uint32_t bytes)
 	         unsigned(v[4]), unsigned(v[5]), unsigned(v[6]), unsigned(v[7]));
 }
 
+/* WHBGfxInit sizes and registers the DRC scan buffer with GX2GetSystemDRCMode(),
+ * which returned 0 (DISABLED) on hardware: a 512-byte buffer in a disabled
+ * mode, so the GamePad kept the system launch screen.  The LUS and DKR ports
+ * use GX2GetSystemDRCScanMode() (1 = SINGLE).  Register a real DRC scan buffer
+ * in that mode, allocated from WHBGfx's own foreground heap (found from the
+ * TV scan buffer it holds), so WHBGfx's release callback frees it with the
+ * heap; redone after every foreground acquire. */
+bool s_drc_registered;
+uint32_t s_drc_attempts;
+void* s_drc_scan;
+
+void drc_register_scan_buffer()
+{
+	if (s_drc_registered || s_drc_attempts >= 10)
+		return;
+	++s_drc_attempts;
+	GX2DrcRenderMode mode = GX2GetSystemDRCScanMode();
+	if (mode == GX2_DRC_RENDER_MODE_DISABLED)
+		mode = GX2_DRC_RENDER_MODE_SINGLE;
+	uint32_t bytes = 0, unk = 0;
+	GX2CalcDRCSize(mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE, &bytes, &unk);
+	uint32_t fga = 0, fgs = 0;
+	OSGetForegroundBucket(&fga, &fgs);
+	GX2Texture last;
+	std::memset(&last, 0, sizeof(last));
+	const BOOL ok = GX2GetLastFrame(GX2_SCAN_TARGET_TV, &last);
+	const uint32_t tvScan = reinterpret_cast<uint32_t>(last.surface.image);
+	const bool inForeground = ok && tvScan >= fga && tvScan - fga < fgs;
+	/* WHBGfx's foreground expanded heap spans the whole foreground frame heap,
+	 * so any address inside the bucket's tail finds it; only an EXPH heap is
+	 * used (an exp-heap call on the frame heap itself would corrupt it). */
+	void* probes[3] = {inForeground ? last.surface.image : nullptr,
+	                   reinterpret_cast<void*>(fga + fgs - 256), reinterpret_cast<void*>(fga + fgs / 2)};
+	MEMHeapHandle heap = nullptr;
+	for (void* probe : probes) {
+		if (!probe || !fgs)
+			continue;
+		MEMHeapHandle h = MEMFindContainHeap(probe);
+		const uint32_t tag = h ? *reinterpret_cast<const uint32_t*>(h) : 0;
+		port_log("[drc] probe %p -> heap %p tag=%08x\n", probe, static_cast<void*>(h), unsigned(tag));
+		if (h && tag == 0x45585048u) { /* 'EXPH' */
+			heap = h;
+			break;
+		}
+	}
+	const char* from = "foreground";
+	if (!heap && s_drc_attempts >= 10) {
+		/* Last resort: WHBGfx's MEM1 heap (holds its colour buffers). */
+		heap = MEMFindContainHeap(WHBGfxGetDRCColourBuffer()->surface.image);
+		from = "MEM1";
+	}
+	port_log("[drc] scan register try=%u mode=%d bytes=%u tvScan ok=%d %p inFG=%d heap=%p (%s)\n",
+	         unsigned(s_drc_attempts), int(mode), unsigned(bytes), int(ok), last.surface.image,
+	         int(inForeground), static_cast<void*>(heap), from);
+	if (!heap || !bytes)
+		return;
+	s_drc_scan = MEMAllocFromExpHeapEx(heap, bytes, GX2_SCAN_BUFFER_ALIGNMENT);
+	if (!s_drc_scan) {
+		port_log("[drc] scan register: alloc of %u bytes failed (free %u)\n", unsigned(bytes),
+		         unsigned(MEMGetAllocatableSizeForExpHeapEx(heap, GX2_SCAN_BUFFER_ALIGNMENT)));
+		return;
+	}
+	GX2Invalidate(GX2_INVALIDATE_MODE_CPU, s_drc_scan, bytes);
+	GX2SetDRCBuffer(s_drc_scan, bytes, mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE);
+	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+	GX2SetDRCScale(tv->surface.width, tv->surface.height);
+	GX2SetDRCEnable(TRUE);
+	s_drc_registered = true;
+	port_log("[drc] DRC scan buffer registered: %p+%u mode=%d scale %ux%u\n", s_drc_scan,
+	         unsigned(bytes), int(mode), unsigned(tv->surface.width), unsigned(tv->surface.height));
+}
+
 void drc_setup(bool first)
 {
 	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
@@ -100,6 +175,11 @@ void drc_setup(bool first)
 		port_log("[drc] foreground regained; DRC scale %ux%u\n",
 		         unsigned(tv->surface.width), unsigned(tv->surface.height));
 		s_canary_armed = false;
+		/* WHBGfx's release callback destroyed its foreground heap (and our
+		 * buffer); its acquire callback registered its disabled one again. */
+		s_drc_registered = false;
+		s_drc_attempts = 0;
+		s_drc_scan = nullptr;
 		return;
 	}
 	uint32_t drcBytes = 0, unk = 0;
@@ -397,6 +477,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	WHBGfxFinishRenderTV();
 	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_DRC);
 	WHBGfxFinishRender();
+	drc_register_scan_buffer();
 	present_diagnostics();
 	WHBGfxBeginRender();
 	WHBGfxBeginRenderTV();
