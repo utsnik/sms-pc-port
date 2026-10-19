@@ -14,6 +14,7 @@
 #include <malloc.h>
 #include <sys/stat.h>
 #include <whb/gfx.h>
+#include <coreinit/memdefaultheap.h>
 #include <gx2/clear.h>
 #include <gx2/display.h>
 #include <gx2/event.h>
@@ -242,7 +243,7 @@ void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
 	dst.use = GX2_SURFACE_USE_TEXTURE;
 	dst.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
 	GX2CalcSurfaceSizeAndAlignment(&dst);
-	dst.image = memalign(dst.alignment, dst.imageSize);
+	dst.image = MEMAllocFromDefaultHeapEx(dst.imageSize, dst.alignment);
 	if (!dst.image) {
 		port_log("[shots] skip %s: out of memory (%u bytes)\n", path, unsigned(dst.imageSize));
 		return;
@@ -256,7 +257,7 @@ void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
 	const bool ok = write_bmp(path, static_cast<const uint8_t*>(dst.image), dst.width, dst.height, dst.pitch, shrink);
 	port_log("[shots] %s %s (%ux%u)\n", ok ? "wrote" : "FAILED", path, unsigned(dst.width / shrink),
 	         unsigned(dst.height / shrink));
-	std::free(dst.image);
+	MEMFreeToDefaultHeap(dst.image);
 }
 
 void take_shots(uint32_t p)
