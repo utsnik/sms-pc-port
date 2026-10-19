@@ -1384,7 +1384,10 @@ static bool initVertexProgram(VertexProgram& shader) {
     memset(shader.vertex.regs.spi_vs_out_id, 0xff, sizeof(shader.vertex.regs.spi_vs_out_id));
     shader.vertex.regs.spi_vs_out_id[0] = 0x03020100;
     shader.vertex.regs.spi_vs_out_id[1] = 0x07060504;
-    shader.vertex.regs.spi_vs_out_id[2] = key.outputMode ? 0xffffffff : 0xffff0908;
+    // Keep the fixed path's export map identical to the packed shader that
+    // the legacy path binds. Cemu rejects the fixed pixel shader when the
+    // unused slots are advertised as absent rather than as its ABI's 0x0a.
+    shader.vertex.regs.spi_vs_out_id[2] = key.outputMode ? 0xff0a0908 : 0xffff0908;
     shader.vertex.regs.sq_vtx_semantic_clear = ~((1u << RAW_ATTR_COUNT) - 1);
     shader.vertex.regs.num_sq_vtx_semantic = RAW_ATTR_COUNT;
     for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) shader.vertex.regs.sq_vtx_semantic[i] = i;
