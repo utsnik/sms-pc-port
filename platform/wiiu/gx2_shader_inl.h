@@ -98,6 +98,11 @@
     ALU_OP2(0x1, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_M4)
 #define ALU_MOV(dstGpr, dstChan, src0Sel, src0Chan) \
     ALU_OP2(0x19, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
+/* One-source OP2 rounding instructions (R600/Latte opcodes 0x14, 0x13). */
+#define ALU_FLOOR(dstGpr, dstChan, src0Sel, src0Chan) \
+    ALU_OP2(0x14, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
+#define ALU_RNDNE(dstGpr, dstChan, src0Sel, src0Chan) \
+    ALU_OP2(0x13, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
 
 /* Predicate and comparison instructions from the lus-rebase Latte assembler. */
 #define ALU_OP2_INST_MIN 0x04
