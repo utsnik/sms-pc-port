@@ -10,6 +10,9 @@
 #include <whb/proc.h>
 #include <proc_ui/procui.h>
 #include <cstdlib>
+#include <cstdio>
+#include <malloc.h>
+#include <sys/stat.h>
 #include <whb/gfx.h>
 #include <gx2/clear.h>
 #include <gx2/display.h>
@@ -151,11 +154,137 @@ void canary_check()
 		         unsigned(w[first]), static_cast<const void*>(w + last));
 }
 
+/* ---- Self-screenshots ------------------------------------------------------
+ * Only when "<app root>shots" (a directory) exists.  At a few presents the TV
+ * colour buffer (2x downscaled) and the GamePad scan buffer are copied into
+ * linear surfaces (GX2CopySurface), the GPU is drained, and both are written
+ * as 24-bit BMPs to "<app root>shots/shotNN-{tv,drc}.bmp".  Runs on the
+ * presenting thread between frames (rare, <= 10 times); every file is closed
+ * before returning. */
+int s_shots_marker = -1;
+uint32_t s_shots_written;
+constexpr uint32_t kShotsMax = 10;
+
+bool shots_wanted(uint32_t p)
+{
+	if (s_shots_marker < 0) {
+		char path[192];
+		std::snprintf(path, sizeof(path), "%sshots", sms_wiiu_app_root());
+		struct stat st;
+		s_shots_marker = (stat(path, &st) == 0) ? 1 : 0;
+		port_log("[shots] marker %s\n", s_shots_marker ? "present: screenshots ON" : "absent: off");
+	}
+	if (!s_shots_marker || s_shots_written >= kShotsMax)
+		return false;
+	return p == 120 || p == 600 || p == 1800 || (p >= 3600 && p % 3600 == 0);
+}
+
+void put32(uint8_t* d, uint32_t v) { d[0] = v; d[1] = v >> 8; d[2] = v >> 16; d[3] = v >> 24; }
+
+/* img is a linear RGBA8 image; writes it downscaled by `shrink` as a BMP. */
+bool write_bmp(const char* path, const uint8_t* img, uint32_t w, uint32_t h, uint32_t pitchPx, uint32_t shrink)
+{
+	const uint32_t ow = w / shrink, oh = h / shrink;
+	const uint32_t rowBytes = (ow * 3 + 3) & ~3u;
+	uint8_t hdr[54] = {'B', 'M'};
+	put32(hdr + 2, 54 + rowBytes * oh);
+	put32(hdr + 10, 54);
+	put32(hdr + 14, 40);
+	put32(hdr + 18, ow);
+	put32(hdr + 22, oh); /* positive = bottom-up */
+	hdr[26] = 1;
+	hdr[28] = 24;
+	put32(hdr + 34, rowBytes * oh);
+	FILE* f = std::fopen(path, "wb");
+	if (!f)
+		return false;
+	static uint8_t row[1920 * 3 + 4];
+	bool ok = std::fwrite(hdr, 1, 54, f) == 54;
+	for (uint32_t y = 0; ok && y < oh; ++y) {
+		const uint8_t* src = img + size_t(oh - 1 - y) * shrink * pitchPx * 4;
+		std::memset(row, 0, rowBytes);
+		for (uint32_t x = 0; x < ow; ++x) {
+			unsigned r = 0, g = 0, b = 0;
+			for (uint32_t dy = 0; dy < shrink; ++dy)
+				for (uint32_t dx = 0; dx < shrink; ++dx) {
+					const uint8_t* px = src + (size_t(dy) * pitchPx + x * shrink + dx) * 4;
+					r += px[0]; g += px[1]; b += px[2];
+				}
+			const unsigned n = shrink * shrink;
+			row[x * 3 + 0] = b / n; row[x * 3 + 1] = g / n; row[x * 3 + 2] = r / n;
+		}
+		ok = std::fwrite(row, 1, rowBytes, f) == rowBytes;
+	}
+	if (std::fclose(f) != 0)
+		ok = false;
+	return ok;
+}
+
+/* Copies `src` (any tiling) into a freshly allocated linear surface, waits for
+ * the GPU, writes the BMP, frees. */
+void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
+{
+	if (!src.image || src.width > 1920 || src.height > 1080 ||
+	    (src.format & 0x3ff) != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8) {
+		port_log("[shots] skip %s: unsupported source (image=%p %ux%u fmt=0x%x)\n", path, src.image,
+		         unsigned(src.width), unsigned(src.height), unsigned(src.format));
+		return;
+	}
+	GX2Surface dst;
+	std::memset(&dst, 0, sizeof(dst));
+	dst.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+	dst.width = src.width;
+	dst.height = src.height;
+	dst.depth = 1;
+	dst.mipLevels = 1;
+	dst.format = src.format;
+	dst.aa = GX2_AA_MODE1X;
+	dst.use = GX2_SURFACE_USE_TEXTURE;
+	dst.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+	GX2CalcSurfaceSizeAndAlignment(&dst);
+	dst.image = memalign(dst.alignment, dst.imageSize);
+	if (!dst.image) {
+		port_log("[shots] skip %s: out of memory (%u bytes)\n", path, unsigned(dst.imageSize));
+		return;
+	}
+	std::memset(dst.image, 0, dst.imageSize);
+	DCFlushRange(dst.image, dst.imageSize);
+	GX2CopySurface(const_cast<GX2Surface*>(&src), 0, 0, &dst, 0, 0);
+	GX2Flush();
+	GX2DrawDone();
+	DCInvalidateRange(dst.image, dst.imageSize);
+	const bool ok = write_bmp(path, static_cast<const uint8_t*>(dst.image), dst.width, dst.height, dst.pitch, shrink);
+	port_log("[shots] %s %s (%ux%u)\n", ok ? "wrote" : "FAILED", path, unsigned(dst.width / shrink),
+	         unsigned(dst.height / shrink));
+	std::free(dst.image);
+}
+
+void take_shots(uint32_t p)
+{
+	if (!shots_wanted(p))
+		return;
+	char dir[192], path[224];
+	std::snprintf(dir, sizeof(dir), "%sshots", sms_wiiu_app_root());
+	mkdir(dir, 0777);
+	const uint32_t n = s_shots_written++;
+	std::snprintf(path, sizeof(path), "%s/shot%02u-tv.bmp", dir, unsigned(n));
+	shot_surface(WHBGfxGetTVColourBuffer()->surface, path, 2);
+	GX2Texture last;
+	std::memset(&last, 0, sizeof(last));
+	if (GX2GetLastFrame(GX2_SCAN_TARGET_DRC, &last)) {
+		std::snprintf(path, sizeof(path), "%s/shot%02u-drc.bmp", dir, unsigned(n));
+		shot_surface(last.surface, path, 1);
+	} else {
+		port_log("[shots] DRC GX2GetLastFrame failed\n");
+	}
+}
+
 /* Called after WHBGfxFinishRender (its GX2DrawDone has completed the frame). */
 void present_diagnostics()
 {
 	++s_presented;
 	const uint32_t p = s_presented;
+	take_shots(p);
 	if (!(p == 2 || p == 120 || p == 1800 || p == 3600 || p % 18000 == 0))
 		return;
 	uint32_t swaps = 0, flips = 0;
