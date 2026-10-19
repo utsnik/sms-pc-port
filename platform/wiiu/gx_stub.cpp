@@ -448,6 +448,12 @@ extern "C" int sms_wiiu_gfx_is_initialized(void)
 	return s_gfx_initialized ? 1 : 0;
 }
 
+extern "C" int64_t wut_OSGetTime_stub(void) __asm__("OSGetTime");
+/* Where a presented frame waits: FinishRender ends with GX2DrawDone (the GPU
+ * finishing the frame), BeginRender waits for the next vsync. */
+static int64_t s_presentFinish, s_presentBegin;
+static uint32_t s_presentFrames;
+
 extern "C" void sms_wiiu_gfx_frame(void)
 {
 	log_active_once();
@@ -474,12 +480,24 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	if (!sms_wiiu_gx2_renderer_has_draws())
 		return;
 	sms_wiiu_gx2_renderer_end();
+	const int64_t t0 = wut_OSGetTime_stub();
 	WHBGfxFinishRenderTV();
 	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_DRC);
 	WHBGfxFinishRender();
+	const int64_t t1 = wut_OSGetTime_stub();
 	drc_register_scan_buffer();
 	present_diagnostics();
 	WHBGfxBeginRender();
+	const int64_t t2 = wut_OSGetTime_stub();
+	s_presentFinish += t1 - t0;
+	s_presentBegin += t2 - t1;
+	if (++s_presentFrames == 30) {
+		const int64_t tick100us = (248625000 / 4) / 10000;
+		port_log("SMS Wii U: [present] per-frame x0.1ms finish(GPU drain)=%u beginRender(vsync)=%u\n",
+		         unsigned(s_presentFinish / 30 / tick100us), unsigned(s_presentBegin / 30 / tick100us));
+		s_presentFinish = s_presentBegin = 0;
+		s_presentFrames = 0;
+	}
 	WHBGfxBeginRenderTV();
 	WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
 	sms_wiiu_gx2_renderer_begin();

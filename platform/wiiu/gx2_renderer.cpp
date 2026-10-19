@@ -197,11 +197,16 @@ static OSTime s_vertexArenaFence[kVertexArenas];
 static uint32_t s_vertexArenaIndex;
 static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
+static OSTime s_vertexFenceWait;
 
 static void beginVertexArena() {
     s_vertexArenaIndex = (s_vertexArenaIndex + 1) % kVertexArenas;
     s_vertexArenaUsed = 0;
-    if (s_vertexArenaFence[s_vertexArenaIndex]) GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
+    if (s_vertexArenaFence[s_vertexArenaIndex]) {
+        const OSTime t0 = OSGetTime();
+        GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
+        s_vertexFenceWait += OSGetTime() - t0;
+    }
 }
 
 static void endVertexArena() {
@@ -2313,10 +2318,11 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u arenaPeak=%u overflows=%u",
-                     (unsigned)g_displayFrames, ms(s_perfWall), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u arenaPeak=%u overflows=%u",
+                     (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows);
+        s_vertexFenceWait = 0;
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
     }
