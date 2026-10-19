@@ -142,6 +142,7 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/vi.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/exception.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/pad.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/profiler.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/audio.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub.cpp
