@@ -19,6 +19,8 @@
 #include <gx2/display.h>
 #include <gx2/event.h>
 #include <gx2/state.h>
+extern "C" void sms_wiiu_gx2_target_begin(void);
+extern "C" void sms_wiiu_gx2_target_present(void);
 #include <gx2/surface.h>
 #include <gx2/swap.h>
 #include <gx2/texture.h>
@@ -410,8 +412,7 @@ extern "C" void sms_wiiu_gfx_init(void)
 	else {
 		drc_setup(true);
 		WHBGfxBeginRender();
-		WHBGfxBeginRenderTV();
-		WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
+		sms_wiiu_gx2_target_begin();
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
 	}
@@ -471,8 +472,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	}
 	if (!s_frame_open) {
 		WHBGfxBeginRender();
-		WHBGfxBeginRenderTV();
-		WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
+		sms_wiiu_gx2_target_begin();
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
 	}
@@ -481,8 +481,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		return;
 	sms_wiiu_gx2_renderer_end();
 	const int64_t t0 = wut_OSGetTime_stub();
-	WHBGfxFinishRenderTV();
-	GX2CopyColorBufferToScanBuffer(WHBGfxGetTVColourBuffer(), GX2_SCAN_TARGET_DRC);
+	sms_wiiu_gx2_target_present();
 	WHBGfxFinishRender();
 	const int64_t t1 = wut_OSGetTime_stub();
 	drc_register_scan_buffer();
@@ -498,8 +497,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		s_presentFinish = s_presentBegin = 0;
 		s_presentFrames = 0;
 	}
-	WHBGfxBeginRenderTV();
-	WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
+	sms_wiiu_gx2_target_begin();
 	sms_wiiu_gx2_renderer_begin();
 	s_frame_open = true;
 }
