@@ -199,6 +199,7 @@ struct TexKeyHash {
 struct TexEntry {
     GLuint tex = 0;
     uint64_t dataHash = 0, tlutHash = 0;
+    uint64_t decodedHash = 0;  // hash of the first 64 decoded level-0 texels
     uint32_t checkedGen = 0;
     uint32_t checkedClock = 0, checkedFrame = 0;  // writeClock() and display frame of the last hash
     bool hashAlways = false;  // its data once changed with no write reported: hashed on every check
@@ -689,6 +690,8 @@ unsigned bindTextureMap(int map, float* outW, float* outH) {
         for (uint32_t l = 0; l < levels; l++) {
             s_decodeBuf.resize(size_t(lw) * lh * 4);
             decodeTexture(src, fmt, lw, lh, tlut, (tlutReg >> 10) & 3, s_decodeBuf.data());
+            if (l == 0)
+                e.decodedHash = xxh64(s_decodeBuf.data(), std::min<size_t>(64, size_t(lw) * lh) * 4, 0);
             glTexImage2D(GL_TEXTURE_2D, GLint(l), GL_RGBA8, GLsizei(lw), GLsizei(lh), 0, GL_RGBA, GL_UNSIGNED_BYTE,
                          s_decodeBuf.data());
             if (!e.hires.empty()) coverage.push_back(alphaCoverage(s_decodeBuf.data(), size_t(lw) * lh));
@@ -723,6 +726,58 @@ unsigned bindTextureMap(int map, float* outW, float* outH) {
     }
     glcBindSampler(map, samplerFor(mode0, mode1, levels, -1, e.arbitraryMips));
     return e.tex;
+}
+
+bool traceTextureInfo(int map, TraceTextureInfo* out) {
+    if (!out || map < 0 || map >= 8) return false;
+    memset(out, 0, sizeof(*out));
+    const uint32_t img0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)];
+    const uint32_t tlutReg = g.bp[bpTexReg(BP_TX_TLUT, map)];
+    out->source = g.texImage[map];
+    out->fmt = (img0 >> 20) & 15;
+    out->width = (img0 & 0x3ff) + 1;
+    out->height = ((img0 >> 10) & 0x3ff) + 1;
+    out->tlut = (out->fmt >= 8 && out->fmt <= 10) ? (tlutReg & 0x3ff) : 0;
+    out->tlutFmt = (out->fmt >= 8 && out->fmt <= 10) ? ((tlutReg >> 10) & 3) : 0;
+
+    auto copy = s_copies.find(out->source);
+    if (copy != s_copies.end()) {
+        out->efbCopy = true;
+        out->copyDest = out->source;
+        out->copyW = uint32_t(copy->second.w);
+        out->copyH = uint32_t(copy->second.h);
+        out->copyFmt = copy->second.fmt;
+        if (copy->second.bytes && copy->second.bytes >= texLevelBytes(copy->second.fmt & 15, copy->second.w,
+                                                                        copy->second.h)) {
+            std::vector<uint8_t> decoded(size_t(copy->second.w) * copy->second.h * 4);
+            decodeTexture(static_cast<const uint8_t*>(out->source), copy->second.fmt & 15,
+                          uint32_t(copy->second.w), uint32_t(copy->second.h), nullptr, 0, decoded.data());
+            out->decodedHash = xxh64(decoded.data(), std::min<size_t>(64, decoded.size() / 4) * 4, 0);
+        }
+        return true;
+    }
+    if (!out->source) {
+        out->fallback = true;
+        uint8_t white[64 * 4];
+        memset(white, 0xff, sizeof(white));
+        out->decodedHash = xxh64(white, sizeof(white), 0);
+        return true;
+    }
+
+    const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
+    uint32_t levels = 1;
+    if (((mode0 >> 5) & 3) != 0) {
+        const uint32_t mode1 = g.bp[bpTexReg(BP_TX_MODE1, map)];
+        const uint32_t maxLod = ((mode1 >> 8) & 0xff) / 16;
+        uint32_t m = std::max(out->width, out->height);
+        while (levels <= maxLod && (m >> levels) >= 1) levels++;
+        if (levels > 11) levels = 11;
+    }
+    TexKey key{out->source, out->fmt, out->width, out->height, levels, out->tlut, out->tlutFmt};
+    auto it = s_cache.find(key);
+    if (it == s_cache.end()) return false;
+    out->decodedHash = it->second.decodedHash;
+    return true;
 }
 
 }  // namespace gx

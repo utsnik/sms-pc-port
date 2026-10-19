@@ -1,4 +1,8 @@
 #include "port_heap.h"
+#include <cstdio>
+#ifndef SMS_GX2_DEBUG_DUMP
+#define SMS_GX2_DEBUG_DUMP 0
+#endif
 #include <coreinit/memdefaultheap.h>
 /* Small GX2 host for the shared GX register decoder.
  *
@@ -301,12 +305,10 @@ static uint32_t tevTextureMask(const TevKey& k) {
 
 static bool tevSupported(const TevKey& k) {
     // Indirect texturing changes the coordinates between stages and remains
-    // on the old path until its Latte implementation is added.  Comparison
-    // forms (bias=3) still use the fixed-function fallback.
+    // on the old path until its Latte implementation is added.
     if (((k.genmode >> 16) & 7) != 0) return false;
     for (uint32_t s = 0; s < k.stages; ++s) {
         if (((k.order[s] >> 6) & 1) && (k.order[s] & 7) >= 8) return false;
-        if (((k.colorEnv[s] >> 16) & 3) == 3 || ((k.alphaEnv[s] >> 16) & 3) == 3) return false;
     }
     return true;
 }
@@ -385,9 +387,71 @@ static uint64_t tevClamp(uint64_t op, bool clamp) {
     return clamp ? op | to_QWORD(0, to_LE(1ull << 31)) : op;
 }
 
+static uint32_t tevCompareChannel(TevSource source, uint32_t component) {
+    // Register, texture and raster inputs carry RGB as separate channels. A
+    // source already selecting alpha or a fixed constant is scalar and must
+    // retain its encoded channel for every component of a colour compare.
+    if (source.chan == _w) return source.chan;
+    if ((source.sel >= 9 && source.sel <= 15) || (source.sel >= 20 && source.sel < 36))
+        return component;
+    return source.chan;
+}
+
+static void tevEmitCompareOp(std::vector<uint64_t>& program, uint32_t dst, bool equal,
+                             TevSource a, uint32_t ach, TevSource b, uint32_t bch) {
+    const uint32_t ac = tevCompareChannel(a, ach), bc = tevCompareChannel(b, bch);
+    tevEmitAlu(program, {equal ? ALU_SETE(_R(dst), _x, a.sel, ac, b.sel, bc)
+                          : ALU_SETGT(_R(dst), _x, a.sel, ac, b.sel, bc)});
+}
+
+static void tevEmitTevCompare(std::vector<uint64_t>& program, uint32_t channel,
+                              TevSource a, TevSource b, uint32_t mode, bool scalar) {
+    if (scalar || mode < 2 || mode >= 6) {
+        const uint32_t component = mode < 2 ? 0 : channel;
+        tevEmitCompareOp(program, 16, (mode & 1) != 0, a, component, b, component);
+        return;
+    }
+
+    const bool equal = (mode & 1) != 0;
+    const uint32_t low = 0, mid = 1, high = mode >= 4 ? 2 : 1;
+    if (equal) {
+        tevEmitCompareOp(program, 17, true, a, high, b, high);
+        tevEmitCompareOp(program, 18, true, a, mode >= 4 ? mid : low, b, mode >= 4 ? mid : low);
+        tevEmitAlu(program, {ALU_MIN(_R(17), _x, _R(17), _x, _R(18), _x)});
+        if (mode >= 4) {
+            tevEmitCompareOp(program, 18, true, a, low, b, low);
+            tevEmitAlu(program, {ALU_MIN(_R(17), _x, _R(17), _x, _R(18), _x)});
+        }
+    } else {
+        tevEmitCompareOp(program, 17, false, a, high, b, high);
+        tevEmitCompareOp(program, 18, true, a, high, b, high);
+        if (mode >= 4)
+            tevEmitAlu(program, {ALU_MOV(_R(16), _x, _R(18), _x)});
+        tevEmitCompareOp(program, 19, false, a, mode >= 4 ? mid : low, b, mode >= 4 ? mid : low);
+        tevEmitAlu(program, {ALU_MUL(_R(19), _x, mode >= 4 ? _R(16) : _R(18), _x, _R(19), _x)});
+        tevEmitAlu(program, {ALU_MAX(_R(17), _x, _R(17), _x, _R(19), _x)});
+        if (mode >= 4) {
+            tevEmitCompareOp(program, 18, true, a, mid, b, mid);
+            tevEmitAlu(program, {ALU_MUL(_R(16), _x, _R(16), _x, _R(18), _x)});
+            tevEmitCompareOp(program, 19, false, a, low, b, low);
+            tevEmitAlu(program, {ALU_MUL(_R(19), _x, _R(16), _x, _R(19), _x)});
+            tevEmitAlu(program, {ALU_MAX(_R(17), _x, _R(17), _x, _R(19), _x)});
+        }
+    }
+    tevEmitAlu(program, {ALU_MOV(_R(16), channel, _R(17), _x)});
+}
+
 static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32_t channel,
                            TevSource a, TevSource b, TevSource c, TevSource d,
                            uint32_t bias, uint32_t op, uint32_t scale, bool clamp) {
+    if (bias == 3) {
+        tevEmitTevCompare(program, channel, a, b, (scale << 1) | op, channel == _w);
+        tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
+        tevEmitAlu(program, {ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel)});
+        if (clamp)
+            tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, ALU_SRC_PV, channel), true)});
+        return;
+    }
     tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel, a.chan _NEG)});
     tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
     // GX's regular TEV equation is D +/- lerp(A, B, C), not merely D +/-
@@ -726,6 +790,123 @@ static const CopyEntry* copyEntryForTexture(const TextureEntry* texture) {
     for (const CopyEntry& c : copyCache())
         if (&c.tex == texture && c.tex.valid) return &c;
     return nullptr;
+}
+
+static FILE* debugFile() {
+    static FILE* f;
+    if (!SMS_GX2_DEBUG_DUMP) return nullptr;
+    if (!f) f = fopen("fs:/vol/external01/gx2dbg.txt", "w");
+    return f;
+}
+
+static uint64_t debugXxh64(const void* data, size_t len) {
+    static const uint64_t p1 = 0x9E3779B185EBCA87ull, p2 = 0xC2B2AE3D27D4EB4Full,
+                          p3 = 0x165667B19E3779F9ull, p4 = 0x85EBCA77C2B2AE63ull,
+                          p5 = 0x27D4EB2F165667C5ull;
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    const uint8_t* end = p + len;
+    auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
+    auto rd64 = [](const uint8_t* q) {
+        uint64_t v = 0;
+        for (int i = 7; i >= 0; --i) v = (v << 8) | q[i];
+        return v;
+    };
+    auto rd32 = [](const uint8_t* q) {
+        return uint32_t(q[0]) | (uint32_t(q[1]) << 8) | (uint32_t(q[2]) << 16) | (uint32_t(q[3]) << 24);
+    };
+    auto round = [&](uint64_t acc, uint64_t in) { return rotl(acc + in * p2, 31) * p1; };
+    auto merge = [&](uint64_t acc, uint64_t v) { return (acc ^ round(0, v)) * p1 + p4; };
+    uint64_t h;
+    if (len >= 32) {
+        uint64_t v1 = p1 + p2, v2 = p2, v3 = 0, v4 = -p1;
+        do {
+            v1 = round(v1, rd64(p)); v2 = round(v2, rd64(p + 8));
+            v3 = round(v3, rd64(p + 16)); v4 = round(v4, rd64(p + 24)); p += 32;
+        } while (end - p >= 32);
+        h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
+        h = merge(h, v1); h = merge(h, v2); h = merge(h, v3); h = merge(h, v4);
+    } else h = p5;
+    h += uint64_t(len);
+    while (end - p >= 8) { h ^= round(0, rd64(p)); h = rotl(h, 27) * p1 + p4; p += 8; }
+    if (end - p >= 4) { h ^= uint64_t(rd32(p)) * p1; h = rotl(h, 23) * p2 + p3; p += 4; }
+    while (p < end) { h ^= uint64_t(*p++) * p5; h = rotl(h, 11) * p1; }
+    h ^= h >> 33; h *= p2; h ^= h >> 29; h *= p3; h ^= h >> 32;
+    return h;
+}
+
+static uint64_t debugDecodedHash(const TextureEntry* texture) {
+    if (!texture || !texture->valid || !texture->texture.surface.image) return 0;
+    const uint32_t w = texture->width, h = texture->height;
+    const uint32_t pitch = texture->texture.surface.pitch ? texture->texture.surface.pitch : w;
+    const uint32_t n = std::min<uint32_t>(64, w * h);
+    uint8_t first[64 * 4];
+    const uint8_t* image = static_cast<const uint8_t*>(texture->texture.surface.image);
+    for (uint32_t i = 0; i < n; ++i) {
+        const uint32_t y = i / w, x = i % w;
+        const uint8_t* p = image + (size_t(y) * pitch + x) * 4;
+        memcpy(first + i * 4, p, 4);
+    }
+    return debugXxh64(first, size_t(n) * 4);
+}
+
+static void debugTexture(FILE* f, int map, const TextureEntry* texture) {
+    if (!texture) {
+        fprintf(f, "m%d:none", map);
+        return;
+    }
+    const CopyEntry* copy = copyEntryForTexture(texture);
+    const uint8_t* source = texture->source;
+    const uint32_t bytes = gx2TexLevelBytes(texture->fmt, texture->width, texture->height);
+    const uint32_t addr = reinterpret_cast<uint32_t>(source);
+    const bool readable = source && bytes && addr + bytes > addr &&
+        ((addr >= 0x10000000u && addr + bytes <= 0x50000000u) ||
+         (addr >= 0xF4000000u && addr + bytes <= 0xF6000000u));
+    fprintf(f, "m%d:f%u:%ux%u:src=%p:h=%016llx:tlut=%u/%u:%s", map, (unsigned)texture->fmt,
+            (unsigned)texture->width, (unsigned)texture->height, (const void*)source,
+            (unsigned long long)debugDecodedHash(texture), (unsigned)texture->tlut, (unsigned)texture->tlutFmt,
+            copy ? "efb" : readable ? "ram" : "fallback");
+    if (copy)
+        fprintf(f, ":copydst=%p:%u,%u:%ux%u", copy->dest, (unsigned)copy->sourceX, (unsigned)copy->sourceY,
+                (unsigned)copy->sourceW, (unsigned)copy->sourceH);
+}
+
+static void debugDraw(const TevKey& key, uint32_t draw, bool tevPath, int textureMap, TextureEntry* texture,
+                      TextureEntry* const* tevTextures, uint32_t nverts, const HostVertex* first,
+                      const float* firstOut) {
+    FILE* f = debugFile();
+    if (!f || draw >= 5000) return;
+    fprintf(f, "DIFF renderer=gx2 frame=%u draw=%u tex=", (unsigned)g_displayFrames, (unsigned)draw);
+    const uint32_t mask = tevTextureMask(key);
+    bool firstTex = true;
+    for (int map = 0; map < 8; ++map) {
+        if (!(mask & (1u << map))) continue;
+        if (!tevPath && !tevTextures[map] && map != textureMap) continue;
+        if (!firstTex) fputc(';', f);
+        firstTex = false;
+        debugTexture(f, map, tevTextures[map] ? tevTextures[map] : texture);
+    }
+    if (firstTex) fputs("none", f);
+    fprintf(f, " tev=gen%08x/st%u", (unsigned)g.bp[BP_GENMODE], (unsigned)key.stages);
+    for (uint32_t s = 0; s < key.stages; ++s)
+        fprintf(f, "/%03x:%06x:%06x", (unsigned)key.order[s], (unsigned)key.colorEnv[s], (unsigned)key.alphaEnv[s]);
+    fprintf(f, " blend=%08x ac=%08x z=%08x verts=%u shader=%s", (unsigned)g.bp[BP_CMODE0],
+            (unsigned)g.bp[BP_ALPHACOMPARE], (unsigned)g.bp[BP_ZMODE], (unsigned)nverts,
+            tevPath ? "per-tev" : "evalTev");
+    if (first) {
+        fprintf(f, " first=pos(%.6g,%.6g,%.6g):col(%u,%u,%u,%u):uv(%.6g,%.6g):clip(%.6g,%.6g,%.6g,%.6g)",
+                first->pos[0], first->pos[1], first->pos[2], first->clr[0][0], first->clr[0][1], first->clr[0][2],
+                first->clr[0][3], first->tex[0][0], first->tex[0][1], firstOut[0], firstOut[1], firstOut[2], firstOut[3]);
+    }
+    fprintf(f, " efb=none\n");
+    fflush(f);
+}
+static void debugCopy(bool disp, uint32_t x, uint32_t y, uint32_t w, uint32_t h, const void* dest, uint32_t ctrl) {
+    FILE* f = debugFile();
+    if (!f) return;
+    fprintf(f, "DIFF renderer=gx2 copy=%s src=%u,%u:%ux%u dst=%p fmt=%u ctrl=%08x\n", disp ? "display" : "texture",
+            (unsigned)x, (unsigned)y, (unsigned)w, (unsigned)h, dest,
+            unsigned(((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7)), (unsigned)ctrl);
+    fflush(f);
 }
 static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     const CopyEntry* e = copyEntryForTexture(texture);
@@ -1396,6 +1577,7 @@ void appendArena(PrimClass, uint32_t, uint32_t, const ArenaRef&, uint32_t, uint3
 bool batchUsesArena() { return false; }
 
 static uint32_t s_drawsThisFrame;
+static uint32_t s_debugDrawNo;
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
     if (s_batch.indices.empty()) return;
@@ -1422,6 +1604,11 @@ void flushBatch() {
         if (allTextures) tevShader = tevShaderForKey(tevKey);
     }
     const bool tevPath = tevShader != nullptr;
+    if (SMS_GX2_DEBUG_DUMP && !tevPath) {
+        const uint32_t mask = tevTextureMask(tevKey);
+        for (int debugMap = 0; debugMap < 8; ++debugMap)
+            if (mask & (1u << debugMap)) tevTextures[debugMap] = getTexture(debugMap);
+    }
     const bool titleSky = tevPath && !textured && g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
                           g.bp[BP_CMODE0] == 0x00005169;
     int coord = 0, map = 0;
@@ -1441,6 +1628,9 @@ void flushBatch() {
     const size_t vertexFloats = tevPath ? 28 : (useTex ? 10 : 8);
     const uint32_t vertexStride = uint32_t(vertexFloats * sizeof(float));
     vbo.reserve(s_batch.indices.size() * vertexFloats);
+    HostVertex firstHv;
+    float firstOut[28] = {};
+    bool haveFirst = false;
     for (uint32_t index : s_batch.indices) {
         HostVertex hv;
         const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
@@ -1467,7 +1657,14 @@ void flushBatch() {
             p[2] = 0.0f;
             p[3] = 1.0f;
         }
+        if (!haveFirst) {
+            firstHv = hv;
+            memcpy(firstOut, vbo.data() + at, vertexFloats * sizeof(float));
+            haveFirst = true;
+        }
     }
+    debugDraw(tevKey, s_debugDrawNo++, tevPath, map, texture, tevTextures,
+              uint32_t(s_batch.indices.size()), haveFirst ? &firstHv : nullptr, firstOut);
     DCFlushRange(vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2SetAttribBuffer(0, uint32_t(vbo.size() * sizeof(float)), tevPath ? vertexStride : shader.stride, vbo.data());
@@ -1491,11 +1688,13 @@ void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
     flushBatch();
     const bool clear = (ctrl >> 11) & 1, disp = (ctrl >> 14) & 1;
+    const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
+    const uint32_t x = src & 0x3ff, y = (src >> 10) & 0x3ff;
+    const uint32_t w = (size & 0x3ff) + 1, h = ((size >> 10) & 0x3ff) + 1;
+    debugCopy(disp, x, y, w, h, g.copyDest, ctrl);
     if (disp || !s_frameActive || !ProcUIInForeground()) return;
     {
-        const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
-        copyToTexture(g.copyDest, src & 0x3ff, (src >> 10) & 0x3ff, (size & 0x3ff) + 1,
-                      ((size >> 10) & 0x3ff) + 1, (ctrl >> 9) & 1);
+        copyToTexture(g.copyDest, x, y, w, h, (ctrl >> 9) & 1);
         rebindTvTarget();  // GX2CopySurface may leave its destination bound
     }
     if (!clear) return;
