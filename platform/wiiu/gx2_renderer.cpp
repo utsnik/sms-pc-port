@@ -1,8 +1,4 @@
-#include <cstdio>
 #include "port_heap.h"
-#ifndef SMS_GX2_DEBUG_DUMP
-#define SMS_GX2_DEBUG_DUMP 1
-#endif
 #include <coreinit/memdefaultheap.h>
 /* Small GX2 host for the shared GX register decoder.
  *
@@ -40,12 +36,9 @@
 #include <cstring>
 #include <malloc.h>
 #include <new>
-#include <stdio.h>
 #include <initializer_list>
 #include <vector>
 
-extern "C" const char* sms_wiiu_stage_path(void);
-extern unsigned g_dbgDLCalls, g_dbgDLBytes;
 namespace gx {
 
 uint32_t gx2TexLevelBytes(uint32_t fmt, uint32_t w, uint32_t h);
@@ -1364,10 +1357,8 @@ uint32_t primitiveIndices(uint8_t op, uint32_t n, uint32_t base, uint32_t* out) 
     return primitiveIndicesLocal(op, n, base, out);
 }
 
-static uint32_t s_dbgPrim, s_dbgApp, s_dbgFlush, s_dbgDiscard;
 uint8_t* primitiveBegin(uint8_t op, uint32_t n, uint32_t fmt, uint32_t stride) {
     SMS_PORT_HEAP_SCOPE();
-    ++s_dbgPrim;
     const PrimClass cls = primClass(op);
     if (!s_batch.indices.empty() && (cls != s_batch.cls || fmt != s_batch.fmt)) flushBatch();
     s_batch.cls = cls; s_batch.fmt = fmt; s_batch.stride = stride;
@@ -1390,7 +1381,6 @@ void primitiveEnd(uint8_t op, uint32_t n) {
 void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* verts, uint32_t n,
                    const uint32_t* idx, uint32_t nidx) {
     SMS_PORT_HEAP_SCOPE();
-    ++s_dbgApp;
     if (!s_batch.indices.empty() && (cls != s_batch.cls || fmt != s_batch.fmt)) flushBatch();
     s_batch.cls = cls; s_batch.fmt = fmt; s_batch.stride = stride;
     const uint32_t base = s_batch.count;
@@ -1406,7 +1396,6 @@ void appendArena(PrimClass, uint32_t, uint32_t, const ArenaRef&, uint32_t, uint3
 bool batchUsesArena() { return false; }
 
 static uint32_t s_drawsThisFrame;
-static uint32_t s_dbgVerts, s_dbgIn, s_dbgBehind, s_dbgZ;
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
     if (s_batch.indices.empty()) return;
@@ -1478,69 +1467,6 @@ void flushBatch() {
             p[2] = 0.0f;
             p[3] = 1.0f;
         }
-        { const float* o = vbo.data() + at; ++s_dbgVerts;
-          if (o[3] > 0 && fabsf(o[0]) <= o[3] && fabsf(o[1]) <= o[3] && o[2] >= 0 && o[2] <= o[3]) ++s_dbgIn;
-          else if (o[3] <= 0) ++s_dbgBehind; else if (o[2] < 0 || o[2] > o[3]) ++s_dbgZ; }
-    }
-    { // TEMP debug dump
-        static int s_dbgDraws = 0; static FILE* s_dbg = nullptr;
-        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650 && s_dbgDraws < 120) {
-            if (!s_dbg) s_dbg = fopen("fs:/vol/external01/gx2dbg.txt", "w");
-            if (s_dbg) {
-                fprintf(s_dbg, "draw %d frame %u fmt %x n %u tex %d tev %d stages %u mask %02x gen %08x vp %g %g %g %g proj %g %g %g %g %g %g %g\n", s_dbgDraws,
-                        (unsigned)g_displayFrames, (unsigned)s_batch.fmt, (unsigned)s_batch.indices.size(), (int)textured,
-                        (int)tevPath, (unsigned)tevKey.stages, (unsigned)tevTextureMask(tevKey), (unsigned)tevKey.genmode,
-                        g.viewport[0], g.viewport[1], g.viewport[2], g.viewport[3], g.projection[0], g.projection[1],
-                        g.projection[2], g.projection[3], g.projection[4], g.projection[5], g.projection[6]);
-                fprintf(s_dbg, "  state cm %08x blend %u cupd %u aupd %u z %08x ztest %u zwrite %u pe %08x ac %08x copy %08x\n",
-                        (unsigned)g.bp[BP_CMODE0], (unsigned)(g.bp[BP_CMODE0] & 1), (unsigned)((g.bp[BP_CMODE0] >> 3) & 1),
-                        (unsigned)((g.bp[BP_CMODE0] >> 4) & 1), (unsigned)g.bp[BP_ZMODE], (unsigned)(g.bp[BP_ZMODE] & 1),
-                        (unsigned)((g.bp[BP_ZMODE] >> 4) & 1), (unsigned)g.bp[BP_PE_CONTROL], (unsigned)g.bp[BP_ALPHACOMPARE],
-                        (unsigned)g.bp[BP_COPY_EXEC]);
-                fprintf(s_dbg, "  tev");
-                for (uint32_t st = 0; st < tevKey.stages && st < 4; ++st)
-                    fprintf(s_dbg, " %u/%06x/%06x/%03x", (unsigned)st, (unsigned)tevKey.order[st],
-                            (unsigned)tevKey.colorEnv[st], (unsigned)tevKey.alphaEnv[st]);
-                fputc('\n', s_dbg);
-                { const uint8_t* ab = g.arrayBase[0]; fprintf(s_dbg, "  arr0 %p stride %u be %d vcd %08x/%08x vatA0 %08x bytes %02x%02x %02x%02x %02x%02x\n", (const void*)ab, (unsigned)g.arrayStride[0], (int)g.arrayBigEndian[0], (unsigned)g.cpVcdLo, (unsigned)g.cpVcdHi, (unsigned)g.cpVatA[0], ab?ab[0]:0, ab?ab[1]:0, ab?ab[2]:0, ab?ab[3]:0, ab?ab[4]:0, ab?ab[5]:0); }
-                { const float* m = reinterpret_cast<const float*>(&g.xfMem[0]); fprintf(s_dbg, "  m0 %g %g %g %g | %g %g %g %g | %g %g %g %g matA %08x cpA %08x\n", m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11], (unsigned)g.xfReg[XFR_MATIDX_A], (unsigned)g.cpMatA); }
-                const size_t st = vertexFloats;
-                for (size_t k = 0; k < 3 && k * st < vbo.size(); k++) {
-                    const float* o = vbo.data() + k * st;
-                    HostVertex hv; const uint8_t d9[9] = {0};
-                    unpackVertex(s_batch.fmt, s_batch.vertices.data() + size_t(s_batch.indices[k]) * s_batch.stride, d9, hv);
-                    const size_t co = tevPath ? 20 : (useTex ? 6 : 4);
-                    const float* tm0 = reinterpret_cast<const float*>(&g.xfMem[0x500 + 60 * 4]);
-                    const float* pm = reinterpret_cast<const float*>(&g.xfMem[(hv.mtx[0] & 63) * 4]);
-                    const float pz = pm[8] * hv.pos[0] + pm[9] * hv.pos[1] + pm[10] * hv.pos[2] + pm[11];
-                    fprintf(s_dbg, "  in %g %g %g mtx %u tc %g,%g %g,%g calcZ %g calcW %g tm60 %g,%g,%g,%g|%g,%g,%g,%g|%g,%g,%g,%g -> %g %g %g %g col %g %g %g %g uv %g,%g %g,%g\n", hv.pos[0], hv.pos[1], hv.pos[2],
-                            (unsigned)hv.mtx[0], hv.tex[0][0], hv.tex[0][1], hv.tex[1][0], hv.tex[1][1], pz, -pz,
-                            tm0[0], tm0[1], tm0[2], tm0[3], tm0[4], tm0[5], tm0[6], tm0[7], tm0[8], tm0[9], tm0[10], tm0[11], o[0], o[1], o[2], o[3],
-                            o[co], o[co + 1], o[co + 2], o[co + 3], tevPath ? o[4] : 0.0f, tevPath ? o[5] : 0.0f,
-                            tevPath ? o[6] : 0.0f, tevPath ? o[7] : 0.0f);
-                }
-                if (texture) {
-                    const uint8_t* t = static_cast<const uint8_t*>(texture->texture.surface.image);
-                    const uint8_t* raw = texture->source;
-                    const uint32_t rawBytes = gx2TexLevelBytes(texture->fmt, texture->width, texture->height);
-                    const uintptr_t rawAddr = reinterpret_cast<uintptr_t>(raw);
-                    const bool rawReadable = raw && rawBytes && rawAddr + rawBytes > rawAddr &&
-                        ((rawAddr >= 0x10000000u && rawAddr + rawBytes <= 0x50000000u) ||
-                         (rawAddr >= 0xF4000000u && rawAddr + rawBytes <= 0xF6000000u));
-                    fprintf(s_dbg, "  src %p base %p image0 %08x image3 %08x raw %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                            (const void*)texture->source, physToPtr(0x20), (unsigned)g.bp[BP_TX_IMAGE0], (unsigned)g.bp[BP_TX_IMAGE3],
-                            rawReadable ? raw[0] : 0, rawReadable ? raw[1] : 0, rawReadable ? raw[2] : 0, rawReadable ? raw[3] : 0,
-                            rawReadable ? raw[4] : 0, rawReadable ? raw[5] : 0, rawReadable ? raw[6] : 0, rawReadable ? raw[7] : 0);
-                    fprintf(s_dbg, "  tex %ux%u fmt %u pitch %u texel0 %u %u %u %u mid %u %u %u %u\n", (unsigned)texture->width, (unsigned)texture->height, (unsigned)texture->fmt,
-                            (unsigned)texture->texture.surface.pitch, t[0], t[1], t[2], t[3], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+1], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+2], t[(texture->height/2*texture->texture.surface.pitch + texture->width/2)*4+3]);
-                }
-                for (const CopyEntry& c : copyCache())
-                    fprintf(s_dbg, "  copycache dest %p tex %ux%u crop %u,%u %ux%u\n", c.dest,
-                            (unsigned)c.tex.width, (unsigned)c.tex.height, (unsigned)c.sourceX,
-                            (unsigned)c.sourceY, (unsigned)c.sourceW, (unsigned)c.sourceH);
-                if (++s_dbgDraws == 120) { fclose(s_dbg); s_dbg = nullptr; }
-            }
-        }
     }
     DCFlushRange(vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo.data(), uint32_t(vbo.size() * sizeof(float)));
@@ -1570,26 +1496,7 @@ void executeCopy(uint32_t ctrl) {
         const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
         copyToTexture(g.copyDest, src & 0x3ff, (src >> 10) & 0x3ff, (size & 0x3ff) + 1,
                       ((size >> 10) & 0x3ff) + 1, (ctrl >> 9) & 1);
-        if (SMS_GX2_DEBUG_DUMP && g_displayFrames > 650) {
-            static uint32_t s_dbgCopies;
-            if (s_dbgCopies < 16) {
-                FILE* f = fopen("fs:/vol/external01/gx2dbg.txt", "a");
-                if (f) {
-                    fprintf(f, "copy frame %u ctrl %08x dest %p src %u,%u size %u,%u half %u\n",
-                            (unsigned)g_displayFrames, (unsigned)ctrl, g.copyDest, (unsigned)(src & 0x3ff),
-                            (unsigned)((src >> 10) & 0x3ff), (unsigned)((size & 0x3ff) + 1),
-                            (unsigned)(((size >> 10) & 0x3ff) + 1), (unsigned)((ctrl >> 9) & 1));
-                    for (uint32_t map = 0; map < 8; ++map) {
-                        if (TextureEntry* e = copyTexture(g.texImage[map]))
-                            fprintf(f, "  cache map %u source %p size %u,%u\n", (unsigned)map,
-                                    (const void*)g.texImage[map], (unsigned)e->width, (unsigned)e->height);
-                    }
-                    fclose(f);
-                }
-                ++s_dbgCopies;
-            }
-        }
-        rebindTvTarget();  // GX2CopySurface leaves its destination bound
+        rebindTvTarget();  // GX2CopySurface may leave its destination bound
     }
     if (!clear) return;
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
@@ -1649,10 +1556,6 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_frameActive) return;
     flushBatch();
-    { static int n = 0;
-      if (SMS_GX2_DEBUG_DUMP && (g_displayFrames % 100) == 0 && n < 40) { FILE* f = fopen("fs:/vol/external01/gx2frames.txt", "a");
-        if (f) { fprintf(f, "frame %u prim %u draws %u verts %u in %u behind %u zout %u stage %s\n", (unsigned)g_displayFrames, s_dbgPrim, s_drawsThisFrame, s_dbgVerts, s_dbgIn, s_dbgBehind, s_dbgZ, sms_wiiu_stage_path()); s_dbgVerts = s_dbgIn = s_dbgBehind = s_dbgZ = 0; g_dbgDLCalls = g_dbgDLBytes = 0; fclose(f); ++n; } }
-      s_dbgPrim = s_dbgApp = 0; }
     GX2Flush();
     s_frameActive = false;
     s_drawsThisFrame = 0;
