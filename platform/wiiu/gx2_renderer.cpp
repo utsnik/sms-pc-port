@@ -194,7 +194,7 @@ static void* alignedZero(size_t alignment, size_t size) {
 // retired the frame that last filled it; an overflowing frame waits for the
 // GPU and starts its arena over.
 static constexpr uint32_t kVertexArenas = 3;
-static constexpr uint32_t kVertexArenaBytes = 8u << 20;
+static constexpr uint32_t kVertexArenaBytes = 16u << 20;  // airstrip: ~107k verts x ~117 B
 static uint8_t* s_vertexArena[kVertexArenas];
 static OSTime s_vertexArenaFence[kVertexArenas];
 static uint32_t s_vertexArenaIndex;
