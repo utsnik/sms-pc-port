@@ -47,6 +47,41 @@ set(SMS_WIIU_OS_ADAPTER_DEFS
   OSWaitCond=sms_wiiu_OSWaitCond
   OSSignalCond=sms_wiiu_OSSignalCond)
 
+# The game's GameCube AI/DSP API shares names with the Wii U's own sndcore2
+# exports, and wut's sndcore2 import stubs are linked once SDL2 (audio.cpp)
+# uses AX. The decomp-facing names are renamed for the game and the port, so
+# sndcore2's definitions stay its own.
+set(SMS_WIIU_SND_ADAPTER_DEFS
+  AIInit=sms_gc_AIInit
+  AICheckInit=sms_gc_AICheckInit
+  AIReset=sms_gc_AIReset
+  AIRegisterDMACallback=sms_gc_AIRegisterDMACallback
+  AIInitDMA=sms_gc_AIInitDMA
+  AIGetDMAEnableFlag=sms_gc_AIGetDMAEnableFlag
+  AIStartDMA=sms_gc_AIStartDMA
+  AIStopDMA=sms_gc_AIStopDMA
+  AIGetDMABytesLeft=sms_gc_AIGetDMABytesLeft
+  AIGetDMAStartAddr=sms_gc_AIGetDMAStartAddr
+  AIGetDMALength=sms_gc_AIGetDMALength
+  AISetDSPSampleRate=sms_gc_AISetDSPSampleRate
+  AIGetDSPSampleRate=sms_gc_AIGetDSPSampleRate
+  DSPInit=sms_gc_DSPInit
+  DSPCheckInit=sms_gc_DSPCheckInit
+  DSPReset=sms_gc_DSPReset
+  DSPHalt=sms_gc_DSPHalt
+  DSPUnhalt=sms_gc_DSPUnhalt
+  DSPAddTask=sms_gc_DSPAddTask
+  DSPCancelTask=sms_gc_DSPCancelTask
+  DSPAssertTask=sms_gc_DSPAssertTask
+  DSPAssertInt=sms_gc_DSPAssertInt
+  DSPGetDMAStatus=sms_gc_DSPGetDMAStatus
+  DSPCheckMailFromDSP=sms_gc_DSPCheckMailFromDSP
+  DSPCheckMailToDSP=sms_gc_DSPCheckMailToDSP
+  DSPReadMailFromDSP=sms_gc_DSPReadMailFromDSP
+  DSPSendMailToDSP=sms_gc_DSPSendMailToDSP
+  DSPQuit=sms_gc_DSPQuit
+)
+
 set(SMS_WIIU_COMMON_SOURCES
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
@@ -107,6 +142,8 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/vi.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/exception.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/pad.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/audio.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_api.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_fifo.cpp
@@ -121,10 +158,10 @@ target_include_directories(sms BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES}
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src
   ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
-target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} ${SMS_WIIU_OS_ADAPTER_DEFS}
-  SMS_AUDIO_DSP_HLE=0 SMS_WIIU_RUN_GAME=1
+target_compile_definitions(sms PRIVATE ${SMS_COMMON_DEFS} ${SMS_WIIU_OS_ADAPTER_DEFS} ${SMS_WIIU_SND_ADAPTER_DEFS}
+  SMS_AUDIO_DSP_HLE=1 SMS_WIIU_RUN_GAME=1
   SMS_WIIU_SKIP_INTRO=$<BOOL:${SMS_WIIU_SKIP_INTRO}>)
-target_compile_definitions(sms_game PRIVATE ${SMS_WIIU_OS_ADAPTER_DEFS})
+target_compile_definitions(sms_game PRIVATE ${SMS_WIIU_OS_ADAPTER_DEFS} ${SMS_WIIU_SND_ADAPTER_DEFS})
 set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/os_core.cpp
   PROPERTIES COMPILE_DEFINITIONS DEBUG=1)
 set_source_files_properties(${SMS_DECOMP}/libs/JSystem/src/JKernel/JKRHeap.cpp
@@ -144,8 +181,10 @@ target_link_options(sms PRIVATE
   "-Wl,-Map,${SMS_WIIU_BUILD_DIR}/sms.map"
   -Wl,--gc-sections
   -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvj)
+# Audio output (audio.cpp): wut's SDL2 port, audio subsystem only.
+find_package(SDL2 REQUIRED CONFIG)
 target_link_libraries(sms PRIVATE
   -Wl,--whole-archive sms_game -Wl,--no-whole-archive
-  wut m)
+  SDL2::SDL2-static wut m)
 
 add_custom_target(sms_wiiu_elf ALL DEPENDS sms)
