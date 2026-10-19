@@ -1129,9 +1129,6 @@ FILE* traceFile();
 enum { kDlRecheckFrames = 30 };
 
 static bool dlCacheEnabled() {
-#ifdef __WIIU__
-    return false;  // TEMP: decode every list while the GX2 renderer is brought up
-#endif
     static int on = -1;
     if (on < 0) {
         const char* e = getenv("SMS_GX_DL_CACHE");

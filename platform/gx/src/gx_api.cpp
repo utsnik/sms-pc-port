@@ -344,9 +344,7 @@ u32 GXEndDisplayList(void) {
     if (n > s_dlSize) logmsg("display list overflow (%u > %u)", n, s_dlSize);
     return n;
 }
-unsigned g_dbgDLCalls, g_dbgDLBytes;
 void GXCallDisplayList(void* list, u32 nbytes) {
-    ++g_dbgDLCalls; g_dbgDLBytes += nbytes;
     if (s_recording) {
         GXPC_Write8(0x40);
         GXPC_Write32(ptrToPhys(list));
