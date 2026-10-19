@@ -3424,11 +3424,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
-                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)s_arenaPeak,
+                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
                      (unsigned)(s_perfGpuVerts / 30), (unsigned)(s_perfCpuVerts / 30),
                      (unsigned)s_vertexRejected,
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
+                     (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
                      (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears);
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
