@@ -166,6 +166,14 @@ void log_stats(int64_t now)
 
 void* pacer(void*)
 {
+	// Opened here, not in AIInit: opening blocks on AX/IPC, and AIInit runs on
+	// JAudio's audio thread inside Kernel::init, before Dvd::init allocates
+	// the buffer of the DVD message queue. Blocking there let the main thread
+	// reach Dvd::dvdProcInit first and initialise that queue with no buffer
+	// (signal 11 in send_message at the first sequence load).
+	g.dev = sms_wiiu_sdl_audio_open(kRate) != 0;
+	if (!g.dev)
+		port_log("[audio] no audio device: pacing AI DMA from the system clock\n");
 	g.statsSince = sms_wiiu_audio_system_time();
 	g.minQueued  = 0xFFFFFFFFu;
 	for (;;) {
@@ -255,9 +263,6 @@ extern "C" void AIInit(u8*)
 		port_log("[audio] SMS_NO_AUDIO: AI DMA idle (no mixing, no output)\n");
 		return;
 	}
-	g.dev = sms_wiiu_sdl_audio_open(kRate) != 0;
-	if (!g.dev)
-		port_log("[audio] no audio device: pacing AI DMA from the system clock\n");
 	if (!OSCreateThread(&s_pacer, pacer, NULL, s_pacer_stack + sizeof s_pacer_stack, sizeof s_pacer_stack,
 	                    kPacerPriority, 1)) {
 		port_log("[audio] could not start the AI pacer thread\n");
