@@ -3,6 +3,9 @@
 #ifndef SMS_GX2_DEBUG_DUMP
 #define SMS_GX2_DEBUG_DUMP 0
 #endif
+#ifndef SMS_GX2_DEBUG_PIXEL_TRACE
+#define SMS_GX2_DEBUG_PIXEL_TRACE 0
+#endif
 #ifndef SMS_GX2_DEBUG_DRAW_LIMIT
 #define SMS_GX2_DEBUG_DRAW_LIMIT 0
 #endif
@@ -61,6 +64,9 @@ uint64_t g_statHiresBytes = 0;
 static bool s_ready;
 static bool s_frameActive;
 static bool initTevVertex();
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+static void debugPixelTrace(uint32_t draw);
+#endif
 
 struct FixedShader {
     GX2VertexShader vertex;
@@ -1730,6 +1736,22 @@ void flushBatch() {
         }
     }
     const uint32_t debugDrawNo = s_debugDrawNo++;
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+    if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) == SMS_GX2_DEBUG_PIXEL_TRACE - 1 && g_displayFrames >= 1000 && tevPath) {
+        float lo[5] = {9, 9, 9, 1e30f, 0}, hi[5] = {-9, -9, -9, -1e30f, 0};
+        uint32_t neg = 0;
+        for (size_t at = 0; at + 28 <= vbo.size(); at += 28) {
+            for (int c = 0; c < 3; ++c) { lo[c] = std::min(lo[c], vbo[at + 20 + c]); hi[c] = std::max(hi[c], vbo[at + 20 + c]); }
+            lo[3] = std::min(lo[3], vbo[at + 3]); hi[3] = std::max(hi[3], vbo[at + 3]);
+            if (vbo[at + 3] <= 0.0f) ++neg;
+        }
+        WHBLogPrintf("SMS Wii U: DRAWSTAT frame=%u draw=%u st=%u ce0=%06x ae0=%06x ord0=%03x cm=%08x z=%02x xf5=%u n=%u ras0=(%.3f-%.3f,%.3f-%.3f,%.3f-%.3f) w=%.1f..%.1f neg=%u",
+                     (unsigned)g_displayFrames, (unsigned)debugDrawNo, (unsigned)tevKey.stages,
+                     (unsigned)tevKey.colorEnv[0], (unsigned)tevKey.alphaEnv[0], (unsigned)tevKey.order[0],
+                     (unsigned)g.bp[BP_CMODE0], (unsigned)(g.bp[BP_ZMODE] & 0xff), (unsigned)g.xfReg[0x05],
+                     (unsigned)(vbo.size() / 28), lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3], (unsigned)neg);
+    }
+#endif
     debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
               s_batch.count, haveFirst ? &firstHv : nullptr, firstOut);
     if (SMS_GX2_DEBUG_DRAW_LIMIT && debugDrawNo >= SMS_GX2_DEBUG_DRAW_LIMIT) {
@@ -1744,6 +1766,9 @@ void flushBatch() {
     GX2DrawEx(mode, uint32_t(s_batch.indices.size()), 0, 1);
     ++s_drawsThisFrame;
     GX2DrawDone();
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+    debugPixelTrace(debugDrawNo);
+#endif
     s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
 }
 
@@ -1778,6 +1803,13 @@ void executeCopy(uint32_t ctrl) {
             s_frameClear[3] = ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f;
             s_frameClearPending = ((g.bp[BP_CMODE0] >> 3) & 1) != 0;
         }
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+        if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) >= SMS_GX2_DEBUG_PIXEL_TRACE - 2 && g_displayFrames >= 1000)
+            WHBLogPrintf("SMS Wii U: DISPCOPY frame=%u ctrl=%08x clear=%d cm=%08x pe=%08x ar=%08x gb=%08x z=%08x zmode=%08x pending=%d",
+                         (unsigned)g_displayFrames, (unsigned)ctrl, (int)clear, (unsigned)g.bp[BP_CMODE0],
+                         (unsigned)g.bp[BP_PE_CONTROL], (unsigned)g.bp[BP_CLEAR_AR], (unsigned)g.bp[BP_CLEAR_GB],
+                         (unsigned)g.bp[BP_CLEAR_Z], (unsigned)g.bp[BP_ZMODE], (int)s_frameClearPending);
+#endif
         return;
     }
     if (!s_frameActive || !ProcUIInForeground()) return;
@@ -1798,7 +1830,112 @@ void executeCopy(uint32_t ctrl) {
     rebindTvTarget();
 }
 void markXfMemDirty() { SMS_PORT_HEAP_SCOPE(); if (!s_batch.indices.empty()) flushBatch(); }
-uint32_t peekColor(int, int) { return 0; }
+// GXPeekARGB: the game reads the EFB back through the CPU. Sunshine's Mario
+// occlusion probe draws a cube that writes destination alpha 0x10 and peeks
+// Mario's screen position from a draw-sync callback; a stub answer made the
+// game believe Mario was always hidden and draw his silhouette every frame.
+//
+// The TV target is tiled, so the GPU copies it into a LINEAR_ALIGNED surface
+// of the same size, and the texel is read after the GPU has finished; only
+// the cache lines read are invalidated.
+//
+// Under Cemu that copy never reaches guest memory (the texel read 0). Cemu
+// performs a LINEAR_SPECIAL copy (which GX2 runs on the CPU) synchronously
+// from its texture cache, so the emulator reads through one more copy into
+// such a surface, issued after the GPU copy (alone it also read 0). On the
+// console the special copy would make the CPU detile the whole target for
+// every peek, so it is not used there.
+static GX2Surface s_peekSurface, s_peekSpecial;
+static bool s_peekSurfaceReady;
+static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
+    GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
+    if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
+    if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
+    if (s_peekSurfaceReady && (s_peekSurface.width != cb->surface.width ||
+                               s_peekSurface.height != cb->surface.height)) {
+        MEMFreeToDefaultHeap(s_peekSurface.image);
+        if (s_peekSpecial.image) MEMFreeToDefaultHeap(s_peekSpecial.image);
+        s_peekSpecial.image = nullptr;
+        s_peekSurfaceReady = false;
+    }
+    const bool cemu = runningUnderCemu();
+    if (!s_peekSurfaceReady) {
+        memset(&s_peekSurface, 0, sizeof(s_peekSurface));
+        s_peekSurface.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+        s_peekSurface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        s_peekSurface.width = cb->surface.width;
+        s_peekSurface.height = cb->surface.height;
+        s_peekSurface.depth = 1;
+        s_peekSurface.mipLevels = 1;
+        s_peekSurface.format = cb->surface.format;
+        s_peekSurface.aa = GX2_AA_MODE1X;
+        s_peekSurface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        GX2CalcSurfaceSizeAndAlignment(&s_peekSurface);
+        s_peekSurface.image = alignedZero(s_peekSurface.alignment, s_peekSurface.imageSize);
+        if (!s_peekSurface.image) return false;
+        // The zero fill must not be written back over the GPU's copy later.
+        DCFlushRange(s_peekSurface.image, s_peekSurface.imageSize);
+        if (cemu) {
+            s_peekSpecial = s_peekSurface;
+            s_peekSpecial.image = nullptr;
+            s_peekSpecial.tileMode = GX2_TILE_MODE_LINEAR_SPECIAL;
+            GX2CalcSurfaceSizeAndAlignment(&s_peekSpecial);
+            s_peekSpecial.image = alignedZero(s_peekSpecial.alignment, s_peekSpecial.imageSize);
+            if (!s_peekSpecial.image) { MEMFreeToDefaultHeap(s_peekSurface.image); return false; }
+        }
+        s_peekSurfaceReady = true;
+    }
+    // Make every queued draw land in memory before the copy reads the target.
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+    GX2DrawDone();
+    GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0);
+    GX2DrawDone();
+    if (cemu) GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0);
+    rebindTvTarget();
+    const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
+        uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
+        if (px >= linear.width) px = linear.width - 1;
+        if (py >= linear.height) py = linear.height - 1;
+        uint8_t* texel = static_cast<uint8_t*>(linear.image) + (size_t(py) * linear.pitch + px) * 4;
+        DCInvalidateRange(texel, 4);
+        out[i] = uint32_t(texel[3]) << 24 | uint32_t(texel[0]) << 16 | uint32_t(texel[1]) << 8 | texel[2];
+    }
+    return true;
+}
+
+uint32_t peekColor(int x, int y) {
+    SMS_PORT_HEAP_SCOPE();
+    flushBatch();
+    if (x < 0 || y < 0) return 0;
+    const int point[1][2] = {{x, y}};
+    uint32_t c = 0;
+    if (!readTvPixels(point, 1, &c)) return 0;
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+    static uint32_t n;
+    if (n++ < 20 || (g_displayFrames % 50) == 0)
+        WHBLogPrintf("SMS Wii U: PEEK frame=%u (%d,%d) = %08x", (unsigned)g_displayFrames, x, y, (unsigned)c);
+#endif
+    return c;
+}
+
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+// Debug: the TV target's ARGB at a few game-space points after every draw of
+// one frame in SMS_GX2_DEBUG_PIXEL_TRACE, logged when a value changes.
+static void debugPixelTrace(uint32_t draw) {
+    if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) != SMS_GX2_DEBUG_PIXEL_TRACE - 1 || g_displayFrames < 1000) return;
+    static const int points[4][2] = {{330, 250}, {320, 313}, {100, 330}, {320, 30}};
+    static uint32_t last[4];
+    uint32_t v[4];
+    if (draw == 0) memset(last, 0xff, sizeof(last));
+    if (!readTvPixels(points, 4, v)) return;
+    if (!memcmp(v, last, sizeof(v))) return;
+    memcpy(last, v, sizeof(v));
+    WHBLogPrintf("SMS Wii U: PIXTRACE frame=%u draw=%u hz=%08x seaA=%08x seaC=%08x top=%08x",
+                 (unsigned)g_displayFrames, (unsigned)draw, (unsigned)v[0], (unsigned)v[1], (unsigned)v[2], (unsigned)v[3]);
+}
+#endif
 uint32_t peekZ(int, int) { return 0xffffff; }
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
@@ -1841,6 +1978,15 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     GX2SetScissor(0, 0, uint32_t(s_tvW), uint32_t(s_tvH));
     s_frameActive = true;
+#if SMS_GX2_DEBUG_PIXEL_TRACE
+    if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) >= SMS_GX2_DEBUG_PIXEL_TRACE - 2 && g_displayFrames >= 1000) {
+        static const int points[4][2] = {{330, 250}, {320, 313}, {100, 330}, {320, 30}};
+        uint32_t v[4] = {};
+        readTvPixels(points, 4, v);
+        WHBLogPrintf("SMS Wii U: BEGIN frame=%u hz=%08x seaA=%08x seaC=%08x top=%08x", (unsigned)g_displayFrames,
+                     (unsigned)v[0], (unsigned)v[1], (unsigned)v[2], (unsigned)v[3]);
+    }
+#endif
     GX2SetRasterizerClipControlHalfZ(TRUE, g.xfReg[0x05] == 0, TRUE);
 }
 // Sunshine runs at 30 fps and waits two retraces per game frame; presenting at
