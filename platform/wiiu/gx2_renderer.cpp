@@ -2628,6 +2628,29 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
                          unsigned(t.texture.surface.tileMode), unsigned(t.texture.surface.pitch),
                          unsigned(t.texture.surface.imageSize), t.texture.surface.image);
     }
+    // The copy's texture format picks the EFB channels the texture holds
+    // (genFS's copy shader on the PC): R8 is an intensity of red, RA8 red and
+    // alpha, A8 alpha, ... The copy keeps the EFB's RGBA and the texture's
+    // component selectors read it as the format would; an EFB without alpha
+    // reads alpha as one.
+    const uint32_t a = (g.bp[BP_PE_CONTROL] & 7) == 1 ? GX2_SQ_SEL_A : GX2_SQ_SEL_1;
+    const uint32_t R = GX2_SQ_SEL_R, G = GX2_SQ_SEL_G, B = GX2_SQ_SEL_B;
+    uint32_t compMap;
+    switch (fmt) {
+    case 0: case 8: compMap = GX2_COMP_MAP(R, R, R, R); break;                          // R4, R8
+    case 2: case 3: compMap = GX2_COMP_MAP(R, R, R, a); break;                          // RA4, RA8
+    case 4: compMap = GX2_COMP_MAP(R, G, B, GX2_SQ_SEL_1); break;                       // RGB565
+    case 7: compMap = GX2_COMP_MAP(a, a, a, a); break;                                  // A8
+    case 9: compMap = GX2_COMP_MAP(G, G, G, G); break;                                  // G8
+    case 10: compMap = GX2_COMP_MAP(B, B, B, B); break;                                 // B8
+    case 11: compMap = GX2_COMP_MAP(G, G, G, R); break;                                 // RG8 (IA8 layout)
+    case 12: compMap = GX2_COMP_MAP(B, B, B, G); break;                                 // GB8 (IA8 layout)
+    default: compMap = GX2_COMP_MAP(R, G, B, a); break;                                 // RGBA8, RGB5A3
+    }
+    if (e->tex.texture.compMap != compMap) {
+        e->tex.texture.compMap = compMap;
+        GX2InitTextureRegs(&e->tex.texture);
+    }
     if (cemu) {
         GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0); invalidateVertexUniforms();
     } else {
