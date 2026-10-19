@@ -287,6 +287,22 @@ static void uploadXfUniformRanges() {
     s_xfMemoryDirty = false;
 }
 
+static bool validateLatteVertexEncodings() {
+    const uint64_t mova = ALU_MOVA_INT(__, _x, _R(15), _x);
+    const uint64_t relative = ALU_MOV_REL_CONST(__, _x, _GX2_C(7), _y);
+    const uint32_t movaWord1 = __builtin_bswap32(uint32_t(mova));
+    const uint32_t relativeWord0 = __builtin_bswap32(uint32_t(relative >> 32));
+    const bool movaOk = ((movaWord1 >> 7) & 0xff) == ALU_OP2_INST_MOVA_INT;
+    const bool relativeOk = ((relativeWord0 >> 9) & 1) != 0 &&
+                            (relativeWord0 & 0x1ff) == (_GX2_C(7) & 0x1ff);
+    if (!movaOk || !relativeOk) {
+        WHBLogPrintf("SMS Wii U: Latte relative-address microcheck failed mova=%08x rel=%08x",
+                     (unsigned)movaWord1, (unsigned)relativeWord0);
+        return false;
+    }
+    return true;
+}
+
 // Vertex streams live in per-frame arenas the GPU reads after the draw call
 // returns, so a draw no longer waits for the GPU (GX2DrawDone per draw cost
 // most of the frame on hardware). An arena is reused only after the GPU has
@@ -502,6 +518,7 @@ static bool initShader(FixedShader& shader, const unsigned char* vs, size_t vsSi
 }
 
 static bool initShaders() {
+    if (!validateLatteVertexEncodings()) return false;
     if (!initShader(s_untextured, dkr_untextured_vs, sizeof(dkr_untextured_vs), dkr_untextured_vs_regs,
                     dkr_untextured_ps, sizeof(dkr_untextured_ps), dkr_untextured_ps_regs, false)) return false;
     if (!initShader(s_modulate, dkr_modulate_vs, sizeof(dkr_modulate_vs), dkr_modulate_vs_regs,
