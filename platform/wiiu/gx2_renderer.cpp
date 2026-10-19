@@ -36,6 +36,7 @@
 #include <gx2/utils.h>
 #include <coreinit/title.h>
 #include <coreinit/cache.h>
+#include <coreinit/time.h>
 #include <whb/gfx.h>
 #include <proc_ui/procui.h>
 #include <whb/log.h>
@@ -1918,6 +1919,15 @@ bool batchUsesArena() { return false; }
 
 static uint32_t s_drawsThisFrame;
 static uint32_t s_debugDrawNo;
+// Per-frame CPU cost of the renderer, logged with the [perf] line.
+static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
+static uint32_t s_perfDraws, s_perfVerts, s_perfFrames;
+struct PerfScope {
+    OSTime& acc; OSTime t0;
+    explicit PerfScope(OSTime& a) : acc(a), t0(OSGetTime()) {}
+    ~PerfScope() { acc += OSGetTime() - t0; }
+};
+
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
     if (s_batch.indices.empty()) return;
@@ -1925,6 +1935,8 @@ void flushBatch() {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
     }
+    PerfScope perfFlush(s_perfFlush);
+    OSTime perfTex0 = OSGetTime();
     const TevKey tevKey = currentTevKey();
     const bool textured = tevTextureMask(tevKey) != 0;
     TextureEntry* tevTextures[8] = {};
@@ -1954,6 +1966,7 @@ void flushBatch() {
     // The vertex layout must follow the shader actually bound: a material that
     // samples a texture we could not load still draws through the stage-1
     // fallback (8 or 10 floats), while the TEV path uses 28 floats.
+    s_perfTex += OSGetTime() - perfTex0;
     const bool useTex = !tevPath && textured && texture;
     FixedShader& shader = useTex ? s_modulate : s_untextured;
     applyState();
@@ -1971,6 +1984,7 @@ void flushBatch() {
         return;
     }
     size_t vboFloats = 0;
+    OSTime perfXform0 = OSGetTime();
     HostVertex firstHv;
     float firstOut[28] = {};
     bool haveFirst = false;
@@ -1993,6 +2007,9 @@ void flushBatch() {
             haveFirst = true;
         }
     }
+    s_perfXform += OSGetTime() - perfXform0;
+    ++s_perfDraws;
+    s_perfVerts += uint32_t(s_batch.indices.size());
     const uint32_t debugDrawNo = s_debugDrawNo++;
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) == SMS_GX2_DEBUG_PIXEL_TRACE - 1 && g_displayFrames >= 1000 && tevPath) {
@@ -2262,9 +2279,18 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     endVertexArena();
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
-    if ((g_displayFrames % 300) == 0)
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u vertexArenaPeak=%u overflows=%u",
-                     (unsigned)g_displayFrames, (unsigned)s_arenaPeak, (unsigned)s_vertexArenaOverflows);
+    const OSTime perfNow = OSGetTime();
+    if (s_perfLastEnd) s_perfWall += perfNow - s_perfLastEnd;
+    s_perfLastEnd = perfNow;
+    if (++s_perfFrames == 30) {
+        const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u flush=%u tex=%u xform=%u draws=%u verts=%u arenaPeak=%u overflows=%u",
+                     (unsigned)g_displayFrames, ms(s_perfWall), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
+                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)s_arenaPeak,
+                     (unsigned)s_vertexArenaOverflows);
+        s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
+        s_perfDraws = s_perfVerts = s_perfFrames = 0;
+    }
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;

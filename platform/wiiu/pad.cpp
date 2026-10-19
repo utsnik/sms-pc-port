@@ -4,6 +4,8 @@
 #include <padscore/kpad.h>
 #include <padscore/wpad.h>
 #include <vpad/input.h>
+#include <coreinit/time.h>
+#include <sysapp/launch.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -303,6 +305,20 @@ void sms_wiiu_input_poll(void)
 				s_status[0].button |= PAD_BUTTON_START | PAD_BUTTON_A;
 				if (n == at)
 					port_log("[pad] autopress START+A at poll %u\n", (unsigned)n);
+			}
+		}
+		/* Unattended runs end themselves, so the next wiiload finds the
+		 * console at the Menu (wiiload into a running title wedges it). */
+		static OSTime s_marker_start;
+		static bool s_exit_requested;
+		if (s_marker && !s_exit_requested) {
+			const OSTime now = OSGetTime();
+			if (!s_marker_start)
+				s_marker_start = now;
+			else if (OSTicksToSeconds(now - s_marker_start) >= 180) {
+				s_exit_requested = true;
+				port_log("[pad] autopress run over (180 s): returning to the Menu\n");
+				SYSLaunchMenu();
 			}
 		}
 	}
