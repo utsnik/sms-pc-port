@@ -481,7 +481,7 @@ static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32
         tevEmitAlu(program, {ALU_MUL(_R(16), channel, _R(16), channel, c.sel, c.chan)});
         tevEmitAlu(program, {ALU_ADD(_R(dest), channel, d.sel, d.chan, _R(16), channel)});
         if (clamp)
-            tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, _R(16), channel), true)});
+            tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, _R(dest), channel), true)});
         return;
     }
     tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel _NEG, a.chan)});
