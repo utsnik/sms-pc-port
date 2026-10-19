@@ -529,10 +529,12 @@ static bool initTevVertex() {
     program.reserve(64);
     program.push_back(CALL_FS NO_BARRIER);
     program.push_back(EXP_DONE(POS0, _R(1), _x, _y, _z, _w));
+    // The last export of each type must be EXPORT_DONE: as a plain EXPORT the
+    // final parameter (colour channel 1) never reached the pixel shader, which
+    // read it as 0 (Mario's material takes its alpha from channel 1).
     for (uint32_t i = 0; i < 10; ++i) {
-        const uint64_t exp = EXP(i == 9 ? PARAM(9) : PARAM(i), _R(2 + i), _x, _y, _z, _w);
-        if (i == 9) program.push_back(exp END_OF_PROGRAM);
-        else program.push_back(exp NO_BARRIER);
+        if (i == 9) program.push_back(EXP_DONE(PARAM(9), _R(2 + i), _x, _y, _z, _w) END_OF_PROGRAM);
+        else program.push_back(EXP(PARAM(i), _R(2 + i), _x, _y, _z, _w) NO_BARRIER);
     }
     s_tevVertexProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, program.size() * sizeof(uint64_t));
     if (!s_tevVertexProgram) return false;
