@@ -1205,37 +1205,35 @@ static bool initVertexProgram(VertexProgram& shader) {
         vertexEmit(alu, {ALU_ADD(_R(20), _w, ALU_SRC_0, _x, _R(40), _z _NEG)});
     }
     // viewport -> TV clip coordinates. C186 is the six-value viewport block;
-    // C187.zw are game scale/X and C188.xy are TV dimensions.
+    // C187.x/y/z/w are game scale, game X, and TV dimensions. Keep this
+    // algebra identical to transformPosition: the generated path must land
+    // in the same 640x480 letterboxed rectangle as the CPU reference.
     vertexEmit(alu, {ALU_MUL(_R(54), _x, _GX2_C(kVtxLiveBase + 2), _z,
-                             _GX2_C(kVtxLiveBase + 3), _z)});
+                             _GX2_C(kVtxLiveBase + 3), _x)});
     vertexEmit(alu, {ALU_MUL(_R(54), _x, _R(54), _x, ALU_SRC_0_5, _x)});
     vertexEmit(alu, {ALU_MUL(_R(54), _y, _GX2_C(kVtxLiveBase + 2), _w,
-                             _GX2_C(kVtxLiveBase + 3), _z)});
+                             _GX2_C(kVtxLiveBase + 3), _x)});
     vertexEmit(alu, {ALU_MUL(_R(54), _y, _R(54), _y, ALU_SRC_0_5, _x)});
-    vertexEmit(alu, {ALU_MUL(_R(55), _x, _GX2_C(kVtxLiveBase + 2), _x,
-                             _GX2_C(kVtxLiveBase + 3), _z)});
-    vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _GX2_C(kVtxLiveBase + 3), _w)});
+    vertexEmit(alu, {ALU_MULADD(_R(55), _x, _GX2_C(kVtxLiveBase + 2), _x,
+                                _GX2_C(kVtxLiveBase + 3), _x,
+                                _R(54), _x)});
+    vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _GX2_C(kVtxLiveBase + 3), _y)});
     vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _R(54), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(55), _y, _GX2_C(kVtxLiveBase + 2), _y,
-                             _GX2_C(kVtxLiveBase + 3), _z)});
-    vertexEmit(alu, {ALU_ADD(_R(55), _y, _R(55), _y, _R(54), _y)});
-    vertexEmit(alu, {ALU_MULADD(_R(55), _x, _R(55), _x, _R(20), _w, _R(54), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(56), _x, _R(54), _y, _R(20), _y)});
-    vertexEmit(alu, {ALU_MULADD(_R(55), _y, _R(55), _y, _R(20), _w, _R(56), _x _NEG)});
-    vertexEmit(alu, {ALU_MUL_x2(_R(55), _x, _R(55), _x, ALU_SRC_1, _x)});
-    vertexEmit(alu, {ALU_MUL_x2(_R(55), _y, _R(55), _y, ALU_SRC_1, _x)});
-    vertexEmit(alu, {ALU_MUL(_R(56), _x, _GX2_C(kVtxLiveBase + 4), _x,
-                             _GX2_C(kVtxLiveBase + 4), _x)});
-    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _R(56), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(55), _x, _R(55), _x, _R(56), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(56), _x, _GX2_C(kVtxLiveBase + 4), _y,
-                             _GX2_C(kVtxLiveBase + 4), _y)});
-    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _R(56), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(55), _y, _R(55), _y, _R(56), _x)});
+    vertexEmit(alu, {ALU_MULADD(_R(55), _y, _GX2_C(kVtxLiveBase + 2), _y,
+                                _GX2_C(kVtxLiveBase + 3), _x,
+                                _R(54), _y)});
+    vertexEmit(alu, {ALU_MUL(_R(55), _x, _R(55), _x, _R(20), _w)});
+    vertexEmit(alu, {ALU_MULADD(_R(55), _x, _R(54), _x, _R(20), _x, _R(55), _x)});
+    vertexEmit(alu, {ALU_MUL(_R(55), _y, _R(55), _y, _R(20), _w)});
+    vertexEmit(alu, {ALU_MULADD(_R(55), _y, _R(54), _y, _R(20), _y _NEG, _R(55), _y)});
+    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 3), _z)});
+    vertexEmit(alu, {ALU_MUL_x2(_R(55), _x, _R(55), _x, _R(56), _x)});
+    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 3), _w)});
+    vertexEmit(alu, {ALU_MUL_x2(_R(55), _y, _R(55), _y, _R(56), _x)});
     vertexEmit(alu, {ALU_ADD(_R(20), _x, _R(55), _x, _R(20), _w _NEG)});
     vertexEmit(alu, {ALU_ADD(_R(20), _y, _R(20), _w, _R(55), _y _NEG)});
-    vertexEmit(alu, {ALU_MULADD(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _w, _R(20), _w,
-                                _GX2_C(kVtxLiveBase + 4), _z)});
+    vertexEmit(alu, {ALU_MUL(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _y, _R(20), _w)});
+    vertexEmit(alu, {ALU_MULADD(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _x, _R(20), _z, _R(20), _z)});
 
     if (key.outputMode) {
         // The fixed pixel programs consume the old five-parameter contract:
