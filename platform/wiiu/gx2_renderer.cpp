@@ -184,6 +184,43 @@ static void* alignedZero(size_t alignment, size_t size) {
     return p;
 }
 
+// Vertex streams live in per-frame arenas the GPU reads after the draw call
+// returns, so a draw no longer waits for the GPU (GX2DrawDone per draw cost
+// most of the frame on hardware). An arena is reused only after the GPU has
+// retired the frame that last filled it; an overflowing frame waits for the
+// GPU and starts its arena over.
+static constexpr uint32_t kVertexArenas = 3;
+static constexpr uint32_t kVertexArenaBytes = 8u << 20;
+static uint8_t* s_vertexArena[kVertexArenas];
+static OSTime s_vertexArenaFence[kVertexArenas];
+static uint32_t s_vertexArenaIndex;
+static uint32_t s_vertexArenaUsed;
+static uint32_t s_vertexArenaOverflows;
+
+static void beginVertexArena() {
+    s_vertexArenaIndex = (s_vertexArenaIndex + 1) % kVertexArenas;
+    s_vertexArenaUsed = 0;
+    if (s_vertexArenaFence[s_vertexArenaIndex]) GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
+}
+
+static void endVertexArena() {
+    s_vertexArenaFence[s_vertexArenaIndex] = GX2GetLastSubmittedTimeStamp();
+}
+
+static float* allocVertices(uint32_t bytes) {
+    uint8_t*& arena = s_vertexArena[s_vertexArenaIndex];
+    if (!arena) arena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kVertexArenaBytes, 256));
+    if (!arena || bytes > kVertexArenaBytes) return nullptr;
+    if (s_vertexArenaUsed + bytes > kVertexArenaBytes) {
+        GX2DrawDone();
+        s_vertexArenaUsed = 0;
+        ++s_vertexArenaOverflows;
+    }
+    float* p = reinterpret_cast<float*>(arena + s_vertexArenaUsed);
+    s_vertexArenaUsed = (s_vertexArenaUsed + bytes + 255) & ~255u;
+    return p;
+}
+
 static void destroyShader(FixedShader& shader) {
     MEMFreeToDefaultHeap(shader.vsProgram);
     MEMFreeToDefaultHeap(shader.psProgram);
@@ -1111,6 +1148,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     const uint32_t logicalW = half ? (w + 1) / 2 : w, logicalH = half ? (h + 1) / 2 : h;
     const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
     if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
+        GX2DrawDone(); // earlier draws this frame may still sample it
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
         e->tex.valid = false;
     }
@@ -1921,13 +1959,18 @@ void flushBatch() {
     applyState();
     if (tevPath) setTevShader(*tevShader, tevTextures);
     else setShader(shader, texture);
-    std::vector<float> vbo;
     // GX2DrawEx is the well-tested path on Wii U (and avoids relying on the
     // lifetime/placement rules of a CPU-side index pointer).  Expand the
     // already-decoded index list into a contiguous vertex stream for stage 1.
     const size_t vertexFloats = tevPath ? 28 : (useTex ? 10 : 8);
     const uint32_t vertexStride = uint32_t(vertexFloats * sizeof(float));
-    vbo.reserve(s_batch.indices.size() * vertexFloats);
+    const uint32_t vboBytes = uint32_t(s_batch.indices.size() * vertexFloats * sizeof(float));
+    float* vbo = allocVertices(vboBytes);
+    if (!vbo) {
+        s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+        return;
+    }
+    size_t vboFloats = 0;
     HostVertex firstHv;
     float firstOut[28] = {};
     bool haveFirst = false;
@@ -1940,13 +1983,13 @@ void flushBatch() {
                                      uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
                                      uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
         unpackVertex(s_batch.fmt, packed, defaults, hv);
-        const size_t at = vbo.size();
-        vbo.resize(at + vertexFloats);
-        if (tevPath) transformTev(hv, vbo.data() + at, tevKey, tevTextures);
-        else transform(hv, vbo.data() + at, coord, useTex, texture);
+        const size_t at = vboFloats;
+        vboFloats += vertexFloats;
+        if (tevPath) transformTev(hv, vbo + at, tevKey, tevTextures);
+        else transform(hv, vbo + at, coord, useTex, texture);
         if (!haveFirst) {
             firstHv = hv;
-            memcpy(firstOut, vbo.data() + at, vertexFloats * sizeof(float));
+            memcpy(firstOut, vbo + at, vertexFloats * sizeof(float));
             haveFirst = true;
         }
     }
@@ -1955,7 +1998,7 @@ void flushBatch() {
     if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) == SMS_GX2_DEBUG_PIXEL_TRACE - 1 && g_displayFrames >= 1000 && tevPath) {
         float lo[5] = {9, 9, 9, 1e30f, 9}, hi[5] = {-9, -9, -9, -1e30f, -9};
         uint32_t neg = 0;
-        for (size_t at = 0; at + 28 <= vbo.size(); at += 28) {
+        for (size_t at = 0; at + 28 <= vboFloats; at += 28) {
             for (int c = 0; c < 3; ++c) { lo[c] = std::min(lo[c], vbo[at + 20 + c]); hi[c] = std::max(hi[c], vbo[at + 20 + c]); }
             lo[3] = std::min(lo[3], vbo[at + 3]); hi[3] = std::max(hi[3], vbo[at + 3]);
             if (vbo[at + 3] <= 0.0f) ++neg;
@@ -1964,7 +2007,7 @@ void flushBatch() {
                      (unsigned)g_displayFrames, (unsigned)debugDrawNo, (unsigned)tevKey.stages,
                      (unsigned)tevKey.colorEnv[0], (unsigned)tevKey.alphaEnv[0], (unsigned)tevKey.order[0],
                      (unsigned)g.bp[BP_CMODE0], (unsigned)(g.bp[BP_ZMODE] & 0xff), (unsigned)g.xfReg[0x05],
-                     (unsigned)(vbo.size() / 28), lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3], (unsigned)neg);
+                     (unsigned)(vboFloats / 28), lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], lo[3], hi[3], (unsigned)neg);
     }
 #endif
     debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
@@ -1973,14 +2016,13 @@ void flushBatch() {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
     }
-    DCFlushRange(vbo.data(), uint32_t(vbo.size() * sizeof(float)));
-    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo.data(), uint32_t(vbo.size() * sizeof(float)));
-    GX2SetAttribBuffer(0, uint32_t(vbo.size() * sizeof(float)), tevPath ? vertexStride : shader.stride, vbo.data());
+    DCFlushRange(vbo, vboBytes);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo, vboBytes);
+    GX2SetAttribBuffer(0, vboBytes, tevPath ? vertexStride : shader.stride, vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
     GX2DrawEx(mode, uint32_t(s_batch.indices.size()), 0, 1);
     ++s_drawsThisFrame;
-    GX2DrawDone();
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     debugPixelTrace(debugDrawNo);
 #endif
@@ -2175,6 +2217,7 @@ extern "C" int sms_wiiu_gx2_renderer_init(void) {
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
+    beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState());
     GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
@@ -2216,6 +2259,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     if (!s_frameActive) return;
     flushBatch();
     GX2Flush();
+    endVertexArena();
+    static uint32_t s_arenaPeak;
+    s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
+    if ((g_displayFrames % 300) == 0)
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u vertexArenaPeak=%u overflows=%u",
+                     (unsigned)g_displayFrames, (unsigned)s_arenaPeak, (unsigned)s_vertexArenaOverflows);
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;
