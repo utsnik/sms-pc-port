@@ -123,6 +123,7 @@
 #define ALU_OP2_INST_MOVA_INT 0x18
 #define ALU_OP2_INST_MULLO_INT 0x73
 #define ALU_OP2_INST_LSHL_INT 0x72
+#define ALU_OP2_INST_ADD_INT 0x34
 #define ALU_OP2_INST_LSHR_INT 0x71
 #define ALU_OP2_INST_INT_TO_FLT 0x6c
 #define ALU_OP2_INST_FLT_TO_INT 0x6b
@@ -149,6 +150,8 @@
     ALU_OP2(ALU_OP2_INST_FLT_TO_INT, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
 #define ALU_INT_TO_FLT(dstGpr, dstChan, src0Sel, src0Chan) \
     ALU_OP2(ALU_OP2_INST_INT_TO_FLT, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
+#define ALU_ADD_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_ADD_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
 #define ALU_RECIP_IEEE(dstGpr, dstChan, src0Sel, src0Chan) \
     ALU_OP2(ALU_OP2_INST_RECIP_IEEE, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
 #define ALU_RECIPSQRT_IEEE(dstGpr, dstChan, src0Sel, src0Chan) \
