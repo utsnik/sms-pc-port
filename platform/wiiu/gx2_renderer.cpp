@@ -200,6 +200,7 @@ struct VertexProgram {
     void* vsProgram;
     void* fetchProgram;
     uint32_t stride;
+    bool warmed;
     bool failed;
 };
 static const char* s_vertexRejectReason = "unknown";
@@ -3029,7 +3030,12 @@ void flushBatch() {
     FixedShader& shader = useTex ? s_modulate : s_untextured;
     const VertexKey vertexKey = currentVertexKey(tevPath, coord, useTex);
     VertexProgram* vertex = s_gpuXfEnabled ? vertexShaderForKey(vertexKey) : nullptr;
-    const bool gpuPath = vertex != nullptr;
+    // Let the CPU reference present one complete draw before Cemu/Cafe first
+    // compiles a new generated pipeline.  Compilation is synchronous on Cemu;
+    // without this priming draw the old render target remains black during
+    // startup even though the CPU path already has the correct file-select
+    // frame.  Each key is primed once, so steady-state draws stay GPU-only.
+    const bool gpuPath = vertex != nullptr && vertex->warmed;
     applyState();
     if (tevPath) setTevShader(*tevShader, tevTextures, gpuPath ? vertex : nullptr);
     else setShader(shader, texture, gpuPath ? vertex : nullptr);
@@ -3107,6 +3113,7 @@ void flushBatch() {
         ++s_perfCpuDraws;
         s_perfCpuVerts += uint32_t(s_batch.indices.size());
     }
+    if (vertex && !vertex->warmed) vertex->warmed = true;
     const uint32_t debugDrawNo = s_debugDrawNo++;
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) == SMS_GX2_DEBUG_PIXEL_TRACE - 1 && g_displayFrames >= 1000 && tevPath && !gpuPath) {
