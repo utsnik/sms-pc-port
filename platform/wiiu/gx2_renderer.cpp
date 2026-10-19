@@ -199,6 +199,22 @@ static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 
+// GPU-read memory released mid-frame (linear texture staging) is freed once
+// the fence of the frame that queued it has retired.
+struct DeferredFree { void* p; uint32_t arena; };
+static DeferredFree s_deferredFree[256];
+static uint32_t s_deferredFreeCount;
+
+static void deferFree(void* p) {
+    if (!p) return;
+    if (s_deferredFreeCount == 256) {
+        GX2DrawDone();
+        for (uint32_t i = 0; i < s_deferredFreeCount; ++i) MEMFreeToDefaultHeap(s_deferredFree[i].p);
+        s_deferredFreeCount = 0;
+    }
+    s_deferredFree[s_deferredFreeCount++] = {p, s_vertexArenaIndex};
+}
+
 static void beginVertexArena() {
     s_vertexArenaIndex = (s_vertexArenaIndex + 1) % kVertexArenas;
     s_vertexArenaUsed = 0;
@@ -207,6 +223,13 @@ static void beginVertexArena() {
         GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
         s_vertexFenceWait += OSGetTime() - t0;
     }
+    // That fence also covers everything queued while this arena was last used.
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < s_deferredFreeCount; ++i) {
+        if (s_deferredFree[i].arena == s_vertexArenaIndex) MEMFreeToDefaultHeap(s_deferredFree[i].p);
+        else s_deferredFree[kept++] = s_deferredFree[i];
+    }
+    s_deferredFreeCount = kept;
 }
 
 static void endVertexArena() {
@@ -1255,6 +1278,47 @@ static float mipLevelDiff(const uint8_t* prev, uint32_t pw, uint32_t ph, const u
 }
 static const float kArbitraryMipThreshold = 14.0f;
 
+// Sampling LINEAR_ALIGNED textures is slow on the Wii U GPU (file select spent
+// ~175 ms a frame waiting for it). The decoded linear surface becomes the
+// staging copy: GX2CopySurface retiles every level into a GX2_TILE_MODE_DEFAULT
+// texture, and the staging memory is freed after this frame's fence. Only runs
+// inside a frame (flushBatch), before applyState/setTevShader re-apply state.
+static void rebindTvTarget();
+static bool s_retileTextures = true;
+static void retileTexture(GX2Texture& texture) {
+    if (!s_retileTextures || runningUnderCemu()) return;
+    GX2Surface& linear = texture.surface;
+    GX2Texture tiled = texture;
+    GX2Surface& t = tiled.surface;
+    t.tileMode = GX2_TILE_MODE_DEFAULT;
+    t.swizzle = 0;
+    t.image = nullptr;
+    t.mipmaps = nullptr;
+    GX2CalcSurfaceSizeAndAlignment(&t);
+    t.image = alignedZero(t.alignment, t.imageSize);
+    if (!t.image) return;
+    if (t.mipLevels > 1) {
+        t.mipmaps = alignedZero(t.alignment, t.mipmapSize);
+        if (!t.mipmaps) { MEMFreeToDefaultHeap(t.image); return; }
+    }
+    // The zero fill must not be written back over the GPU's copy later.
+    DCFlushRange(t.image, t.imageSize);
+    if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
+    GX2InitTextureRegs(&tiled);
+    for (uint32_t level = 0; level < t.mipLevels; ++level)
+        GX2CopySurface(&linear, level, 0, &t, level, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, t.image, t.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, t.image, t.imageSize);
+    if (t.mipmaps) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, t.mipmaps, t.mipmapSize);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, t.mipmaps, t.mipmapSize);
+    }
+    rebindTvTarget();  // GX2CopySurface leaves its destination bound
+    deferFree(linear.image);
+    deferFree(linear.mipmaps);
+    texture = tiled;
+}
+
 static TextureEntry* getTexture(int map) {
     SMS_PORT_HEAP_SCOPE();
     const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
@@ -1385,6 +1449,7 @@ static TextureEntry* getTexture(int map) {
     if (prev) MEMFreeToDefaultHeap(prev);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
     if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
+    retileTexture(e.texture);
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
     e.valid = true;
     return &e;
