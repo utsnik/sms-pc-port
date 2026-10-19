@@ -24,6 +24,7 @@
 #include "gx2_shader_inl.h"
 
 #include <gx2/draw.h>
+#include <gx2/swap.h>
 #include <gx2/clear.h>
 #include <gx2/event.h>
 #include <gx2/mem.h>
@@ -52,6 +53,8 @@
 
 namespace gx {
 
+static GX2ColorBuffer* renderColour();
+static GX2DepthBuffer* renderDepth();
 uint32_t gx2TexLevelBytes(uint32_t fmt, uint32_t w, uint32_t h);
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
@@ -1240,7 +1243,7 @@ static bool runningUnderCemu() {
 static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     ++s_perfCopies;
-    GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
+    GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return;
     const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
     uint32_t tw = uint32_t(float(w) * s_gameScale), th = uint32_t(float(h) * s_gameScale);
@@ -1549,10 +1552,80 @@ static void setShader(FixedShader& shader, TextureEntry* texture) {
     }
 }
 
+// The game renders into an 854x480 target (the GamePad's size; the 640x480
+// EFB at 1:1) instead of WHBGfx's 1080p TV buffer: the generated TEV shaders
+// made file select fill-bound (175 ms a frame at 1080p, 37 ms at 640x480).
+// The surfaces alias WHBGfx's TV colour/depth memory (MEM1), which nothing
+// else draws into any more; present copies (and scales) the target to the TV
+// and GamePad scan buffers.
+static constexpr bool kNativeRender = true;
+static constexpr uint32_t kRenderW = 854, kRenderH = 480;
+static GX2ColorBuffer s_renderColour;
+static GX2DepthBuffer s_renderDepth;
+static bool s_renderOwn, s_renderTried;
+
+static void initRenderTarget() {
+    if (s_renderTried) return;
+    s_renderTried = true;
+    if (!kNativeRender) return;
+    GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+    GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
+    if (!tv || !td || !tv->surface.image || !td->surface.image) return;
+    s_renderColour = *tv;
+    GX2Surface& c = s_renderColour.surface;
+    c.width = kRenderW; c.height = kRenderH;
+    c.image = nullptr; c.mipmaps = nullptr; c.swizzle = 0;
+    GX2CalcSurfaceSizeAndAlignment(&c);
+    s_renderDepth = *td;
+    GX2Surface& d = s_renderDepth.surface;
+    d.width = kRenderW; d.height = kRenderH;
+    d.image = nullptr; d.mipmaps = nullptr; d.swizzle = 0;
+    GX2CalcSurfaceSizeAndAlignment(&d);
+    const bool fits = c.imageSize <= tv->surface.imageSize && d.imageSize <= td->surface.imageSize &&
+                      (reinterpret_cast<uintptr_t>(tv->surface.image) % c.alignment) == 0 &&
+                      (reinterpret_cast<uintptr_t>(td->surface.image) % d.alignment) == 0;
+    WHBLogPrintf("SMS Wii U: native render target %ux%u colour=%u/%u depth=%u/%u -> %s", (unsigned)kRenderW,
+                 (unsigned)kRenderH, (unsigned)c.imageSize, (unsigned)tv->surface.imageSize, (unsigned)d.imageSize,
+                 (unsigned)td->surface.imageSize, fits ? "on" : "OFF (does not fit)");
+    if (!fits) return;
+    c.image = tv->surface.image;
+    d.image = td->surface.image;
+    s_renderDepth.hiZPtr = nullptr;
+    GX2InitColorBufferRegs(&s_renderColour);
+    GX2InitDepthBufferRegs(&s_renderDepth);
+    s_renderOwn = true;
+}
+
+static GX2ColorBuffer* renderColour() {
+    initRenderTarget();
+    return s_renderOwn ? &s_renderColour : WHBGfxGetTVColourBuffer();
+}
+static GX2DepthBuffer* renderDepth() {
+    initRenderTarget();
+    return s_renderOwn ? &s_renderDepth : WHBGfxGetTVDepthBuffer();
+}
+
+// Frame start (instead of WHBGfxBeginRenderTV + clear) and present.
+extern "C" void sms_wiiu_gx2_target_begin(void) {
+    initRenderTarget();
+    if (!s_renderOwn) {
+        WHBGfxBeginRenderTV();
+        WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
+        return;
+    }
+    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f);
+    GX2SetContextState(WHBGfxGetTVContextState());
+}
+extern "C" void sms_wiiu_gx2_target_present(void) {
+    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV);
+    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC);
+}
+
 // TV target size (WHBGfx picks 720p or 1080p) and the 4:3 game rectangle in it:
 // the 640x480 EFB scaled to the target's height and centred.
 static void updateTarget() {
-    const GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
+    const GX2ColorBuffer* cb = renderColour();
     if (cb && cb->surface.width && cb->surface.height) {
         s_tvW = float(cb->surface.width);
         s_tvH = float(cb->surface.height);
@@ -2264,8 +2337,8 @@ static float s_frameClear[4];
 static bool s_frameClearPending = false;
 static void rebindTvTarget() {
     GX2SetContextState(WHBGfxGetTVContextState());
-    GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
-    GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+    GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(renderDepth());
 }
 void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
@@ -2306,11 +2379,11 @@ void executeCopy(uint32_t ctrl) {
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
     if ((g.bp[BP_CMODE0] >> 3) & 1)
         ++s_perfClears;
-        GX2ClearColor(WHBGfxGetTVColourBuffer(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
+        GX2ClearColor(renderColour(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
                       float(gb & 255) / 255.0f,
                       ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f);
     if ((g.bp[BP_ZMODE] >> 4) & 1)
-        GX2ClearDepthStencilEx(WHBGfxGetTVDepthBuffer(), float(z & 0xffffff) / 16777215.0f, 0,
+        GX2ClearDepthStencilEx(renderDepth(), float(z & 0xffffff) / 16777215.0f, 0,
                                GX2_CLEAR_FLAGS_DEPTH);
     rebindTvTarget();
 }
@@ -2334,7 +2407,7 @@ static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
     ++s_perfPeeks;
-    GX2ColorBuffer* cb = WHBGfxGetTVColourBuffer();
+    GX2ColorBuffer* cb = renderColour();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
     if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
     if (s_peekSurfaceReady && (s_peekSurface.width != cb->surface.width ||
@@ -2448,19 +2521,19 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     if (!s_ready || !ProcUIInForeground()) return;
     beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState());
-    GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
-    GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
-    GX2ClearDepthStencilEx(WHBGfxGetTVDepthBuffer(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
+    GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(renderDepth());
+    GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
     GX2SetContextState(WHBGfxGetTVContextState());
-    GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
-    GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+    GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(renderDepth());
     updateTarget();
     if (s_frameClearPending) {
-        GX2ClearColor(WHBGfxGetTVColourBuffer(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]);
+        GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]);
         s_frameClearPending = false;
         GX2SetContextState(WHBGfxGetTVContextState());
-        GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
-        GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+        GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(renderDepth());
     }
     s_debugDrawNo = 0;
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
