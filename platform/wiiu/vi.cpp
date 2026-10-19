@@ -14,6 +14,8 @@ void sms_wiiu_gfx_frame(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
 void sms_wiiu_dump_threads(void);
+void sms_wiiu_profiler_tick(void);
+void sms_wiiu_profiler_stop(void);
 void sms_wiiu_dvd_pump(void);
 void sms_wiiu_crash_return_to_menu(void);
 extern volatile int sms_wiiu_crash_pending;
@@ -81,16 +83,19 @@ void sms_wiiu_frame_boundary(void)
 	 * from here, the only thread allowed to pump ProcUI. */
 	if (sms_wiiu_crash_pending) {
 		s_exit_logged = true;
+		sms_wiiu_profiler_stop();
 		sms_wiiu_crash_return_to_menu();
 		return;
 	}
 	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
 	if (!WHBProcIsRunning()) {
 		s_exit_logged = true;
+		sms_wiiu_profiler_stop();
 		port_log("SMS Wii U: ProcUI exit requested; shutting down\n");
 		sms_wiiu_exit();
 		return;
 	}
+	sms_wiiu_profiler_tick();
 	port_irq_check();
 	/* Deliver queued DVD async-read callbacks (GameCube ran them from the DVD
 	 * interrupt); nothing else calls the pump. */
