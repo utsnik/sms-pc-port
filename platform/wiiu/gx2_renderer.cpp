@@ -769,9 +769,6 @@ static uint32_t tevTextureMask(const TevKey& k) {
 }
 
 static bool tevSupported(const TevKey& k) {
-    // Indirect stages (tevEmitIndirectStage) stay on the old path until the
-    // implementation is verified against the PC renderer.
-    if (tevNumInd(k) != 0) return false;
     for (uint32_t s = 0; s < k.stages; ++s) {
         if (((k.order[s] >> 6) & 1) && (k.order[s] & 7) >= 8) return false;
     }
@@ -3312,6 +3309,12 @@ static TextureEntry* textureForCoord(const TevKey& key, TextureEntry* const* tex
             const uint32_t map = order & 7;
             if (textures[map]) return textures[map];
         }
+    }
+    // A coordinate read only by an indirect lookup belongs to its map.
+    for (uint32_t i = 0; i < tevNumInd(key); ++i) {
+        if (((key.iref >> (6 * i + 3)) & 7) != uint32_t(coord)) continue;
+        const uint32_t map = (key.iref >> (6 * i)) & 7;
+        if (textures[map]) return textures[map];
     }
     return nullptr;
 }
