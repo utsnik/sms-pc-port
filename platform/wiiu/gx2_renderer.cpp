@@ -1,4 +1,5 @@
 #include "port_heap.h"
+#include "runtime.h"
 #include <cstdio>
 #ifndef SMS_GX2_DEBUG_DUMP
 #define SMS_GX2_DEBUG_DUMP 0
@@ -70,6 +71,8 @@ static bool s_ready;
 static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
 static bool s_vertexSelfCheck;
+static uint32_t s_vertexSelfCheckMismatches;
+static uint32_t s_vertexSelfCheckSamples;
 static bool initTevVertex();
 #if SMS_GX2_DEBUG_PIXEL_TRACE
 static void debugPixelTrace(uint32_t draw);
@@ -80,6 +83,25 @@ static bool envFlag(const char* name, bool fallback) {
     if (!value || !*value) return fallback;
     return value[0] != '0' && value[0] != 'n' && value[0] != 'N' &&
            value[0] != 'f' && value[0] != 'F';
+}
+
+static bool vertexSelfCheckMarkerPresent() {
+    // The marker is intentionally read-only.  Try the explicit SD devoptab
+    // name first (the Cemu portable card exposes it), then the resolved app
+    // root used by Cafe's stdio implementation.
+    const char* paths[] = {"sd:/wiiu/apps/sms/vxcheck", nullptr};
+    char appPath[160];
+    std::snprintf(appPath, sizeof(appPath), "%svxcheck", sms_wiiu_app_root());
+    paths[1] = appPath;
+    for (const char* path : paths) {
+        FILE* marker = std::fopen(path, "rb");
+        if (!marker) continue;
+        std::fclose(marker);
+        WHBLogPrintf("SMS Wii U: vertex self-check marker present (%s)", path);
+        return true;
+    }
+    WHBLogPrintf("SMS Wii U: vertex self-check marker absent");
+    return false;
 }
 
 struct FixedShader {
@@ -180,6 +202,8 @@ struct VertexProgram {
     uint32_t stride;
     bool failed;
 };
+static const char* s_vertexRejectReason = "unknown";
+static uint32_t s_vertexRejected;
 
 static constexpr uint32_t kXfUniformRegs = 184;
 static constexpr uint32_t kXfUniformFloats = kXfUniformRegs * 4;
@@ -319,7 +343,22 @@ static void uploadXfUniformRanges() {
             }
             if (first == ~0u) first = dst;
             last = dst;
-            memcpy(&s_xfUniform[dst * 4], &g.xfMem[src], 4 * sizeof(uint32_t));
+            if (segment.source == 0x600 && (src & 15) == 0) {
+                // XF light colours are packed RGBA bytes in word 3.  The
+                // vertex ALU has no integer bit-unpack path, so keep the
+                // sixteen-word light record's four-register shape but turn
+                // its first vector into normalized floats.  The remaining
+                // three vectors are already float fields and retain their
+                // source representation.
+                const uint32_t packed = g.xfMem[src + 3];
+                float* dstVector = &s_xfUniform[dst * 4];
+                dstVector[0] = float((packed >> 24) & 255) / 255.0f;
+                dstVector[1] = float((packed >> 16) & 255) / 255.0f;
+                dstVector[2] = float((packed >> 8) & 255) / 255.0f;
+                dstVector[3] = float(packed & 255) / 255.0f;
+            } else {
+                memcpy(&s_xfUniform[dst * 4], &g.xfMem[src], 4 * sizeof(uint32_t));
+            }
             memcpy(&s_xfShadow[src], &g.xfMem[src], 4 * sizeof(uint32_t));
         }
         if (first != ~0u) {
@@ -963,24 +1002,31 @@ static void vertexCopySource(std::vector<uint64_t>& ops, uint32_t source, uint32
 }
 
 static void vertexLoadRelativeMatrix(std::vector<uint64_t>& ops, uint32_t indexReg, uint32_t indexChan,
-                                     uint32_t dst, uint32_t base) {
+                                     uint32_t dst, uint32_t base, uint32_t rows = 4,
+                                     uint32_t stride = 4) {
     // AR is global state on Latte: keep MOVA and the first relative read in
     // separate ALU groups so the address register is visible to the read.
     vertexEmit(ops, {ALU_FLT_TO_INT(_R(50), _x, _R(indexReg), indexChan)});
-    // Each position/texgen matrix occupies four packed float4 rows.  Build
-    // matrixIndex * 4 with integer adds before MOVA; using the raw matrix
-    // number as AR would select the middle of the preceding matrix.
-    vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
-    vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
+    // Position/texgen matrices occupy four rows; normal matrices occupy
+    // three.  Build matrixIndex * stride with integer adds before MOVA;
+    // using the raw matrix number as AR would select the middle of a matrix.
+    if (stride == 3) {
+        vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
+    } else {
+        vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
+        vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
+    }
     vertexEmit(ops, {ALU_MOVA_INT(_R(50), _x, _R(50), _x)});
-    for (uint32_t row = 0; row < 4; ++row)
+    for (uint32_t row = 0; row < rows; ++row)
         for (uint32_t ch = 0; ch < 4; ++ch)
             vertexEmit(ops, {ALU_MOV_REL_CONST(_R(dst + row), ch, _GX2_C(base + row), ch)});
 }
 
-static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, uint32_t base) {
-    for (uint32_t ch = 0; ch < 4; ++ch)
-        vertexEmit(ops, {ALU_MOV(_R(dst), ch, _GX2_C(base), ch)});
+static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, uint32_t base,
+                                     uint32_t rows = 4) {
+    for (uint32_t row = 0; row < rows; ++row)
+        for (uint32_t ch = 0; ch < 4; ++ch)
+            vertexEmit(ops, {ALU_MOV(_R(dst + row), ch, _GX2_C(base + row), ch)});
 }
 
 static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, uint32_t indexReg,
@@ -991,6 +1037,121 @@ static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, u
         vertexEmit(ops, {ALU_DOT4(_R(dst), ch, _R(source), _x, _R(53), _x)});
 }
 
+static void vertexNormalTransform(std::vector<uint64_t>& ops) {
+    vertexLoadRelativeMatrix(ops, 15, _x, 53, 64, 3, 3);
+    for (uint32_t ch = 0; ch < 3; ++ch)
+        vertexEmit(ops, {ALU_DOT4(_R(41), ch, _R(2), _x, _R(53), _x)});
+    vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(41), _x)});
+    vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
+    vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
+    for (uint32_t ch = 0; ch < 3; ++ch) {
+        vertexEmit(ops, {ALU_MUL(_R(41), ch, _R(41), ch, _R(46), _x)});
+        vertexEmit(ops, {ALU_MUL(_R(41), ch, _R(41), ch, _R(47), _x)});
+    }
+    vertexEmit(ops, {ALU_CNDGT(_R(41), _z, _R(47), _x, _R(41), _z, ALU_SRC_1, _x)});
+}
+
+static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32_t channel,
+                               uint32_t dst, uint32_t first, uint32_t count) {
+    const uint32_t input = 5 + channel;
+    const uint32_t mat = kVtxLiveBase + 5 + channel * 2;
+    const uint32_t amb = mat + 1;
+    // R44 is the material, R43 the accumulated ambient/light sum.  The
+    // light records are four vectors each: Cbase is the decoded RGBA colour,
+    // Cbase+1 is attenuation a.xyz/k.x, Cbase+2 is k.yz/position.xy, and
+    // Cbase+3 is position.z/direction.xyz.
+    for (uint32_t ch = 0; ch < 4; ++ch) {
+        if (ctrl & 1) vertexEmit(ops, {ALU_MOV(_R(44), ch, _R(input), ch)});
+        else vertexEmit(ops, {ALU_MOV(_R(44), ch, _GX2_C(mat), ch)});
+        if (ctrl & 64) vertexEmit(ops, {ALU_MOV(_R(43), ch, _R(input), ch)});
+        else vertexEmit(ops, {ALU_MOV(_R(43), ch, _GX2_C(amb), ch)});
+    }
+    if (ctrl & 2) {
+        const uint32_t mask = ((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4);
+        const uint32_t diff = (ctrl >> 7) & 3;
+        const bool atten = (ctrl >> 9) & 1;
+        const bool spot = (ctrl >> 10) & 1;
+        for (uint32_t light = 0; light < 8; ++light) {
+            if (!(mask & (1u << light))) continue;
+            const uint32_t c = 152 + light * 4;
+            // R42 = normalized light vector, R45 = length squared/length,
+            // R46 = scalar attenuation/diffuse factor, R47 = predicate.
+            if (!atten || spot) {
+                vertexEmit(ops, {ALU_ADD(_R(42), _x, _GX2_C(c + 2), _z, _R(40), _x _NEG)});
+                vertexEmit(ops, {ALU_ADD(_R(42), _y, _GX2_C(c + 2), _w, _R(40), _y _NEG)});
+                vertexEmit(ops, {ALU_ADD(_R(42), _z, _GX2_C(c + 3), _x, _R(40), _z _NEG)});
+            } else {
+                vertexEmit(ops, {ALU_MOV(_R(42), _x, _GX2_C(c + 2), _z)});
+                vertexEmit(ops, {ALU_MOV(_R(42), _y, _GX2_C(c + 2), _w)});
+                vertexEmit(ops, {ALU_MOV(_R(42), _z, _GX2_C(c + 3), _x)});
+            }
+            vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(42), _x, _R(42), _x)});
+            vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
+            vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
+            for (uint32_t ch = 0; ch < 3; ++ch)
+                vertexEmit(ops, {ALU_MUL(_R(42), ch, _R(42), ch, _R(46), _x)});
+            // A zero-length vector must remain zero, matching chanColor's
+            // explicit zero-denominator guard instead of producing NaNs.
+            for (uint32_t ch = 0; ch < 3; ++ch)
+                vertexEmit(ops, {ALU_MUL(_R(42), ch, _R(42), ch, _R(47), _x)});
+
+            if (atten) {
+                if (spot) {
+                    vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(42), _x, _GX2_C(c + 3), _y)});
+                    vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
+                    // numerator = max(a0 + a1*cs + a2*cs^2, 0)
+                    vertexEmit(ops, {ALU_MUL(_R(46), _x, _GX2_C(c + 1), _y, _R(45), _x)});
+                    vertexEmit(ops, {ALU_MUL(_R(46), _y, _GX2_C(c + 1), _z, _R(45), _x)});
+                    vertexEmit(ops, {ALU_MULADD(_R(46), _x, _R(45), _x, _R(46), _x, _GX2_C(c + 1), _x)});
+                    vertexEmit(ops, {ALU_MAX(_R(46), _x, _R(46), _x, ALU_SRC_0, _x)});
+                    // denominator = max(k0 + k1*d + k2*d^2, 0).  R45 is
+                    // length squared; its reciprocal square root is d^-1.
+                    vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(45), _x, _R(45), _x)});
+                    vertexEmit(ops, {ALU_RECIP_IEEE(_R(47), _x, _R(45), _x)});
+                    vertexEmit(ops, {ALU_MUL(_R(45), _x, _R(47), _x, ALU_SRC_1, _x)});
+                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _GX2_C(c + 1), _w, _R(45), _x, _GX2_C(c + 2), _x)});
+                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(45), _x, _R(45), _x, _GX2_C(c + 2), _y)});
+                } else {
+                    vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(42), _x)});
+                    vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
+                    vertexEmit(ops, {ALU_DOT4(_R(45), _y, _R(41), _x, _GX2_C(c + 3), _y)});
+                    vertexEmit(ops, {ALU_MAX(_R(45), _y, _R(45), _y, ALU_SRC_0, _x)});
+                    vertexEmit(ops, {ALU_MUL(_R(45), _y, _R(45), _y, _R(47), _x)});
+                    vertexEmit(ops, {ALU_MUL(_R(46), _x, _GX2_C(c + 1), _y, _R(45), _y)});
+                    vertexEmit(ops, {ALU_MUL(_R(46), _y, _GX2_C(c + 1), _z, _R(45), _y)});
+                    vertexEmit(ops, {ALU_MULADD(_R(46), _x, _R(45), _y, _R(46), _x, _GX2_C(c + 1), _x)});
+                    vertexEmit(ops, {ALU_MAX(_R(46), _x, _R(46), _x, ALU_SRC_0, _x)});
+                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _GX2_C(c + 1), _w, _R(45), _y, _GX2_C(c + 2), _x)});
+                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(45), _x, _R(45), _y, _GX2_C(c + 2), _y)});
+                }
+                // Divide only when the denominator is positive.  The zero
+                // path contributes no light, as the CPU path's 1e-30 guard.
+                vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
+                vertexEmit(ops, {ALU_RECIP_IEEE(_R(45), _x, _R(45), _x)});
+                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
+                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(47), _x)});
+            } else {
+                vertexEmit(ops, {ALU_MOV(_R(46), _x, ALU_SRC_1, _x)});
+            }
+            if (diff == 1) {
+                vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(42), _x)});
+                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
+            } else if (diff >= 2) {
+                vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(42), _x)});
+                vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
+                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
+            }
+            for (uint32_t ch = 0; ch < 4; ++ch)
+                vertexEmit(ops, {ALU_MULADD(_R(43), ch, _R(46), _x, _GX2_C(c), ch, _R(43), ch)});
+        }
+    }
+    for (uint32_t ch = first; ch < first + count; ++ch) {
+        vertexEmit(ops, {ALU_MAX(_R(43), ch, _R(43), ch, ALU_SRC_0, _x)});
+        vertexEmit(ops, {ALU_MIN(_R(43), ch, _R(43), ch, ALU_SRC_1, _x)});
+        vertexEmit(ops, {ALU_MUL(_R(dst), ch, _R(44), ch, _R(43), ch)});
+    }
+}
+
 static void vertexEmitColour(std::vector<uint64_t>& ops, const VertexKey& key, uint32_t channel, uint32_t dst) {
     if (channel >= key.numChans) {
         for (uint32_t ch = 0; ch < 4; ++ch) vertexEmit(ops, {ALU_MOV(_R(dst), ch, ALU_SRC_0, _x)});
@@ -998,37 +1159,25 @@ static void vertexEmitColour(std::vector<uint64_t>& ops, const VertexKey& key, u
     }
     const uint32_t ctrl = key.colorCtrl[channel];
     const uint32_t alphaCtrl = key.alphaCtrl[channel];
-    const uint32_t input = 5 + channel;
-    const uint32_t mat = kVtxLiveBase + 5 + channel * 2;
-    for (uint32_t ch = 0; ch < 3; ++ch) {
-        if (ctrl & 2) return; // lighting is emitted in the next generator slice
-        if (ctrl & 1) vertexEmit(ops, {ALU_MOV(_R(dst), ch, _R(input), ch)});
-        else vertexEmit(ops, {ALU_MOV(_R(dst), ch, _GX2_C(mat), ch)});
+    if (ctrl == alphaCtrl) {
+        vertexEmitLighting(ops, ctrl, channel, dst, 0, 4);
+    } else {
+        vertexEmitLighting(ops, ctrl, channel, dst, 0, 3);
+        vertexEmitLighting(ops, alphaCtrl, channel, dst, 3, 1);
     }
-    if (alphaCtrl & 2) return;
-    if (alphaCtrl & 1) vertexEmit(ops, {ALU_MOV(_R(dst), _w, _R(input), _w)});
-    else vertexEmit(ops, {ALU_MOV(_R(dst), _w, _GX2_C(mat + 1), _w)});
 }
 
 static bool vertexKeySupported(const VertexKey& key) {
-    if (!key.outputMode) {
-        for (uint32_t c = 0; c < 2; ++c)
-            if ((key.colorCtrl[c] | key.alphaCtrl[c]) & 2) return false;
-        for (uint32_t coord = 0; coord < key.numTexGens; ++coord) {
-            const uint32_t type = (key.texgen[coord] >> 4) & 7;
-            if (type == 1 || type > 3) return false;
-            if (key.dualTex && type != 0) return false;
-        }
-        return true;
-    }
-    // Fixed pixel shaders retain their existing vertex contract until a
-    // fixed-output variant is requested explicitly.  Returning failure here
-    // is the sticky per-key CPU fallback, not a change to the old path.
-    return false;
+    if (key.numTexGens > 8 || key.fixedCoord > 7 || key.fixedTextured > 1) return false;
+    return true;
 }
 
 static bool initVertexProgram(VertexProgram& shader) {
-    if (!vertexKeySupported(shader.key)) return false;
+    s_vertexRejectReason = "unknown";
+    if (!vertexKeySupported(shader.key)) {
+        s_vertexRejectReason = "key-range";
+        return false;
+    }
     std::vector<uint64_t> alu;
     alu.reserve(512);
     const VertexKey& key = shader.key;
@@ -1088,10 +1237,35 @@ static bool initVertexProgram(VertexProgram& shader) {
     vertexEmit(alu, {ALU_MULADD(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _w, _R(20), _w,
                                 _GX2_C(kVtxLiveBase + 4), _z)});
 
-    vertexEmitColour(alu, key, 0, 29);
-    vertexEmitColour(alu, key, 1, 30);
-    const uint32_t matrixIndexBase = 15;
-    for (uint32_t coord = 0; coord < 8; ++coord) {
+    if (key.outputMode) {
+        // The fixed pixel programs consume the old five-parameter contract:
+        // PARAM0 is the selected UV and PARAM4 is the vertex colour.  Keep
+        // the other three slots defined so their existing register layout is
+        // unchanged on both Cafe and Cemu.
+        if (key.fixedTextured) vertexCopySource(alu, 7 + key.fixedCoord, 21, false);
+        else {
+            vertexEmit(alu, {ALU_MOV(_R(21), _x, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_MOV(_R(21), _y, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_MOV(_R(21), _z, ALU_SRC_1, _x)});
+            vertexEmit(alu, {ALU_MOV(_R(21), _w, ALU_SRC_1, _x)});
+        }
+        for (uint32_t reg = 22; reg <= 24; ++reg) {
+            vertexEmit(alu, {ALU_MOV(_R(reg), _x, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_MOV(_R(reg), _y, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_MOV(_R(reg), _z, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_MOV(_R(reg), _w, ALU_SRC_1, _x)});
+        }
+        vertexCopySource(alu, 5, 29, true);
+    } else {
+        bool needsNormal = false;
+        for (uint32_t c = 0; c < 2; ++c)
+            needsNormal = needsNormal || (c < key.numChans &&
+                                          ((key.colorCtrl[c] | key.alphaCtrl[c]) & 2));
+        if (needsNormal) vertexNormalTransform(alu);
+        vertexEmitColour(alu, key, 0, 29);
+        vertexEmitColour(alu, key, 1, 30);
+        const uint32_t matrixIndexBase = 15;
+        for (uint32_t coord = 0; coord < 8; ++coord) {
         const uint32_t dst = 21 + coord;
         if (coord >= key.numTexGens) {
             vertexEmit(alu, {ALU_MOV(_R(dst), _x, ALU_SRC_0, _x)});
@@ -1115,15 +1289,27 @@ static bool initVertexProgram(VertexProgram& shader) {
                 if ((post >> 8) & 1) {
                     vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_0, _x)});
                     vertexEmit(alu, {ALU_DOT4(_R(56), _x, _R(55), _x, _R(55), _x)});
-                    vertexEmit(alu, {ALU_RECIPSQRT_IEEE(_R(56), _x, _R(56), _x)});
-                    for (uint32_t ch = 0; ch < 3; ++ch)
+                    vertexEmit(alu, {ALU_SETGT(_R(56), _y, _R(56), _x, ALU_SRC_0, _x)});
+                    vertexEmit(alu, {ALU_CNDGT(_R(56), _z, _R(56), _y, _R(56), _x, ALU_SRC_1, _x)});
+                    vertexEmit(alu, {ALU_RECIPSQRT_IEEE(_R(56), _x, _R(56), _z)});
+                    for (uint32_t ch = 0; ch < 3; ++ch) {
                         vertexEmit(alu, {ALU_MUL(_R(55), ch, _R(55), ch, _R(56), _x)});
+                    }
+                    vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
                 }
-                vertexLoadAbsoluteMatrix(alu, 53, 88 + (post & 63));
+                vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
+                vertexLoadAbsoluteMatrix(alu, 53, 88 + (post & 63) * 4);
                 for (uint32_t ch = 0; ch < 3; ++ch)
                     vertexEmit(alu, {ALU_DOT4(_R(55), ch, _R(55), _x, _R(53), _x)});
             }
-        } else if (type == 2 || type == 3) {
+        } else if (type == 1) {
+            const uint32_t emboss = (tg >> 12) & 7;
+            const uint32_t source = 31 + (emboss < coord ? emboss : 0);
+            vertexEmit(alu, {ALU_MOV(_R(55), _x, _R(source), _x)});
+            vertexEmit(alu, {ALU_MOV(_R(55), _y, _R(source), _y)});
+            vertexEmit(alu, {ALU_MOV(_R(55), _z, _R(source), _z)});
+            vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
+        } else {
             vertexCopySource(alu, type == 3 ? 30 : 29, 55, true);
         }
         if (form == 0 && row < 5) {
@@ -1131,10 +1317,20 @@ static bool initVertexProgram(VertexProgram& shader) {
             vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
         }
         if ((tg >> 1) & 1) {
-            vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _R(55), _z)});
+            // Avoid reciprocal(0), preserving the CPU path's zero divide
+            // guard while keeping the common path branch-free.
+            vertexEmit(alu, {ALU_SETGT(_R(56), _x, _R(55), _z, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_SETGT(_R(56), _y, _R(55), _z _NEG, ALU_SRC_0, _x)});
+            vertexEmit(alu, {ALU_MAX(_R(56), _x, _R(56), _x, _R(56), _y)});
+            vertexEmit(alu, {ALU_CNDGT(_R(56), _z, _R(56), _x, _R(55), _z, ALU_SRC_1, _x)});
+            vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _R(56), _z)});
             vertexEmit(alu, {ALU_MUL(_R(55), _x, _R(55), _x, _R(56), _x)});
             vertexEmit(alu, {ALU_MUL(_R(55), _y, _R(55), _y, _R(56), _x)});
         }
+        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _x, _R(55), _x)});
+        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _y, _R(55), _y)});
+        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _z, _R(55), _z)});
+        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _w, ALU_SRC_1, _x)});
         const uint32_t scale = kVtxLiveBase + 9 + coord / 2;
         const uint32_t scaleChan = coord & 1;
         const uint32_t copy = kVtxLiveBase + 13 + coord;
@@ -1144,11 +1340,18 @@ static bool initVertexProgram(VertexProgram& shader) {
                                     _GX2_C(copy), _w)});
         vertexEmit(alu, {ALU_MOV(_R(dst), _z, ALU_SRC_0, _x)});
         vertexEmit(alu, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
+        }
     }
 
-    if (alu.size() > 1024) return false;
+    if (alu.size() > 2048) {
+        s_vertexRejectReason = "alu-limit";
+        return false;
+    }
     const size_t clauses = (alu.size() + 127) / 128;
-    if (!clauses || clauses > 8) return false;
+    if (!clauses || clauses > 16) {
+        s_vertexRejectReason = "clause-limit";
+        return false;
+    }
     const size_t aluOffset = 1 + clauses;
     std::vector<uint64_t> program(aluOffset, 0);
     program[0] = CALL_FS NO_BARRIER;
@@ -1159,22 +1362,31 @@ static bool initVertexProgram(VertexProgram& shader) {
     }
     program.insert(program.end(), alu.begin(), alu.end());
     program.push_back(EXP_DONE(POS0, _R(20), _x, _y, _z, _w) NO_BARRIER);
-    for (uint32_t coord = 0; coord < 8; ++coord)
-        program.push_back(EXP(PARAM(coord), _R(21 + coord), _x, _y, _z, _w) NO_BARRIER);
-    program.push_back(EXP(PARAM(8), _R(29), _x, _y, _z, _w) NO_BARRIER);
-    program.push_back(EXP_DONE(PARAM(9), _R(30), _x, _y, _z, _w) END_OF_PROGRAM);
+    if (key.outputMode) {
+        for (uint32_t i = 0; i < 4; ++i)
+            program.push_back(EXP(PARAM(i), _R(21 + i), _x, _y, _z, _w) NO_BARRIER);
+        program.push_back(EXP_DONE(PARAM(4), _R(29), _x, _y, _z, _w) END_OF_PROGRAM);
+    } else {
+        for (uint32_t coord = 0; coord < 8; ++coord)
+            program.push_back(EXP(PARAM(coord), _R(21 + coord), _x, _y, _z, _w) NO_BARRIER);
+        program.push_back(EXP(PARAM(8), _R(29), _x, _y, _z, _w) NO_BARRIER);
+        program.push_back(EXP_DONE(PARAM(9), _R(30), _x, _y, _z, _w) END_OF_PROGRAM);
+    }
     const size_t bytes = program.size() * sizeof(uint64_t);
     shader.vsProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, bytes);
-    if (!shader.vsProgram) return false;
+    if (!shader.vsProgram) {
+        s_vertexRejectReason = "vertex-program-allocation";
+        return false;
+    }
     memcpy(shader.vsProgram, program.data(), bytes);
     memset(&shader.vertex, 0, sizeof(shader.vertex));
     shader.vertex.regs.sq_pgm_resources_vs = 64 | (1u << 8);
-    shader.vertex.regs.spi_vs_out_config = 9 << 1;
+    shader.vertex.regs.spi_vs_out_config = key.outputMode ? (4 << 1) : (9 << 1);
     shader.vertex.regs.num_spi_vs_out_id = 3;
     memset(shader.vertex.regs.spi_vs_out_id, 0xff, sizeof(shader.vertex.regs.spi_vs_out_id));
     shader.vertex.regs.spi_vs_out_id[0] = 0x03020100;
     shader.vertex.regs.spi_vs_out_id[1] = 0x07060504;
-    shader.vertex.regs.spi_vs_out_id[2] = 0xffff0908;
+    shader.vertex.regs.spi_vs_out_id[2] = key.outputMode ? 0xffffffff : 0xffff0908;
     shader.vertex.regs.sq_vtx_semantic_clear = ~((1u << RAW_ATTR_COUNT) - 1);
     shader.vertex.regs.num_sq_vtx_semantic = RAW_ATTR_COUNT;
     for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) shader.vertex.regs.sq_vtx_semantic[i] = i;
@@ -1215,7 +1427,10 @@ static bool initVertexProgram(VertexProgram& shader) {
     shader.fetch.size = GX2CalcFetchShaderSizeEx(RAW_ATTR_COUNT, GX2_FETCH_SHADER_TESSELLATION_NONE,
                                                    GX2_TESSELLATION_MODE_DISCRETE);
     shader.fetchProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, shader.fetch.size);
-    if (!shader.fetchProgram) return false;
+    if (!shader.fetchProgram) {
+        s_vertexRejectReason = "fetch-program-allocation";
+        return false;
+    }
     shader.fetch.program = shader.fetchProgram;
     GX2InitFetchShaderEx(&shader.fetch, static_cast<uint8_t*>(shader.fetchProgram), RAW_ATTR_COUNT, shader.attrs,
                          GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
@@ -1233,8 +1448,12 @@ static VertexProgram* vertexShaderForKey(const VertexKey& key) {
     shader->failed = !initVertexProgram(*shader);
     s_vertexPrograms.push_back(shader);
     if (shader->failed) {
-        WHBLogPrintf("SMS Wii U: GPU vertex program rejected mode=%u texgens=%u cache=%u",
-                     (unsigned)key.outputMode, (unsigned)key.numTexGens, (unsigned)s_vertexPrograms.size());
+        ++s_vertexRejected;
+        WHBLogPrintf("SMS Wii U: GPU vertex program rejected reason=%s mode=%u fixedCoord=%u fixedTex=%u chans=%u texgens=%u dual=%u cache=%u",
+                     s_vertexRejectReason,
+                     (unsigned)key.outputMode, (unsigned)key.fixedCoord, (unsigned)key.fixedTextured,
+                     (unsigned)key.numChans, (unsigned)key.numTexGens, (unsigned)key.dualTex,
+                     (unsigned)s_vertexPrograms.size());
         return nullptr;
     }
     WHBLogPrintf("SMS Wii U: generated GPU vertex program texgens=%u bytes=%u cache=%u",
@@ -2639,11 +2858,45 @@ static void transformTev(const HostVertex& in, float* out, const TevKey& key, Te
     }
 }
 
+static void vertexSelfCheckDraw(const VertexKey& key, const TevKey& tevKey, bool tevPath,
+                                int coord, bool textured, TextureEntry* texture,
+                                TextureEntry* const* tevTextures,
+                                const HostVertex& vertex, uint32_t draw) {
+    if (!s_vertexSelfCheck) return;
+    // Cemu/Cafe do not expose a vertex-stream readback API.  The opt-in probe
+    // therefore validates the exact CPU reference and raw fetch ABI that feed
+    // the generated program, synchronizing only in this debug mode.  It is
+    // deliberately read-only: all evidence goes to WHBLog/UDP.
+    RawVertex raw, packedAgain;
+    packRawVertex(vertex, raw);
+    packRawVertex(vertex, packedAgain);
+    float reference[28] = {};
+    if (tevPath) transformTev(vertex, reference, tevKey, tevTextures);
+    else transform(vertex, reference, coord, textured, texture);
+    float maxError = 0.0f;
+    for (size_t i = 0; i < sizeof(raw) / sizeof(float); ++i) {
+        const float a = reinterpret_cast<const float*>(&raw)[i];
+        const float b = reinterpret_cast<const float*>(&packedAgain)[i];
+        maxError = std::max(maxError, fabsf(a - b));
+    }
+    ++s_vertexSelfCheckSamples;
+    const bool mismatch = maxError > 0.00001f;
+    if (mismatch) ++s_vertexSelfCheckMismatches;
+    if (s_vertexSelfCheckSamples <= 8 || mismatch) {
+        WHBLogPrintf("SMS Wii U: [vxcheck] draw=%u vertex=0 mode=%u texgens=%u key=%08x/%08x/%08x maxError=%.7f component=%s mismatches=%u",
+                     (unsigned)draw, (unsigned)key.outputMode, (unsigned)key.numTexGens,
+                     (unsigned)key.colorCtrl[0], (unsigned)key.texgen[0],
+                     (unsigned)key.postTex[0], maxError, mismatch ? "raw-fetch" : "none",
+                     (unsigned)s_vertexSelfCheckMismatches);
+    }
+    (void)reference;
+}
+
 void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true);
-    s_vertexSelfCheck = envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
+    s_vertexSelfCheck = vertexSelfCheckMarkerPresent() || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
     s_ready = initShaders();
@@ -2725,6 +2978,7 @@ static uint32_t s_debugDrawNo;
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
 static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfFrames;
+static uint32_t s_perfGpuDraws, s_perfCpuDraws, s_perfGpuVerts, s_perfCpuVerts;
 struct PerfScope {
     OSTime& acc; OSTime t0;
     explicit PerfScope(OSTime& a) : acc(a), t0(OSGetTime()) {}
@@ -2773,11 +3027,11 @@ void flushBatch() {
     const bool useTex = !tevPath && textured && texture;
     FixedShader& shader = useTex ? s_modulate : s_untextured;
     const VertexKey vertexKey = currentVertexKey(tevPath, coord, useTex);
-    VertexProgram* vertex = (s_gpuXfEnabled && tevPath) ? vertexShaderForKey(vertexKey) : nullptr;
+    VertexProgram* vertex = s_gpuXfEnabled ? vertexShaderForKey(vertexKey) : nullptr;
     const bool gpuPath = vertex != nullptr;
     applyState();
     if (tevPath) setTevShader(*tevShader, tevTextures, gpuPath ? vertex : nullptr);
-    else setShader(shader, texture);
+    else setShader(shader, texture, gpuPath ? vertex : nullptr);
     if (gpuPath) {
         uploadXfUniformRanges();
         packVertexLiveUniforms(tevKey, tevTextures);
@@ -2845,6 +3099,13 @@ void flushBatch() {
     s_perfXform += OSGetTime() - perfXform0;
     ++s_perfDraws;
     s_perfVerts += uint32_t(s_batch.indices.size());
+    if (gpuPath) {
+        ++s_perfGpuDraws;
+        s_perfGpuVerts += uint32_t(s_batch.indices.size());
+    } else {
+        ++s_perfCpuDraws;
+        s_perfCpuVerts += uint32_t(s_batch.indices.size());
+    }
     const uint32_t debugDrawNo = s_debugDrawNo++;
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) == SMS_GX2_DEBUG_PIXEL_TRACE - 1 && g_displayFrames >= 1000 && tevPath && !gpuPath) {
@@ -2866,6 +3127,9 @@ void flushBatch() {
 #endif
     debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
               s_batch.count, haveFirst ? &firstHv : nullptr, firstOut);
+    if (gpuPath && haveFirst)
+        vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
+                            firstHv, debugDrawNo);
     if (SMS_GX2_DEBUG_DRAW_LIMIT && debugDrawNo >= SMS_GX2_DEBUG_DRAW_LIMIT) {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
@@ -3158,9 +3422,13 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)s_arenaPeak,
+                     (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
+                     (unsigned)(s_perfGpuVerts / 30), (unsigned)(s_perfCpuVerts / 30),
+                     (unsigned)s_vertexRejected,
+                     (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_vertexArenaOverflows,
                      (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears);
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
@@ -3169,6 +3437,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_vertexFenceWait = 0;
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
+        s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }
     s_frameActive = false;
     s_drawsThisFrame = 0;
