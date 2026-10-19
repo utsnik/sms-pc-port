@@ -1722,6 +1722,8 @@ void flushBatch() {
 // GX clears the EFB as part of a copy. Without it the depth of earlier passes
 // (shadow and reflection renders) rejected the whole main view. The display
 // copy is not cleared: the frame is presented at the next retrace.
+static float s_frameClear[3];
+static bool s_frameClearPending = false;
 static void rebindTvTarget() {
     GX2SetContextState(WHBGfxGetTVContextState());
     GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
@@ -1735,7 +1737,20 @@ void executeCopy(uint32_t ctrl) {
     const uint32_t x = src & 0x3ff, y = (src >> 10) & 0x3ff;
     const uint32_t w = (size & 0x3ff) + 1, h = ((size >> 10) & 0x3ff) + 1;
     debugCopy(disp, x, y, w, h, g.copyDest, ctrl);
-    if (disp || !s_frameActive || !ProcUIInForeground()) return;
+    if (disp) {
+        // A display copy with clear resets the EFB for the next frame.  The
+        // colour buffer is the one presented, so the clear is deferred to the
+        // start of the next frame instead of being applied here.
+        if (clear && s_frameActive) {
+            const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB];
+            s_frameClear[0] = float(ar & 255) / 255.0f;
+            s_frameClear[1] = float((gb >> 8) & 255) / 255.0f;
+            s_frameClear[2] = float(gb & 255) / 255.0f;
+            s_frameClearPending = ((g.bp[BP_CMODE0] >> 3) & 1) != 0;
+        }
+        return;
+    }
+    if (!s_frameActive || !ProcUIInForeground()) return;
     {
         copyToTexture(g.copyDest, x, y, w, h, (ctrl >> 9) & 1);
         rebindTvTarget();  // GX2CopySurface may leave its destination bound
@@ -1783,6 +1798,13 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
     updateTarget();
+    if (s_frameClearPending) {
+        GX2ClearColor(WHBGfxGetTVColourBuffer(), s_frameClear[0], s_frameClear[1], s_frameClear[2], 1.0f);
+        s_frameClearPending = false;
+        GX2SetContextState(WHBGfxGetTVContextState());
+        GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
+    }
     s_debugDrawNo = 0;
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     GX2SetScissor(0, 0, uint32_t(s_tvW), uint32_t(s_tvH));
