@@ -1220,7 +1220,7 @@ static void chanColor(const HostVertex& in, int c, int out[4]) {
 
     float normal[3] = {0.0f, 0.0f, 1.0f}, position[3];
     const uint32_t matrix = in.mtx[0] & 63;
-    const float* nm = reinterpret_cast<const float*>(&g.xfMem[256 + matrix * 3]);
+    const float* nm = reinterpret_cast<const float*>(&g.xfMem[0x400 + matrix * 3]);
     normal[0] = nm[0] * in.nrm[0] + nm[1] * in.nrm[1] + nm[2] * in.nrm[2];
     normal[1] = nm[3] * in.nrm[0] + nm[4] * in.nrm[1] + nm[5] * in.nrm[2];
     normal[2] = nm[6] * in.nrm[0] + nm[7] * in.nrm[1] + nm[8] * in.nrm[2];
