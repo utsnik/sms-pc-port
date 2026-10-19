@@ -3,6 +3,9 @@
 #ifndef SMS_GX2_DEBUG_DUMP
 #define SMS_GX2_DEBUG_DUMP 0
 #endif
+#ifndef SMS_GX2_DEBUG_DRAW_LIMIT
+#define SMS_GX2_DEBUG_DRAW_LIMIT 0
+#endif
 #include <coreinit/memdefaultheap.h>
 /* Small GX2 host for the shared GX register decoder.
  *
@@ -322,14 +325,14 @@ static TevSource tevFixed(uint32_t value) {
     // Uniform vectors 8..15 hold the fixed TEV constants.  Keeping these in
     // the same constant file as TEVREG/KONST makes every numeric input a
     // uniform and avoids baking colour values into a cached program.
-    return {_GX2_C(32 + 4 * (value >> 2)), value & 3};
+    return {_GX2_C(8 + (value >> 2)), value & 3};
 }
 
 static TevSource tevKonst(const TevKey& k, uint32_t sel, uint32_t chan, bool alpha = false) {
     if (sel < 8) return tevFixed(sel);
     if (alpha) return tevFixed(12);
-    if (sel >= 12 && sel < 16) return {_GX2_C(4 * (4 + sel - 12)), chan};
-    if (sel >= 16) return {_GX2_C(4 * (4 + (sel & 3))), (sel - 16) >> 2};
+    if (sel >= 12 && sel < 16) return {_GX2_C(4 + sel - 12), chan};
+    if (sel >= 16) return {_GX2_C(4 + (sel & 3)), (sel - 16) >> 2};
     return tevFixed(12);
 }
 
@@ -387,53 +390,60 @@ static uint64_t tevClamp(uint64_t op, bool clamp) {
     return clamp ? op | to_QWORD(0, to_LE(1ull << 31)) : op;
 }
 
-static uint32_t tevCompareChannel(TevSource source, uint32_t component) {
-    // Register, texture and raster inputs carry RGB as separate channels. A
-    // source already selecting alpha or a fixed constant is scalar and must
-    // retain its encoded channel for every component of a colour compare.
-    if (source.chan == _w) return source.chan;
-    if ((source.sel >= 9 && source.sel <= 15) || (source.sel >= 20 && source.sel < 36))
-        return component;
-    return source.chan;
-}
-
 static void tevEmitCompareOp(std::vector<uint64_t>& program, uint32_t dst, bool equal,
                              TevSource a, uint32_t ach, TevSource b, uint32_t bch) {
-    const uint32_t ac = tevCompareChannel(a, ach), bc = tevCompareChannel(b, bch);
+    (void)ach; (void)bch;
+    const uint32_t ac = a.chan, bc = b.chan;
     tevEmitAlu(program, {equal ? ALU_SETE(_R(dst), _x, a.sel, ac, b.sel, bc)
                           : ALU_SETGT(_R(dst), _x, a.sel, ac, b.sel, bc)});
 }
 
+// Compare inputs are fetched per component (R, G, B of the colour A/B
+// arguments) because a 16/24-bit compare reads several components regardless
+// of which output channel is being produced.
+struct TevCompareSrc {
+    const TevKey* key; uint32_t stage; uint32_t aSel, bSel; bool alphaArgs;
+    TevSource get(bool isB, uint32_t comp) const {
+        const uint32_t sel = isB ? bSel : aSel;
+        return alphaArgs ? tevAlphaSource(*key, stage, sel) : tevColorSource(*key, stage, sel, comp);
+    }
+};
+
 static void tevEmitTevCompare(std::vector<uint64_t>& program, uint32_t channel,
-                              TevSource a, TevSource b, uint32_t mode, bool scalar) {
-    if (scalar || mode < 2 || mode >= 6) {
+                              const TevCompareSrc& cs, const TevCompareSrc& colorCs, uint32_t mode, bool scalar) {
+    // Alpha compares of the 16/24-bit kinds read the stage's colour A/B
+    // arguments (as genFS does); only the per-component kind reads alpha.
+    const TevCompareSrc& src = (scalar && mode < 6) ? colorCs : cs;
+    auto A = [&](uint32_t comp) { return src.get(false, comp); };
+    auto B = [&](uint32_t comp) { return src.get(true, comp); };
+    if (mode < 2 || mode >= 6) {
         const uint32_t component = mode < 2 ? 0 : channel;
-        tevEmitCompareOp(program, 16, (mode & 1) != 0, a, component, b, component);
+        tevEmitCompareOp(program, 17, (mode & 1) != 0, A(component), 0, B(component), 0);
         return;
     }
 
     const bool equal = (mode & 1) != 0;
     const uint32_t low = 0, mid = 1, high = mode >= 4 ? 2 : 1;
     if (equal) {
-        tevEmitCompareOp(program, 17, true, a, high, b, high);
-        tevEmitCompareOp(program, 18, true, a, mode >= 4 ? mid : low, b, mode >= 4 ? mid : low);
+        tevEmitCompareOp(program, 17, true, A(high), 0, B(high), 0);
+        tevEmitCompareOp(program, 18, true, A(mode >= 4 ? mid : low), 0, B(mode >= 4 ? mid : low), 0);
         tevEmitAlu(program, {ALU_MIN(_R(17), _x, _R(17), _x, _R(18), _x)});
         if (mode >= 4) {
-            tevEmitCompareOp(program, 18, true, a, low, b, low);
+            tevEmitCompareOp(program, 18, true, A(low), 0, B(low), 0);
             tevEmitAlu(program, {ALU_MIN(_R(17), _x, _R(17), _x, _R(18), _x)});
         }
     } else {
-        tevEmitCompareOp(program, 17, false, a, high, b, high);
-        tevEmitCompareOp(program, 18, true, a, high, b, high);
+        tevEmitCompareOp(program, 17, false, A(high), 0, B(high), 0);
+        tevEmitCompareOp(program, 18, true, A(high), 0, B(high), 0);
         if (mode >= 4)
             tevEmitAlu(program, {ALU_MOV(_R(16), _x, _R(18), _x)});
-        tevEmitCompareOp(program, 19, false, a, mode >= 4 ? mid : low, b, mode >= 4 ? mid : low);
+        tevEmitCompareOp(program, 19, false, A(mode >= 4 ? mid : low), 0, B(mode >= 4 ? mid : low), 0);
         tevEmitAlu(program, {ALU_MUL(_R(19), _x, mode >= 4 ? _R(16) : _R(18), _x, _R(19), _x)});
         tevEmitAlu(program, {ALU_MAX(_R(17), _x, _R(17), _x, _R(19), _x)});
         if (mode >= 4) {
-            tevEmitCompareOp(program, 18, true, a, mid, b, mid);
+            tevEmitCompareOp(program, 18, true, A(mid), 0, B(mid), 0);
             tevEmitAlu(program, {ALU_MUL(_R(16), _x, _R(16), _x, _R(18), _x)});
-            tevEmitCompareOp(program, 19, false, a, low, b, low);
+            tevEmitCompareOp(program, 19, false, A(low), 0, B(low), 0);
             tevEmitAlu(program, {ALU_MUL(_R(19), _x, _R(16), _x, _R(19), _x)});
             tevEmitAlu(program, {ALU_MAX(_R(17), _x, _R(17), _x, _R(19), _x)});
         }
@@ -443,20 +453,21 @@ static void tevEmitTevCompare(std::vector<uint64_t>& program, uint32_t channel,
 
 static void tevEmitChannel(std::vector<uint64_t>& program, uint32_t dest, uint32_t channel,
                            TevSource a, TevSource b, TevSource c, TevSource d,
-                           uint32_t bias, uint32_t op, uint32_t scale, bool clamp) {
+                           uint32_t bias, uint32_t op, uint32_t scale, bool clamp,
+                           const TevCompareSrc& cs, const TevCompareSrc& colorCs) {
     if (bias == 3) {
-        tevEmitTevCompare(program, channel, a, b, (scale << 1) | op, channel == _w);
-        tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
-        tevEmitAlu(program, {ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel)});
+        tevEmitTevCompare(program, channel, cs, colorCs, (scale << 1) | op, channel == _w);
+        tevEmitAlu(program, {ALU_MUL(_R(16), channel, _R(16), channel, c.sel, c.chan)});
+        tevEmitAlu(program, {ALU_ADD(_R(dest), channel, d.sel, d.chan, _R(16), channel)});
         if (clamp)
-            tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, ALU_SRC_PV, channel), true)});
+            tevEmitAlu(program, {tevClamp(ALU_MOV(_R(dest), channel, _R(16), channel), true)});
         return;
     }
     tevEmitAlu(program, {ALU_ADD(_R(16), channel, b.sel, b.chan, a.sel, a.chan _NEG)});
-    tevEmitAlu(program, {ALU_MUL(_R(16), channel, ALU_SRC_PV, channel, c.sel, c.chan)});
+    tevEmitAlu(program, {ALU_MUL(_R(16), channel, _R(16), channel, c.sel, c.chan)});
     // GX's regular TEV equation is D +/- lerp(A, B, C), not merely D +/-
     // (B-A)*C.  Keep A in the temporary before applying the final D/op.
-    tevEmitAlu(program, {ALU_ADD(_R(16), channel, ALU_SRC_PV, channel, a.sel, a.chan)});
+    tevEmitAlu(program, {ALU_ADD(_R(16), channel, _R(16), channel, a.sel, a.chan)});
     uint64_t result = op ? ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel _NEG)
                          : ALU_ADD(_R(dest), channel, d.sel, d.chan, ALU_SRC_PV, channel);
     tevEmitAlu(program, {result});
@@ -647,26 +658,34 @@ static bool initTevPixel(TevShader& shader) {
     uint32_t lastColor = 0, lastAlpha = 0;
     for (uint32_t reg = 0; reg < 4; ++reg)
         for (uint32_t ch = 0; ch < 4; ++ch)
-            tevEmitAlu(program, {ALU_MOV(_R(12 + reg), ch, _GX2_C(4 * reg), ch)});
+            tevEmitAlu(program, {ALU_MOV(_R(12 + reg), ch, _GX2_C(reg), ch)});
     for (uint32_t stage = 0; stage < shader.key.stages; ++stage) {
         const uint32_t ce = shader.key.colorEnv[stage], ae = shader.key.alphaEnv[stage];
         const uint32_t colorDest = (ce >> 22) & 3, alphaDest = (ae >> 22) & 3;
         const uint32_t colorBias = (ce >> 16) & 3, alphaBias = (ae >> 16) & 3;
         const uint32_t colorScale = (ce >> 20) & 3, alphaScale = (ae >> 20) & 3;
+        // Results are staged in R11 and committed after the whole stage:
+        // compare modes read several components of their inputs, which must
+        // not already hold this stage's output.
+        const TevCompareSrc colorCs{&shader.key, stage, (ce >> 12) & 15, (ce >> 8) & 15, false};
+        const TevCompareSrc alphaCs{&shader.key, stage, (ae >> 13) & 7, (ae >> 10) & 7, true};
         for (uint32_t ch = 0; ch < 3; ++ch) {
-            tevEmitChannel(program, 12 + colorDest, ch,
+            tevEmitChannel(program, 11, ch,
                            tevColorSource(shader.key, stage, (ce >> 12) & 15, ch),
                            tevColorSource(shader.key, stage, (ce >> 8) & 15, ch),
                            tevColorSource(shader.key, stage, (ce >> 4) & 15, ch),
                            tevColorSource(shader.key, stage, ce & 15, ch),
-                           colorBias, (ce >> 18) & 1, colorScale, (ce >> 19) & 1);
+                           colorBias, (ce >> 18) & 1, colorScale, (ce >> 19) & 1, colorCs, colorCs);
         }
-        tevEmitChannel(program, 12 + alphaDest, _w,
+        tevEmitChannel(program, 11, _w,
                        tevAlphaSource(shader.key, stage, (ae >> 13) & 7),
                        tevAlphaSource(shader.key, stage, (ae >> 10) & 7),
                        tevAlphaSource(shader.key, stage, (ae >> 7) & 7),
                        tevAlphaSource(shader.key, stage, (ae >> 4) & 7),
-                       alphaBias, (ae >> 18) & 1, alphaScale, (ae >> 19) & 1);
+                       alphaBias, (ae >> 18) & 1, alphaScale, (ae >> 19) & 1, alphaCs, colorCs);
+        for (uint32_t ch = 0; ch < 3; ++ch)
+            tevEmitAlu(program, {ALU_MOV(_R(12 + colorDest), ch, _R(11), ch)});
+        tevEmitAlu(program, {ALU_MOV(_R(12 + alphaDest), _w, _R(11), _w)});
         lastColor = colorDest;
         lastAlpha = alphaDest;
     }
@@ -679,8 +698,18 @@ static bool initTevPixel(TevShader& shader) {
     const size_t compareCount = program.size() - compareOffset;
     size_t cf = 0;
     if (texCount) program[cf++] = TEX(texOffset, texCount) VALID_PIX;
-    if (aluCount) program[cf++] = ALU(aluOffset, aluCount);
-    if (compareCount) program[cf++] = ALU(compareOffset, compareCount);
+    // An ALU clause holds at most 128 instruction slots; longer TEV chains
+    // (e.g. five stages with compares) must be split over several clauses.
+    for (size_t at = 0; at < aluCount;) {
+        size_t n = aluCount - at < 128 ? aluCount - at : 128;
+        program[cf++] = ALU(aluOffset + at, n);
+        at += n;
+    }
+    for (size_t at = 0; at < compareCount;) {
+        size_t n = compareCount - at < 128 ? compareCount - at : 128;
+        program[cf++] = ALU(compareOffset + at, n);
+        at += n;
+    }
     uint64_t exportOp = EXP_DONE(PIX0, _R(12 + lastColor), _x, _y, _z, _w);
     if (killed) exportOp |= to_QWORD(0, to_LE(1u << 22));
     program[cf++] = exportOp END_OF_PROGRAM;
@@ -870,6 +899,8 @@ static void debugTexture(FILE* f, int map, const TextureEntry* texture) {
                 (unsigned)copy->sourceW, (unsigned)copy->sourceH);
 }
 
+static bool evalTev(const HostVertex& in, float* rgba, bool* usesTex);
+
 static void debugDraw(const TevKey& key, uint32_t draw, bool tevPath, int textureMap, TextureEntry* texture,
                       TextureEntry* const* tevTextures, uint32_t nverts, const HostVertex* first,
                       const float* firstOut) {
@@ -893,9 +924,16 @@ static void debugDraw(const TevKey& key, uint32_t draw, bool tevPath, int textur
             (unsigned)g.bp[BP_ALPHACOMPARE], (unsigned)g.bp[BP_ZMODE], (unsigned)nverts,
             tevPath ? "per-tev" : "evalTev");
     if (first) {
-        fprintf(f, " first=pos(%.6g,%.6g,%.6g):col(%u,%u,%u,%u):uv(%.6g,%.6g):clip(%.6g,%.6g,%.6g,%.6g)",
-                first->pos[0], first->pos[1], first->pos[2], first->clr[0][0], first->clr[0][1], first->clr[0][2],
-                first->clr[0][3], first->tex[0][0], first->tex[0][1], firstOut[0], firstOut[1], firstOut[2], firstOut[3]);
+        float eval[4] = {};
+        evalTev(*first, eval, nullptr);
+        const float* m = reinterpret_cast<const float*>(&g.xfMem[(first->mtx[0] & 63) * 4]);
+        const float* p = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
+        fprintf(f, " first=pos(%.6g,%.6g,%.6g):mtx=%u:m(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g,%.6g):proj(%.6g,%.6g,%.6g,%.6g,%.6g,%.6g):col(%u,%u,%u,%u):uv(%.6g,%.6g):eval(%.6g,%.6g,%.6g,%.6g):outuv(%.6g,%.6g):clip(%.6g,%.6g,%.6g,%.6g)",
+                first->pos[0], first->pos[1], first->pos[2],
+                (unsigned)(first->mtx[0] & 63), m[0],m[1],m[2],m[3],m[4],m[5],m[6],m[7],m[8],m[9],m[10],m[11],
+                p[0],p[1],p[2],p[3],p[4],p[5], first->clr[0][0], first->clr[0][1], first->clr[0][2],
+                first->clr[0][3], first->tex[0][0], first->tex[0][1], eval[0], eval[1], eval[2], eval[3],
+                tevPath ? firstOut[4] : firstOut[4], tevPath ? firstOut[5] : firstOut[5], firstOut[0], firstOut[1], firstOut[2], firstOut[3]);
     }
     fprintf(f, " efb=none\n");
     fflush(f);
@@ -1663,8 +1701,13 @@ void flushBatch() {
             haveFirst = true;
         }
     }
-    debugDraw(tevKey, s_debugDrawNo++, tevPath, map, texture, tevTextures,
+    const uint32_t debugDrawNo = s_debugDrawNo++;
+    debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
               uint32_t(s_batch.indices.size()), haveFirst ? &firstHv : nullptr, firstOut);
+    if (SMS_GX2_DEBUG_DRAW_LIMIT && debugDrawNo >= SMS_GX2_DEBUG_DRAW_LIMIT) {
+        s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+        return;
+    }
     DCFlushRange(vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vbo.data(), uint32_t(vbo.size() * sizeof(float)));
     GX2SetAttribBuffer(0, uint32_t(vbo.size() * sizeof(float)), tevPath ? vertexStride : shader.stride, vbo.data());
@@ -1740,6 +1783,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetColorBuffer(WHBGfxGetTVColourBuffer(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(WHBGfxGetTVDepthBuffer());
     updateTarget();
+    s_debugDrawNo = 0;
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     GX2SetScissor(0, 0, uint32_t(s_tvW), uint32_t(s_tvH));
     s_frameActive = true;
