@@ -1167,20 +1167,32 @@ static void applyState() {
              : m == GX2_BLEND_MODE_INV_DST_ALPHA ? GX2_BLEND_MODE_ZERO : m;
     };
     const bool blend = (cm & 1) != 0;
-    if (blend && ((cm >> 11) & 1))
-        GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ONE,
-                           GX2_BLEND_COMBINE_MODE_REV_SUB, FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ONE,
-                           GX2_BLEND_COMBINE_MODE_REV_SUB);
-    else {
-        const GX2BlendMode sf = noDstAlpha(kSrc[(cm >> 8) & 7]), df = noDstAlpha(kDst[(cm >> 5) & 7]);
-        GX2SetBlendControl(GX2_RENDER_TARGET_0, sf, df, GX2_BLEND_COMBINE_MODE_ADD, FALSE, sf, df,
-                           GX2_BLEND_COMBINE_MODE_ADD);
+    // CMODE1 bit 8 (GX_SetDstAlpha): the alpha written to the target is the
+    // constant in its low byte instead of the fragment's alpha.
+    const uint32_t cm1 = g.bp[BP_CMODE1];
+    const bool dstAlphaConst = ((cm1 >> 8) & 1) != 0;
+    GX2BlendMode csrc = GX2_BLEND_MODE_ONE, cdst = GX2_BLEND_MODE_ZERO;
+    GX2BlendCombineMode ccomb = GX2_BLEND_COMBINE_MODE_ADD;
+    if (blend && ((cm >> 11) & 1)) {
+        csrc = GX2_BLEND_MODE_ONE; cdst = GX2_BLEND_MODE_ONE; ccomb = GX2_BLEND_COMBINE_MODE_REV_SUB;
+    } else if (blend) {
+        csrc = noDstAlpha(kSrc[(cm >> 8) & 7]); cdst = noDstAlpha(kDst[(cm >> 5) & 7]);
     }
-    GX2SetDepthOnlyControl(ztest, zwrite, ztest ? GX2_COMPARE_FUNC_LEQUAL : GX2_COMPARE_FUNC_ALWAYS);
+    if (dstAlphaConst) {
+        GX2SetBlendConstantColor(0.0f, 0.0f, 0.0f, float(cm1 & 0xff) / 255.0f);
+        GX2SetBlendControl(GX2_RENDER_TARGET_0, csrc, cdst, ccomb, TRUE, GX2_BLEND_MODE_CONSTANT_ALPHA,
+                           GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+    } else {
+        GX2SetBlendControl(GX2_RENDER_TARGET_0, csrc, cdst, ccomb, FALSE, csrc, cdst, ccomb);
+    }
+    GX2SetDepthOnlyControl(ztest, zwrite, ztest ? GX2CompareFunction((zmode >> 1) & 7) : GX2_COMPARE_FUNC_ALWAYS);
     GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
     GX2SetPolygonOffset(0, 0, 0, 0, 0);
-    GX2SetPolygonControl(GX2_FRONT_FACE_CCW, FALSE, FALSE, FALSE, GX2_POLYGON_MODE_TRIANGLE,
-                         GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
+    // GX front faces are clockwise on screen (the PC path's GL_CCW in its
+    // y-down window space); cull modes 1/2/3 drop back/front/all faces.
+    const uint32_t cull = (g.bp[BP_GENMODE] >> 14) & 3;
+    GX2SetPolygonControl(GX2_FRONT_FACE_CW, cull == 2 || cull == 3, cull == 1 || cull == 3, FALSE,
+                         GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
     const float scaleX = s_gameScale, scaleY = s_gameScale;
     const int vx = int(s_gameX + g.viewport[0] * scaleX);
     const int vy = int(g.viewport[1] * scaleY);
@@ -1200,7 +1212,7 @@ static void applyState() {
     // bit for GX2's color mask rather than treating GX_BM_NONE as write-off.
     const bool colourUpd = ((cm >> 3) & 1) != 0;
     const bool alphaUpd = hasAlpha && ((cm >> 4) & 1) != 0;
-    GX2SetColorControl(GX2_LOGIC_OP_COPY, blend ? 0xff : 0x00, FALSE, TRUE);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, (blend || dstAlphaConst) ? 0xff : 0x00, FALSE, TRUE);
     GX2SetTargetChannelMasks(GX2ChannelMask((colourUpd ? GX2_CHANNEL_MASK_RGB : 0) | (alphaUpd ? GX2_CHANNEL_MASK_A : 0)),
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0);
