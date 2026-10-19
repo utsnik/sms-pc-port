@@ -108,6 +108,52 @@ struct TevShader {
     uint32_t textureMask;
 };
 
+/*
+ * GPU-transform ABI.  The raw stream deliberately uses only formats already
+ * exercised by the Cafe/Cemu fetch path: three-component float vectors,
+ * float4 colours, float2 texcoords, and float4 matrix-index groups.  Matrix
+ * indices are exact integral float values; the vertex program converts them
+ * to AR with FLT_TO_INT/MOVA_INT before relative constant-file reads.  Keeping
+ * the index groups as float4 is a documented portability fallback for builds
+ * whose GX2 headers do not expose an integer byte attribute format.
+ *
+ *   0: position       float3
+ *   12: normal        float3
+ *   24: binormal      float3
+ *   36: tangent       float3
+ *   48: colours       float4, float4 (normalised 0..1)
+ *   80: texcoords     eight float2 pairs
+ *   144: matrix index 0..11 as three float4 groups
+ */
+struct RawVertex {
+    float pos[3], nrm[3], bin[3], tan[3];
+    float clr[2][4];
+    float tex[8][2];
+    float mtx[12];
+};
+static_assert(sizeof(RawVertex) == 192, "the raw GX2 fetch ABI must stay compact and stable");
+static constexpr uint32_t kRawVertexStride = sizeof(RawVertex);
+static constexpr uint32_t kRawVertexFloats = sizeof(RawVertex) / sizeof(float);
+
+enum RawAttrib : uint32_t {
+    RAW_ATTR_POS = 0, RAW_ATTR_NRM, RAW_ATTR_BIN, RAW_ATTR_TAN,
+    RAW_ATTR_CLR0, RAW_ATTR_CLR1, RAW_ATTR_TEX0, RAW_ATTR_TEX1,
+    RAW_ATTR_TEX2, RAW_ATTR_TEX3, RAW_ATTR_TEX4, RAW_ATTR_TEX5,
+    RAW_ATTR_TEX6, RAW_ATTR_TEX7, RAW_ATTR_MTX0, RAW_ATTR_MTX1, RAW_ATTR_MTX2,
+    RAW_ATTR_COUNT,
+};
+
+static constexpr uint32_t kXfUniformRegs = 184;
+static constexpr uint32_t kXfUniformFloats = kXfUniformRegs * 4;
+static constexpr uint32_t kVtxLiveBase = kXfUniformRegs;
+static constexpr uint32_t kVtxLiveRegs = 21;
+static float s_xfUniform[kXfUniformFloats];
+static uint32_t s_xfShadow[XF_MEM_WORDS];
+static bool s_xfUniformValid;
+static float s_vtxLive[kVtxLiveRegs * 4];
+static uint32_t s_xfUploadCalls;
+static uint32_t s_xfUploadRegs;
+
 static FixedShader s_untextured, s_modulate;
 static GX2VertexShader s_tevVertex;
 static GX2FetchShader s_tevFetch;
@@ -186,6 +232,59 @@ static void* alignedZero(size_t alignment, size_t size) {
     void* p = MEMAllocFromDefaultHeapEx(uint32_t(size), int(alignment));
     if (p) memset(p, 0, size);
     return p;
+}
+
+struct XfUniformSegment { uint32_t source, destination, words; };
+static constexpr XfUniformSegment kXfSegments[] = {
+    {0x000,   0, 256}, // raw position/texgen matrix words
+    {0x400, 256,  96}, // normal matrix words
+    {0x500, 352, 256}, // post-texture matrix words
+    {0x600, 608, 128}, // eight light records
+};
+static bool s_xfMemoryDirty = true;
+
+/*
+ * GX2 uniform writes are vector-register writes.  Compare the packed source
+ * ranges in four-word units and write only coalesced changed ranges.  This is
+ * intentionally independent of markXfMemDirty's no-straddle flush: the GX
+ * decoder does not pass the changed XF address through that legacy interface,
+ * so the renderer owns the shadow and discovers the exact dirty vectors here.
+ */
+static void uploadXfUniformRanges() {
+    if (!s_xfMemoryDirty) return;
+    if (!s_xfUniformValid) memset(s_xfShadow, 0xff, sizeof(s_xfShadow));
+    for (const XfUniformSegment& segment : kXfSegments) {
+        uint32_t first = ~0u, last = 0;
+        for (uint32_t word = 0; word < segment.words; word += 4) {
+            const uint32_t src = segment.source + word;
+            const uint32_t dst = segment.destination + word;
+            bool changed = !s_xfUniformValid;
+            for (uint32_t c = 0; c < 4; ++c)
+                changed = changed || s_xfShadow[src + c] != g.xfMem[src + c];
+            if (!changed) {
+                if (first != ~0u) {
+                    const uint32_t count = last - first + 1;
+                    GX2SetVertexUniformReg(first, count * 4, &s_xfUniform[first * 4]);
+                    ++s_xfUploadCalls;
+                    s_xfUploadRegs += count;
+                    first = ~0u;
+                }
+                continue;
+            }
+            if (first == ~0u) first = dst;
+            last = dst;
+            memcpy(&s_xfUniform[dst * 4], &g.xfMem[src], 4 * sizeof(uint32_t));
+            memcpy(&s_xfShadow[src], &g.xfMem[src], 4 * sizeof(uint32_t));
+        }
+        if (first != ~0u) {
+            const uint32_t count = last - first + 1;
+            GX2SetVertexUniformReg(first, count * 4, &s_xfUniform[first * 4]);
+            ++s_xfUploadCalls;
+            s_xfUploadRegs += count;
+        }
+    }
+    s_xfUniformValid = true;
+    s_xfMemoryDirty = false;
 }
 
 // Vertex streams live in per-frame arenas the GPU reads after the draw call
@@ -1982,6 +2081,50 @@ static TextureEntry* textureForCoord(const TevKey& key, TextureEntry* const* tex
         }
     }
     return nullptr;
+}
+
+static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textures) {
+    memset(s_vtxLive, 0, sizeof(s_vtxLive));
+    const float* proj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
+    const float* viewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
+    memcpy(&s_vtxLive[0], proj, 6 * sizeof(float));
+    s_vtxLive[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
+    memcpy(&s_vtxLive[8], viewport, 6 * sizeof(float));
+    s_vtxLive[14] = s_gameScale;
+    s_vtxLive[15] = s_gameX;
+    s_vtxLive[16] = s_tvW;
+    s_vtxLive[17] = s_tvH;
+    auto colour = [](uint32_t value, float* out) {
+        out[0] = float((value >> 24) & 255) / 255.0f;
+        out[1] = float((value >> 16) & 255) / 255.0f;
+        out[2] = float((value >> 8) & 255) / 255.0f;
+        out[3] = float(value & 255) / 255.0f;
+    };
+    colour(g.xfReg[XFR_MAT0 + 0], &s_vtxLive[20]);
+    colour(g.xfReg[XFR_AMB0 + 0], &s_vtxLive[24]);
+    colour(g.xfReg[XFR_MAT0 + 1], &s_vtxLive[28]);
+    colour(g.xfReg[XFR_AMB0 + 1], &s_vtxLive[32]);
+    // C193..C196: manual scale followed by the copy rectangle transform.
+    for (int coord = 0; coord < 8; ++coord) {
+        float* scale = &s_vtxLive[36 + coord * 2];
+        scale[0] = scale[1] = 1.0f;
+        TextureEntry* texture = textureForCoord(key, textures, coord);
+        if (g.tcManual[coord] && texture && texture->width && texture->height) {
+            scale[0] = float((g.bp[BP_SU_SSIZE + coord * 2] & 0xffff) + 1) / float(texture->width);
+            scale[1] = float((g.bp[BP_SU_SSIZE + coord * 2 + 1] & 0xffff) + 1) / float(texture->height);
+        }
+        float* copy = &s_vtxLive[52 + coord * 4];
+        copy[0] = copy[1] = 1.0f;
+        copy[2] = copy[3] = 0.0f;
+        const CopyEntry* entry = copyEntryForTexture(texture);
+        if (entry && entry->sourceW && entry->sourceH) {
+            copy[0] = float(entry->sourceW) / s_tvW;
+            copy[1] = float(entry->sourceH) / s_tvH;
+            copy[2] = float(entry->sourceX) / s_tvW;
+            copy[3] = float(entry->sourceY) / s_tvH;
+        }
+    }
+    GX2SetVertexUniformReg(kVtxLiveBase, kVtxLiveRegs * 4, s_vtxLive);
 }
 
 static void transformTev(const HostVertex& in, float* out, const TevKey& key, TextureEntry* const* textures) {
