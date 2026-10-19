@@ -200,6 +200,77 @@ static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
 
+// Per-draw GPU cost: the bottom-of-pipe GPU clock is stamped after every draw
+// (and once at frame start) into this arena's slots; once the arena's fence
+// has retired, each draw's cost is the difference to the previous stamp.
+extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
+static constexpr uint32_t kGpuStamps = 1024;
+struct GpuDrawInfo {
+    uint32_t verts, stages, texMask, blend, zmode, texW, texH, area, drawNo;
+};
+static uint64_t* s_gpuStamps[3];
+static GpuDrawInfo* s_gpuInfo[3];
+static uint32_t s_gpuCount[3];
+static uint64_t s_gpuTotal;
+static uint32_t s_gpuFrames;
+struct GpuTop { uint64_t cost; GpuDrawInfo info; };
+static GpuTop s_gpuTop[8];
+
+static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
+    if (!s_gpuStamps[arena]) {
+        s_gpuStamps[arena] = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGpuStamps * 8, 64));
+        s_gpuInfo[arena] = static_cast<GpuDrawInfo*>(MEMAllocFromDefaultHeapEx(kGpuStamps * sizeof(GpuDrawInfo), 64));
+        if (!s_gpuStamps[arena] || !s_gpuInfo[arena]) return;
+        // No dirty CPU lines may later be written back over the GPU's stamps.
+        memset(s_gpuStamps[arena], 0, kGpuStamps * 8);
+        DCFlushRange(s_gpuStamps[arena], kGpuStamps * 8);
+    }
+    uint32_t& n = s_gpuCount[arena];
+    if (n >= kGpuStamps) return;
+    if (info) s_gpuInfo[arena][n] = *info;
+    GX2SampleBottomGPUCycle(&s_gpuStamps[arena][n]);
+    ++n;
+}
+
+static void gpuCollect(uint32_t arena) {
+    const uint32_t n = s_gpuCount[arena];
+    s_gpuCount[arena] = 0;
+    if (n < 2 || !s_gpuStamps[arena]) return;
+    DCInvalidateRange(s_gpuStamps[arena], n * 8);
+    const uint64_t* st = s_gpuStamps[arena];
+    if (st[n - 1] > st[0]) s_gpuTotal += st[n - 1] - st[0];
+    ++s_gpuFrames;
+    for (uint32_t i = 1; i < n; ++i) {
+        if (st[i] <= st[i - 1]) continue;
+        const uint64_t cost = st[i] - st[i - 1];
+        int slot = -1;
+        for (int k = 0; k < 8; ++k)
+            if (slot < 0 || s_gpuTop[k].cost < s_gpuTop[slot].cost) slot = k;
+        if (cost > s_gpuTop[slot].cost) s_gpuTop[slot] = {cost, s_gpuInfo[arena][i]};
+    }
+}
+
+static void gpuReport() {
+    if (!s_gpuFrames) return;
+    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u (top single draws over the window follow)",
+                 (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames));
+    for (int r = 0; r < 8; ++r) {
+        int best = -1;
+        for (int k = 0; k < 8; ++k)
+            if (s_gpuTop[k].cost && (best < 0 || s_gpuTop[k].cost > s_gpuTop[best].cost)) best = k;
+        if (best < 0) break;
+        const GpuDrawInfo& d = s_gpuTop[best].info;
+        WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u",
+                     r, (unsigned)s_gpuTop[best].cost, (unsigned)d.drawNo, (unsigned)d.verts, (unsigned)d.stages,
+                     (unsigned)d.texMask, (unsigned)d.texW, (unsigned)d.texH, (unsigned)d.blend, (unsigned)d.zmode,
+                     (unsigned)d.area);
+        s_gpuTop[best].cost = 0;
+    }
+    memset(s_gpuTop, 0, sizeof(s_gpuTop));
+    s_gpuTotal = 0;
+    s_gpuFrames = 0;
+}
+
 // GPU-read memory released mid-frame (linear texture staging) is freed once
 // the fence of the frame that queued it has retired.
 struct DeferredFree { void* p; uint32_t arena; };
@@ -225,6 +296,8 @@ static void beginVertexArena() {
         GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
         s_vertexFenceWait += OSGetTime() - t0;
     }
+    gpuCollect(s_vertexArenaIndex);
+    gpuStamp(s_vertexArenaIndex, nullptr);
     // That fence also covers everything queued while this arena was last used.
     uint32_t kept = 0;
     for (uint32_t i = 0; i < s_deferredFreeCount; ++i) {
@@ -2150,6 +2223,33 @@ void flushBatch() {
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
     GX2DrawEx(mode, uint32_t(s_batch.indices.size()), 0, 1);
     ++s_drawsThisFrame;
+    {
+        GpuDrawInfo info = {};
+        info.verts = uint32_t(s_batch.indices.size());
+        info.stages = tevPath ? tevKey.stages : 0;
+        info.texMask = tevTextureMask(tevKey);
+        info.blend = g.bp[BP_CMODE0];
+        info.zmode = g.bp[BP_ZMODE] & 0xff;
+        info.drawNo = debugDrawNo;
+        TextureEntry* t0 = texture;
+        for (int m = 0; m < 8 && !t0; ++m) t0 = tevTextures[m];
+        if (t0) { info.texW = t0->width; info.texH = t0->height; }
+        // Screen-space bounding box of the draw (clip -> TV pixels).
+        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+        for (size_t at = 0; at + vertexFloats <= vboFloats; at += vertexFloats) {
+            const float w = vbo[at + 3];
+            if (w <= 0.00001f) continue;
+            const float x = vbo[at] / w, y = vbo[at + 1] / w;
+            x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+        }
+        if (x1 > x0 && y1 > y0) {
+            const float cx0 = std::max(x0, -1.0f), cx1 = std::min(x1, 1.0f);
+            const float cy0 = std::max(y0, -1.0f), cy1 = std::min(y1, 1.0f);
+            if (cx1 > cx0 && cy1 > cy0)
+                info.area = uint32_t((cx1 - cx0) * 0.5f * s_tvW * (cy1 - cy0) * 0.5f * s_tvH);
+        }
+        gpuStamp(s_vertexArenaIndex, &info);
+    }
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     debugPixelTrace(debugDrawNo);
 #endif
@@ -2402,6 +2502,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexArenaOverflows,
                      (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears);
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
+        static uint32_t s_gpuReportEvery;
+        if (++s_gpuReportEvery >= 4) { s_gpuReportEvery = 0; gpuReport(); }
         s_vertexFenceWait = 0;
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
