@@ -6,6 +6,7 @@
 #include <vpad/input.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 namespace {
@@ -27,8 +28,24 @@ s8 stick_value(float value)
 	return static_cast<s8>(value * 100.0f);
 }
 
+/* Unattended test input is compiled in but stays off unless a file named
+ * "autopress" exists in the app directory on the SD card (Cemu test SD only).
+ * -DSMS_WIIU_AUTOPRESS=0 removes it entirely. */
 #ifndef SMS_WIIU_AUTOPRESS
 #define SMS_WIIU_AUTOPRESS 1
+#endif
+
+#if SMS_WIIU_AUTOPRESS
+bool autopress_marker_present()
+{
+	char path[160];
+	std::snprintf(path, sizeof(path), "%sautopress", sms_wiiu_app_root());
+	FILE* file = std::fopen(path, "rb");
+	if (!file)
+		return false;
+	std::fclose(file);
+	return true;
+}
 #endif
 
 u16 map_vpad_buttons(uint32_t buttons)
@@ -214,8 +231,13 @@ void sms_wiiu_input_poll(void)
 	 * at the console. Build with -DSMS_WIIU_AUTOPRESS=0 for a release. */
 	{
 		static uint32_t s_poll_count;
+		static int s_marker = -1;
 		static const uint32_t kPressAt[] = { 1200, 1500, 1800, 2400, 3000 };
-		uint32_t n = ++s_poll_count;
+		if (s_marker < 0) {
+			s_marker = autopress_marker_present() ? 1 : 0;
+			port_log("[pad] autopress marker %s\n", s_marker ? "present: unattended input ON" : "absent: off");
+		}
+		uint32_t n = s_marker ? ++s_poll_count : 0;
 		for (uint32_t at : kPressAt) {
 			if (n >= at && n < at + 6) {
 				if (s_status[0].err != PAD_ERR_NONE)
