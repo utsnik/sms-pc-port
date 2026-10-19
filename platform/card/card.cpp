@@ -37,6 +37,11 @@ static int card_mkdir(const char* path, int mode) { return mkdir(path, mode); }
 #define card_mkdir port_mkdir
 #endif
 #include <errno.h>
+#ifdef TARGET_WIIU
+#include "../wiiu/port_heap.h"
+#else
+#define SMS_PORT_HEAP_SCOPE() ((void)0)
+#endif
 #include <dolphin/dvd.h>
 #ifdef TARGET_WIIU
 #include "../wiiu/runtime.h"
@@ -131,7 +136,7 @@ bool read_all(const std::string& path, std::vector<u8>& out)
 	if (!f)
 		return false;
 	out.clear();
-	u8 buf[65536];
+	u8 buf[4096]; // small: the game's card worker thread has a small stack
 	size_t n;
 	while ((n = fread(buf, 1, sizeof buf, f)) > 0)
 		out.insert(out.end(), buf, buf + n);
@@ -297,6 +302,7 @@ s32 used_blocks()
 // Slot A's folder; save states keep theirs beside it (platform/savestate).
 extern "C" const char* port_card_dir(void)
 {
+	SMS_PORT_HEAP_SCOPE();
 	static std::string dir = card_dir();
 	return dir.c_str();
 }
@@ -316,6 +322,7 @@ extern "C" s32 CARDProbeEx(s32 chan, s32* memSize, s32* sectorSize)
 }
 extern "C" s32 CARDMount(s32 chan, void*, CARDCallback)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	load();
@@ -324,6 +331,7 @@ extern "C" s32 CARDMount(s32 chan, void*, CARDCallback)
 }
 extern "C" s32 CARDMountAsync(s32 chan, void* work, CARDCallback detach, CARDCallback attach)
 {
+	SMS_PORT_HEAP_SCOPE();
 	s32 r = CARDMount(chan, work, detach);
 	if (attach)
 		attach(chan, r);
@@ -331,12 +339,14 @@ extern "C" s32 CARDMountAsync(s32 chan, void* work, CARDCallback detach, CARDCal
 }
 extern "C" s32 CARDUnmount(s32 chan)
 {
+	SMS_PORT_HEAP_SCOPE();
 	g_mounted = false;
 	return chan == 0 ? CARD_RESULT_READY : CARD_RESULT_NOCARD;
 }
 extern "C" long CARDCheck(long chan) { return chan == 0 ? CARD_RESULT_READY : CARD_RESULT_NOCARD; }
 extern "C" long CARDFormat(long chan)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	for (int i = 0; i < kMaxFiles; i++) {
@@ -352,6 +362,7 @@ extern "C" long CARDFormat(long chan)
 }
 extern "C" s32 CARDFreeBlocks(s32 chan, s32* bytesFree, s32* filesFree)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	load();
@@ -372,6 +383,7 @@ extern "C" s32 CARDGetSectorSize(s32 chan, u32* size)
 
 extern "C" s32 CARDOpen(s32 chan, char* fileName, CARDFileInfo* fi)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	load();
@@ -387,6 +399,7 @@ extern "C" s32 CARDOpen(s32 chan, char* fileName, CARDFileInfo* fi)
 }
 extern "C" s32 CARDFastOpen(s32 chan, s32 fileNo, CARDFileInfo* fi)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	if (fileNo < 0 || fileNo >= kMaxFiles || !g_files[fileNo].used)
@@ -401,11 +414,13 @@ extern "C" s32 CARDFastOpen(s32 chan, s32 fileNo, CARDFileInfo* fi)
 }
 extern "C" s32 CARDClose(CARDFileInfo* fi)
 {
+	SMS_PORT_HEAP_SCOPE();
 	fi->chan = -1;
 	return CARD_RESULT_READY;
 }
 extern "C" long CARDCreate(long chan, char* fileName, unsigned long size, CARDFileInfo* fi)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	load();
@@ -442,6 +457,7 @@ extern "C" long CARDCreate(long chan, char* fileName, unsigned long size, CARDFi
 }
 extern "C" long CARDRead(CARDFileInfo* fi, void* buf, s32 length, s32 offset)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (fi->fileNo < 0 || fi->fileNo >= kMaxFiles || !g_files[fi->fileNo].used)
 		return CARD_RESULT_NOFILE;
 	std::vector<u8>& d = g_files[fi->fileNo].data;
@@ -452,6 +468,7 @@ extern "C" long CARDRead(CARDFileInfo* fi, void* buf, s32 length, s32 offset)
 }
 extern "C" long CARDWrite(CARDFileInfo* fi, void* buf, long length, long offset)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (fi->fileNo < 0 || fi->fileNo >= kMaxFiles || !g_files[fi->fileNo].used)
 		return CARD_RESULT_NOFILE;
 	std::vector<u8>& d = g_files[fi->fileNo].data;
@@ -464,6 +481,7 @@ extern "C" long CARDWrite(CARDFileInfo* fi, void* buf, long length, long offset)
 }
 extern "C" s32 CARDGetStatus(s32 chan, s32 fileNo, CARDStat* stat)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	if (fileNo < 0 || fileNo >= kMaxFiles || !g_files[fileNo].used)
@@ -475,6 +493,7 @@ extern "C" s32 CARDGetStatus(s32 chan, s32 fileNo, CARDStat* stat)
 }
 extern "C" long CARDSetStatus(long chan, long fileNo, CARDStat* stat)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	if (fileNo < 0 || fileNo >= kMaxFiles || !g_files[fileNo].used)
@@ -493,6 +512,7 @@ extern "C" long CARDSetStatus(long chan, long fileNo, CARDStat* stat)
 }
 extern "C" long CARDFastDelete(long chan, long fileNo)
 {
+	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
 	if (fileNo < 0 || fileNo >= kMaxFiles || !g_files[fileNo].used)
@@ -508,6 +528,7 @@ extern "C" long CARDFastDelete(long chan, long fileNo)
 }
 extern "C" s32 CARDDelete(s32 chan, char* fileName)
 {
+	SMS_PORT_HEAP_SCOPE();
 	load();
 	int no = find(fileName);
 	return no < 0 ? CARD_RESULT_NOFILE : (s32)CARDFastDelete(chan, no);

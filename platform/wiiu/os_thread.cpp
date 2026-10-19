@@ -48,6 +48,7 @@ const uint8_t kGameThreadAffinityCpu1 = 1u << 1;
 
 const uint32_t kWutThreadBytes = 0x6a0;
 const unsigned kMaxThreads = 64;
+const uint32_t kMinThreadStack = 0x10000;
 const unsigned kMaxQueues = 128;
 
 struct ThreadRecord {
@@ -57,6 +58,8 @@ struct ThreadRecord {
 	void* arg;
 	void* stack;
 	uint32_t stack_size;
+	void* host_stack;
+	uint32_t host_stack_bytes;
 	s32 priority;
 	void* result;
 	bool active;
@@ -237,7 +240,28 @@ int sms_wiiu_OSCreateThread(OSThread* game, void* (*entry)(void*), void* arg,
 	}
 	if (!r)
 		return FALSE;
+	/* The game sizes stacks for the GameCube SDK (the card worker has 4 KiB).
+	 * Port code that runs on these threads (stdio, std::string, 64 KiB read
+	 * buffers) needs far more, and an overflow lands in the JKR heap blocks
+	 * allocated next to the stack. Small stacks are replaced by one from the
+	 * system heap, reused when the record is. */
+	void* host_stack = r->host_stack;
+	uint32_t host_stack_bytes = r->host_stack_bytes;
+	if (stack_size < kMinThreadStack) {
+		if (host_stack_bytes < kMinThreadStack) {
+			if (host_stack)
+				MEMFreeToDefaultHeap(host_stack);
+			host_stack = MEMAllocFromDefaultHeapEx(kMinThreadStack, 0x40);
+			host_stack_bytes = host_stack ? kMinThreadStack : 0;
+			if (!host_stack)
+				return FALSE;
+		}
+		stack = static_cast<uint8_t*>(host_stack) + host_stack_bytes;
+		stack_size = host_stack_bytes;
+	}
 	std::memset(r, 0, sizeof(*r));
+	r->host_stack = host_stack;
+	r->host_stack_bytes = host_stack_bytes;
 	r->game = game;
 	r->entry = entry;
 	r->arg = arg;
