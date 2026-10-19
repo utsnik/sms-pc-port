@@ -1659,18 +1659,6 @@ void flushBatch() {
     }
     const bool titleSky = tevPath && !textured && g.viewport[2] == 640.0f && g.viewport[3] == 448.0f &&
                           g.bp[BP_CMODE0] == 0x00005169;
-    // The PC trace's draw 30 is the far-side title sky shell.  Its source
-    // colour is the blue raster gradient, but the shell is outside GX2's
-    // normal clip volume and the generated TEV path leaves the target white.
-    // Preserve the following title passes and establish the traced backdrop
-    // colour at this exact pass boundary instead.
-    if (titleSky) {
-        GX2ClearColor(WHBGfxGetTVColourBuffer(), 0.08f, 0.28f, 0.70f, 1.0f);
-        s_batch.vertices.clear();
-        s_batch.indices.clear();
-        s_batch.count = 0;
-        return;
-    }
     int coord = 0, map = 0;
     TextureEntry* texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
@@ -1704,6 +1692,18 @@ void flushBatch() {
         vbo.resize(at + vertexFloats);
         if (tevPath) transformTev(hv, vbo.data() + at, tevKey, tevTextures);
         else transform(hv, vbo.data() + at, coord, useTex, texture);
+        if (titleSky) {
+            // The PC backend keeps the far-side sky shell visible through its
+            // clip convention.  GX2 uses a positive half-Z clip volume, so
+            // retain the traced raster colours and place each source triangle
+            // in that same visible rectangle.
+            const uint32_t corner = uint32_t((vbo.size() / vertexFloats - 1) % 3);
+            float* p = vbo.data() + at;
+            p[0] = corner == 1 ? 3.0f : -1.0f;
+            p[1] = corner == 2 ? 3.0f : -1.0f;
+            p[2] = 0.0f;
+            p[3] = 1.0f;
+        }
         if (!haveFirst) {
             firstHv = hv;
             memcpy(firstOut, vbo.data() + at, vertexFloats * sizeof(float));
