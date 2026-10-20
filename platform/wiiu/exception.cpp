@@ -165,10 +165,20 @@ int rescue(int, const char**)
 
 extern "C" void sms_wiiu_install_exception_handlers(void)
 {
-	if (OSCreateThread(&s_rescue, rescue, 0, nullptr, s_rescue_stack + sizeof s_rescue_stack,
-	                   sizeof s_rescue_stack, 0, OS_THREAD_ATTRIB_AFFINITY_CPU1))
-		OSResumeThread(&s_rescue);
-	else
+	/* Priority 0 was refused (2026-10-20); the parked main thread no longer
+	 * competes, so any priority above the game's (16) will do. */
+	static const int kPriorities[] = {1, 8, 15};
+	bool started = false;
+	for (int prio : kPriorities) {
+		if (OSCreateThread(&s_rescue, rescue, 0, nullptr, s_rescue_stack + sizeof s_rescue_stack,
+		                   sizeof s_rescue_stack, prio, OS_THREAD_ATTRIB_AFFINITY_CPU1)) {
+			OSResumeThread(&s_rescue);
+			WHBLogPrintf("[crash] rescue thread started at priority %d", prio);
+			started = true;
+			break;
+		}
+	}
+	if (!started)
 		WHBLogPrint("[crash] could not start the rescue thread");
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_DSI, on_dsi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ISI, on_isi);
