@@ -3244,7 +3244,15 @@ void flushBatch() {
     }
     float* vbo = reinterpret_cast<float*>(block);
     uint32_t* ibo = reinterpret_cast<uint32_t*>(block + iboOffset);
-    memset(block + vertexCount * vertexStride, 0, vertexStride);
+    if (gpuPath) {
+        // Zero the vertex lines in cache without reading MEM2: the decoder
+        // writes every vertex here, and cold write-allocate fills were the
+        // top CPU cost.  Covers the sentinel slot too.  block is 256-aligned.
+        for (uint32_t off = 0; off < vboBytes; off += 32)
+            asm volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
+    } else {
+        memset(block + vertexCount * vertexStride, 0, vertexStride);
+    }
     OSTime perfXform0 = OSGetTime();
     HostVertex firstHv;
     float firstOut[28] = {};
