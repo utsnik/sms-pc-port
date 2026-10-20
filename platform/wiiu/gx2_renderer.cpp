@@ -455,7 +455,9 @@ static GpuTop s_gpuTop[8];
 static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
+static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the [gpu] report
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
+    if (!s_gpuDiag) return;
     if (!s_gpuStamps[arena]) {
         s_gpuStamps[arena] = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGpuStamps * 8, 64));
         s_gpuInfo[arena] = static_cast<GpuDrawInfo*>(MEMAllocFromDefaultHeapEx(kGpuStamps * sizeof(GpuDrawInfo), 64));
@@ -3808,6 +3810,7 @@ void rendererInit(float) {
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
+    s_gpuDiag = sdMarkerPresent("perfdiag");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
@@ -3821,8 +3824,7 @@ bool rendererReady() { return s_ready; }
 void releaseGlThread() {}
 
 void onStateChange() {
-    SMS_PORT_HEAP_SCOPE();
-    if (!s_batch.indices.empty()) flushBatch();
+    if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
 }
 
 PrimClass primClass(uint8_t op) { return op >= 0xb8 ? PRIM_POINTS : op >= 0xa8 ? PRIM_LINES : PRIM_TRIS; }
@@ -3848,22 +3850,31 @@ uint32_t primitiveIndices(uint8_t op, uint32_t n, uint32_t base, uint32_t* out) 
     return primitiveIndicesLocal(op, n, base, out);
 }
 
+// The batch vectors only allocate when they grow: open the heap scope (four
+// coreinit calls) for that case alone.
+template <typename V> static void batchReserve(V& v, size_t want) {
+    if (want > v.capacity()) {
+        SMS_PORT_HEAP_SCOPE();
+        v.reserve(want > 2 * v.capacity() ? want : 2 * v.capacity());
+    }
+}
+
 uint8_t* primitiveBegin(uint8_t op, uint32_t n, uint32_t fmt, uint32_t stride) {
-    SMS_PORT_HEAP_SCOPE();
     const PrimClass cls = primClass(op);
     if (!s_batch.indices.empty() && (cls != s_batch.cls || fmt != s_batch.fmt)) flushBatch();
     s_batch.cls = cls; s_batch.fmt = fmt; s_batch.stride = stride;
     const size_t old = s_batch.vertices.size();
+    batchReserve(s_batch.vertices, old + size_t(n) * stride);
     s_batch.vertices.resize(old + size_t(n) * stride);
     return s_batch.vertices.data() + old;
 }
 
 void primitiveEnd(uint8_t op, uint32_t n) {
-    SMS_PORT_HEAP_SCOPE();
     if (!n) return;
     const uint32_t base = s_batch.count;
     s_batch.count += n;
     const size_t old = s_batch.indices.size();
+    batchReserve(s_batch.indices, old + size_t(n) * 3);
     s_batch.indices.resize(old + size_t(n) * 3);
     const uint32_t used = primitiveIndicesLocal(op, n, base, s_batch.indices.data() + old);
     s_batch.indices.resize(old + used);
@@ -3871,9 +3882,10 @@ void primitiveEnd(uint8_t op, uint32_t n) {
 
 void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* verts, uint32_t n,
                    const uint32_t* idx, uint32_t nidx) {
-    SMS_PORT_HEAP_SCOPE();
     if (!s_batch.indices.empty() && (cls != s_batch.cls || fmt != s_batch.fmt)) flushBatch();
     s_batch.cls = cls; s_batch.fmt = fmt; s_batch.stride = stride;
+    batchReserve(s_batch.vertices, s_batch.vertices.size() + size_t(n) * stride);
+    batchReserve(s_batch.indices, s_batch.indices.size() + nidx);
     const uint32_t base = s_batch.count;
     s_batch.vertices.insert(s_batch.vertices.end(), verts, verts + size_t(n) * stride);
     s_batch.count += n;
@@ -4072,16 +4084,18 @@ void flushBatch() {
             GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                              const_cast<uint32_t*>(storedIdx), 0, 1);
             ++s_drawsThisFrame;
-            GpuDrawInfo info = {};
-            info.verts = pend.nidx;
-            info.stages = tevKey.stages;
-            info.texMask = tevTextureMask(tevKey);
-            info.blend = g.bp[BP_CMODE0];
-            info.zmode = g.bp[BP_ZMODE] & 0xff;
-            info.drawNo = debugDrawNo;
-            for (int m = 0; m < 8; ++m)
-                if (tevTextures[m]) { info.texW = tevTextures[m]->width; info.texH = tevTextures[m]->height; break; }
-            gpuStamp(s_vertexArenaIndex, &info);
+            if (s_gpuDiag) {
+                GpuDrawInfo info = {};
+                info.verts = pend.nidx;
+                info.stages = tevKey.stages;
+                info.texMask = tevTextureMask(tevKey);
+                info.blend = g.bp[BP_CMODE0];
+                info.zmode = g.bp[BP_ZMODE] & 0xff;
+                info.drawNo = debugDrawNo;
+                for (int m = 0; m < 8; ++m)
+                    if (tevTextures[m]) { info.texW = tevTextures[m]->width; info.texH = tevTextures[m]->height; break; }
+                gpuStamp(s_vertexArenaIndex, &info);
+            }
             return;
         }
         // Not on the generated program (its first, priming draw, or the fixed
@@ -4235,33 +4249,35 @@ void flushBatch() {
     }
     ++s_drawsThisFrame;
     {
-        GpuDrawInfo info = {};
-        info.verts = uint32_t(s_batch.indices.size());
-        info.stages = tevPath ? tevKey.stages : 0;
-        info.texMask = tevTextureMask(tevKey);
-        info.blend = g.bp[BP_CMODE0];
-        info.zmode = g.bp[BP_ZMODE] & 0xff;
-        info.drawNo = debugDrawNo;
-        TextureEntry* t0 = texture;
-        for (int m = 0; m < 8 && !t0; ++m) t0 = tevTextures[m];
-        if (t0) { info.texW = t0->width; info.texH = t0->height; }
-        // Screen-space bounding box of the draw (clip -> TV pixels).
-        float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
-        for (size_t v = 0; v < vertexCount && !gpuPath; ++v) {
-            if (!s_uniqueDone[v]) continue;
-            const size_t at = v * vertexFloats;
-            const float w = vbo[at + 3];
-            if (w <= 0.00001f) continue;
-            const float x = vbo[at] / w, y = vbo[at + 1] / w;
-            x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+        if (s_gpuDiag) {
+            GpuDrawInfo info = {};
+            info.verts = uint32_t(s_batch.indices.size());
+            info.stages = tevPath ? tevKey.stages : 0;
+            info.texMask = tevTextureMask(tevKey);
+            info.blend = g.bp[BP_CMODE0];
+            info.zmode = g.bp[BP_ZMODE] & 0xff;
+            info.drawNo = debugDrawNo;
+            TextureEntry* t0 = texture;
+            for (int m = 0; m < 8 && !t0; ++m) t0 = tevTextures[m];
+            if (t0) { info.texW = t0->width; info.texH = t0->height; }
+            // Screen-space bounding box of the draw (clip -> TV pixels).
+            float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+            for (size_t v = 0; v < vertexCount && !gpuPath; ++v) {
+                if (!s_uniqueDone[v]) continue;
+                const size_t at = v * vertexFloats;
+                const float w = vbo[at + 3];
+                if (w <= 0.00001f) continue;
+                const float x = vbo[at] / w, y = vbo[at + 1] / w;
+                x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
+            }
+            if (x1 > x0 && y1 > y0) {
+                const float cx0 = std::max(x0, -1.0f), cx1 = std::min(x1, 1.0f);
+                const float cy0 = std::max(y0, -1.0f), cy1 = std::min(y1, 1.0f);
+                if (cx1 > cx0 && cy1 > cy0)
+                    info.area = uint32_t((cx1 - cx0) * 0.5f * s_tvW * (cy1 - cy0) * 0.5f * s_tvH);
+            }
+            gpuStamp(s_vertexArenaIndex, &info);
         }
-        if (x1 > x0 && y1 > y0) {
-            const float cx0 = std::max(x0, -1.0f), cx1 = std::min(x1, 1.0f);
-            const float cy0 = std::max(y0, -1.0f), cy1 = std::min(y1, 1.0f);
-            if (cx1 > cx0 && cy1 > cy0)
-                info.area = uint32_t((cx1 - cx0) * 0.5f * s_tvW * (cy1 - cy0) * 0.5f * s_tvH);
-        }
-        gpuStamp(s_vertexArenaIndex, &info);
     }
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     debugPixelTrace(debugDrawNo);
@@ -4328,8 +4344,7 @@ void executeCopy(uint32_t ctrl) {
     rebindTvTarget();
 }
 void markXfMemDirty() {
-    SMS_PORT_HEAP_SCOPE();
-    if (!s_batch.indices.empty()) flushBatch();
+    if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
     s_xfMemoryDirty = true;
 }
 // GXPeekARGB: the game reads the EFB back through the CPU. Sunshine's Mario
