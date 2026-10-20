@@ -3279,7 +3279,7 @@ void flushBatch() {
             const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
             float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
             HostVertex& dec = gpuPath ? *reinterpret_cast<HostVertex*>(out) : hv;
-            unpackVertex(s_batch.fmt, packed, defaults, dec);
+            unpackVertex(s_batch.fmt, packed, defaults, dec, gpuPath);
             if (gpuPath && s_vertexSelfCheck)
                 vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
                                     dec, s_debugDrawNo);
