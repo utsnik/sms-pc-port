@@ -426,6 +426,7 @@ extern "C" void sms_wiiu_gfx_init(void)
  * its foreground-release handling; release it, then end the process like a
  * return from main. */
 extern "C" void sms_wiiu_audio_shutdown(void);
+extern "C" void sms_wiiu_vsync_pace_stop(void);
 
 extern "C" void sms_wiiu_exit(void)
 {
@@ -435,6 +436,7 @@ extern "C" void sms_wiiu_exit(void)
 	 * "exiting" line, so a repeat must show which step never returned. */
 	WHBLogPrintf("SMS Wii U: exit: audio shutdown");
 	sms_wiiu_audio_shutdown();
+	sms_wiiu_vsync_pace_stop();
 	if (s_gfx_initialized) {
 		if (s_frame_open) {
 			WHBLogPrintf("SMS Wii U: exit: renderer end");
@@ -496,6 +498,59 @@ static void present_begin_pipelined(void)
 		GX2WaitForVsync();
 	}
 	GX2SetContextState(WHBGfxGetTVContextState());
+}
+
+/* Real vsyncs, counted by GX2's vsync event. The VI emulation advances its
+ * retrace count by the vsyncs that really passed and waits for one when none
+ * has, so JDrama's waitForRetrace(2) holds the game to 30 fps as a GameCube's
+ * VI did (20 fps when a frame overruns). Without it every emulated retrace
+ * was free: the airstrip ran at ~40 fps, 1.33x speed (2026-10-20). The SD
+ * marker "nopace" keeps the old free-running count for A/B runs. */
+static volatile uint32_t s_vsyncs;
+static uint32_t s_vsyncsSeen;
+static int s_pace = -1;
+static uint32_t s_paceCalls, s_paceWaits, s_paceFields;
+
+static void on_vsync(GX2EventType, void*) { ++s_vsyncs; }
+
+extern "C" uint32_t sms_wiiu_vsync_fields(void)
+{
+	if (!s_gfx_initialized || !ProcUIInForeground())
+		return 1;
+	if (s_pace < 0) {
+		s_pace = !sms_wiiu_sd_marker("nopace");
+		if (s_pace)
+			GX2SetEventCallback(GX2_EVENT_TYPE_VSYNC, on_vsync, nullptr);
+		s_vsyncsSeen = s_vsyncs;
+		port_log("SMS Wii U: retrace pacing %s (SD marker nopace)\n", s_pace ? "on real vsyncs" : "off");
+	}
+	if (!s_pace)
+		return 1;
+	int32_t fields = int32_t(s_vsyncs - s_vsyncsSeen);
+	if (fields <= 0) {
+		GX2WaitForVsync();
+		++s_paceWaits;
+		/* The event callback may not have run yet: the wait itself is a field. */
+		fields = int32_t(s_vsyncs - s_vsyncsSeen);
+		if (fields < 1)
+			fields = 1;
+	}
+	s_vsyncsSeen += uint32_t(fields);
+	s_paceFields += uint32_t(fields);
+	if (++s_paceCalls == 600) {
+		port_log("SMS Wii U: [pace] 600 retraces = %u vsyncs, %u waited (vsync events %u)\n",
+		         unsigned(s_paceFields), unsigned(s_paceWaits), unsigned(s_vsyncs));
+		s_paceCalls = s_paceWaits = s_paceFields = 0;
+	}
+	return uint32_t(fields);
+}
+
+/* Every exit path drops the callback, or GX2 calls into an unmapped process. */
+extern "C" void sms_wiiu_vsync_pace_stop(void)
+{
+	if (s_pace > 0)
+		GX2SetEventCallback(GX2_EVENT_TYPE_VSYNC, nullptr, nullptr);
+	s_pace = 0;
 }
 
 extern "C" void sms_wiiu_gfx_frame(void)
