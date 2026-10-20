@@ -2408,7 +2408,10 @@ static void setShader(FixedShader& shader, TextureEntry* texture, VertexProgram*
 // else draws into any more; present copies (and scales) the target to the TV
 // and GamePad scan buffers.
 static constexpr bool kNativeRender = true;
-static constexpr uint32_t kRenderW = 854, kRenderH = 480;
+// Render size is a setting: SD marker res1080 -> 1920x1080, res720 ->
+// 1280x720, otherwise 854x480.  The game's 4:3 picture is scaled to the
+// target height and centred.
+static uint32_t kRenderW = 854, kRenderH = 480;
 static GX2ColorBuffer s_renderColour;
 static GX2DepthBuffer s_renderDepth;
 static bool s_renderOwn, s_renderTried;
@@ -2417,6 +2420,8 @@ static void initRenderTarget() {
     if (s_renderTried) return;
     s_renderTried = true;
     if (!kNativeRender) return;
+    if (sdMarkerPresent("res1080")) { kRenderW = 1920; kRenderH = 1080; }
+    else if (sdMarkerPresent("res720")) { kRenderW = 1280; kRenderH = 720; }
     GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
     GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
     if (!tv || !td || !tv->surface.image || !td->surface.image) return;
