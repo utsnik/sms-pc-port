@@ -1002,7 +1002,7 @@ static uint32_t vertexInputForRow(uint32_t row) {
     if (row == 1) return 2; // normal
     if (row == 3) return 3; // binormal
     if (row == 4) return 4; // tangent
-    if (row >= 5) return RAW_ATTR_TEX01 + (row - 5) / 2; // packed source texcoord pair
+    if (row >= 5) return RAW_ATTR_TEX01 + (row - 5) / 2 + 1; // packed source texcoord pair
     return 29; // raster colour 0, selected by the caller for row 2
 }
 
@@ -1014,7 +1014,7 @@ static void vertexCopySource(std::vector<uint64_t>& ops, uint32_t source, uint32
 }
 
 static void vertexCopyTexSource(std::vector<uint64_t>& ops, uint32_t coord, uint32_t dst) {
-    const uint32_t source = RAW_ATTR_TEX01 + coord / 2;
+    const uint32_t source = RAW_ATTR_TEX01 + coord / 2 + 1;
     const uint32_t chan = (coord & 1) * 2;
     vertexEmit(ops, {ALU_MOV(_R(dst), _x, _R(source), chan)});
     vertexEmit(ops, {ALU_MOV(_R(dst), _y, _R(source), chan + 1)});
@@ -1060,7 +1060,7 @@ static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, u
 }
 
 static void vertexNormalTransform(std::vector<uint64_t>& ops) {
-    vertexLoadRelativeMatrix(ops, 15, _x, 53, 64, 3, 3);
+    vertexLoadRelativeMatrix(ops, RAW_ATTR_MTX0 + 1, _x, 53, 64, 3, 3);
     for (uint32_t ch = 0; ch < 3; ++ch)
         vertexEmitDot4(ops, 41, ch, _R(2), _R(53 + ch));
     vertexEmitDot4(ops, 45, _x, _R(41), _R(41));
@@ -1206,7 +1206,7 @@ static bool initVertexProgram(VertexProgram& shader) {
 
     // Position: raw position -> the per-vertex model matrix selected through
     // MOVA/AR-indexed constant reads -> live projection and target mapping.
-    vertexMatrixTransform(alu, 1, 15, _x, 40, 0, true);
+    vertexMatrixTransform(alu, 1, RAW_ATTR_MTX0 + 1, _x, 40, 0, true);
     if (key.projectionOrtho) {
         vertexEmit(alu, {ALU_MULADD(_R(20), _x, _R(40), _x, _GX2_C(kVtxLiveBase), _x,
                                     _GX2_C(kVtxLiveBase), _y)});
@@ -1284,7 +1284,7 @@ static bool initVertexProgram(VertexProgram& shader) {
         if (needsNormal) vertexNormalTransform(alu);
         vertexEmitColour(alu, key, 0, 29);
         vertexEmitColour(alu, key, 1, 30);
-        const uint32_t matrixIndexBase = 15;
+        const uint32_t matrixIndexBase = RAW_ATTR_MTX0 + 1;
         for (uint32_t coord = 0; coord < 8; ++coord) {
         const uint32_t dst = 21 + coord;
         if (coord >= key.numTexGens) {
