@@ -549,6 +549,7 @@ static const uint8_t* arrayElem(int slot, uint32_t idx) {
 }
 
 static uint32_t s_vertsLoaded = 0;
+uint32_t g_dlReplayIdx = 0;  // indices drawn from cached display lists (perf counter)
 double g_decodeSeconds = 0;  // detailed timers: time in the vertex loader
 extern double g_flushSeconds;
 
@@ -1333,6 +1334,7 @@ void callDisplayList(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE()
                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
         }
         s_vertsLoaded += e.verts;
+        for (const DlRun& r : e.runs) g_dlReplayIdx += uint32_t(r.idx.size());
         g_traceLastVat = e.lastVat;
         e.misses = 0;
         return;

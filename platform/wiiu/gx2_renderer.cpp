@@ -451,6 +451,8 @@ static uint64_t s_gpuTotal;
 static uint32_t s_gpuFrames;
 struct GpuTop { uint64_t cost; GpuDrawInfo info; };
 static GpuTop s_gpuTop[8];
+static uint64_t s_rateStamp0, s_rateStamp1;
+static OSTime s_rateTime0, s_rateTime1;
 
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
     if (!s_gpuStamps[arena]) {
@@ -475,6 +477,9 @@ static void gpuCollect(uint32_t arena) {
     DCInvalidateRange(s_gpuStamps[arena], n * 8);
     const uint64_t* st = s_gpuStamps[arena];
     if (st[n - 1] > st[0]) s_gpuTotal += st[n - 1] - st[0];
+    // Timer rate check: first stamps of the window's frames against OSTime.
+    if (!s_gpuFrames) { s_rateStamp0 = st[0]; s_rateTime0 = OSGetTime(); }
+    s_rateStamp1 = st[0]; s_rateTime1 = OSGetTime();
     ++s_gpuFrames;
     for (uint32_t i = 1; i < n; ++i) {
         if (st[i] <= st[i - 1]) continue;
@@ -488,8 +493,11 @@ static void gpuCollect(uint32_t arena) {
 
 static void gpuReport() {
     if (!s_gpuFrames) return;
-    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u (top single draws over the window follow)",
-                 (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames));
+    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u timer-rate=%u/s (top single draws over the window follow)",
+                 (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames),
+                 s_rateTime1 > s_rateTime0
+                     ? (unsigned)((s_rateStamp1 - s_rateStamp0) * 1000ull / OSTicksToMilliseconds(s_rateTime1 - s_rateTime0))
+                     : 0u);
     for (int r = 0; r < 8; ++r) {
         int best = -1;
         for (int k = 0; k < 8; ++k)
@@ -4408,7 +4416,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -4417,12 +4425,13 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
-                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears);
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30));
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
         static uint32_t s_gpuReportEvery;
         if (++s_gpuReportEvery >= 4) { s_gpuReportEvery = 0; gpuReport(); }
         s_vertexFenceWait = 0;
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
+        g_dlReplayIdx = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }
