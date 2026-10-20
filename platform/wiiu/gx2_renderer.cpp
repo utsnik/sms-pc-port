@@ -85,22 +85,21 @@ static bool envFlag(const char* name, bool fallback) {
            value[0] != 'f' && value[0] != 'F';
 }
 
-static bool vertexSelfCheckMarkerPresent() {
-    // The marker is intentionally read-only.  Try the explicit SD devoptab
-    // name first (the Cemu portable card exposes it), then the resolved app
-    // root used by Cafe's stdio implementation.
-    const char* paths[] = {"sd:/wiiu/apps/sms/vxcheck", nullptr};
-    char appPath[160];
-    std::snprintf(appPath, sizeof(appPath), "%svxcheck", sms_wiiu_app_root());
-    paths[1] = appPath;
+static bool sdMarkerPresent(const char* name) {
+    // Markers are intentionally read-only.  Try the explicit SD devoptab name
+    // first (the Cemu portable card exposes it), then the resolved app root
+    // used by Cafe's stdio implementation.
+    char sdPath[160], appPath[160];
+    std::snprintf(sdPath, sizeof(sdPath), "sd:/wiiu/apps/sms/%s", name);
+    std::snprintf(appPath, sizeof(appPath), "%s%s", sms_wiiu_app_root(), name);
+    const char* paths[] = {sdPath, appPath};
     for (const char* path : paths) {
         FILE* marker = std::fopen(path, "rb");
         if (!marker) continue;
         std::fclose(marker);
-        WHBLogPrintf("SMS Wii U: vertex self-check marker present (%s)", path);
+        WHBLogPrintf("SMS Wii U: marker %s present (%s)", name, path);
         return true;
     }
-    WHBLogPrintf("SMS Wii U: vertex self-check marker absent");
     return false;
 }
 
@@ -205,7 +204,7 @@ struct VertexProgram {
 static const char* s_vertexRejectReason = "unknown";
 static uint32_t s_vertexRejected;
 
-static constexpr uint32_t kXfUniformRegs = 184;
+static constexpr uint32_t kXfUniformRegs = 192;
 static constexpr uint32_t kXfUniformFloats = kXfUniformRegs * 4;
 static constexpr uint32_t kVtxLiveBase = kXfUniformRegs;
 static constexpr uint32_t kVtxLiveRegs = 21;
@@ -304,12 +303,16 @@ static void* alignedZero(size_t alignment, size_t size) {
     return p;
 }
 
-struct XfUniformSegment { uint32_t source, destination, words; };
+// `stride` is the number of XF words held by one uniform vector.  Normal
+// matrices are 3x3 with three-word rows, so they are spread one row per
+// vector (w = 0) to keep a matrix index a plain register offset.
+struct XfUniformSegment { uint32_t source, destination, words, stride; };
+static constexpr uint32_t kXfNormalBase = 64, kXfPostTexBase = 96, kXfLightBase = 160;
 static constexpr XfUniformSegment kXfSegments[] = {
-    {0x000,   0, 256}, // raw position/texgen matrix words -> C0..C63
-    {0x400,  64,  96}, // normal matrix words -> C64..C87
-    {0x500,  88, 256}, // post-texture matrix words -> C88..C151
-    {0x600, 152, 128}, // eight light records -> C152..C183
+    {0x000,            0, 256, 4}, // raw position/texgen matrix words -> C0..C63
+    {0x400, kXfNormalBase,  96, 3}, // normal matrix rows -> C64..C95
+    {0x500, kXfPostTexBase, 256, 4}, // post-texture matrix words -> C96..C159
+    {0x600, kXfLightBase, 128, 4}, // eight light records -> C160..C191
 };
 static bool s_xfMemoryDirty = true;
 
@@ -325,11 +328,12 @@ static void uploadXfUniformRanges() {
     if (!s_xfUniformValid) memset(s_xfShadow, 0xff, sizeof(s_xfShadow));
     for (const XfUniformSegment& segment : kXfSegments) {
         uint32_t first = ~0u, last = 0;
-        for (uint32_t word = 0; word < segment.words; word += 4) {
+        const uint32_t n = segment.stride;
+        for (uint32_t word = 0; word < segment.words; word += n) {
             const uint32_t src = segment.source + word;
-            const uint32_t dst = segment.destination + word / 4;
+            const uint32_t dst = segment.destination + word / n;
             bool changed = !s_xfUniformValid;
-            for (uint32_t c = 0; c < 4; ++c)
+            for (uint32_t c = 0; c < n; ++c)
                 changed = changed || s_xfShadow[src + c] != g.xfMem[src + c];
             if (!changed) {
                 if (first != ~0u) {
@@ -357,9 +361,10 @@ static void uploadXfUniformRanges() {
                 dstVector[2] = float((packed >> 8) & 255) / 255.0f;
                 dstVector[3] = float(packed & 255) / 255.0f;
             } else {
-                memcpy(&s_xfUniform[dst * 4], &g.xfMem[src], 4 * sizeof(uint32_t));
+                memcpy(&s_xfUniform[dst * 4], &g.xfMem[src], n * sizeof(uint32_t));
+                if (n == 3) s_xfUniform[dst * 4 + 3] = 0.0f;
             }
-            memcpy(&s_xfShadow[src], &g.xfMem[src], 4 * sizeof(uint32_t));
+            memcpy(&s_xfShadow[src], &g.xfMem[src], n * sizeof(uint32_t));
         }
         if (first != ~0u) {
             const uint32_t count = last - first + 1;
@@ -1026,20 +1031,13 @@ static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, u
                                      uint32_t rows = 4);
 
 static void vertexLoadRelativeMatrix(std::vector<uint64_t>& ops, uint32_t indexReg, uint32_t indexChan,
-                                     uint32_t dst, uint32_t base, uint32_t rows = 4,
-                                     uint32_t stride = 4) {
-    // Keep the converted index in PV instead of a temporary GPR. Cemu's
-    // legacy decompiler handles relative constant reads and PV arithmetic,
-    // while a converted integer held in a GPR is rejected by its MOVA path.
+                                     uint32_t dst, uint32_t base, uint32_t rows = 4) {
+    // Every XF matrix row occupies one uniform vector, so the GX matrix index
+    // is the register offset itself.  Keep the converted index in PV rather
+    // than a GPR: Cemu's legacy decompiler rejects a GPR-held MOVA source.
+    // FLT_TO_INT runs on the transcendental unit, so its no-GPR result is PS.
     vertexEmit(ops, {ALU_FLT_TO_INT(__, _x, _R(indexReg), indexChan)});
-    // FLT_TO_INT is a transcendental-unit instruction, so its no-GPR result
-    // is PS rather than PV.  Copy it into PV before the integer address math.
-    vertexEmit(ops, {ALU_MOV(__, _y, ALU_SRC_PS, _x)});
-    vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _x)});
-    if (stride == 3)
-        vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _y)});
-    else
-        vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _x)});
+    vertexEmit(ops, {ALU_MOV(__, _x, ALU_SRC_PS, _x)});
     vertexEmit(ops, {ALU_MOVA_INT(__, _x, ALU_SRC_PV, _x)});
     for (uint32_t row = 0; row < rows; ++row)
         for (uint32_t ch = 0; ch < 4; ++ch)
@@ -1062,7 +1060,7 @@ static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, u
 }
 
 static void vertexNormalTransform(std::vector<uint64_t>& ops) {
-    vertexLoadRelativeMatrix(ops, RAW_ATTR_MTX0 + 1, _x, 53, 64, 3, 3);
+    vertexLoadRelativeMatrix(ops, RAW_ATTR_MTX0 + 1, _x, 53, kXfNormalBase, 3);
     for (uint32_t ch = 0; ch < 3; ++ch)
         vertexEmitDot4(ops, 41, ch, _R(2), _R(53 + ch));
     vertexEmitDot4(ops, 45, _x, _R(41), _R(41));
@@ -1097,7 +1095,7 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
         const bool spot = (ctrl >> 10) & 1;
         for (uint32_t light = 0; light < 8; ++light) {
             if (!(mask & (1u << light))) continue;
-            const uint32_t c = 152 + light * 4;
+            const uint32_t c = kXfLightBase + light * 4;
             // R42 = normalized light vector, R45 = length squared/length,
             // R46 = scalar attenuation/diffuse factor, R47 = predicate.
             if (!atten || spot) {
@@ -1242,7 +1240,6 @@ static bool initVertexProgram(VertexProgram& shader) {
                                 _GX2_C(kVtxLiveBase + 3), _x,
                                 _R(54), _x)});
     vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _GX2_C(kVtxLiveBase + 3), _y)});
-    vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _R(54), _x)});
     vertexEmit(alu, {ALU_MULADD(_R(55), _y, _GX2_C(kVtxLiveBase + 2), _y,
                                 _GX2_C(kVtxLiveBase + 3), _x,
                                 _R(54), _y)});
@@ -1258,6 +1255,17 @@ static bool initVertexProgram(VertexProgram& shader) {
     vertexEmit(alu, {ALU_ADD(_R(20), _y, _R(20), _w, _R(55), _y _NEG)});
     vertexEmit(alu, {ALU_MUL(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _y, _R(20), _w)});
     vertexEmit(alu, {ALU_MULADD(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _x, _R(20), _z, _R(20), _z)});
+
+    // TEMP diagnostic: bypass XF matrix/projection output with the raw
+    // position interpreted as the game's 640x480 screen coordinates.
+    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 2), _x)});
+    vertexEmit(alu, {ALU_MUL_x2(_R(20), _x, _R(1), _x, _R(56), _x)});
+    vertexEmit(alu, {ALU_ADD(_R(20), _x, _R(20), _x, ALU_SRC_1 _NEG, _x)});
+    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 2), _w)});
+    vertexEmit(alu, {ALU_MUL_x2(_R(20), _y, _R(1), _y, _R(56), _x)});
+    vertexEmit(alu, {ALU_ADD(_R(20), _y, ALU_SRC_1, _x, _R(20), _y _NEG)});
+    vertexEmit(alu, {ALU_MOV(_R(20), _z, ALU_SRC_0_5, _x)});
+    vertexEmit(alu, {ALU_MOV(_R(20), _w, ALU_SRC_1, _x)});
 
     if (key.outputMode) {
         // The fixed pixel programs consume the old five-parameter contract:
@@ -1323,7 +1331,7 @@ static bool initVertexProgram(VertexProgram& shader) {
                     vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
                 }
                 vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
-                vertexLoadAbsoluteMatrix(alu, 53, 88 + (post & 63) * 4);
+                vertexLoadAbsoluteMatrix(alu, 53, kXfPostTexBase + (post & 63));
                 for (uint32_t ch = 0; ch < 3; ++ch)
                     vertexEmitDot4(alu, 55, ch, _R(55), _R(53 + ch));
             }
@@ -2926,8 +2934,9 @@ static void vertexSelfCheckDraw(const VertexKey& key, const TevKey& tevKey, bool
 void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
-    s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true);
-    s_vertexSelfCheck = vertexSelfCheckMarkerPresent() || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
+    // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
+    s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
+    s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
     s_ready = initShaders();
