@@ -18,6 +18,17 @@
 #include <dolphin/dsp.h>
 
 #include "dsp_mixer.h"
+#ifdef TARGET_WIIU
+/* The mailbox deque and command vector grow from game threads. Outside a
+ * PortHeapScope the Wii U operator new takes the game's current JKR heap, so a
+ * deque block landed in a heap the game later reset and reused for
+ * JPAEmitterManager's emitter pool, and each subframe's mail pair
+ * (0xDCD10004, 0xF355FF00) overwrote the free list: the 1-in-2 DSI at Mario's
+ * first step on file select (2026-10-20). */
+#include "../wiiu/port_heap.h"
+#else
+#define SMS_PORT_HEAP_SCOPE() ((void)0)
+#endif
 
 #include <deque>
 #include <new>
@@ -55,8 +66,10 @@ Hle& hle_state()
 {
 	alignas(Hle) static unsigned char storage[sizeof(Hle)];
 	static Hle* state;
-	if (!state)
+	if (!state) {
+		SMS_PORT_HEAP_SCOPE();
 		state = new (storage) Hle();
+	}
 	return *state;
 }
 #define g (hle_state())
@@ -66,7 +79,11 @@ Hle g;
 
 const uint8_t* aram_lookup(uint32_t a) { return port_aram_ptr(a); }
 
-void post(u32 m) { g.fromDsp.push_back(m); }
+void post(u32 m)
+{
+	SMS_PORT_HEAP_SCOPE();
+	g.fromDsp.push_back(m);
+}
 
 // Raise the DSP interrupt: runs the decomp's __DSPHandler in interrupt
 // context at the next check point (the sender still has interrupts off).
@@ -191,6 +208,7 @@ extern "C" void port_audio_dsp_mail_to(u32 mail)
 	g.lastMail = mail;
 	if (!g.inCmd)
 		return;
+	SMS_PORT_HEAP_SCOPE();
 	g.words.push_back(mail);
 	if (g.words.size() == g.want) {
 		g.inCmd = false;
