@@ -1,7 +1,5 @@
 #include "port_os.h"
 #include "runtime.h"
-extern "C" void sms_wiiu_watch_range(const char*, const void*, uint32_t, uint32_t);
-extern "C" uint32_t sms_wiiu_watch_word(void);
 
 #include <dolphin/dvd.h>
 #include <dolphin/os/OSCache.h>
@@ -220,9 +218,7 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		std::fclose(file);
 		return DVD_RESULT_FATAL_ERROR;
 	}
-	const uint32_t watch_before = sms_wiiu_watch_word();
 	size_t got = std::fread(address, 1, want, file);
-	sms_wiiu_watch_range("dvd read", address, uint32_t(want), watch_before);
 	/* A GameCube DVD read is a DMA; callers may invalidate the buffer after it,
 	 * which on the Wii U would drop this CPU copy. Write it back to memory. */
 	if (got)

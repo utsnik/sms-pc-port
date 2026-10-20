@@ -17,12 +17,8 @@ const u32 kAramBase = 0x4000;
 u8* g_aram;
 u32 g_alloc = kAramBase;
 
-extern "C" void sms_wiiu_watch_range(const char*, const void*, u32, u32) __attribute__((weak));
-extern "C" u32 sms_wiiu_watch_word(void) __attribute__((weak));
-
 void copy(u32 type, u32 src, u32 dst, u32 len)
 {
-	const u32 before = sms_wiiu_watch_word ? sms_wiiu_watch_word() : 0;
 	if (type == ARAM_DIR_MRAM_TO_ARAM) {
 		if (dst + len <= kAramSize)
 			memcpy(g_aram + dst, (void*)(uintptr_t)src, len);
@@ -37,8 +33,6 @@ void copy(u32 type, u32 src, u32 dst, u32 len)
 			DCFlushRange((void*)(uintptr_t)dst, len);
 			if (GXPC_MemoryWritten)
 				GXPC_MemoryWritten((void*)(uintptr_t)dst, len);
-			if (sms_wiiu_watch_range)
-				sms_wiiu_watch_range("aram->mram", (void*)(uintptr_t)dst, len, before);
 		} else
 			port_log("[ar] read out of range 0x%x+0x%x\n", src, len);
 	}
