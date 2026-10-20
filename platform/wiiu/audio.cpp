@@ -146,6 +146,8 @@ u32 isqrt(u64 v)
 	return (u32)r;
 }
 
+extern "C" void sms_wiiu_hang_check(void);
+
 void log_stats(int64_t now)
 {
 	int64_t span = now - g.statsSince;
@@ -162,6 +164,7 @@ void log_stats(int64_t now)
 	g.peak       = 0;
 	g.statsSince     = now;
 	g.statsSubframes = sub;
+	sms_wiiu_hang_check();
 	g.blocks = g.underruns = g.pendingWaits = 0;
 	g.minQueued = 0xFFFFFFFFu;
 	g.maxQueued = 0;
