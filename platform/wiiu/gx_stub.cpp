@@ -262,6 +262,15 @@ bool shots_wanted(uint32_t p)
 	}
 	if (!s_shots_marker || s_shots_written >= kShotsMax)
 		return false;
+	/* SMS_SHOTS_FROM=<present> (autoplay file): 4 shots, 400 presents apart,
+	 * from there instead (A/B pictures of one place in a level). */
+	static int s_from = -1;
+	if (s_from < 0) {
+		const char* v = std::getenv("SMS_SHOTS_FROM");
+		s_from = v ? std::atoi(v) : 0;
+	}
+	if (s_from > 0)
+		return p >= uint32_t(s_from) && (p - uint32_t(s_from)) % 400 == 0 && s_shots_written < 4;
 	return p == 120 || p == 600 || p == 1800 || (p >= 3600 && p % 3600 == 0);
 }
 
