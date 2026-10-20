@@ -20,6 +20,8 @@ extern u8* sms_wiiu_mem2_base;
 extern u32 sms_wiiu_mem2_size;
 
 const char* sms_wiiu_app_root(void);
+/* 1 when the file <app root>/<name> exists (read-only SD switches). */
+int sms_wiiu_sd_marker(const char* name);
 uint32_t sms_wiiu_heap_free(void);
 u32 sms_wiiu_frame_count(void);
 const char* sms_wiiu_stage_path(void);

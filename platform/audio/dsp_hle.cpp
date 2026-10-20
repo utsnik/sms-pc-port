@@ -26,10 +26,12 @@
  * (0xDCD10004, 0xF355FF00) overwrote the free list: the 1-in-2 DSI at Mario's
  * first step on file select (2026-10-20). */
 #include "../wiiu/port_heap.h"
+#include "../wiiu/runtime.h"
 #else
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
 
+#include <cstring>
 #include <deque>
 #include <new>
 #include <string>
@@ -126,6 +128,20 @@ void render_subframe()
 {
 	maybe_dump_aram();
 	u32 n = g.subSamples;
+#ifdef TARGET_WIIU
+	// A/B switch (SD marker "nomix"): silence instead of the mixer, to
+	// measure what mixing on the audio thread costs core 1.
+	static int s_noMix = -1;
+	if (s_noMix < 0) {
+		s_noMix = sms_wiiu_sd_marker("nomix");
+		if (s_noMix)
+			port_log("[audio] SD marker nomix: DSP mixer skipped (silence)\n");
+	}
+	if (s_noMix) {
+		std::memset(g.outA + g.sub * n, 0, n * sizeof(int16_t));
+		std::memset(g.outB + g.sub * n, 0, n * sizeof(int16_t));
+	} else
+#endif
 	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
 	g.sub++;
 	g.subframesRendered++;
