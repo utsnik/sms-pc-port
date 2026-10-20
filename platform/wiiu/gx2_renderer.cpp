@@ -184,13 +184,11 @@ static constexpr uint32_t kVertexKeyLayoutVersion = 1;
  *   80: texcoords     eight float2 pairs
  *   144: matrix index 0..11 as three float4 groups
  */
-struct RawVertex {
-    float pos[3], nrm[3], bin[3], tan[3];
-    float clr[2][4];
-    float tex[8][2];
-    float mtx[12];
-};
-static_assert(sizeof(RawVertex) == 192, "the raw GX2 fetch ABI must stay compact and stable");
+// The raw GX2 fetch ABI is HostVertex itself: the decoder writes straight
+// into the vertex arena and the fetch unit converts colours (UNORM8) and
+// matrix indices (USCALED8), so no per-vertex CPU packing remains.
+using RawVertex = HostVertex;
+static_assert(sizeof(RawVertex) == 132, "the raw GX2 fetch ABI must stay compact and stable");
 static constexpr uint32_t kRawVertexStride = sizeof(RawVertex);
 static constexpr uint32_t kRawVertexFloats = sizeof(RawVertex) / sizeof(float);
 
@@ -745,16 +743,7 @@ static VertexKey currentVertexKey(bool tevOutput, int fixedCoord, bool fixedText
     return k;
 }
 
-static void packRawVertex(const HostVertex& in, RawVertex& out) {
-    memcpy(out.pos, in.pos, sizeof(out.pos));
-    memcpy(out.nrm, in.nrm, sizeof(out.nrm));
-    memcpy(out.bin, in.bin, sizeof(out.bin));
-    memcpy(out.tan, in.tan, sizeof(out.tan));
-    for (int c = 0; c < 2; ++c)
-        for (int i = 0; i < 4; ++i) out.clr[c][i] = float(in.clr[c][i]) / 255.0f;
-    memcpy(out.tex, in.tex, sizeof(out.tex));
-    for (int i = 0; i < 12; ++i) out.mtx[i] = float(in.mtx[i] & 63);
-}
+static void packRawVertex(const HostVertex& in, RawVertex& out) { out = in; }
 
 static uint32_t tevTextureMask(const TevKey& k) {
     uint32_t mask = 0;
@@ -1524,13 +1513,17 @@ static bool initVertexProgram(VertexProgram& shader) {
         uint32_t(offsetof(RawVertex, mtx[8])),
     };
     const uint32_t components[RAW_ATTR_COUNT] = {3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4};
+    const bool colourAttr[RAW_ATTR_COUNT] = {false, false, false, false, true, true};
+    const bool indexAttr[RAW_ATTR_COUNT] = {false, false, false, false, false, false,
+                                            false, false, false, false, true, true, true};
     for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) {
         shader.attribVars[i] = {"raw", GX2_SHADER_VAR_TYPE_FLOAT4, 0, i};
         GX2AttribStream& attr = shader.attrs[i];
         attr.location = i;
         attr.buffer = 0;
         attr.offset = offsets[i];
-        attr.format = components[i] == 2 ? GX2_ATTRIB_FORMAT_FLOAT_32_32 :
+        attr.format = colourAttr[i] ? GX2_ATTRIB_FORMAT_UNORM_8_8_8_8 :
+                      indexAttr[i] ? GX2AttribFormat(GX2_ATTRIB_FLAG_SCALED | GX2_ATTRIB_TYPE_8_8_8_8) :
                       components[i] == 3 ? GX2_ATTRIB_FORMAT_FLOAT_32_32_32 : GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
         attr.type = GX2_ATTRIB_INDEX_PER_VERTEX;
         attr.aluDivisor = 0;
@@ -3273,17 +3266,19 @@ void flushBatch() {
         if (!s_uniqueDone[index]) {
             HostVertex hv;
             const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
-            unpackVertex(s_batch.fmt, packed, defaults, hv);
+            float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
+            HostVertex& dec = gpuPath ? *reinterpret_cast<HostVertex*>(out) : hv;
+            unpackVertex(s_batch.fmt, packed, defaults, dec);
             if (gpuPath && s_vertexSelfCheck)
                 vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
-                                    hv, s_debugDrawNo);
-            float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
+                                    dec, s_debugDrawNo);
             if (gpuPath) {
-                packRawVertex(hv, *reinterpret_cast<RawVertex*>(out));
+                // dec already sits in the arena in the fetch layout.
 #if SMS_GX2_VX_ORACLE
+                const HostVertex orig = dec;
                 float reference[28] = {};
-                if (tevPath) transformTev(hv, reference, tevKey, tevTextures);
-                else transform(hv, reference, coord, useTex, texture);
+                if (tevPath) transformTev(orig, reference, tevKey, tevTextures);
+                else transform(orig, reference, coord, useTex, texture);
                 if (SMS_GX2_VX_ORACLE != 8)
                 memcpy(reinterpret_cast<RawVertex*>(out)->tex[6],
                        reference + (SMS_GX2_VX_ORACLE == 2 ? 4 : SMS_GX2_VX_ORACLE == 6 ? 24 : 0), 4 * sizeof(float));
@@ -3298,7 +3293,7 @@ void flushBatch() {
             s_uniqueDone[index] = 1;
             ++s_perfUnique;
             if (!haveFirst) {
-                firstHv = hv;
+                firstHv = dec;
                 if (!gpuPath) memcpy(firstOut, out, vertexFloats * sizeof(float));
                 haveFirst = true;
             }
