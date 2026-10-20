@@ -193,6 +193,8 @@ struct ArenaRef {
     uint64_t key = 0;  // backend's own tag for what the stored form depends on (Wii U: matrix defaults)
 };
 extern uint32_t g_dlReplayIdx;
+extern uint64_t g_dlTicks;    // time inside callDisplayList, draws included (Wii U perfdiag)
+extern bool g_perfStages;     // Wii U: SD marker perfdiag times the per-draw stages
 bool arenaEnabled();
 uint32_t arenaGeneration();
 bool arenaUpload(const uint8_t* verts, uint32_t count, uint32_t stride, const uint32_t* idx, uint32_t nidx, ArenaRef& out);

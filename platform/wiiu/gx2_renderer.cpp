@@ -3905,6 +3905,7 @@ void rendererInit(float) {
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    g_perfStages = s_gpuDiag;
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
@@ -4092,6 +4093,16 @@ static uint32_t s_drawsThisFrame;
 static uint32_t s_debugDrawNo;
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
+// perfdiag only: flushBatch's stages (key = TEV key, textures and pixel shader
+// lookup; vkey = vertex key and program; state = applyState; shader =
+// setTevShader/setShader; xfu = XF and live vertex uniforms; submit = the rest).
+static OSTime s_stKey, s_stVkey, s_stState, s_stShader, s_stXfu;
+static inline OSTime stageLap(OSTime& acc, OSTime t) {
+    if (!g_perfStages) return 0;
+    const OSTime now = OSGetTime();
+    acc += now - t;
+    return now;
+}
 static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfFrames;
 static uint32_t s_perfGpuDraws, s_perfCpuDraws, s_perfGpuVerts, s_perfCpuVerts;
 struct PerfScope {
@@ -4144,6 +4155,8 @@ void flushBatch() {
     // samples a texture we could not load still draws through the stage-1
     // fallback (8 or 10 floats), while the TEV path uses 28 floats.
     s_perfTex += OSGetTime() - perfTex0;
+    OSTime stT = g_perfStages ? OSGetTime() : 0;
+    if (g_perfStages) s_stKey += stT - perfTex0;
     const bool useTex = !tevPath && textured && texture;
     FixedShader& shader = useTex ? s_modulate : s_untextured;
     const VertexKey vertexKey = currentVertexKey(tevPath, coord, useTex);
@@ -4158,13 +4171,17 @@ void flushBatch() {
     // startup even though the CPU path already has the correct file-select
     // frame.  Each key is primed once, so steady-state draws stay GPU-only.
     const bool gpuPath = vertex != nullptr && vertex->warmed;
+    stT = stageLap(s_stVkey, stT);
     applyState();
+    stT = stageLap(s_stState, stT);
     if (tevPath) setTevShader(*tevShader, tevTextures, gpuPath ? vertex : nullptr);
     else setShader(shader, texture, gpuPath ? vertex : nullptr);
+    stT = stageLap(s_stShader, stT);
     if (gpuPath) {
         uploadXfUniformRanges();
         packVertexLiveUniforms(tevKey, tevTextures);
     }
+    stageLap(s_stXfu, stT);
     if (s_dlPending.ref) {
         const auto pend = s_dlPending;
         s_dlPending = {};
@@ -4665,6 +4682,14 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
                      (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)s_perfDlUploads, (unsigned)s_perfDlDecoded);
+        if (g_perfStages) {
+            const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
+            WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",
+                         ms(s_perfFlush), ms(s_stKey), ms(s_stVkey), ms(s_stState), ms(s_stShader), ms(s_stXfu),
+                         ms(s_perfFlush > staged ? s_perfFlush - staged : 0), ms(OSTime(g_dlTicks)));
+            s_stKey = s_stVkey = s_stState = s_stShader = s_stXfu = 0;
+            g_dlTicks = 0;
+        }
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
         static uint32_t s_gpuReportEvery;
         if (++s_gpuReportEvery >= 4) { s_gpuReportEvery = 0; gpuReport(); }
