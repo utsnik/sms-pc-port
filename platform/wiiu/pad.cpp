@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <strings.h>
 
 /* Set when the port itself asks for the Menu; vi.cpp drains the GPU before the
  * ProcUI pump that releases the foreground. */
@@ -51,6 +53,73 @@ bool autopress_marker_present()
 		return false;
 	std::fclose(file);
 	return true;
+}
+
+/* A script in the "autoplay" file drives the pad by retrace field, in the
+ * desktop SMS_AUTOPRESS form (control@field[+hold], comma or newline
+ * separated). Lines NAME=VALUE are set as environment variables instead
+ * (SMS_WARP, SMS_SKIP_MOVIES), so getenv-driven debug switches work here. */
+struct ScriptPress {
+	u16 button;
+	s8 sx, sy;
+	uint32_t at, until;
+};
+ScriptPress s_script[48];
+int s_script_count;
+volatile uint32_t s_field;
+
+bool script_control(const char* name, ScriptPress& p)
+{
+	static const struct { const char* name; u16 button; s8 sx, sy; } kControls[] = {
+		{ "a", PAD_BUTTON_A, 0, 0 }, { "b", PAD_BUTTON_B, 0, 0 }, { "x", PAD_BUTTON_X, 0, 0 },
+		{ "y", PAD_BUTTON_Y, 0, 0 }, { "start", PAD_BUTTON_START, 0, 0 }, { "z", PAD_TRIGGER_Z, 0, 0 },
+		{ "l", PAD_TRIGGER_L, 0, 0 }, { "r", PAD_TRIGGER_R, 0, 0 }, { "up", PAD_BUTTON_UP, 0, 0 },
+		{ "down", PAD_BUTTON_DOWN, 0, 0 }, { "left", PAD_BUTTON_LEFT, 0, 0 },
+		{ "right", PAD_BUTTON_RIGHT, 0, 0 }, { "stick_left", 0, -100, 0 }, { "stick_right", 0, 100, 0 },
+		{ "stick_up", 0, 0, 100 }, { "stick_down", 0, 0, -100 },
+	};
+	for (const auto& c : kControls)
+		if (strcasecmp(c.name, name) == 0) {
+			p.button = c.button;
+			p.sx = c.sx;
+			p.sy = c.sy;
+			return true;
+		}
+	return false;
+}
+
+void script_load(FILE* f)
+{
+	char buf[2048];
+	size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+	buf[n] = 0;
+	char* save = nullptr;
+	for (char* tok = strtok_r(buf, ",\r\n", &save); tok; tok = strtok_r(nullptr, ",\r\n", &save)) {
+		while (*tok == ' ' || *tok == '\t')
+			tok++;
+		if (char* eq = std::strchr(tok, '=')) {
+			*eq = 0;
+			setenv(tok, eq + 1, 1);
+			port_log("[pad] autoplay env %s=%s\n", tok, eq + 1);
+			continue;
+		}
+		char* at = std::strchr(tok, '@');
+		if (!at || s_script_count >= (int)(sizeof(s_script) / sizeof(s_script[0])))
+			continue;
+		*at = 0;
+		ScriptPress p{};
+		if (!script_control(tok, p)) {
+			port_log("[pad] autoplay: unknown control '%s'\n", tok);
+			continue;
+		}
+		uint32_t hold = 8;
+		if (const char* plus = std::strchr(at + 1, '+'))
+			hold = (uint32_t)atoi(plus + 1);
+		p.at = (uint32_t)atoi(at + 1);
+		p.until = p.at + hold;
+		s_script[s_script_count++] = p;
+	}
+	port_log("[pad] autoplay: %d scripted presses\n", s_script_count);
 }
 #endif
 
@@ -311,19 +380,34 @@ void sms_wiiu_input_poll(void)
 			std::snprintf(path, sizeof(path), "%sautoplay", sms_wiiu_app_root());
 			FILE* f = std::fopen(path, "rb");
 			s_autoplay = f ? 1 : 0;
-			if (f) std::fclose(f);
+			if (f) {
+				script_load(f);
+				std::fclose(f);
+			}
 			port_log("[pad] autoplay marker %s\n", s_autoplay ? "present" : "absent");
 		}
 		/* Keep the virtual port-0 pad connected between presses: with the
 		 * GamePad asleep it reads as unplugged and the menus stall. */
 		if (s_autoplay > 0 && n >= 1200 && s_status[0].err != PAD_ERR_NONE)
 			std::memset(&s_status[0], 0, sizeof(PADStatus));
-		if (s_autoplay > 0 && n >= 3600 && (n % 120) < 6) {
+		if (s_script_count) {
+			const uint32_t field = s_field;
+			for (int i = 0; i < s_script_count; i++) {
+				const ScriptPress& p = s_script[i];
+				if (field < p.at || field >= p.until)
+					continue;
+				if (field == p.at)
+					port_log("[pad] autoplay press %d at field %u\n", i, (unsigned)field);
+				s_status[0].button |= p.button;
+				if (p.sx) s_status[0].stickX = p.sx;
+				if (p.sy) s_status[0].stickY = p.sy;
+			}
+		} else if (s_autoplay > 0 && n >= 3600 && (n % 120) < 6) {
 			s_status[0].button |= PAD_BUTTON_A;
 			if ((n % 600) < 6) s_status[0].button |= PAD_BUTTON_START;
 		}
 		for (uint32_t at : kPressAt) {
-			if (n >= at && n < at + 6) {
+			if (!s_script_count && n >= at && n < at + 6) {
 				if (s_status[0].err != PAD_ERR_NONE)
 					std::memset(&s_status[0], 0, sizeof(PADStatus));
 				s_status[0].button |= PAD_BUTTON_START | PAD_BUTTON_A;
@@ -424,3 +508,12 @@ int port_camera_take_mouse(f32* dx, f32* dy)
 }
 
 } // extern "C"
+
+extern "C" void port_pad_autopress_field(uint32_t field)
+{
+#if SMS_WIIU_AUTOPRESS
+	s_field = field;
+#else
+	(void)field;
+#endif
+}
