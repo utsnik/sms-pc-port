@@ -47,6 +47,7 @@ bool s_frame_open;
 
 extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
+extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
 
@@ -269,6 +270,16 @@ bool shots_wanted(uint32_t p)
 		const char* v = std::getenv("SMS_SHOTS_FROM");
 		s_from = v ? std::atoi(v) : 0;
 	}
+	/* SMS_SHOTS_ABA=1: three consecutive presents per shot point instead, the
+	 * middle frame drawn with the redundancy caches off (nodiff), at two
+	 * points: one run gives the same game state both ways. */
+	static int s_aba = -1;
+	if (s_aba < 0) {
+		const char* v = std::getenv("SMS_SHOTS_ABA");
+		s_aba = v && *v == '1';
+	}
+	if (s_from > 0 && s_aba)
+		return p >= uint32_t(s_from) && (p - uint32_t(s_from)) % 400 < 3 && s_shots_written < 6;
 	if (s_from > 0)
 		return p >= uint32_t(s_from) && (p - uint32_t(s_from)) % 400 == 0 && s_shots_written < 4;
 	return p == 120 || p == 600 || p == 1800 || (p >= 3600 && p % 3600 == 0);
@@ -381,6 +392,12 @@ void take_shots(uint32_t p)
 		shot_surface(last.surface, path, 1);
 	} else {
 		port_log("[shots] DRC GX2GetLastFrame failed\n");
+	}
+	/* SMS_SHOTS_ABA: the frame after the first of each triple is the B frame. */
+	if (std::getenv("SMS_SHOTS_ABA")) {
+		const bool b = (n - s_base) % 3 == 0;
+		sms_wiiu_gx2_force_nodiff(b ? 1 : 0);
+		port_log("[shots] shot%02u taken; next frame nodiff=%d\n", unsigned(n), int(b));
 	}
 }
 

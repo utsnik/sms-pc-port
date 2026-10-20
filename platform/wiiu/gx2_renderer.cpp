@@ -405,7 +405,7 @@ static bool s_tevPixelValid, s_vtxLiveValid, s_stateValid;
 static const void* s_boundFetch;
 static const void* s_boundVertex;
 static const void* s_boundPixel;
-static bool s_noDiff;
+static bool s_noDiff, s_noDiffMarker;
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
 static void invalidateVertexUniforms() {
@@ -3988,7 +3988,7 @@ void rendererInit(float) {
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     s_gpuDiag = sdMarkerPresent("perfdiag");
     g_perfStages = s_gpuDiag;
-    s_noDiff = sdMarkerPresent("nodiff");
+    s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
@@ -4510,6 +4510,13 @@ void executeCopy(uint32_t ctrl) {
             s_frameClear[2] = float(gb & 255) / 255.0f;
             s_frameClear[3] = ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f;
             s_frameClearPending = ((g.bp[BP_CMODE0] >> 3) & 1) != 0;
+            static uint32_t s_loggedClear = ~0u;
+            if (((ar & 0xffff) << 16 | (gb & 0xffff)) != s_loggedClear) {
+                s_loggedClear = (ar & 0xffff) << 16 | (gb & 0xffff);
+                WHBLogPrintf("SMS Wii U: frame clear colour rgba=%u,%u,%u,%u pending=%d",
+                             unsigned(ar & 255), unsigned((gb >> 8) & 255), unsigned(gb & 255),
+                             unsigned((ar >> 8) & 255), int(s_frameClearPending));
+            }
         }
 #if SMS_GX2_DEBUG_PIXEL_TRACE
         if ((g_displayFrames % SMS_GX2_DEBUG_PIXEL_TRACE) >= SMS_GX2_DEBUG_PIXEL_TRACE - 2 && g_displayFrames >= 1000)
@@ -4698,6 +4705,14 @@ extern "C" int sms_wiiu_gx2_renderer_init(void) {
     rendererInit(1.0f);
     return s_ready ? 1 : 0;
 }
+/* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
+ * presenting thread, between frames, so one run shows the same game state
+ * with and without the redundancy caches. */
+extern "C" void sms_wiiu_gx2_force_nodiff(int on) {
+    s_noDiff = s_noDiffMarker || on;
+    invalidateVertexUniforms();
+}
+
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
