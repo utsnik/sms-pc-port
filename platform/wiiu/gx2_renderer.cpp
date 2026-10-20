@@ -256,6 +256,47 @@ static std::vector<VertexProgram*>& vertexPrograms() {
     return *s_vertexShaderObject;
 }
 #define s_vertexPrograms (vertexPrograms())
+
+/* Both shader caches are looked up for every draw (~700 a frame in Delfino
+ * Plaza). A linear memcmp scan over ~100 keys of 352 bytes cost 3.6% of the
+ * game's core (2026-10-20), so each cache also has this index: the key's hash
+ * picks a slot, and only an equal hash gets the full compare. Static storage
+ * (no allocation outside a port heap scope); the caches only ever grow, and a
+ * full index sends lookups back to the scan. */
+template <typename Key>
+static uint32_t shaderKeyHash(const Key& key) {
+    static_assert(sizeof(Key) % 4 == 0, "keys are whole words");
+    const uint32_t* w = reinterpret_cast<const uint32_t*>(&key);
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < sizeof(Key) / 4; ++i) h = (h ^ w[i]) * 16777619u;
+    return h ^ (h >> 15);
+}
+
+template <typename Entry>
+struct ShaderKeyIndex {
+    static constexpr uint32_t kSlots = 1024;  // power of two; filled to 3/4 at most
+    uint32_t hash[kSlots];
+    Entry* entry[kSlots];
+    uint32_t used;
+    bool full;
+
+    template <typename Key>
+    Entry* find(const Key& key, uint32_t h) const {
+        for (uint32_t i = h & (kSlots - 1);; i = (i + 1) & (kSlots - 1)) {
+            if (!entry[i]) return nullptr;
+            if (hash[i] == h && !memcmp(&entry[i]->key, &key, sizeof(key))) return entry[i];
+        }
+    }
+    void insert(Entry* e, uint32_t h) {
+        if (used >= kSlots / 4 * 3) { full = true; return; }
+        uint32_t i = h & (kSlots - 1);
+        while (entry[i]) i = (i + 1) & (kSlots - 1);
+        hash[i] = h;
+        entry[i] = e;
+        ++used;
+    }
+};
+static ShaderKeyIndex<TevShader> s_tevShaderIndex;
 static GX2AttribVar s_attribVars[] = {
     {"aVtxPos", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 0},
     {"aTexCoord0", GX2_SHADER_VAR_TYPE_FLOAT4, 0, 1},
@@ -1683,14 +1724,20 @@ static bool initVertexProgram(VertexProgram& shader) {
     return true;
 }
 
+static ShaderKeyIndex<VertexProgram> s_vertexProgramIndex;
+
 static VertexProgram* vertexShaderForKey(const VertexKey& key) {
-    for (VertexProgram* shader : s_vertexPrograms)
-        if (!memcmp(&shader->key, &key, sizeof(key))) return shader->failed ? nullptr : shader;
+    const uint32_t hash = shaderKeyHash(key);
+    if (VertexProgram* hit = s_vertexProgramIndex.find(key, hash)) return hit->failed ? nullptr : hit;
+    if (s_vertexProgramIndex.full)
+        for (VertexProgram* shader : s_vertexPrograms)
+            if (!memcmp(&shader->key, &key, sizeof(key))) return shader->failed ? nullptr : shader;
     VertexProgram* shader = new VertexProgram();
     memset(shader, 0, sizeof(*shader));
     shader->key = key;
     shader->failed = !initVertexProgram(*shader);
     s_vertexPrograms.push_back(shader);
+    s_vertexProgramIndex.insert(shader, hash);
     if (shader->failed) {
         ++s_vertexRejected;
         WHBLogPrintf("SMS Wii U: GPU vertex program rejected reason=%s mode=%u fixedCoord=%u fixedTex=%u chans=%u texgens=%u dual=%u cache=%u",
@@ -2529,8 +2576,11 @@ static bool initTevPixel(TevShader& shader) {
 }
 
 static TevShader* tevShaderForKey(const TevKey& key) {
-    for (TevShader* shader : s_tevShaders)
-        if (!memcmp(&shader->key, &key, sizeof(key))) return shader;
+    const uint32_t hash = shaderKeyHash(key);
+    if (TevShader* hit = s_tevShaderIndex.find(key, hash)) return hit;
+    if (s_tevShaderIndex.full)
+        for (TevShader* shader : s_tevShaders)
+            if (!memcmp(&shader->key, &key, sizeof(key))) return shader;
     TevShader* shader = new TevShader();
     memset(shader, 0, sizeof(*shader));
     shader->key = key;
@@ -2540,6 +2590,7 @@ static TevShader* tevShaderForKey(const TevKey& key) {
         return nullptr;
     }
     s_tevShaders.push_back(shader);
+    s_tevShaderIndex.insert(shader, hash);
     WHBLogPrintf("SMS Wii U: generated TEV pixel shader stages=%u tex=%02x gprs=%u groups=%u bytes=%u cache=%u",
                  (unsigned)key.stages, (unsigned)shader->textureMask, (unsigned)s_ra.count,
                  (unsigned)s_tevGroups, (unsigned)shader->pixel.size, (unsigned)s_tevShaders.size());
