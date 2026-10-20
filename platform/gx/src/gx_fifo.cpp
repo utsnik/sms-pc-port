@@ -534,10 +534,16 @@ extern double g_flushSeconds;
 // enables (position always); the renderer feeds the others as constant
 // vertex attributes. Layout: pos f32x3 | nrm f32x3 | bin, tan f32x3 (NBT) |
 // clr0 u8x4 | clr1 u8x4 | tex0..7 f32x2 | matrix indices u8x12.
-const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) { SMS_PORT_HEAP_SCOPE();
+const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) {
+    // Called per vertex: answer repeats without the heap scope or the map
+    // (map nodes are stable, so the cached pointer stays valid).
+    static uint32_t s_lastFmt = ~0u;
+    static const VtxFmtLayout* s_last;
+    if (fmt == s_lastFmt) return *s_last;
+    SMS_PORT_HEAP_SCOPE();
     static std::unordered_map<uint32_t, VtxFmtLayout> cache;
     auto it = cache.find(fmt);
-    if (it != cache.end()) return it->second;
+    if (it != cache.end()) { s_lastFmt = fmt; s_last = &it->second; return it->second; }
     VtxFmtLayout l;
     memset(&l, 0, sizeof(l));
     uint16_t o = 12;
@@ -563,9 +569,9 @@ const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) { SMS_PORT_HEAP_SCOPE();
     return cache.emplace(fmt, l).first->second;
 }
 
-void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& hv) {
+void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& hv, bool zeroed) {
     const VtxFmtLayout& l = vtxFmtLayout(fmt);
-    memset(static_cast<void*>(&hv), 0, sizeof(hv));
+    if (!zeroed) memset(static_cast<void*>(&hv), 0, sizeof(hv));
     hv.nrm[2] = 1.0f;
     memset(hv.clr, 255, sizeof(hv.clr));
     memcpy(hv.mtx, defMtx, 9);

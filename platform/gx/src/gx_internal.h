@@ -165,7 +165,8 @@ struct VtxFmtLayout {
 };
 const VtxFmtLayout& vtxFmtLayout(uint32_t fmt);
 // Expands a packed vertex (for traces).
-void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& out);
+// zeroed: the destination is already all zero bytes (dcbz), skip the clear.
+void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& out, bool zeroed = false);
 
 // The loader decodes a primitive's vertices straight into the batch:
 // primitiveBegin returns room for `count` vertices of format `fmt` (after
