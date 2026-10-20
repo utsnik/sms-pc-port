@@ -45,6 +45,9 @@ constexpr uint32_t kSpOffset = 0x0C;  // gpr1
 constexpr uint32_t kLeafSlots = 1024;
 constexpr uint32_t kCallSlots = 1024;
 constexpr uint32_t kThreads = 16;
+constexpr uint32_t kIncSlots = 4096;
+constexpr uint32_t kStackStartOffset = 0x394;  // OSThread::stackStart (the top)
+constexpr uint32_t kStackEndOffset = 0x398;    // OSThread::stackEnd (the bottom)
 
 struct Table {
 	uint32_t pc[kSlots];
@@ -58,6 +61,10 @@ struct Table {
 	uint32_t dropped;
 	uint32_t callDropped;
 	uint32_t main;  // samples that interrupted the main (game) thread
+	// Main-thread samples by every return address on the stack: what each
+	// function and its callees cost together (inclusive).
+	uint32_t incPc[kIncSlots], incCount[kIncSlots];
+	uint32_t incDropped;
 };
 
 alignas(64) uint8_t s_alarm[0x80];
@@ -90,6 +97,29 @@ inline bool stack_addr(uint32_t a) { return a >= 0x10000000u && a < 0x50000000u 
 // OSGetSymbolName dereferences what it is given: only code addresses (system
 // RPLs and the game's text) may be named. A stray stack word faulted it.
 inline bool code_addr(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u && !(a & 3); }
+
+inline bool code_addr_(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u && !(a & 3); }
+
+void count_inclusive(Table& t, const uint8_t* ctx)
+{
+	const uint32_t top = *reinterpret_cast<const uint32_t*>(ctx + kStackStartOffset);
+	const uint32_t bottom = *reinterpret_cast<const uint32_t*>(ctx + kStackEndOffset);
+	uint32_t sp = *reinterpret_cast<const uint32_t*>(ctx + kSpOffset);
+	for (int depth = 0; depth < 32; ++depth) {
+		if (sp < bottom || sp + 8 > top || (sp & 3)) return;
+		const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
+		if (next <= sp || next + 8 > top) return;
+		const uint32_t ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+		sp = next;
+		if (!code_addr_(ret)) continue;
+		uint32_t slot = (ret >> 2) * 2654435761u % kIncSlots;
+		for (uint32_t probe = 0;; ++probe, slot = (slot + 1) % kIncSlots) {
+			if (probe == 32) { ++t.incDropped; break; }
+			if (t.incPc[slot] == ret) { ++t.incCount[slot]; break; }
+			if (!t.incPc[slot]) { t.incPc[slot] = ret; t.incCount[slot] = 1; break; }
+		}
+	}
+}
 
 void count_call(Table& t, const uint8_t* ctx, uint32_t pc)
 {
@@ -126,7 +156,10 @@ void on_alarm(void*, void* context)
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
 	Table& t = s_tables[s_active & 1];
 	++t.samples;
-	if (context == s_mainThread) ++t.main;
+	if (context == s_mainThread) {
+		++t.main;
+		count_inclusive(t, static_cast<const uint8_t*>(context));
+	}
 	uint32_t tid = 0;
 	for (; tid < kThreads; ++tid) {
 		if (t.thread[tid] == context) { ++t.threadCount[tid]; break; }
@@ -257,6 +290,34 @@ void report(Table& t)
 		port_log("[prof] via %5.1f pct %s <- %s <- %s\n", t.samples ? 100.0f * t.callCount[best] / t.samples : 0.0f,
 		         short_name(leaf), short_name(caller), t.callUp[best] ? short_name(up) : "?");
 		t.callCount[best] = 0;
+	}
+	{
+		// Inclusive: per function, the main-thread samples with it on the stack.
+		static Func inc[512];
+		uint32_t ninc = 0;
+		for (uint32_t i = 0; i < kIncSlots; ++i) {
+			if (!t.incPc[i]) continue;
+			char name[64] = {};
+			wut_OSGetSymbolName(t.incPc[i], name, sizeof(name));
+			uint32_t f = 0;
+			while (f < ninc && std::strcmp(inc[f].name, name) != 0) ++f;
+			if (f == ninc) {
+				if (ninc == 512) continue;
+				std::memcpy(inc[f].name, name, sizeof(name));
+				inc[f].count = 0;
+				++ninc;
+			}
+			inc[f].count += t.incCount[i];
+		}
+		port_log("[prof] inclusive (of %u main-thread samples, dropped %u):\n", (unsigned)t.main, (unsigned)t.incDropped);
+		for (int rank = 0; rank < 45; ++rank) {
+			uint32_t best = ninc;
+			for (uint32_t f = 0; f < ninc; ++f)
+				if (inc[f].count && (best == ninc || inc[f].count > inc[best].count)) best = f;
+			if (best == ninc) break;
+			port_log("[prof] inc %5.1f pct %s\n", t.main ? 100.0f * inc[best].count / t.main : 0.0f, inc[best].name);
+			inc[best].count = 0;
+		}
 	}
 	for (int rank = 0; rank < 30; ++rank) {
 		uint32_t best = nfuncs;
