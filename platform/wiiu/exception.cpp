@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <whb/log.h>
 
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -66,23 +67,43 @@ void append_symbol(const char* tag, uint32_t addr)
 bool readable(uint32_t addr) { return addr >= 0x10000000u && addr < 0x50000000u && !(addr & 3u); }
 
 /* Every GPR, then the words around r3 (for JSUPtrList::remove, the list):
- * whatever overwrote it may have left recognisable data next to it. */
+ * whatever overwrote it may have left recognisable data next to it. Built in
+ * one buffer and printed with WHBLogPrint: WHBLogPrintf from the handler sent
+ * the first line again and again over the dump (2026-10-20). */
+char s_dump[4096];
+
+void dump_line(const char* fmt, ...)
+{
+	size_t used = std::strlen(s_dump);
+	if (used > 1000) { // keep each print well inside one UDP datagram
+		WHBLogPrint(s_dump);
+		s_dump[0] = '\0';
+		used = 0;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	std::vsnprintf(s_dump + used, sizeof(s_dump) - used, fmt, ap);
+	va_end(ap);
+}
+
 void dump(OSContext* context)
 {
+	s_dump[0] = '\0';
 	for (int i = 0; i < 32; i += 8)
-		WHBLogPrintf("[crash] r%-2d %08X %08X %08X %08X %08X %08X %08X %08X", i,
-		             (unsigned)context->gpr[i], (unsigned)context->gpr[i + 1], (unsigned)context->gpr[i + 2],
-		             (unsigned)context->gpr[i + 3], (unsigned)context->gpr[i + 4], (unsigned)context->gpr[i + 5],
-		             (unsigned)context->gpr[i + 6], (unsigned)context->gpr[i + 7]);
+		dump_line("[crash] r%-2d %08X %08X %08X %08X %08X %08X %08X %08X\n", i,
+		          (unsigned)context->gpr[i], (unsigned)context->gpr[i + 1], (unsigned)context->gpr[i + 2],
+		          (unsigned)context->gpr[i + 3], (unsigned)context->gpr[i + 4], (unsigned)context->gpr[i + 5],
+		          (unsigned)context->gpr[i + 6], (unsigned)context->gpr[i + 7]);
 	uint32_t base = (context->gpr[3] & ~31u) - 0x100;
-	if (!readable(base) || !readable(base + 0x200))
-		return;
-	for (uint32_t a = base; a < base + 0x200; a += 32) {
-		const uint32_t* w = (const uint32_t*)a;
-		WHBLogPrintf("[crash] %08X: %08X %08X %08X %08X %08X %08X %08X %08X", (unsigned)a, (unsigned)w[0],
-		             (unsigned)w[1], (unsigned)w[2], (unsigned)w[3], (unsigned)w[4], (unsigned)w[5],
-		             (unsigned)w[6], (unsigned)w[7]);
+	if (readable(base) && readable(base + 0x200)) {
+		for (uint32_t a = base; a < base + 0x200; a += 32) {
+			const uint32_t* w = (const uint32_t*)a;
+			dump_line("[crash] %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", (unsigned)a, (unsigned)w[0],
+			          (unsigned)w[1], (unsigned)w[2], (unsigned)w[3], (unsigned)w[4], (unsigned)w[5],
+			          (unsigned)w[6], (unsigned)w[7]);
+		}
 	}
+	WHBLogPrint(s_dump);
 }
 
 void trace(OSContext* context)
@@ -139,8 +160,9 @@ BOOL fatal(const char* type, OSContext* context)
 	context->lr = 0;
 	context->gpr[1] &= ~0xFu; // keep the stack, 16-byte aligned
 	context->gpr[1] -= 0x100;   // below the faulting frame's red zone
-	WHBLogPrintf("[crash] %s thread faulted: context=%p owner=%p", main_thread ? "main" : "other",
-	             (void*)context, sms_wiiu_vi_owner_thread());
+	std::snprintf(s_message, sizeof(s_message), "[crash] %s thread faulted: context=%p owner=%p",
+	              main_thread ? "main" : "other", (void*)context, sms_wiiu_vi_owner_thread());
+	WHBLogPrint(s_message);
 	if (main_thread) {
 		sms_wiiu_crash_stage = 1;
 	} else {
