@@ -191,6 +191,7 @@ struct ArenaRef {
     int32_t baseVertex = 0;
     size_t iOff = 0;   // byte offset of its indices
 };
+extern uint32_t g_dlReplayIdx;
 bool arenaEnabled();
 uint32_t arenaGeneration();
 bool arenaUpload(const uint8_t* verts, uint32_t count, uint32_t stride, const uint32_t* idx, uint32_t nidx, ArenaRef& out);

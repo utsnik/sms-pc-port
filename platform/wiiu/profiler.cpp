@@ -24,6 +24,7 @@ int wut_OSSetPeriodicAlarm(void*, WutTime, WutTime, WutAlarmCallback) __asm__("O
 int wut_OSCancelAlarm(void*) __asm__("OSCancelAlarm");
 WutTime wut_OSGetTime(void) __asm__("OSGetTime");
 uint32_t wut_OSGetSymbolName(uint32_t, char*, uint32_t) __asm__("OSGetSymbolName");
+void* wut_OSGetCurrentThread(void) __asm__("OSGetCurrentThread");
 }
 
 constexpr WutTime kTimerHz = 248625000 / 4;
@@ -38,11 +39,13 @@ struct Table {
 	uint32_t count[kSlots];
 	uint32_t samples;
 	uint32_t dropped;
+	uint32_t main;  // samples that interrupted the main (game) thread
 };
 
 alignas(64) uint8_t s_alarm[0x80];
 Table s_tables[2];
 volatile uint32_t s_active;
+void* s_mainThread;  // an OSThread starts with its OSContext
 bool s_running;
 WutTime s_lastReport;
 
@@ -51,6 +54,7 @@ void on_alarm(void*, void* context)
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
 	Table& t = s_tables[s_active & 1];
 	++t.samples;
+	if (context == s_mainThread) ++t.main;
 	uint32_t slot = (pc >> 2) * 2654435761u % kSlots;
 	for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kSlots) {
 		if (t.pc[slot] == pc) { ++t.count[slot]; return; }
@@ -82,7 +86,7 @@ void report(Table& t)
 		}
 		funcs[f].count += t.count[i];
 	}
-	port_log("[prof] samples=%u dropped=%u functions=%u\n", (unsigned)t.samples, (unsigned)t.dropped, (unsigned)nfuncs);
+	port_log("[prof] samples=%u dropped=%u functions=%u main-thread=%u\n", (unsigned)t.samples, (unsigned)t.dropped, (unsigned)nfuncs, (unsigned)t.main);
 	for (int rank = 0; rank < 25; ++rank) {
 		uint32_t best = nfuncs;
 		for (uint32_t f = 0; f < nfuncs; ++f)
@@ -105,6 +109,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	const WutTime now = wut_OSGetTime();
 	if (!s_running) {
 		std::memset(s_tables, 0, sizeof(s_tables));
+		s_mainThread = wut_OSGetCurrentThread();
 		wut_OSCreateAlarm(s_alarm);
 		s_running = wut_OSSetPeriodicAlarm(s_alarm, now + kPeriod, kPeriod, on_alarm) != 0;
 		s_lastReport = now;
