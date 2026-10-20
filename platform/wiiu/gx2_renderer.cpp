@@ -1085,7 +1085,10 @@ static void vertexNormalTransform(std::vector<uint64_t>& ops) {
     vertexLoadRelativeMatrix(ops, RAW_ATTR_MTX0 + 1, _x, 53, kXfNormalBase, 3);
     for (uint32_t ch = 0; ch < 3; ++ch)
         vertexEmitDot4(ops, 41, ch, _R(2), _R(53 + ch));
-    vertexEmitDot4(ops, 45, _x, _R(41), _R(41));
+    // Three-component length: R41.w is never written.
+    vertexEmit(ops, {ALU_MUL(_R(45), _x, _R(41), _x, _R(41), _x)});
+    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(41), _y, _R(41), _y, _R(45), _x)});
+    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(41), _z, _R(41), _z, _R(45), _x)});
     vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
     vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
     for (uint32_t ch = 0; ch < 3; ++ch) {
@@ -1110,7 +1113,20 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
         if (ctrl & 64) vertexEmit(ops, {ALU_MOV(_R(43), ch, _R(input), ch)});
         else vertexEmit(ops, {ALU_MOV(_R(43), ch, _GX2_C(amb), ch)});
     }
-    if (ctrl & 2) {
+    // Mirrors chanColor.  Light record vectors: C(c) = decoded colour,
+    // C(c+1) = (a0, a1, a2, k0), C(c+2) = (k1, k2, pos.x, pos.y),
+    // C(c+3) = (pos.z, dir.x, dir.y, dir.z).  Dots are three-component:
+    // the w lanes of R41/R42 are not defined.
+    // dst.chan = A.xyz . B.(b0, b0+1, b0+2)
+    auto dot3 = [&](uint32_t dst, uint32_t dstChan, uint32_t aReg, uint32_t bSel, uint32_t b0) {
+        vertexEmit(ops, {ALU_MUL(_R(dst), dstChan, _R(aReg), _x, bSel, b0)});
+        vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, _R(aReg), _y, bSel, b0 + 1, _R(dst), dstChan)});
+        vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, _R(aReg), _z, bSel, b0 + 2, _R(dst), dstChan)});
+    };
+    if (!(ctrl & 2)) {
+        // Lighting off: the material alone (no ambient term).
+        for (uint32_t ch = 0; ch < 4; ++ch) vertexEmit(ops, {ALU_MOV(_R(43), ch, ALU_SRC_1, _x)});
+    } else {
         const uint32_t mask = ((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4);
         const uint32_t diff = (ctrl >> 7) & 3;
         const bool atten = (ctrl >> 9) & 1;
@@ -1118,8 +1134,7 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
         for (uint32_t light = 0; light < 8; ++light) {
             if (!(mask & (1u << light))) continue;
             const uint32_t c = kXfLightBase + light * 4;
-            // R42 = normalized light vector, R45 = length squared/length,
-            // R46 = scalar attenuation/diffuse factor, R47 = predicate.
+            // R42 = light vector (normalised below), R48.x = its length.
             if (!atten || spot) {
                 vertexEmit(ops, {ALU_ADD(_R(42), _x, _GX2_C(c + 2), _z, _R(40), _x _NEG)});
                 vertexEmit(ops, {ALU_ADD(_R(42), _y, _GX2_C(c + 2), _w, _R(40), _y _NEG)});
@@ -1129,60 +1144,46 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
                 vertexEmit(ops, {ALU_MOV(_R(42), _y, _GX2_C(c + 2), _w)});
                 vertexEmit(ops, {ALU_MOV(_R(42), _z, _GX2_C(c + 3), _x)});
             }
-            vertexEmitDot4(ops, 45, _x, _R(42), _R(42));
+            dot3(45, _x, 42, _R(42), _x);                                   // len^2
             vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
-            vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
+            vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _y, _R(45), _x)});   // 1/len
+            vertexEmit(ops, {ALU_MUL(_R(46), _y, _R(46), _y, _R(47), _x)});  // 0 when len == 0
+            vertexEmit(ops, {ALU_MUL(_R(48), _x, _R(45), _x, _R(46), _y)});  // len
             for (uint32_t ch = 0; ch < 3; ++ch)
-                vertexEmit(ops, {ALU_MUL(_R(42), ch, _R(42), ch, _R(46), _x)});
-            // A zero-length vector must remain zero, matching chanColor's
-            // explicit zero-denominator guard instead of producing NaNs.
-            for (uint32_t ch = 0; ch < 3; ++ch)
-                vertexEmit(ops, {ALU_MUL(_R(42), ch, _R(42), ch, _R(47), _x)});
+                vertexEmit(ops, {ALU_MUL(_R(42), ch, _R(42), ch, _R(46), _y)});
 
             if (atten) {
+                // R45.y = attenuation variable (cos for spot, t for specular),
+                // R48.y = distance variable (len for spot, t for specular).
                 if (spot) {
-                    vertexEmitDot4(ops, 45, _x, _R(42), _GX2_C(c + 3));
-                    vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
-                    // numerator = max(a0 + a1*cs + a2*cs^2, 0)
-                    vertexEmit(ops, {ALU_MUL(_R(46), _x, _GX2_C(c + 1), _y, _R(45), _x)});
-                    vertexEmit(ops, {ALU_MUL(_R(46), _y, _GX2_C(c + 1), _z, _R(45), _x)});
-                    vertexEmit(ops, {ALU_MULADD(_R(46), _x, _R(45), _x, _R(46), _x, _GX2_C(c + 1), _x)});
-                    vertexEmit(ops, {ALU_MAX(_R(46), _x, _R(46), _x, ALU_SRC_0, _x)});
-                    // denominator = max(k0 + k1*d + k2*d^2, 0).  R45 is
-                    // length squared; its reciprocal square root is d^-1.
-                    vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(45), _x, _R(45), _x)});
-                    vertexEmit(ops, {ALU_RECIP_IEEE(_R(47), _x, _R(45), _x)});
-                    vertexEmit(ops, {ALU_MUL(_R(45), _x, _R(47), _x, ALU_SRC_1, _x)});
-                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _GX2_C(c + 1), _w, _R(45), _x, _GX2_C(c + 2), _x)});
-                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(45), _x, _R(45), _x, _GX2_C(c + 2), _y)});
-                } else {
-                    vertexEmitDot4(ops, 45, _x, _R(41), _R(42));
-                    vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
-                    vertexEmitDot4(ops, 45, _y, _R(41), _GX2_C(c + 3));
+                    dot3(45, _y, 42, _GX2_C(c + 3), _y);
                     vertexEmit(ops, {ALU_MAX(_R(45), _y, _R(45), _y, ALU_SRC_0, _x)});
-                    vertexEmit(ops, {ALU_MUL(_R(45), _y, _R(45), _y, _R(47), _x)});
-                    vertexEmit(ops, {ALU_MUL(_R(46), _x, _GX2_C(c + 1), _y, _R(45), _y)});
-                    vertexEmit(ops, {ALU_MUL(_R(46), _y, _GX2_C(c + 1), _z, _R(45), _y)});
-                    vertexEmit(ops, {ALU_MULADD(_R(46), _x, _R(45), _y, _R(46), _x, _GX2_C(c + 1), _x)});
-                    vertexEmit(ops, {ALU_MAX(_R(46), _x, _R(46), _x, ALU_SRC_0, _x)});
-                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _GX2_C(c + 1), _w, _R(45), _y, _GX2_C(c + 2), _x)});
-                    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(45), _x, _R(45), _y, _GX2_C(c + 2), _y)});
+                    vertexEmit(ops, {ALU_MOV(_R(48), _y, _R(48), _x)});
+                } else {
+                    dot3(45, _z, 41, _R(42), _x);                           // n . l
+                    vertexEmit(ops, {ALU_SETGT(_R(47), _z, _R(45), _z, ALU_SRC_0, _x)});
+                    dot3(45, _y, 41, _GX2_C(c + 3), _y);                    // n . dir
+                    vertexEmit(ops, {ALU_MAX(_R(45), _y, _R(45), _y, ALU_SRC_0, _x)});
+                    vertexEmit(ops, {ALU_MUL(_R(45), _y, _R(45), _y, _R(47), _z)});
+                    vertexEmit(ops, {ALU_MOV(_R(48), _y, _R(45), _y)});
                 }
-                // Divide only when the denominator is positive.  The zero
-                // path contributes no light, as the CPU path's 1e-30 guard.
-                vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
-                vertexEmit(ops, {ALU_RECIP_IEEE(_R(45), _x, _R(45), _x)});
-                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
-                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(47), _x)});
+                // num = max(a0 + a1 v + a2 v^2, 0)
+                vertexEmit(ops, {ALU_MULADD(_R(46), _x, _GX2_C(c + 1), _z, _R(45), _y, _GX2_C(c + 1), _y)});
+                vertexEmit(ops, {ALU_MULADD(_R(46), _x, _R(46), _x, _R(45), _y, _GX2_C(c + 1), _x)});
+                vertexEmit(ops, {ALU_MAX(_R(46), _x, _R(46), _x, ALU_SRC_0, _x)});
+                // den = k0 + k1 d + k2 d^2; a non-positive denominator gives no light
+                vertexEmit(ops, {ALU_MULADD(_R(46), _z, _GX2_C(c + 2), _y, _R(48), _y, _GX2_C(c + 2), _x)});
+                vertexEmit(ops, {ALU_MULADD(_R(46), _z, _R(46), _z, _R(48), _y, _GX2_C(c + 1), _w)});
+                vertexEmit(ops, {ALU_SETGT(_R(47), _y, _R(46), _z, ALU_SRC_0, _x)});
+                vertexEmit(ops, {ALU_RECIP_IEEE(_R(46), _z, _R(46), _z)});
+                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(46), _z)});
+                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(47), _y)});
             } else {
                 vertexEmit(ops, {ALU_MOV(_R(46), _x, ALU_SRC_1, _x)});
             }
-            if (diff == 1) {
-                vertexEmitDot4(ops, 45, _x, _R(41), _R(42));
-                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
-            } else if (diff >= 2) {
-                vertexEmitDot4(ops, 45, _x, _R(41), _R(42));
-                vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
+            if (diff != 0) {
+                dot3(45, _x, 41, _R(42), _x);
+                if (diff >= 2) vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
                 vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
             }
             for (uint32_t ch = 0; ch < 4; ++ch)
