@@ -302,6 +302,24 @@ void sms_wiiu_input_poll(void)
 			port_log("[pad] autopress marker %s\n", s_marker ? "present: unattended input ON" : "absent: off");
 		}
 		uint32_t n = s_marker ? ++s_poll_count : 0;
+		/* "autoplay" marker: keep going past file select into a stage: A
+		 * every 120 polls (menus, dialogue), START+A every 600 (cutscene
+		 * skip; a pause it opens is closed by the next A). Runs 300 s. */
+		static int s_autoplay = -1;
+		if (s_autoplay < 0 && s_marker) {
+			char path[192];
+			std::snprintf(path, sizeof(path), "%sautoplay", sms_wiiu_app_root());
+			FILE* f = std::fopen(path, "rb");
+			s_autoplay = f ? 1 : 0;
+			if (f) std::fclose(f);
+			port_log("[pad] autoplay marker %s\n", s_autoplay ? "present" : "absent");
+		}
+		if (s_autoplay > 0 && n >= 3600 && (n % 120) < 6) {
+			if (s_status[0].err != PAD_ERR_NONE)
+				std::memset(&s_status[0], 0, sizeof(PADStatus));
+			s_status[0].button |= PAD_BUTTON_A;
+			if ((n % 600) < 6) s_status[0].button |= PAD_BUTTON_START;
+		}
 		for (uint32_t at : kPressAt) {
 			if (n >= at && n < at + 6) {
 				if (s_status[0].err != PAD_ERR_NONE)
@@ -319,7 +337,7 @@ void sms_wiiu_input_poll(void)
 			const OSTime now = OSGetTime();
 			if (!s_marker_start)
 				s_marker_start = now;
-			else if (OSTicksToSeconds(now - s_marker_start) >= 180) {
+			else if (OSTicksToSeconds(now - s_marker_start) >= (s_autoplay > 0 ? 300 : 180)) {
 				s_exit_requested = true;
 				sms_wiiu_menu_exit_pending = 1;
 				port_log("[pad] autopress run over (180 s): returning to the Menu\n");
