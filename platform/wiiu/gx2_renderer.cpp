@@ -1079,99 +1079,6 @@ struct TevChannel {
     bool clamp;
 };
 
-// Channels of one stage into the stage result, in genFS's integer maths:
-//   regular: D +/- lerp(A, B, C) (+/-128), then *2, *4 or >>1
-//            lerp = (A * (256 - C') + B * C' + 128) >> 8, C' = C + (C >> 7)
-//   compare: D + (cond ? C : 0)
-// then clamped to 0..255 or to -1024..1023. A, B, C are 8-bit sources. The
-// channels given together share bias, op, scale and clamp.
-static void tevEmitChannels(std::vector<uint64_t>& program, TevChannel* chs, uint32_t n,
-                            const TevCompareSrc& cs, const TevCompareSrc& colorCs) {
-    const uint32_t t0 = s_ra.t[0], t1 = s_ra.t[1], t2 = s_ra.t[2], dst = s_ra.stage;
-    std::vector<TevIns> g;
-    auto flush = [&]() { tevEmitGroup(program, g); g.clear(); };
-    // Constant-file A/B/C operands to GPRs.
-    const uint32_t* k = s_ra.k;
-    for (uint32_t i = 0; i < n; ++i) {
-        TevChannel& c = chs[i];
-        TevSource* ops[3] = {&c.a, &c.b, &c.c};
-        for (int j = 0; j < 3; ++j)
-            if (tevIsConst(*ops[j])) {
-                g.push_back(tevOp1(kOpMov, k[j], c.ch, *ops[j]));
-                *ops[j] = tevG(k[j], c.ch);
-            }
-    }
-    flush();
-    const TevChannel& f = chs[0];
-    if (f.bias == 3) {
-        // The 16/24-bit compares use the X of the temporaries as scratch, so
-        // each channel is finished before the next one starts.
-        for (uint32_t i = 0; i < n; ++i) {
-            const uint32_t ch = chs[i].ch;
-            tevEmitTevCompare(program, ch, cs, colorCs, (f.scale << 1) | f.op, ch == _w);
-            tevEmitAlu(program, {ALU_MUL(_R(t0), ch, _R(t0), ch, chs[i].c.sel, chs[i].c.chan)});
-            tevEmitAlu(program, {ALU_ADD(_R(t1), ch, chs[i].d.sel, chs[i].d.chan, _R(t0), ch)});
-            tevEmitAlu(program, {f.clamp ? ALU_MAX(_R(t1), ch, _R(t1), ch, ALU_SRC_0, _x)
-                                         : ALU_MAX(_R(t1), ch, _R(t1), ch, _GX2_C(13), _z)});
-            tevEmitAlu(program, {f.clamp ? ALU_MIN(_R(dst), ch, _R(t1), ch, _GX2_C(12), _w)
-                                         : ALU_MIN(_R(dst), ch, _R(t1), ch, _GX2_C(13), _w)});
-        }
-        return;
-    } else {
-        // t0 = C' = C + floor(C / 128)
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpMul, t0, chs[i].ch, chs[i].c, tevC(13, _y)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp1(kOpFloor, t0, chs[i].ch, tevG(t0, chs[i].ch)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpAdd, t0, chs[i].ch, tevG(t0, chs[i].ch), chs[i].c));
-        // t1 = B - A, t2 = A * 256 (independent of the previous op)
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpAdd, t1, chs[i].ch, chs[i].b, tevNeg(chs[i].a)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpMul, t2, chs[i].ch, chs[i].a, tevC(12, _x)));
-        flush();
-        // t1 = (B - A) * C' + A * 256 + 128 = A * (256 - C') + B * C' + 128
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpMul, t1, chs[i].ch, tevG(t1, chs[i].ch), tevG(t0, chs[i].ch)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpAdd, t1, chs[i].ch, tevG(t1, chs[i].ch), tevG(t2, chs[i].ch)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpAdd, t1, chs[i].ch, tevG(t1, chs[i].ch), tevC(12, _z)));
-        flush();
-        // t1 = floor(t1 / 256), the lerp; then D +/- lerp
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp(kOpMul, t1, chs[i].ch, tevG(t1, chs[i].ch), tevC(12, _y)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp1(kOpFloor, t1, chs[i].ch, tevG(t1, chs[i].ch)));
-        flush();
-        for (uint32_t i = 0; i < n; ++i) {
-            const TevSource l = tevG(t1, chs[i].ch);
-            g.push_back(tevOp(kOpAdd, t1, chs[i].ch, chs[i].d, f.op ? tevNeg(l) : l));
-        }
-        flush();
-        if (f.bias == 1 || f.bias == 2) {
-            for (uint32_t i = 0; i < n; ++i)
-                g.push_back(tevOp(kOpAdd, t1, chs[i].ch, tevG(t1, chs[i].ch), f.bias == 1 ? tevC(12, _z) : tevC(14, _x)));
-            flush();
-        }
-        if (f.scale == 1 || f.scale == 2) {
-            for (uint32_t i = 0; i < n; ++i)
-                g.push_back(tevOp(kOpMul, t1, chs[i].ch, tevG(t1, chs[i].ch), {ALU_SRC_1, _x},
-                                  f.scale == 1 ? ALU_OMOD_M2 : ALU_OMOD_M4));
-            flush();
-        } else if (f.scale == 3) {
-            for (uint32_t i = 0; i < n; ++i)
-                g.push_back(tevOp(kOpMul, t1, chs[i].ch, tevG(t1, chs[i].ch), {ALU_SRC_0_5, _x}));
-            flush();
-            for (uint32_t i = 0; i < n; ++i) g.push_back(tevOp1(kOpFloor, t1, chs[i].ch, tevG(t1, chs[i].ch)));
-            flush();
-        }
-    }
-    for (uint32_t i = 0; i < n; ++i)
-        g.push_back(tevOp(kOpMax, t1, chs[i].ch, tevG(t1, chs[i].ch), f.clamp ? TevSource{ALU_SRC_0, _x} : tevC(13, _z)));
-    flush();
-    for (uint32_t i = 0; i < n; ++i)
-        g.push_back(tevOp(kOpMin, dst, chs[i].ch, tevG(t1, chs[i].ch), f.clamp ? tevC(12, _w) : tevC(13, _w)));
-    flush();
-}
-
 static void vertexEmit(std::vector<uint64_t>& ops, std::initializer_list<uint64_t> group) {
     for (uint64_t op : group) ops.push_back(op);
     if (!ops.empty()) ops.back() |= to_QWORD(to_LE(1ull << 31), 0);
@@ -1861,7 +1768,7 @@ static void tevAnalyze(const TevKey& key) {
             else { l = 0; h = 255; }
             range(t.d, dv, &dl, &dh);
             int x, y;
-            if (t.compare) { x = dl; y = dh + 255; }
+            if (t.compare) { x = dl; y = dh + (cv >= 0 ? cv : 255); }
             else if (t.op) { x = dl - h; y = dh - l; }
             else { x = dl + l; y = dh + h; }
             if (!t.compare) {
@@ -1872,8 +1779,8 @@ static void tevAnalyze(const TevKey& key) {
                 if (t.scale == 3) { x >>= 1; y >>= 1; }
             }
             const int cl = t.clamp ? 0 : -1024, ch = t.clamp ? 255 : 1023;
-            t.needMax = t.compare || x < cl;
-            t.needMin = t.compare || y > ch;
+            t.needMax = x < cl;
+            t.needMin = y > ch;
             t.lo = x < cl ? cl : x > ch ? ch : x;
             t.hi = y > ch ? ch : y < cl ? cl : y;
             rlo[p] = t.lo; rhi[p] = t.hi;
@@ -1936,6 +1843,27 @@ static void tevChannelSteps(std::vector<TevStep>& st, const TevPart& t, uint32_t
     // 128 from whichever constant does not collide with x's channel.
     auto k128 = [&](TevSource x) { return tevIsConst(x) && x.chan == _y ? tevC(12, _z) : tevC(11, _y); };
     TevSource cur;
+    if (t.compare) {
+        // D + (cond ? C : 0); 8/16/24-bit conditions were computed into t0.x
+        // (colour) or t0.w (alpha), per-component ones are made here.
+        const uint32_t mode = (t.scale << 1) | t.op;
+        TevSource cond;
+        if (mode < 6) {
+            cond = tevG(tg[0], ch == _w ? uint32_t(_w) : uint32_t(_x));
+        } else {
+            op((mode & 1) ? ALU_OP2_INST_SETE : ALU_OP2_INST_SETGT, 0, a, b);
+            cond = T(0);
+        }
+        op(kOpMul, 1, cond, c);
+        cur = T(1);
+        if (!t.dZero) { op(kOpAdd, 1, d, cur); cur = T(1); }
+        if (t.needMax) { op(kOpMax, 1, cur, t.clamp ? TevSource{ALU_SRC_0, 0} : tevC(13, _z)); cur = T(1); }
+        if (t.needMin) { op(kOpMin, 1, cur, t.clamp ? tevC(12, _w) : tevC(13, _w)); cur = T(1); }
+        if (st.empty() || !(st.back().dst == 1 && cur.sel == T(1).sel && cur.chan == ch && tevSelNoNeg(cur) == cur.sel))
+            st.push_back({kOpMov, 1, cur, {ALU_SRC_0, 0}, ALU_OMOD_OFF});
+        st.back().dst = 3;
+        return;
+    }
     if (t.lerp == kLerpA) cur = a;
     else if (t.lerp == kLerpB) cur = b;
     else {
@@ -2321,8 +2249,21 @@ static bool initTevPixel(TevShader& shader) {
     ra.inputs = next;
     if (!ra.inputs) { ra.semantic[0] = 8; ra.inputs = 1; next = 1; }  // a pixel shader imports at least one value
     for (uint32_t i = 0; i < numInd; ++i) { ra.ind[i] = next++; ra.icoord[i] = next++; }
+    // A texture fetch may overwrite its coordinate's GPR when no later fetch
+    // and no indirect stage (whose ALU runs after the fetches) reads it.
+    auto coordDeadAfter = [&](uint32_t stage) {
+        const uint32_t coord = (key.order[stage] >> 3) & 7;
+        for (uint32_t s = 0; s < key.stages; ++s) {
+            if (!((key.order[s] >> 6) & 1) || ((key.order[s] >> 3) & 7) != coord) continue;
+            if (indStage(s) || s > stage) return false;
+        }
+        return true;
+    };
     for (uint32_t stage = 0; stage < key.stages; ++stage) {
-        if ((key.order[stage] >> 6) & 1) ra.tex[stage] = next++;
+        if ((key.order[stage] >> 6) & 1) {
+            if (!indStage(stage) && coordDeadAfter(stage)) ra.tex[stage] = ra.coord[(key.order[stage] >> 3) & 7];
+            else ra.tex[stage] = next++;
+        }
         if (indStage(stage)) {
             ra.scoord[stage] = next++;
             if ((key.ind[stage] >> 7) & 3) ra.bump[stage] = next++;
@@ -2338,8 +2279,7 @@ static bool initTevPixel(TevShader& shader) {
     ra.stage = next++;
     const uint32_t temps = (anyMask || s_plan.anyCompare || anyInd) ? 4 : 3;
     for (uint32_t i = 0; i < temps; ++i) ra.t[i] = next++;
-    if (s_plan.anyCompare)
-        for (uint32_t i = 0; i < 4; ++i) ra.k[i] = next++;
+    if (s_plan.anyCompare) ra.k[3] = next++;  // tevEmitCompareOp's constant copy
     ra.count = next;
     (void)anyFb;
     static const uint32_t kAll[4] = {0, 1, 2, 3};
@@ -2444,56 +2384,30 @@ static bool initTevPixel(TevShader& shader) {
         chs[3] = {_w, tevAlphaSource(cx, aa, true), tevAlphaSource(cx, ab, true),
                   tevAlphaSource(cx, ac, true), tevAlphaSource(cx, ad, false),
                   pa.bias, pa.op, pa.scale, pa.clamp};
-        if (!pc.compare && !pa.compare) {
-            // Each channel writes its destination register directly.
-            std::vector<TevStep> steps[4];
-            for (uint32_t ch = 0; ch < 4; ++ch)
-                tevChannelSteps(steps[ch], ch < 3 ? pc : pa, ch, chs[ch].a, chs[ch].b, chs[ch].c, chs[ch].d);
-            if (colorDest == alphaDest) {
-                tevEmitSteps(program, steps, kAll, 4, ra.reg[colorDest]);
-            } else {
-                // Two destinations: end-align all four channels, then write
-                // each part into its own register.
-                std::vector<TevStep> merged[4];
-                for (uint32_t ch = 0; ch < 4; ++ch) merged[ch] = steps[ch];
-                size_t longest = 0;
-                for (uint32_t ch = 0; ch < 4; ++ch) if (merged[ch].size() > longest) longest = merged[ch].size();
-                std::vector<TevIns> grp;
-                for (size_t k = 0; k < longest; ++k) {
-                    for (uint32_t ch = 0; ch < 4; ++ch) {
-                        const size_t skip = longest - merged[ch].size();
-                        if (k < skip) continue;
-                        const TevStep& st = merged[ch][k - skip];
-                        const uint32_t to = st.dst == 3 ? ra.reg[ch < 3 ? colorDest : alphaDest] : ra.t[st.dst];
-                        grp.push_back(tevOp(st.inst, to, ch, st.s0, st.s1, st.omod));
-                    }
-                    tevEmitGroup(program, grp);
-                    grp.clear();
-                }
+        // Compare stages: the condition of an 8/16/24-bit compare reads
+        // several components and is shared by the channels, so it is
+        // computed first (alpha's into t0.w, then colour's into t0.x); the
+        // per-component kinds compare in each channel's own steps.
+        const TevCompareSrc colorCs{&cx, ca, cb, false};
+        const TevCompareSrc alphaCs{&cx, aa, ab, true};
+        const uint32_t cmode = (pc.scale << 1) | pc.op, amode = (pa.scale << 1) | pa.op;
+        if (pa.compare && amode < 6) tevEmitTevCompare(program, _w, alphaCs, colorCs, amode, true);
+        if (pc.compare && cmode < 6) tevEmitTevCompare(program, _x, colorCs, colorCs, cmode, false);
+        // Each channel writes its destination register directly, all in the
+        // last group.
+        std::vector<TevStep> steps[4];
+        for (uint32_t ch = 0; ch < 4; ++ch)
+            tevChannelSteps(steps[ch], ch < 3 ? pc : pa, ch, chs[ch].a, chs[ch].b, chs[ch].c, chs[ch].d);
+        size_t longest = 0;
+        for (uint32_t ch = 0; ch < 4; ++ch) if (steps[ch].size() > longest) longest = steps[ch].size();
+        for (size_t k = 0; k < longest; ++k) {
+            for (uint32_t ch = 0; ch < 4; ++ch) {
+                const size_t skip = longest - steps[ch].size();
+                if (k < skip) continue;
+                const TevStep& st = steps[ch][k - skip];
+                const uint32_t to = st.dst == 3 ? ra.reg[ch < 3 ? colorDest : alphaDest] : ra.t[st.dst];
+                g.push_back(tevOp(st.inst, to, ch, st.s0, st.s1, st.omod));
             }
-        } else {
-            // Compare stages read several components of their inputs: the
-            // result is staged and committed after the whole stage.
-            const TevCompareSrc colorCs{&cx, ca, cb, false};
-            const TevCompareSrc alphaCs{&cx, aa, ab, true};
-            if (pc.compare) {
-                tevEmitChannels(program, chs, 3, colorCs, colorCs);
-            } else {
-                std::vector<TevStep> steps[3];
-                for (uint32_t ch = 0; ch < 3; ++ch)
-                    tevChannelSteps(steps[ch], pc, ch, chs[ch].a, chs[ch].b, chs[ch].c, chs[ch].d);
-                tevEmitSteps(program, steps, kAll, 3, ra.stage);
-            }
-            if (pa.compare) {
-                tevEmitChannels(program, chs + 3, 1, alphaCs, colorCs);
-            } else {
-                std::vector<TevStep> steps[1];
-                static const uint32_t kW[1] = {_w};
-                tevChannelSteps(steps[0], pa, _w, chs[3].a, chs[3].b, chs[3].c, chs[3].d);
-                tevEmitSteps(program, steps, kW, 1, ra.stage);
-            }
-            for (uint32_t ch = 0; ch < 3; ++ch) g.push_back(tevOp1(kOpMov, ra.reg[colorDest], ch, tevG(ra.stage, ch)));
-            g.push_back(tevOp1(kOpMov, ra.reg[alphaDest], _w, tevG(ra.stage, _w)));
             flush();
         }
         lastColor = colorDest;
