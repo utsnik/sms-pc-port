@@ -314,9 +314,11 @@ void sms_wiiu_input_poll(void)
 			if (f) std::fclose(f);
 			port_log("[pad] autoplay marker %s\n", s_autoplay ? "present" : "absent");
 		}
+		/* Keep the virtual port-0 pad connected between presses: with the
+		 * GamePad asleep it reads as unplugged and the menus stall. */
+		if (s_autoplay > 0 && n >= 1200 && s_status[0].err != PAD_ERR_NONE)
+			std::memset(&s_status[0], 0, sizeof(PADStatus));
 		if (s_autoplay > 0 && n >= 3600 && (n % 120) < 6) {
-			if (s_status[0].err != PAD_ERR_NONE)
-				std::memset(&s_status[0], 0, sizeof(PADStatus));
 			s_status[0].button |= PAD_BUTTON_A;
 			if ((n % 600) < 6) s_status[0].button |= PAD_BUTTON_START;
 		}
