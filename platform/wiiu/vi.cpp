@@ -1,5 +1,4 @@
 #include "runtime.h"
-extern "C" uint32_t sms_wiiu_watch_word(void);
 extern "C" uint32_t sms_port_heap_fallbacks(void);
 extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 
@@ -141,17 +140,6 @@ void sms_wiiu_frame_boundary(void)
 		         s_frame_count, s_stage_path, sms_wiiu_heap_free(),
 		         sms_port_heap_fallbacks(), sms_port_heap_fallback_bytes(),
 		         port_dvd_busy() ? "busy" : "idle");
-	}
-	/* Crash hunt: report the watched word turning into a non-pointer. */
-	{
-		static uint32_t s_last, s_reports;
-		const uint32_t w = sms_wiiu_watch_word();
-		const bool ok = w == 0 || (w >= 0x10000000u && w < 0x20000000u && !(w & 3u));
-		if (w != s_last && !ok && s_reports < 8) {
-			++s_reports;
-			port_log("[watch] frame %u: word %08x -> %08x\n", s_frame_count, s_last, w);
-		}
-		s_last = w;
 	}
 	/* SMS_CRASHTEST=<frame> (autoplay file): a deliberate DSI on the main
 	 * thread, to prove the crash path returns to the Menu unattended. */
