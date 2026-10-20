@@ -3271,6 +3271,9 @@ void flushBatch() {
             HostVertex hv;
             const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
             unpackVertex(s_batch.fmt, packed, defaults, hv);
+            if (gpuPath && s_vertexSelfCheck)
+                vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
+                                    hv, s_debugDrawNo);
             float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
             if (gpuPath) {
                 packRawVertex(hv, *reinterpret_cast<RawVertex*>(out));
@@ -3330,9 +3333,6 @@ void flushBatch() {
 #endif
     debugDraw(tevKey, debugDrawNo, tevPath, map, texture, tevTextures,
               s_batch.count, haveFirst ? &firstHv : nullptr, firstOut);
-    if (gpuPath && haveFirst)
-        vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
-                            firstHv, debugDrawNo);
     if (SMS_GX2_DEBUG_DRAW_LIMIT && debugDrawNo >= SMS_GX2_DEBUG_DRAW_LIMIT) {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         return;
