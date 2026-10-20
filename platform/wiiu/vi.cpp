@@ -18,6 +18,7 @@ extern "C" volatile int sms_wiiu_menu_exit_pending;
 
 extern "C" {
 void sms_wiiu_gfx_frame(void);
+uint32_t sms_wiiu_vsync_fields(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
 void sms_wiiu_dump_threads(void);
@@ -120,10 +121,13 @@ void sms_wiiu_frame_boundary(void)
 	 * interrupt); nothing else calls the pump. */
 	sms_wiiu_dvd_pump();
 	sms_wiiu_input_poll();
+	/* The retrace count follows the TV: a retrace waits for a real vsync,
+	 * and one that ends late counts every field that passed. */
+	const u32 fields = sms_wiiu_vsync_fields();
 	if (s_pre_callback)
-		s_pre_callback(s_retrace_count + 1);
+		s_pre_callback(s_retrace_count + fields);
 	sms_wiiu_gfx_frame();
-	++s_retrace_count;
+	s_retrace_count += fields;
 	++s_frame_count;
 	s_current_framebuffer = s_next_framebuffer;
 	if (s_post_callback)

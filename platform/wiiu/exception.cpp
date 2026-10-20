@@ -221,8 +221,11 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
  * global destructors (other game threads are still alive). WHBProc/std::exit
  * were not used here: with them the Menu started (its music played) but the
  * app never let go of the screen. */
+extern "C" void sms_wiiu_vsync_pace_stop(void);
+
 extern "C" void sms_wiiu_crash_return_to_menu(void)
 {
+	sms_wiiu_vsync_pace_stop();
 	sms_wiiu_crash_stage = 2;
 	OSSetThreadPriority(cafe_OSGetCurrentThread(), 1);
 	WHBLogPrint("[crash] returning to the Wii U Menu");
