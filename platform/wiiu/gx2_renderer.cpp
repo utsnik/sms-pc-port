@@ -987,17 +987,14 @@ static void vertexEmit(std::vector<uint64_t>& ops, std::initializer_list<uint64_
 
 static void vertexEmitDot4(std::vector<uint64_t>& ops, uint32_t dst, uint32_t dstChan,
                            uint32_t src0, uint32_t src1) {
-    // Latte requires the four reduction instructions to occupy distinct
-    // destination channels.  Reduce into scratch so DOT4's broadcast does
-    // not overwrite the other components of the value being built.
-    constexpr uint32_t scratch = 59;
-    vertexEmit(ops, {
-        ALU_DOT4(_R(scratch), _x, src0, _x, src1, _x),
-        ALU_DOT4(__, _y, src0, _y, src1, _y),
-        ALU_DOT4(__, _z, src0, _z, src1, _z),
-        ALU_DOT4(__, _w, src0, _w, src1, _w),
-    });
-    vertexEmit(ops, {ALU_MOV(_R(dst), dstChan, _R(scratch), _x)});
+    // Keep the result in one component.  The generated shaders use this for
+    // matrix rows and lighting vectors; scalar multiply-adds avoid DOT4's
+    // reduction broadcast clobbering the other components under Cemu's
+    // legacy decompiler.
+    vertexEmit(ops, {ALU_MUL(_R(dst), dstChan, src0, _x, src1, _x)});
+    vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _y, src1, _y, _R(dst), dstChan)});
+    vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _z, src1, _z, _R(dst), dstChan)});
+    vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _w, src1, _w, _R(dst), dstChan)});
 }
 
 static uint32_t vertexInputForRow(uint32_t row) {
@@ -1059,13 +1056,13 @@ static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, u
     if (relative) vertexLoadRelativeMatrix(ops, indexReg, indexChan, 53, base);
     else vertexLoadAbsoluteMatrix(ops, 53, base);
     for (uint32_t ch = 0; ch < 3; ++ch)
-        vertexEmitDot4(ops, dst, ch, _R(source), _R(53));
+        vertexEmitDot4(ops, dst, ch, _R(source), _R(53 + ch));
 }
 
 static void vertexNormalTransform(std::vector<uint64_t>& ops) {
     vertexLoadRelativeMatrix(ops, 15, _x, 53, 64, 3, 3);
     for (uint32_t ch = 0; ch < 3; ++ch)
-        vertexEmitDot4(ops, 41, ch, _R(2), _R(53));
+        vertexEmitDot4(ops, 41, ch, _R(2), _R(53 + ch));
     vertexEmitDot4(ops, 45, _x, _R(41), _R(41));
     vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
     vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
@@ -1326,7 +1323,7 @@ static bool initVertexProgram(VertexProgram& shader) {
                 vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
                 vertexLoadAbsoluteMatrix(alu, 53, 88 + (post & 63) * 4);
                 for (uint32_t ch = 0; ch < 3; ++ch)
-                    vertexEmitDot4(alu, 55, ch, _R(55), _R(53));
+                    vertexEmitDot4(alu, 55, ch, _R(55), _R(53 + ch));
             }
         } else if (type == 1) {
             const uint32_t emboss = (tg >> 12) & 7;
