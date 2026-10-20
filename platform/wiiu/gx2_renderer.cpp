@@ -987,15 +987,11 @@ static void vertexEmit(std::vector<uint64_t>& ops, std::initializer_list<uint64_
 
 static void vertexEmitDot4(std::vector<uint64_t>& ops, uint32_t dst, uint32_t dstChan,
                            uint32_t src0, uint32_t src1) {
-    const uint32_t c0 = dstChan & 3;
-    const uint32_t c1 = (c0 + 1) & 3;
-    const uint32_t c2 = (c0 + 2) & 3;
-    const uint32_t c3 = (c0 + 3) & 3;
     vertexEmit(ops, {
-        ALU_DOT4(_R(dst), c0, src0, _x, src1, _x),
-        ALU_DOT4(__, c1, src0, _y, src1, _y),
-        ALU_DOT4(__, c2, src0, _z, src1, _z),
-        ALU_DOT4(__, c3, src0, _w, src1, _w),
+        ALU_DOT4(_R(dst), dstChan, src0, _x, src1, _x),
+        ALU_DOT4(__, dstChan, src0, _y, src1, _y),
+        ALU_DOT4(__, dstChan, src0, _z, src1, _z),
+        ALU_DOT4(__, dstChan, src0, _w, src1, _w),
     });
 }
 
