@@ -1,6 +1,9 @@
 #include "port_heap.h"
 #include "runtime.h"
 #include <cstdio>
+#ifndef SMS_GX2_ASYNC_PEEK
+#define SMS_GX2_ASYNC_PEEK 1
+#endif
 #ifndef SMS_GX2_TEV_UNTEXTURED
 #define SMS_GX2_TEV_UNTEXTURED 1
 #endif
@@ -3521,6 +3524,34 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
             if (!s_peekSpecial.image) { MEMFreeToDefaultHeap(s_peekSurface.image); return false; }
         }
         s_peekSurfaceReady = true;
+    }
+    if (!cemu && SMS_GX2_ASYNC_PEEK) {
+        // Console: answer from the copy queued by the previous peek (one
+        // frame old, finished long ago) and queue this frame's copy without
+        // draining the GPU.  The synchronous version stalled the CPU on the
+        // whole frame's GPU work twice per peek.
+        static uint64_t s_peekStamp;
+        static bool s_peekQueued;
+        const bool have = s_peekQueued;
+        if (have) {
+            GX2WaitTimeStamp(s_peekStamp);
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
+                uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
+                if (px >= s_peekSurface.width) px = s_peekSurface.width - 1;
+                if (py >= s_peekSurface.height) py = s_peekSurface.height - 1;
+                uint8_t* texel = static_cast<uint8_t*>(s_peekSurface.image) + (size_t(py) * s_peekSurface.pitch + px) * 4;
+                DCInvalidateRange(texel, 4);
+                out[i] = uint32_t(texel[3]) << 24 | uint32_t(texel[0]) << 16 | uint32_t(texel[1]) << 8 | texel[2];
+            }
+        }
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+        GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
+        rebindTvTarget();
+        GX2Flush();
+        s_peekStamp = GX2GetLastSubmittedTimeStamp();
+        s_peekQueued = true;
+        return have;
     }
     // Make every queued draw land in memory before the copy reads the target.
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
