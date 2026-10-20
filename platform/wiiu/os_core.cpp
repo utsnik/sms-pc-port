@@ -286,7 +286,6 @@ int port_vi_idle_advance(void) { return 0; }
 int port_vi_deterministic(void) { return 0; }
 s64 port_vi_virtual_ticks(void) { return port_time_ticks(); }
 void port_audio_on_retrace(void) {}
-void port_pad_autopress_field(uint32_t) {}
 void port_window_icon_init(void) {}
 void port_irq_add_source_dummy(void) {}
 
