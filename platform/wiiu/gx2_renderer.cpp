@@ -85,6 +85,7 @@ uint64_t g_statHiresBytes = 0;
 static bool s_ready;
 static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
+static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
 static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
@@ -3806,6 +3807,7 @@ void rendererInit(float) {
     if (s_ready) return;
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
+    s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
@@ -3943,7 +3945,7 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     return true;
 }
 
-bool arenaEnabled() { return s_gpuXfEnabled; }
+bool arenaEnabled() { return s_gpuXfEnabled && s_dlArenaEnabled; }
 uint32_t arenaGeneration() { return s_dlArenaGen; }
 bool arenaUpload(const uint8_t* verts, uint32_t, uint32_t, const uint32_t* idx, uint32_t, ArenaRef& out) {
     // The decode needs the run's format and matrix registers, which only
