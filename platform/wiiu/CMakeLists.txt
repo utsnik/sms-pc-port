@@ -182,7 +182,8 @@ target_link_options(sms PRIVATE
   "-Wl,-Map,${SMS_WIIU_BUILD_DIR}/sms.map"
   -Wl,--gc-sections
   -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvj
-  -Wl,--wrap=DCFlushRange -Wl,--wrap=DCStoreRange -Wl,--wrap=DCFlushRangeNoSync -Wl,--wrap=DCStoreRangeNoSync)
+  -Wl,--wrap=DCFlushRange -Wl,--wrap=DCStoreRange -Wl,--wrap=DCFlushRangeNoSync -Wl,--wrap=DCStoreRangeNoSync
+  -Wl,--wrap=DCInvalidateRange)
 # Audio output (audio.cpp): wut's SDL2 port, audio subsystem only.
 find_package(SDL2 REQUIRED CONFIG)
 target_link_libraries(sms PRIVATE

@@ -339,6 +339,49 @@ void __real_DCFlushRangeNoSync(void*, uint32_t);
 void __real_DCStoreRangeNoSync(void*, uint32_t);
 void GXPC_MemoryWritten(const void* p, uint32_t size);
 void __wrap_DCFlushRange(void* p, uint32_t n) { __real_DCFlushRange(p, n); GXPC_MemoryWritten(p, n); }
+
+/* Crash hunt (JPAEmitterManager free list = 0xDCD10004, hardware only): the
+ * watched word is that list's head, at a fixed offset in the game arena.
+ * Every cache invalidate and every CPU "DMA" whose cache lines cover it is
+ * logged with the word before and after, so a discarded write shows itself. */
+uint32_t sms_wiiu_watch_addr;
+static uint32_t s_watch_logs;
+uint32_t cafe_OSGetSymbolName(uint32_t, char*, uint32_t) __asm__("OSGetSymbolName");
+static bool covers(const void* p, uint32_t n)
+{
+	const uint32_t a = uint32_t(uintptr_t(p)) & ~31u, e = (uint32_t(uintptr_t(p)) + n + 31u) & ~31u;
+	return sms_wiiu_watch_addr && sms_wiiu_watch_addr >= a && sms_wiiu_watch_addr < e;
+}
+static void note(const char* what, const void* p, uint32_t n, uint32_t before, void* caller)
+{
+	if (s_watch_logs >= 64)
+		return;
+	++s_watch_logs;
+	char name[96] = "";
+	cafe_OSGetSymbolName(uint32_t(uintptr_t(caller)), name, sizeof(name));
+	port_log("[watch] %s %p+0x%x word %08x -> %08x from %s\n", what, p, unsigned(n), unsigned(before),
+	         unsigned(*reinterpret_cast<volatile uint32_t*>(uintptr_t(sms_wiiu_watch_addr))), name);
+}
+void sms_wiiu_watch_range(const char* what, const void* p, uint32_t n, uint32_t before)
+{
+	if (covers(p, n))
+		note(what, p, n, before, __builtin_return_address(0));
+}
+uint32_t sms_wiiu_watch_word(void)
+{
+	return sms_wiiu_watch_addr ? *reinterpret_cast<volatile uint32_t*>(uintptr_t(sms_wiiu_watch_addr)) : 0;
+}
+void __real_DCInvalidateRange(void*, uint32_t);
+void __wrap_DCInvalidateRange(void* p, uint32_t n)
+{
+	if (!covers(p, n)) {
+		__real_DCInvalidateRange(p, n);
+		return;
+	}
+	const uint32_t before = sms_wiiu_watch_word();
+	__real_DCInvalidateRange(p, n);
+	note("invalidate", p, n, before, __builtin_return_address(0));
+}
 void __wrap_DCStoreRange(void* p, uint32_t n) { __real_DCStoreRange(p, n); GXPC_MemoryWritten(p, n); }
 void __wrap_DCFlushRangeNoSync(void* p, uint32_t n) { __real_DCFlushRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
 void __wrap_DCStoreRangeNoSync(void* p, uint32_t n) { __real_DCStoreRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }

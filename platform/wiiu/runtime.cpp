@@ -1,4 +1,5 @@
 #include "runtime.h"
+extern "C" uint32_t sms_wiiu_watch_addr;
 
 #include "port_stub.h"
 #include "port_os.h"
@@ -234,6 +235,9 @@ void sms_wiiu_runtime_init(void)
 	/* Cached display lists and decodes skip re-hashing pages that no cache
 	 * flush has touched since; track the game arena for that. */
 	GXPC_SetWriteStampWindow(arena);
+	/* Crash hunt: JPAEmitterManager's free-list head sat at this offset in
+	 * every crash (0x4FF534, three builds). */
+	sms_wiiu_watch_addr = reinterpret_cast<uint32_t>(arena) + 0x4FF534u;
 	resolve_app_root();
 	std::strncpy(s_files_root, kAppRootCandidates[kAppRootIndex],
 	             sizeof(s_files_root));
