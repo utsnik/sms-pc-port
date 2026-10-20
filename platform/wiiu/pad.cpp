@@ -391,12 +391,19 @@ void sms_wiiu_input_poll(void)
 		if (s_autoplay > 0 && n >= 1200 && s_status[0].err != PAD_ERR_NONE)
 			std::memset(&s_status[0], 0, sizeof(PADStatus));
 		if (s_script_count) {
-			const uint32_t field = s_field;
+			/* Retrace fields from wall time: vi.cpp's field hook does not run
+			 * on this platform, so take the larger of the two. */
+			static OSTime s_script_start;
+			if (!s_script_start)
+				s_script_start = OSGetTime();
+			const uint32_t wall = (uint32_t)(OSTicksToMilliseconds(OSGetTime() - s_script_start) * 5994 / 100000);
+			const uint32_t field = s_field > wall ? s_field : wall;
 			for (int i = 0; i < s_script_count; i++) {
 				const ScriptPress& p = s_script[i];
 				if (field < p.at || field >= p.until)
 					continue;
-				if (field == p.at)
+				static uint64_t s_logged;
+				if (!(s_logged & (1ull << i)) && (s_logged |= 1ull << i))
 					port_log("[pad] autoplay press %d at field %u\n", i, (unsigned)field);
 				s_status[0].button |= p.button;
 				if (p.sx) s_status[0].stickX = p.sx;
