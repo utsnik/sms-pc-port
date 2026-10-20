@@ -197,6 +197,7 @@ enum RawAttrib : uint32_t {
 
 struct VertexProgram {
     VertexKey key;
+    uint32_t aluCount;
     GX2VertexShader vertex;
     GX2FetchShader fetch;
     GX2AttribStream attrs[RAW_ATTR_COUNT];
@@ -1218,6 +1219,7 @@ static bool vertexKeySupported(const VertexKey& key) {
 }
 
 static bool runningUnderCemu();
+static bool s_vertexOneClause;
 
 static bool initVertexProgram(VertexProgram& shader) {
     s_vertexRejectReason = "unknown";
@@ -1441,9 +1443,14 @@ static bool initVertexProgram(VertexProgram& shader) {
         s_vertexRejectReason = "alu-limit";
         return false;
     }
+    shader.aluCount = uint32_t(alu.size());
     const size_t clauses = (alu.size() + 127) / 128;
     if (!clauses || clauses > 16) {
         s_vertexRejectReason = "clause-limit";
+        return false;
+    }
+    if (clauses > 1 && s_vertexOneClause) {
+        s_vertexRejectReason = "multi-clause (gpuxf1clause marker)";
         return false;
     }
     // Control flow first, ALU code after it: the CF stream must end in the
@@ -1560,8 +1567,8 @@ static VertexProgram* vertexShaderForKey(const VertexKey& key) {
                      (unsigned)s_vertexPrograms.size());
         return nullptr;
     }
-    WHBLogPrintf("SMS Wii U: generated GPU vertex program texgens=%u bytes=%u cache=%u chans=%u cc=%08x/%08x tg=%08x/%08x/%08x/%08x dual=%u",
-                 (unsigned)key.numTexGens, (unsigned)shader->vertex.size, (unsigned)s_vertexPrograms.size(),
+    WHBLogPrintf("SMS Wii U: generated GPU vertex program alu=%u texgens=%u bytes=%u cache=%u chans=%u cc=%08x/%08x tg=%08x/%08x/%08x/%08x dual=%u",
+                 (unsigned)shader->aluCount, (unsigned)key.numTexGens, (unsigned)shader->vertex.size, (unsigned)s_vertexPrograms.size(),
                  (unsigned)key.numChans, (unsigned)key.colorCtrl[0], (unsigned)key.colorCtrl[1],
                  (unsigned)key.texgen[0], (unsigned)key.texgen[1], (unsigned)key.texgen[2], (unsigned)key.texgen[3],
                  (unsigned)key.dualTex);
@@ -3063,6 +3070,7 @@ void rendererInit(float) {
     if (s_ready) return;
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
+    s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
