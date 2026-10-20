@@ -392,14 +392,25 @@ static bool s_xfMemoryDirty = true;
 // Clears, copies and context-state restores run GX2's own programs and
 // replace the vertex constant registers, so the uniform shadow must forget
 // what it believes the GPU holds after any of them.
-/* What the TEV path last wrote to the pixel uniform registers: setTevShader
- * sends only the vectors that changed. Everything that clobbers GPU state
- * (copies, clears, context switches) goes through invalidateVertexUniforms,
- * which drops this shadow too. */
-static bool s_tevPixelValid;
+/* Per-draw redundancy caches: what the last draw left bound, so the next one
+ * sends only what differs. Everything that clobbers GPU state (copies,
+ * clears, context switches, frame start) goes through
+ * invalidateVertexUniforms, which drops them all; the SD marker "nodiff"
+ * drops them before every draw instead (A/B for speed and for the picture).
+ *  - s_tevPixelValid: the TEV pixel uniforms (setTevShader's shadow);
+ *  - s_vtxLiveValid: the generated vertex program's live block;
+ *  - s_stateValid: applyState's GX2 state;
+ *  - s_bound*: the fetch, vertex and pixel shaders. */
+static bool s_tevPixelValid, s_vtxLiveValid, s_stateValid;
+static const void* s_boundFetch;
+static const void* s_boundVertex;
+static const void* s_boundPixel;
+static bool s_noDiff;
+static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
 static void invalidateVertexUniforms() {
-    s_tevPixelValid = false;
+    s_tevPixelValid = s_vtxLiveValid = s_stateValid = false;
+    s_boundFetch = s_boundVertex = s_boundPixel = nullptr;
     s_xfUniformValid = false;
     s_xfMemoryDirty = true;
 }
@@ -2605,15 +2616,42 @@ static TevShader* tevShaderForKey(const TevKey& key) {
 }
 
 static void textureUvTransform(const TextureEntry* texture, float out[4]);
+static void bindShaders(GX2FetchShader* fetch, GX2VertexShader* vertex, GX2PixelShader* pixel) {
+    if (fetch != s_boundFetch) { GX2SetFetchShader(fetch); s_boundFetch = fetch; }
+    if (vertex != s_boundVertex) { GX2SetVertexShader(vertex); s_boundVertex = vertex; }
+    if (pixel != s_boundPixel) { GX2SetPixelShader(pixel); s_boundPixel = pixel; }
+}
+
+// Everything setTevShader's uniforms are computed from.
+struct TevParamInputs {
+    uint32_t tevReg[8], kreg[8], ss[2], indMtx[9];
+    const TextureEntry* tex[8];
+    uint32_t texW[8], texH[8];
+    uint32_t copyGeneration;
+};
+
 static void setTevShader(TevShader& shader, TextureEntry* const* textures, VertexProgram* vertex = nullptr) {
-    if (vertex) {
-        GX2SetFetchShader(&vertex->fetch);
-        GX2SetVertexShader(&vertex->vertex);
-    } else {
-        GX2SetFetchShader(&s_tevFetch);
-        GX2SetVertexShader(&s_tevVertex);
+    if (vertex) bindShaders(&vertex->fetch, &vertex->vertex, &shader.pixel);
+    else bindShaders(&s_tevFetch, &s_tevVertex, &shader.pixel);
+    // Unchanged inputs since the last upload: the registers already hold
+    // these uniforms (most consecutive draws share them).
+    TevParamInputs in;
+    memset(&in, 0, sizeof(in));
+    for (int i = 0; i < 8; ++i) {
+        in.tevReg[i] = g.bp[BP_TEV_REG + i];
+        in.kreg[i] = g.kreg[i];
+        in.tex[i] = textures[i];
+        in.texW[i] = textures[i] ? textures[i]->width : 0;
+        in.texH[i] = textures[i] ? textures[i]->height : 0;
     }
-    GX2SetPixelShader(&shader.pixel);
+    in.ss[0] = g.bp[BP_RAS1_SS0];
+    in.ss[1] = g.bp[BP_RAS1_SS1];
+    for (int i = 0; i < 9; ++i) in.indMtx[i] = g.bp[BP_IND_MTX + i];
+    in.copyGeneration = s_copyGeneration;
+    static TevParamInputs s_lastInputs;
+    const bool sameInputs = s_tevPixelValid && !memcmp(&in, &s_lastInputs, sizeof(in));
+    if (!sameInputs) {
+    s_lastInputs = in;
     // Integer TEV operands (see the constant-file layout above tevColorSource).
     float params[kTevUniforms * 4] = {};
     for (int i = 0; i < 4; ++i) {
@@ -2713,6 +2751,7 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
             r = end;
         }
     }
+    }  // !sameInputs
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
         GX2SetPixelTexture(&textures[map]->texture, map);
@@ -2743,9 +2782,16 @@ static TextureEntry* copyTexture(const void* source) {
     return nullptr;
 }
 static const CopyEntry* copyEntryForTexture(const TextureEntry* texture) {
-    for (const CopyEntry& c : copyCache())
-        if (&c.tex == texture && c.tex.valid) return &c;
-    return nullptr;
+    // A copy's texture lives inside its CopyEntry: find the entry by address
+    // (this ran a scan over every copy for each map of every draw).
+    const std::vector<CopyEntry>& copies = copyCache();
+    if (!texture || copies.empty()) return nullptr;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(&copies.front().tex);
+    const uintptr_t at = reinterpret_cast<uintptr_t>(texture);
+    if (at < first) return nullptr;
+    const size_t i = (at - first) / sizeof(CopyEntry);
+    if (i >= copies.size() || &copies[i].tex != texture || !copies[i].tex.valid) return nullptr;
+    return &copies[i];
 }
 
 static FILE* debugFile() {
@@ -2901,6 +2947,7 @@ static bool runningUnderCemu() {
 static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     ++s_perfCopies;
+    ++s_copyGeneration;
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return;
     const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
@@ -3227,14 +3274,8 @@ static TextureEntry* getTexture(int map) {
 }
 
 static void setShader(FixedShader& shader, TextureEntry* texture, VertexProgram* vertex = nullptr) {
-    if (vertex) {
-        GX2SetFetchShader(&vertex->fetch);
-        GX2SetVertexShader(&vertex->vertex);
-    } else {
-        GX2SetFetchShader(&shader.fetch);
-        GX2SetVertexShader(&shader.vertex);
-    }
-    GX2SetPixelShader(&shader.pixel);
+    if (vertex) bindShaders(&vertex->fetch, &vertex->vertex, &shader.pixel);
+    else bindShaders(&shader.fetch, &shader.vertex, &shader.pixel);
     static const float windowParams[4] = {1, 0, 0, 0};
     GX2SetPixelUniformReg(shader.pixel.uniformVars[0].offset, 4, windowParams);
     s_tevPixelValid = false;  // overlaps the TEV path's registers
@@ -3333,6 +3374,19 @@ static void updateTarget() {
 }
 
 static void applyState() {
+    // Same inputs as the last draw: GX2 already holds this state.
+    struct StateInputs { uint32_t zmode, xf5, cm0, cm1, pe, genmode, scissor[4]; float scale, x, w, h; };
+    StateInputs in;
+    memset(&in, 0, sizeof(in));
+    in.zmode = g.bp[BP_ZMODE]; in.xf5 = g.xfReg[0x05];
+    in.cm0 = g.bp[BP_CMODE0]; in.cm1 = g.bp[BP_CMODE1];
+    in.pe = g.bp[BP_PE_CONTROL]; in.genmode = g.bp[BP_GENMODE];
+    memcpy(in.scissor, g.scissor, sizeof(in.scissor));
+    in.scale = s_gameScale; in.x = s_gameX; in.w = s_tvW; in.h = s_tvH;
+    static StateInputs s_last;
+    if (s_stateValid && !memcmp(&in, &s_last, sizeof(in))) return;
+    s_last = in;
+    s_stateValid = true;
     const uint32_t zmode = g.bp[BP_ZMODE];
     const bool ztest = (zmode & 1) != 0;
     const bool zwrite = (zmode & 16) != 0;
@@ -3738,6 +3792,10 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
             copy[3] = float(entry->sourceY) / s_tvH;
         }
     }
+    static float s_vtxLiveShadow[sizeof(s_vtxLive) / sizeof(float)];
+    if (s_vtxLiveValid && !memcmp(s_vtxLive, s_vtxLiveShadow, sizeof(s_vtxLiveShadow))) return;
+    memcpy(s_vtxLiveShadow, s_vtxLive, sizeof(s_vtxLiveShadow));
+    s_vtxLiveValid = true;
     GX2SetVertexUniformReg(kVtxLiveBase * 4, kVtxLiveRegs * 4, s_vtxLive);
 }
 
@@ -3930,6 +3988,7 @@ void rendererInit(float) {
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     s_gpuDiag = sdMarkerPresent("perfdiag");
     g_perfStages = s_gpuDiag;
+    s_noDiff = sdMarkerPresent("nodiff");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
@@ -4144,6 +4203,7 @@ void flushBatch() {
         return;
     }
     PerfScope perfFlush(s_perfFlush);
+    if (s_noDiff) invalidateVertexUniforms();
     OSTime perfTex0 = OSGetTime();
     const TevKey tevKey = currentTevKey();
     const bool textured = tevTextureMask(tevKey) != 0;
@@ -4676,6 +4736,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     }
 #endif
     GX2SetRasterizerClipControlHalfZ(TRUE, g.xfReg[0x05] == 0, TRUE);
+    invalidateVertexUniforms();  // the frame's own viewport/scissor/clip writes above
 }
 // Sunshine runs at 30 fps and waits two retraces per game frame; presenting at
 // the second one showed a freshly cleared, empty frame half the time.
