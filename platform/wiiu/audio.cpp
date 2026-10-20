@@ -180,7 +180,12 @@ void* pacer(void*)
 	// the buffer of the DVD message queue. Blocking there let the main thread
 	// reach Dvd::dvdProcInit first and initialise that queue with no buffer
 	// (signal 11 in send_message at the first sequence load).
-	g.dev = sms_wiiu_sdl_audio_open(kRate) != 0;
+	// A/B switch (SD marker "noaudio"): no SDL device, so no AX voices, to
+	// measure what the system's AX thread costs core 1.
+	const bool noAudio = sms_wiiu_sd_marker("noaudio");
+	if (noAudio)
+		port_log("[audio] SD marker noaudio: SDL audio not opened\n");
+	g.dev = !noAudio && sms_wiiu_sdl_audio_open(kRate) != 0;
 	if (!g.dev)
 		port_log("[audio] no audio device: pacing AI DMA from the system clock\n");
 	g.statsSince = sms_wiiu_audio_system_time();

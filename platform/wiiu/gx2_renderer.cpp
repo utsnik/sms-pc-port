@@ -465,17 +465,22 @@ static bool s_vertexArenaInvalidated;
 // Per-draw GPU cost: the bottom-of-pipe GPU clock is stamped after every draw
 // (and once at frame start) into this arena's slots; once the arena's fence
 // has retired, each draw's cost is the difference to the previous stamp.
+// A top-of-pipe stamp beside each one marks when the command processor reached
+// the draw: a top stamp later than the previous bottom stamp is time the GPU
+// sat idle waiting for commands, not time it spent drawing.
 extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
+extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
 static constexpr uint32_t kGpuStamps = 1024;
 struct GpuDrawInfo {
     uint32_t verts, stages, texMask, blend, zmode, texW, texH, area, drawNo;
 };
 static uint64_t* s_gpuStamps[3];
+static uint64_t* s_gpuTopStamps[3];
 static GpuDrawInfo* s_gpuInfo[3];
 static uint32_t s_gpuCount[3];
-static uint64_t s_gpuTotal;
+static uint64_t s_gpuTotal, s_gpuIdle;
 static uint32_t s_gpuFrames;
-struct GpuTop { uint64_t cost; GpuDrawInfo info; };
+struct GpuTop { uint64_t cost, idle; GpuDrawInfo info; };
 static GpuTop s_gpuTop[8];
 static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
@@ -484,16 +489,18 @@ static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
     if (!s_gpuDiag) return;
     if (!s_gpuStamps[arena]) {
-        s_gpuStamps[arena] = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGpuStamps * 8, 64));
+        s_gpuStamps[arena] = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGpuStamps * 16, 64));
         s_gpuInfo[arena] = static_cast<GpuDrawInfo*>(MEMAllocFromDefaultHeapEx(kGpuStamps * sizeof(GpuDrawInfo), 64));
         if (!s_gpuStamps[arena] || !s_gpuInfo[arena]) return;
+        s_gpuTopStamps[arena] = s_gpuStamps[arena] + kGpuStamps;
         // No dirty CPU lines may later be written back over the GPU's stamps.
-        memset(s_gpuStamps[arena], 0, kGpuStamps * 8);
-        DCFlushRange(s_gpuStamps[arena], kGpuStamps * 8);
+        memset(s_gpuStamps[arena], 0, kGpuStamps * 16);
+        DCFlushRange(s_gpuStamps[arena], kGpuStamps * 16);
     }
     uint32_t& n = s_gpuCount[arena];
     if (n >= kGpuStamps) return;
     if (info) s_gpuInfo[arena][n] = *info;
+    GX2SampleTopGPUCycle(&s_gpuTopStamps[arena][n]);
     GX2SampleBottomGPUCycle(&s_gpuStamps[arena][n]);
     ++n;
 }
@@ -503,7 +510,9 @@ static void gpuCollect(uint32_t arena) {
     s_gpuCount[arena] = 0;
     if (n < 2 || !s_gpuStamps[arena]) return;
     DCInvalidateRange(s_gpuStamps[arena], n * 8);
+    DCInvalidateRange(s_gpuTopStamps[arena], n * 8);
     const uint64_t* st = s_gpuStamps[arena];
+    const uint64_t* top = s_gpuTopStamps[arena];
     if (st[n - 1] > st[0]) s_gpuTotal += st[n - 1] - st[0];
     // Timer rate check: first stamps of the window's frames against OSTime.
     if (!s_gpuFrames) { s_rateStamp0 = st[0]; s_rateTime0 = OSGetTime(); }
@@ -512,17 +521,20 @@ static void gpuCollect(uint32_t arena) {
     for (uint32_t i = 1; i < n; ++i) {
         if (st[i] <= st[i - 1]) continue;
         const uint64_t cost = st[i] - st[i - 1];
+        const uint64_t idle = top[i] > st[i - 1] ? std::min(top[i] - st[i - 1], cost) : 0;
+        s_gpuIdle += idle;
         int slot = -1;
         for (int k = 0; k < 8; ++k)
             if (slot < 0 || s_gpuTop[k].cost < s_gpuTop[slot].cost) slot = k;
-        if (cost > s_gpuTop[slot].cost) s_gpuTop[slot] = {cost, s_gpuInfo[arena][i]};
+        if (cost > s_gpuTop[slot].cost) s_gpuTop[slot] = {cost, idle, s_gpuInfo[arena][i]};
     }
 }
 
 static void gpuReport() {
     if (!s_gpuFrames) return;
-    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u timer-rate=%u/s (top single draws over the window follow)",
-                 (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames),
+    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u idle=%u busy=%u timer-rate=%u/s (top single draws over the window follow)",
+                 (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames), (unsigned)(s_gpuIdle / s_gpuFrames),
+                 (unsigned)((s_gpuTotal - std::min(s_gpuIdle, s_gpuTotal)) / s_gpuFrames),
                  s_rateTime1 > s_rateTime0
                      ? (unsigned)((s_rateStamp1 - s_rateStamp0) * 1000ull / OSTicksToMilliseconds(s_rateTime1 - s_rateTime0))
                      : 0u);
@@ -532,14 +544,15 @@ static void gpuReport() {
             if (s_gpuTop[k].cost && (best < 0 || s_gpuTop[k].cost > s_gpuTop[best].cost)) best = k;
         if (best < 0) break;
         const GpuDrawInfo& d = s_gpuTop[best].info;
-        WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u",
-                     r, (unsigned)s_gpuTop[best].cost, (unsigned)d.drawNo, (unsigned)d.verts, (unsigned)d.stages,
+        WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u idle=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u",
+                     r, (unsigned)s_gpuTop[best].cost, (unsigned)s_gpuTop[best].idle, (unsigned)d.drawNo, (unsigned)d.verts, (unsigned)d.stages,
                      (unsigned)d.texMask, (unsigned)d.texW, (unsigned)d.texH, (unsigned)d.blend, (unsigned)d.zmode,
                      (unsigned)d.area);
         s_gpuTop[best].cost = 0;
     }
     memset(s_gpuTop, 0, sizeof(s_gpuTop));
     s_gpuTotal = 0;
+    s_gpuIdle = 0;
     s_gpuFrames = 0;
 }
 

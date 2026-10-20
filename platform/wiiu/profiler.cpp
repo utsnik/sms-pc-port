@@ -6,6 +6,13 @@
  * resolves each PC to its function with OSGetSymbolName and logs the top
  * functions. The alarm callback takes no locks and allocates nothing.
  *
+ * A leaf (memset, OSRestoreInterrupts, ...) says little by itself, and the
+ * alarm is held off while interrupts are disabled, so samples pile up in
+ * OSRestoreInterrupts. Once a report has seen which PCs resolve to a leaf,
+ * later samples at those PCs are also counted by caller (LR) and the
+ * caller's caller (from the stack back chain). Samples are also counted by
+ * the interrupted thread, since the game's other threads share the core.
+ *
  * The game's SDK has its own OSAlarm, so coreinit is bound by symbol name. */
 #include "runtime.h"
 
@@ -33,17 +40,81 @@ constexpr WutTime kPeriod = kTimerHz / 1013;
 constexpr WutTime kReportEvery = kTimerHz * 10;
 constexpr uint32_t kSlots = 4096;
 constexpr uint32_t kSrr0Offset = 0x98;
+constexpr uint32_t kLrOffset = 0x8C;
+constexpr uint32_t kSpOffset = 0x0C;  // gpr1
+constexpr uint32_t kLeafSlots = 1024;
+constexpr uint32_t kCallSlots = 1024;
+constexpr uint32_t kThreads = 16;
 
 struct Table {
 	uint32_t pc[kSlots];
 	uint32_t count[kSlots];
+	uint8_t tid[kSlots];  // index into thread[] (kThreads = not tracked)
+	// Leaf samples by call path: the leaf PC, its caller and that caller's caller.
+	uint32_t callPc[kCallSlots], callLr[kCallSlots], callUp[kCallSlots], callCount[kCallSlots];
+	void* thread[kThreads];
+	uint32_t threadCount[kThreads];
 	uint32_t samples;
 	uint32_t dropped;
+	uint32_t callDropped;
 	uint32_t main;  // samples that interrupted the main (game) thread
 };
 
 alignas(64) uint8_t s_alarm[0x80];
 Table s_tables[2];
+// PCs known to be inside a leaf function, learned by report(); 0 = empty.
+uint32_t s_leafPc[kLeafSlots];
+
+inline uint32_t slot_of(uint32_t key, uint32_t slots) { return (key >> 2) * 2654435761u % slots; }
+
+bool is_leaf_pc(uint32_t pc)
+{
+	uint32_t slot = slot_of(pc, kLeafSlots);
+	for (uint32_t probe = 0; probe < 16; ++probe, slot = (slot + 1) % kLeafSlots) {
+		if (s_leafPc[slot] == pc) return true;
+		if (!s_leafPc[slot]) return false;
+	}
+	return false;
+}
+
+void learn_leaf_pc(uint32_t pc)
+{
+	uint32_t slot = slot_of(pc, kLeafSlots);
+	for (uint32_t probe = 0; probe < 16; ++probe, slot = (slot + 1) % kLeafSlots) {
+		if (s_leafPc[slot] == pc) return;
+		if (!s_leafPc[slot]) { s_leafPc[slot] = pc; return; }
+	}
+}
+
+inline bool stack_addr(uint32_t a) { return a >= 0x10000000u && a < 0x50000000u && !(a & 3); }
+// OSGetSymbolName dereferences what it is given: only code addresses (system
+// RPLs and the game's text) may be named. A stray stack word faulted it.
+inline bool code_addr(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u && !(a & 3); }
+
+void count_call(Table& t, const uint8_t* ctx, uint32_t pc)
+{
+	const uint32_t lr = *reinterpret_cast<const uint32_t*>(ctx + kLrOffset);
+	// A leaf builds no frame, so the stack pointer is still the caller's
+	// frame; its back-chain word leads to the frame holding the caller's
+	// own return address.
+	uint32_t up = 0;
+	const uint32_t sp = *reinterpret_cast<const uint32_t*>(ctx + kSpOffset);
+	if (stack_addr(sp)) {
+		const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
+		if (stack_addr(next) && next > sp && next - sp < 0x10000u)
+			up = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+	}
+	if (!code_addr(up)) up = 0;
+	uint32_t slot = slot_of(lr ^ (up * 31u), kCallSlots);
+	for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kCallSlots) {
+		if (t.callCount[slot] && t.callLr[slot] == lr && t.callUp[slot] == up) { ++t.callCount[slot]; return; }
+		if (!t.callCount[slot]) {
+			t.callPc[slot] = pc; t.callLr[slot] = lr; t.callUp[slot] = up; t.callCount[slot] = 1;
+			return;
+		}
+	}
+	++t.callDropped;
+}
 volatile uint32_t s_active;
 void* s_mainThread;  // an OSThread starts with its OSContext
 volatile uint32_t s_frameTicks;  // frame boundaries seen, for the hang check
@@ -56,12 +127,55 @@ void on_alarm(void*, void* context)
 	Table& t = s_tables[s_active & 1];
 	++t.samples;
 	if (context == s_mainThread) ++t.main;
-	uint32_t slot = (pc >> 2) * 2654435761u % kSlots;
+	uint32_t tid = 0;
+	for (; tid < kThreads; ++tid) {
+		if (t.thread[tid] == context) { ++t.threadCount[tid]; break; }
+		if (!t.thread[tid]) { t.thread[tid] = context; t.threadCount[tid] = 1; break; }
+	}
+	if (is_leaf_pc(pc)) count_call(t, static_cast<const uint8_t*>(context), pc);
+	uint32_t slot = slot_of(pc ^ (tid << 28), kSlots);
 	for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kSlots) {
-		if (t.pc[slot] == pc) { ++t.count[slot]; return; }
-		if (!t.pc[slot]) { t.pc[slot] = pc; t.count[slot] = 1; return; }
+		if (t.pc[slot] == pc && t.tid[slot] == tid) { ++t.count[slot]; return; }
+		if (!t.pc[slot]) { t.pc[slot] = pc; t.tid[slot] = (uint8_t)tid; t.count[slot] = 1; return; }
 	}
 	++t.dropped;
+}
+
+// Leaves whose samples are worth charging to their callers.
+bool leaf_name(const char* name)
+{
+	const char* bar = std::strchr(name, '|');
+	const char* sym = bar ? bar + 1 : name;
+	static const char* const kLeaves[] = {"OSRestoreInterrupts", "memset", "memcpy", "memcmp", "memmove",
+	                                      "DCFlushRange", "DCInvalidateRange", "DCStoreRange"};
+	for (const char* leaf : kLeaves)
+		if (std::strcmp(sym, leaf) == 0) return true;
+	return false;
+}
+
+// "module|symbol" -> "symbol", so three names fit on one log line.
+const char* short_name(const char* name)
+{
+	const char* bar = std::strchr(name, '|');
+	return bar ? bar + 1 : name;
+}
+
+// Only when the sampled context really is a live OSThread.
+bool is_thread(void* context)
+{
+	const uint8_t* p = static_cast<const uint8_t*>(context);
+	if (!p || !stack_addr(reinterpret_cast<uint32_t>(p))) return false;
+	return *reinterpret_cast<const uint64_t*>(p) == 0x4F53436F6E747874ull &&  // OS_CONTEXT_TAG
+	       *reinterpret_cast<const uint32_t*>(p + 0x320) == 0x74487244u;       // OS_THREAD_TAG
+}
+
+const char* thread_name(void* context)
+{
+	if (!is_thread(context)) return nullptr;
+	const uint8_t* p = static_cast<const uint8_t*>(context);
+	const char* name = *reinterpret_cast<const char* const*>(p + 0x5C0);
+	const uint32_t at = reinterpret_cast<uint32_t>(name);
+	return at >= 0x01000000u && at < 0x50000000u ? name : nullptr;
 }
 
 struct Func {
@@ -86,9 +200,65 @@ void report(Table& t)
 			++nfuncs;
 		}
 		funcs[f].count += t.count[i];
+		if (leaf_name(name)) learn_leaf_pc(t.pc[i]);
 	}
-	port_log("[prof] samples=%u dropped=%u functions=%u main-thread=%u\n", (unsigned)t.samples, (unsigned)t.dropped, (unsigned)nfuncs, (unsigned)t.main);
-	for (int rank = 0; rank < 25; ++rank) {
+	/* No '%' in these lines' output: the console log handler formats the
+	 * finished line again, so "0.6% safe|..." became a %s with a junk
+	 * pointer and faulted in OSConsoleWrite. */
+	port_log("[prof] samples=%u dropped=%u functions=%u main-thread=%u call-dropped=%u\n", (unsigned)t.samples,
+	         (unsigned)t.dropped, (unsigned)nfuncs, (unsigned)t.main, (unsigned)t.callDropped);
+	for (uint32_t i = 0; i < kThreads && t.thread[i]; ++i) {
+		const char* tn = thread_name(t.thread[i]);
+		char label[40];
+		std::snprintf(label, sizeof(label), "%.31s", tn ? tn : "?");
+		port_log("[prof] thr %08x %5.1f pct %s%s\n", (unsigned)reinterpret_cast<uint32_t>(t.thread[i]),
+		         t.samples ? 100.0f * t.threadCount[i] / t.samples : 0.0f, label,
+		         t.thread[i] == s_mainThread ? " (main)" : "");
+	}
+	// Each other thread with a real share: its own top functions.
+	for (uint32_t th = 0; th < kThreads && t.thread[th]; ++th) {
+		if (t.thread[th] == s_mainThread || t.threadCount[th] * 50 < t.samples) continue;
+		static Func tf[64];
+		uint32_t ntf = 0;
+		for (uint32_t i = 0; i < kSlots; ++i) {
+			if (!t.pc[i] || t.tid[i] != th) continue;
+			char name[64] = {};
+			wut_OSGetSymbolName(t.pc[i], name, sizeof(name));
+			uint32_t f = 0;
+			while (f < ntf && std::strcmp(tf[f].name, name) != 0) ++f;
+			if (f == ntf) {
+				if (ntf == 64) continue;
+				std::memcpy(tf[f].name, name, sizeof(name));
+				tf[f].count = 0;
+				++ntf;
+			}
+			tf[f].count += t.count[i];
+		}
+		for (int rank = 0; rank < 6; ++rank) {
+			uint32_t best = ntf;
+			for (uint32_t f = 0; f < ntf; ++f)
+				if (tf[f].count && (best == ntf || tf[f].count > tf[best].count)) best = f;
+			if (best == ntf) break;
+			port_log("[prof] thr %08x %5.1f pct %s\n", (unsigned)reinterpret_cast<uint32_t>(t.thread[th]),
+			         100.0f * tf[best].count / t.samples, tf[best].name);
+			tf[best].count = 0;
+		}
+	}
+	// Leaf samples by call path, largest first.
+	for (int rank = 0; rank < 20; ++rank) {
+		uint32_t best = kCallSlots;
+		for (uint32_t i = 0; i < kCallSlots; ++i)
+			if (t.callCount[i] && (best == kCallSlots || t.callCount[i] > t.callCount[best])) best = i;
+		if (best == kCallSlots) break;
+		char leaf[64] = {}, caller[64] = {}, up[64] = {};
+		wut_OSGetSymbolName(t.callPc[best], leaf, sizeof(leaf));
+		if (code_addr(t.callLr[best])) wut_OSGetSymbolName(t.callLr[best], caller, sizeof(caller));
+		if (t.callUp[best]) wut_OSGetSymbolName(t.callUp[best], up, sizeof(up));
+		port_log("[prof] via %5.1f pct %s <- %s <- %s\n", t.samples ? 100.0f * t.callCount[best] / t.samples : 0.0f,
+		         short_name(leaf), short_name(caller), t.callUp[best] ? short_name(up) : "?");
+		t.callCount[best] = 0;
+	}
+	for (int rank = 0; rank < 30; ++rank) {
 		uint32_t best = nfuncs;
 		for (uint32_t f = 0; f < nfuncs; ++f)
 			if (funcs[f].count && (best == nfuncs || funcs[f].count > funcs[best].count)) best = f;

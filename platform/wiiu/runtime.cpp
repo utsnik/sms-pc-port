@@ -177,6 +177,17 @@ const char* sms_wiiu_app_root(void) { return kAppRootCandidates[kAppRootIndex]; 
 
 uint32_t sms_wiiu_heap_free(void) { return default_heap_free(); }
 
+int sms_wiiu_sd_marker(const char* name)
+{
+	char path[256];
+	std::snprintf(path, sizeof(path), "%s%s", sms_wiiu_app_root(), name);
+	FILE* f = std::fopen(path, "rb");
+	if (!f)
+		return 0;
+	std::fclose(f);
+	return 1;
+}
+
 void port_log(const char* fmt, ...)
 {
 	char line[1024];
