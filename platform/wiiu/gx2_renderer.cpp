@@ -1,6 +1,9 @@
 #include "port_heap.h"
 #include "runtime.h"
 #include <cstdio>
+#ifndef SMS_GX2_VX_BRACKET
+#define SMS_GX2_VX_BRACKET 1
+#endif
 #ifndef SMS_GX2_GPU_XF_DELAY
 #define SMS_GX2_GPU_XF_DELAY 0
 #endif
@@ -206,6 +209,7 @@ struct VertexProgram {
     void* fetchProgram;
     uint32_t stride;
     bool warmed;
+    bool bracketed;
     bool failed;
 };
 static const char* s_vertexRejectReason = "unknown";
@@ -3340,7 +3344,23 @@ void flushBatch() {
     GX2SetAttribBuffer(0, vboBytes, gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
+    const bool bracket = SMS_GX2_VX_BRACKET && gpuPath && !vertex->bracketed;
+    if (bracket) {
+        // Debug: name each generated program before its first draw and wait
+        // for the GPU after it, so a hang leaves that program as the last line.
+        vertex->bracketed = true;
+        const VertexKey& k = vertex->key;
+        WHBLogPrintf("SMS Wii U: [vxbracket] first draw alu=%u bytes=%u chans=%u cc=%08x/%08x ac=%08x/%08x tg=%08x/%08x/%08x/%08x n=%u dual=%u post=%03x ortho=%u",
+                     (unsigned)vertex->aluCount, (unsigned)vertex->vertex.size, (unsigned)k.numChans,
+                     (unsigned)k.colorCtrl[0], (unsigned)k.colorCtrl[1], (unsigned)k.alphaCtrl[0], (unsigned)k.alphaCtrl[1],
+                     (unsigned)k.texgen[0], (unsigned)k.texgen[1], (unsigned)k.texgen[2], (unsigned)k.texgen[3],
+                     (unsigned)k.numTexGens, (unsigned)k.dualTex, (unsigned)k.postTex[0], (unsigned)k.projectionOrtho);
+    }
     GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+    if (bracket) {
+        GX2DrawDone();
+        WHBLogPrintf("SMS Wii U: [vxbracket] done");
+    }
     ++s_drawsThisFrame;
     {
         GpuDrawInfo info = {};
