@@ -269,6 +269,8 @@ void resetState() {
 // scope is four coreinit calls (~2.5 ms/frame on the airstrip). The callees
 // that allocate (onStateChange's flush, executeCopy, the vertex batch) open
 // their own; the draw-sync callback is game code and must stay unscoped.
+uint32_t g_xfDirtyLo = ~0u, g_xfDirtyHi = 0;
+
 void writeBP(uint32_t value) {
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
@@ -381,6 +383,8 @@ void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
             if (g.xfMem[addr] != v) {
                 onStateChange();
                 g.xfMem[addr] = v;
+                if (addr < g_xfDirtyLo) g_xfDirtyLo = addr;
+                if (addr > g_xfDirtyHi) g_xfDirtyHi = addr;
                 markXfMemDirty();
             }
         } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {

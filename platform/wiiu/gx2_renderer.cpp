@@ -66,6 +66,8 @@
 #include <malloc.h>
 #include <new>
 #include <initializer_list>
+#include <deque>
+#include <unordered_map>
 #include <vector>
 
 namespace gx {
@@ -304,14 +306,27 @@ struct TextureEntry {
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
+    uint32_t next = UINT32_MAX;  // older entry with the same source (textureIndex chain)
 };
-static unsigned char s_textureStorage[sizeof(std::vector<TextureEntry>)] __attribute__((aligned(8)));
-static std::vector<TextureEntry>* s_textureObject;
-static std::vector<TextureEntry>& textureCache() {
-    if (!s_textureObject) s_textureObject = new (s_textureStorage) std::vector<TextureEntry>();
+// A deque, not a vector: getTexture hands out pointers, and a draw binds up to
+// eight maps; a vector growing on the second map's miss moved the first map's
+// entry under its pointer.
+static unsigned char s_textureStorage[sizeof(std::deque<TextureEntry>)] __attribute__((aligned(8)));
+static std::deque<TextureEntry>* s_textureObject;
+static std::deque<TextureEntry>& textureCache() {
+    if (!s_textureObject) s_textureObject = new (s_textureStorage) std::deque<TextureEntry>();
     return *s_textureObject;
 }
 #define s_textures (textureCache())
+// source address -> newest entry for it; every bind looked through all entries.
+static unsigned char s_textureIndexStorage[sizeof(std::unordered_map<const uint8_t*, uint32_t>)]
+    __attribute__((aligned(8)));
+static std::unordered_map<const uint8_t*, uint32_t>* s_textureIndexObject;
+static std::unordered_map<const uint8_t*, uint32_t>& textureIndex() {
+    if (!s_textureIndexObject)
+        s_textureIndexObject = new (s_textureIndexStorage) std::unordered_map<const uint8_t*, uint32_t>();
+    return *s_textureIndexObject;
+}
 
 // GPU buffers come from the system default heap: newlib's memalign draws on
 // wut's small sbrk area and crashed in _memalign_r once real textures loaded.
@@ -351,10 +366,20 @@ static void invalidateVertexUniforms() {
 static void uploadXfUniformRanges() {
     if (!s_xfMemoryDirty) return;
     if (!s_xfUniformValid) memset(s_xfShadow, 0xff, sizeof(s_xfShadow));
+    // Only the words writeXF changed since the last upload need comparing;
+    // the whole XF memory was scanned on most draws.
+    const uint32_t dirtyLo = s_xfUniformValid ? g_xfDirtyLo : 0;
+    const uint32_t dirtyHi = s_xfUniformValid ? g_xfDirtyHi : ~0u;
+    g_xfDirtyLo = ~0u;
+    g_xfDirtyHi = 0;
     for (const XfUniformSegment& segment : kXfSegments) {
         uint32_t first = ~0u, last = 0;
         const uint32_t n = segment.stride;
-        for (uint32_t word = 0; word < segment.words; word += n) {
+        if (dirtyLo > dirtyHi || dirtyHi < segment.source || dirtyLo >= segment.source + segment.words) continue;
+        const uint32_t from = dirtyLo > segment.source ? (dirtyLo - segment.source) / n * n : 0;
+        const uint64_t end = uint64_t(dirtyHi) - segment.source + 1;  // ~0u = everything: no wrap
+        const uint32_t to = end < segment.words ? uint32_t(end) : segment.words;
+        for (uint32_t word = from; word < to; word += n) {
             const uint32_t src = segment.source + word;
             const uint32_t dst = segment.destination + word / n;
             bool changed = !s_xfUniformValid;
@@ -2974,7 +2999,6 @@ static void retileTexture(GX2Texture& texture) {
 }
 
 static TextureEntry* getTexture(int map) {
-    SMS_PORT_HEAP_SCOPE();
     const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
     const uint32_t mode1 = g.bp[bpTexReg(BP_TX_MODE1, map)];
     const uint32_t image0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)];
@@ -2991,9 +3015,12 @@ static TextureEntry* getTexture(int map) {
         return c;
     }
     const uint32_t levels = textureLevels(mode0, mode1, w, h);
-    for (size_t i = 0; i < s_textures.size(); ++i) {
+    auto& index = textureIndex();
+    const auto head = index.find(source);
+    const uint32_t first = head == index.end() ? UINT32_MAX : head->second;
+    for (uint32_t i = first; i != UINT32_MAX; i = s_textures[i].next) {
         TextureEntry& e = s_textures[i];
-        if (e.valid && e.source == source && e.fmt == fmt && e.width == w && e.height == h &&
+        if (e.valid && e.fmt == fmt && e.width == w && e.height == h &&
             e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
             // The sampler state belongs to the texmap, not the image: the same
             // texture may be bound with other wrap or filter modes.
@@ -3001,8 +3028,11 @@ static TextureEntry* getTexture(int map) {
             return &e;
         }
     }
+    SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
+    e.next = first;
+    index[source] = uint32_t(s_textures.size() - 1);
     e.source = source; e.fmt = fmt; e.width = w; e.height = h; e.tlut = tlut; e.tlutFmt = tlutFmt;
     e.levels = levels;
     e.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
