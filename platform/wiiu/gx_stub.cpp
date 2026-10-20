@@ -361,7 +361,17 @@ void take_shots(uint32_t p)
 	char dir[192], path[224];
 	std::snprintf(dir, sizeof(dir), "%sshots", sms_wiiu_app_root());
 	mkdir(dir, 0777);
-	const uint32_t n = s_shots_written++;
+	/* Numbering continues after the shots already on the card, so a second
+	 * run before they are fetched does not overwrite the first one's. */
+	static uint32_t s_base = ~0u;
+	if (s_base == ~0u) {
+		s_base = 0;
+		for (struct stat st; s_base < 90; ++s_base) {
+			std::snprintf(path, sizeof(path), "%s/shot%02u-tv.bmp", dir, unsigned(s_base));
+			if (stat(path, &st) != 0) break;
+		}
+	}
+	const uint32_t n = s_base + s_shots_written++;
 	std::snprintf(path, sizeof(path), "%s/shot%02u-tv.bmp", dir, unsigned(n));
 	shot_surface(WHBGfxGetTVColourBuffer()->surface, path, 2);
 	GX2Texture last;
