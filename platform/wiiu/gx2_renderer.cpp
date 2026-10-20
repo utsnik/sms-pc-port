@@ -3565,6 +3565,11 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     if (!s_ready || !ProcUIInForeground()) return;
     beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
+    // The generated vertex programs use up to R60; the default split gives
+    // vertex shaders 48 GPRs and asking for more hangs the GPU on hardware
+    // (Cemu does not enforce it).  64 + 184 keeps the default 248 total; the
+    // TEV pixel shaders need 44.  Set inside the TV context so it is shadowed.
+    GX2SetShaderModeEx(GX2_SHADER_MODE_UNIFORM_REGISTER, 64, 64, 0, 0, 184, 192);
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH); invalidateVertexUniforms();
