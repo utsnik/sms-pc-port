@@ -23,6 +23,12 @@ extern "C" void sms_wiiu_exit(void);
 extern "C" void sms_wiiu_audio_shutdown(void);
 extern "C" volatile int sms_wiiu_crash_pending;
 volatile int sms_wiiu_crash_pending;
+/* How far the crash path got, reported by the audio thread's stats line: a
+ * crashed main thread can no longer be asked. 1 = handler resumed the thread,
+ * 2 = recovery entered, 3 = audio stopped, 4 = Menu requested, 5 = ProcUI
+ * exiting; 10+ = a parked non-main thread. */
+extern "C" volatile int sms_wiiu_crash_stage;
+volatile int sms_wiiu_crash_stage;
 
 namespace {
 
@@ -31,6 +37,7 @@ namespace {
  * thread), fall back to the error screen after 10 seconds. */
 void park_crashed_thread(void)
 {
+	sms_wiiu_crash_stage = 10;
 	sms_wiiu_crash_pending = 1;
 	WHBLogPrint("[crash] game thread parked; the main thread returns to the Menu");
 	OSSleepTicks(OSSecondsToTicks(10));
@@ -51,6 +58,28 @@ void append_symbol(const char* tag, uint32_t addr)
 	OSGetSymbolName(addr, name, sizeof(name));
 	if (used < sizeof(s_trace))
 		std::snprintf(s_trace + used, sizeof(s_trace) - used, "%s %08X %s\n", tag, (unsigned)addr, name);
+}
+
+bool readable(uint32_t addr) { return addr >= 0x10000000u && addr < 0x50000000u && !(addr & 3u); }
+
+/* Every GPR, then the words around r3 (for JSUPtrList::remove, the list):
+ * whatever overwrote it may have left recognisable data next to it. */
+void dump(OSContext* context)
+{
+	for (int i = 0; i < 32; i += 8)
+		WHBLogPrintf("[crash] r%-2d %08X %08X %08X %08X %08X %08X %08X %08X", i,
+		             (unsigned)context->gpr[i], (unsigned)context->gpr[i + 1], (unsigned)context->gpr[i + 2],
+		             (unsigned)context->gpr[i + 3], (unsigned)context->gpr[i + 4], (unsigned)context->gpr[i + 5],
+		             (unsigned)context->gpr[i + 6], (unsigned)context->gpr[i + 7]);
+	uint32_t base = (context->gpr[3] & ~31u) - 0x100;
+	if (!readable(base) || !readable(base + 0x200))
+		return;
+	for (uint32_t a = base; a < base + 0x200; a += 32) {
+		const uint32_t* w = (const uint32_t*)a;
+		WHBLogPrintf("[crash] %08X: %08X %08X %08X %08X %08X %08X %08X %08X", (unsigned)a, (unsigned)w[0],
+		             (unsigned)w[1], (unsigned)w[2], (unsigned)w[3], (unsigned)w[4], (unsigned)w[5],
+		             (unsigned)w[6], (unsigned)w[7]);
+	}
 }
 
 void trace(OSContext* context)
@@ -84,6 +113,7 @@ BOOL fatal(const char* type, OSContext* context)
 	if (context) {
 		trace(context);
 		WHBLogPrint(s_trace);
+		dump(context);
 	}
 	/* A second fault (or none of the recovery paths apply): the old behaviour,
 	 * an error screen that needs a reboot. */
@@ -101,6 +131,9 @@ BOOL fatal(const char* type, OSContext* context)
 	context->lr = 0;
 	context->gpr[1] &= ~0xFu; // keep the stack, 16-byte aligned
 	context->gpr[1] -= 0x100;   // below the faulting frame's red zone
+	WHBLogPrintf("[crash] resuming %s thread: context=%p owner=%p", main_thread ? "main" : "other",
+	             (void*)context, sms_wiiu_vi_owner_thread());
+	sms_wiiu_crash_stage = 1;
 	return TRUE;
 }
 
@@ -124,10 +157,13 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
  * app never let go of the screen. */
 extern "C" void sms_wiiu_crash_return_to_menu(void)
 {
+	sms_wiiu_crash_stage = 2;
 	OSSetThreadPriority(OSGetCurrentThread(), 0);
 	WHBLogPrint("[crash] returning to the Wii U Menu");
 	sms_wiiu_audio_shutdown();
+	sms_wiiu_crash_stage = 3;
 	SYSLaunchMenu();
+	sms_wiiu_crash_stage = 4;
 	for (;;) {
 		ProcUIStatus status = ProcUIProcessMessages(TRUE);
 		if (status == PROCUI_STATUS_RELEASE_FOREGROUND)
@@ -135,6 +171,7 @@ extern "C" void sms_wiiu_crash_return_to_menu(void)
 		else if (status == PROCUI_STATUS_EXITING)
 			break;
 	}
+	sms_wiiu_crash_stage = 5;
 	WHBLogPrint("[crash] ProcUI exiting");
 	ProcUIShutdown();
 	_Exit(0);

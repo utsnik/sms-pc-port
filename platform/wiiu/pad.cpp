@@ -44,6 +44,15 @@ s8 stick_value(float value)
 #endif
 
 #if SMS_WIIU_AUTOPRESS
+/* An unattended run's length: SMS_AUTOPLAY_SECS from the autoplay file, else
+ * 300 s with a script and 180 s without. Read on use: the script sets it. */
+int run_seconds(bool script)
+{
+	const char* v = std::getenv("SMS_AUTOPLAY_SECS");
+	const int secs = v ? std::atoi(v) : 0;
+	return secs > 0 ? secs : (script ? 300 : 180);
+}
+
 bool autopress_marker_present()
 {
 	char path[160];
@@ -437,10 +446,10 @@ void sms_wiiu_input_poll(void)
 			const OSTime now = OSGetTime();
 			if (!s_marker_start)
 				s_marker_start = now;
-			else if (OSTicksToSeconds(now - s_marker_start) >= (s_autoplay > 0 ? 300 : 180)) {
+			else if (OSTicksToSeconds(now - s_marker_start) >= run_seconds(s_autoplay > 0)) {
 				s_exit_requested = true;
 				sms_wiiu_menu_exit_pending = 1;
-				port_log("[pad] autopress run over (180 s): returning to the Menu\n");
+				port_log("[pad] autopress run over (%d s): returning to the Menu\n", run_seconds(s_autoplay > 0));
 				SYSLaunchMenu();
 			}
 		}

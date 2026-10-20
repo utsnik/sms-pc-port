@@ -11,6 +11,7 @@ extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 #include <whb/log.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 extern "C" volatile int sms_wiiu_menu_exit_pending;
@@ -139,6 +140,18 @@ void sms_wiiu_frame_boundary(void)
 		         s_frame_count, s_stage_path, sms_wiiu_heap_free(),
 		         sms_port_heap_fallbacks(), sms_port_heap_fallback_bytes(),
 		         port_dvd_busy() ? "busy" : "idle");
+	}
+	/* SMS_CRASHTEST=<frame> (autoplay file): a deliberate DSI on the main
+	 * thread, to prove the crash path returns to the Menu unattended. */
+	static int s_crash_test = -1;
+	if (s_crash_test < 0) {
+		const char* v = std::getenv("SMS_CRASHTEST");
+		s_crash_test = v ? std::atoi(v) : 0;
+	}
+	if (s_crash_test > 0 && s_frame_count >= u32(s_crash_test)) {
+		port_log("SMS Wii U: crash test at frame %u\n", s_frame_count);
+		s_crash_test = 0;
+		*reinterpret_cast<volatile u32*>(uintptr_t(0x8)) = 0xDEADu;
 	}
 	if (!s_soak_reported && s_frame_count >= 18000) {
 		s_soak_reported = true;

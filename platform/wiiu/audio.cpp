@@ -147,6 +147,7 @@ u32 isqrt(u64 v)
 }
 
 extern "C" void sms_wiiu_hang_check(void);
+extern "C" volatile int sms_wiiu_crash_stage;
 
 void log_stats(int64_t now)
 {
@@ -165,6 +166,8 @@ void log_stats(int64_t now)
 	g.statsSince     = now;
 	g.statsSubframes = sub;
 	sms_wiiu_hang_check();
+	if (sms_wiiu_crash_stage)
+		port_log("[crash] recovery stage %d\n", sms_wiiu_crash_stage);
 	g.blocks = g.underruns = g.pendingWaits = 0;
 	g.minQueued = 0xFFFFFFFFu;
 	g.maxQueued = 0;
