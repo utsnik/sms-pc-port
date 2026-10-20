@@ -142,31 +142,16 @@ void sms_wiiu_frame_boundary(void)
 		         sms_port_heap_fallbacks(), sms_port_heap_fallback_bytes(),
 		         port_dvd_busy() ? "busy" : "idle");
 	}
-	/* Crash hunt: walk the emitter free list (JSUPtrLink: object, list, prev,
-	 * next) from the watched head and report the first link that is not a
-	 * game-arena pointer, once per run, with the words around it. */
-	if (s_frame_count > 2000) {
-		static bool s_reported;
-		const uint32_t lo = uint32_t(uintptr_t(sms_wiiu_mem2_base)), hi = lo + sms_wiiu_mem2_size - 16;
-		auto good = [lo, hi](uint32_t v) { return v == 0 || (v >= lo && v < hi && !(v & 3u)); };
-		uint32_t node = sms_wiiu_watch_word(), prev = 0, steps = 0;
-		while (!s_reported && node && good(node) && steps < 1024) {
-			const uint32_t* w = reinterpret_cast<const uint32_t*>(uintptr_t(node));
-			if (!good(w[3]) || !good(w[2])) {
-				s_reported = true;
-				port_log("[watch] frame %u: free-list node %08x (#%u, prev %08x) has prev %08x next %08x\n",
-				         s_frame_count, node, steps, prev, w[2], w[3]);
-				const uint32_t* m = reinterpret_cast<const uint32_t*>(uintptr_t((node & ~31u) - 64));
-				for (int i = 0; i < 40; i += 8)
-					port_log("[watch] %08x: %08x %08x %08x %08x %08x %08x %08x %08x\n",
-					         unsigned(uintptr_t(m + i)), m[i], m[i + 1], m[i + 2], m[i + 3], m[i + 4], m[i + 5],
-					         m[i + 6], m[i + 7]);
-				break;
-			}
-			prev = node;
-			node = w[3];
-			++steps;
+	/* Crash hunt: report the watched word turning into a non-pointer. */
+	{
+		static uint32_t s_last, s_reports;
+		const uint32_t w = sms_wiiu_watch_word();
+		const bool ok = w == 0 || (w >= 0x10000000u && w < 0x20000000u && !(w & 3u));
+		if (w != s_last && !ok && s_reports < 8) {
+			++s_reports;
+			port_log("[watch] frame %u: word %08x -> %08x\n", s_frame_count, s_last, w);
 		}
+		s_last = w;
 	}
 	/* SMS_CRASHTEST=<frame> (autoplay file): a deliberate DSI on the main
 	 * thread, to prove the crash path returns to the Menu unattended. */
