@@ -985,6 +985,20 @@ static void vertexEmit(std::vector<uint64_t>& ops, std::initializer_list<uint64_
     if (!ops.empty()) ops.back() |= to_QWORD(to_LE(1ull << 31), 0);
 }
 
+static void vertexEmitDot4(std::vector<uint64_t>& ops, uint32_t dst, uint32_t dstChan,
+                           uint32_t src0, uint32_t src1) {
+    const uint32_t c0 = dstChan & 3;
+    const uint32_t c1 = (c0 + 1) & 3;
+    const uint32_t c2 = (c0 + 2) & 3;
+    const uint32_t c3 = (c0 + 3) & 3;
+    vertexEmit(ops, {
+        ALU_DOT4(_R(dst), c0, src0, _x, src1, _x),
+        ALU_DOT4(__, c1, src0, _y, src1, _y),
+        ALU_DOT4(__, c2, src0, _z, src1, _z),
+        ALU_DOT4(__, c3, src0, _w, src1, _w),
+    });
+}
+
 static uint32_t vertexInputForRow(uint32_t row) {
     if (row == 0) return 1; // position
     if (row == 1) return 2; // normal
@@ -1010,29 +1024,30 @@ static void vertexCopyTexSource(std::vector<uint64_t>& ops, uint32_t coord, uint
     vertexEmit(ops, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
 }
 
+static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, uint32_t base,
+                                     uint32_t rows = 4);
+
 static void vertexLoadRelativeMatrix(std::vector<uint64_t>& ops, uint32_t indexReg, uint32_t indexChan,
                                      uint32_t dst, uint32_t base, uint32_t rows = 4,
                                      uint32_t stride = 4) {
-    // AR is global state on Latte: keep MOVA and the first relative read in
-    // separate ALU groups so the address register is visible to the read.
-    vertexEmit(ops, {ALU_FLT_TO_INT(_R(50), _x, _R(indexReg), indexChan)});
-    // Position/texgen matrices occupy four rows; normal matrices occupy
-    // three.  Build matrixIndex * stride with integer adds before MOVA;
-    // using the raw matrix number as AR would select the middle of a matrix.
-    if (stride == 3) {
-        vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
-    } else {
-        vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
-        vertexEmit(ops, {ALU_ADD_INT(_R(50), _x, _R(50), _x, _R(50), _x)});
-    }
-    vertexEmit(ops, {ALU_MOVA_INT(_R(50), _x, _R(50), _x)});
+    // Keep the converted index in PV instead of a temporary GPR. Cemu's
+    // legacy decompiler handles relative constant reads and PV arithmetic,
+    // while a converted integer held in a GPR is rejected by its MOVA path.
+    vertexEmit(ops, {ALU_FLT_TO_INT(__, _x, _R(indexReg), indexChan)});
+    vertexEmit(ops, {ALU_MOV(__, _y, ALU_SRC_PV, _x)});
+    vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _x)});
+    if (stride == 3)
+        vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _y)});
+    else
+        vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _x)});
+    vertexEmit(ops, {ALU_MOVA_INT(__, _x, ALU_SRC_PV, _x)});
     for (uint32_t row = 0; row < rows; ++row)
         for (uint32_t ch = 0; ch < 4; ++ch)
             vertexEmit(ops, {ALU_MOV_REL_CONST(_R(dst + row), ch, _GX2_C(base + row), ch)});
 }
 
 static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, uint32_t base,
-                                     uint32_t rows = 4) {
+                                     uint32_t rows) {
     for (uint32_t row = 0; row < rows; ++row)
         for (uint32_t ch = 0; ch < 4; ++ch)
             vertexEmit(ops, {ALU_MOV(_R(dst + row), ch, _GX2_C(base + row), ch)});
@@ -1043,14 +1058,14 @@ static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, u
     if (relative) vertexLoadRelativeMatrix(ops, indexReg, indexChan, 53, base);
     else vertexLoadAbsoluteMatrix(ops, 53, base);
     for (uint32_t ch = 0; ch < 3; ++ch)
-        vertexEmit(ops, {ALU_DOT4(_R(dst), ch, _R(source), _x, _R(53), _x)});
+        vertexEmitDot4(ops, dst, ch, _R(source), _R(53));
 }
 
 static void vertexNormalTransform(std::vector<uint64_t>& ops) {
     vertexLoadRelativeMatrix(ops, 15, _x, 53, 64, 3, 3);
     for (uint32_t ch = 0; ch < 3; ++ch)
-        vertexEmit(ops, {ALU_DOT4(_R(41), ch, _R(2), _x, _R(53), _x)});
-    vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(41), _x)});
+        vertexEmitDot4(ops, 41, ch, _R(2), _R(53));
+    vertexEmitDot4(ops, 45, _x, _R(41), _R(41));
     vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
     vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
     for (uint32_t ch = 0; ch < 3; ++ch) {
@@ -1094,7 +1109,7 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
                 vertexEmit(ops, {ALU_MOV(_R(42), _y, _GX2_C(c + 2), _w)});
                 vertexEmit(ops, {ALU_MOV(_R(42), _z, _GX2_C(c + 3), _x)});
             }
-            vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(42), _x, _R(42), _x)});
+            vertexEmitDot4(ops, 45, _x, _R(42), _R(42));
             vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
             vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
             for (uint32_t ch = 0; ch < 3; ++ch)
@@ -1106,7 +1121,7 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
 
             if (atten) {
                 if (spot) {
-                    vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(42), _x, _GX2_C(c + 3), _y)});
+                    vertexEmitDot4(ops, 45, _x, _R(42), _GX2_C(c + 3));
                     vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
                     // numerator = max(a0 + a1*cs + a2*cs^2, 0)
                     vertexEmit(ops, {ALU_MUL(_R(46), _x, _GX2_C(c + 1), _y, _R(45), _x)});
@@ -1121,9 +1136,9 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
                     vertexEmit(ops, {ALU_MULADD(_R(45), _x, _GX2_C(c + 1), _w, _R(45), _x, _GX2_C(c + 2), _x)});
                     vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(45), _x, _R(45), _x, _GX2_C(c + 2), _y)});
                 } else {
-                    vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(42), _x)});
+                    vertexEmitDot4(ops, 45, _x, _R(41), _R(42));
                     vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
-                    vertexEmit(ops, {ALU_DOT4(_R(45), _y, _R(41), _x, _GX2_C(c + 3), _y)});
+                    vertexEmitDot4(ops, 45, _y, _R(41), _GX2_C(c + 3));
                     vertexEmit(ops, {ALU_MAX(_R(45), _y, _R(45), _y, ALU_SRC_0, _x)});
                     vertexEmit(ops, {ALU_MUL(_R(45), _y, _R(45), _y, _R(47), _x)});
                     vertexEmit(ops, {ALU_MUL(_R(46), _x, _GX2_C(c + 1), _y, _R(45), _y)});
@@ -1143,10 +1158,10 @@ static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32
                 vertexEmit(ops, {ALU_MOV(_R(46), _x, ALU_SRC_1, _x)});
             }
             if (diff == 1) {
-                vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(42), _x)});
+                vertexEmitDot4(ops, 45, _x, _R(41), _R(42));
                 vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
             } else if (diff >= 2) {
-                vertexEmit(ops, {ALU_DOT4(_R(45), _x, _R(41), _x, _R(42), _x)});
+                vertexEmitDot4(ops, 45, _x, _R(41), _R(42));
                 vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
                 vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
             }
@@ -1298,7 +1313,7 @@ static bool initVertexProgram(VertexProgram& shader) {
                 const uint32_t post = key.postTex[coord];
                 if ((post >> 8) & 1) {
                     vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_0, _x)});
-                    vertexEmit(alu, {ALU_DOT4(_R(56), _x, _R(55), _x, _R(55), _x)});
+                    vertexEmitDot4(alu, 56, _x, _R(55), _R(55));
                     vertexEmit(alu, {ALU_SETGT(_R(56), _y, _R(56), _x, ALU_SRC_0, _x)});
                     vertexEmit(alu, {ALU_CNDGT(_R(56), _z, _R(56), _y, _R(56), _x, ALU_SRC_1, _x)});
                     vertexEmit(alu, {ALU_RECIPSQRT_IEEE(_R(56), _x, _R(56), _z)});
@@ -1310,7 +1325,7 @@ static bool initVertexProgram(VertexProgram& shader) {
                 vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
                 vertexLoadAbsoluteMatrix(alu, 53, 88 + (post & 63) * 4);
                 for (uint32_t ch = 0; ch < 3; ++ch)
-                    vertexEmit(alu, {ALU_DOT4(_R(55), ch, _R(55), _x, _R(53), _x)});
+                    vertexEmitDot4(alu, 55, ch, _R(55), _R(53));
             }
         } else if (type == 1) {
             const uint32_t emboss = (tg >> 12) & 7;
