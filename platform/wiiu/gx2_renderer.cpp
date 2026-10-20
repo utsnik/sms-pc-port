@@ -1,6 +1,9 @@
 #include "port_heap.h"
 #include "runtime.h"
 #include <cstdio>
+#ifndef SMS_GX2_TEV_UNTEXTURED
+#define SMS_GX2_TEV_UNTEXTURED 1
+#endif
 #ifndef SMS_GX2_VX_BRACKET
 #define SMS_GX2_VX_BRACKET 0
 #endif
@@ -3193,7 +3196,7 @@ void flushBatch() {
         // colour-only geometry. Keep the generated TEV path for every draw
         // that actually samples a texture; no-texture draws still use the
         // CPU TEV evaluator when they are priming a generated fixed program.
-        if (mask && allTextures) tevShader = tevShaderForKey(tevKey);
+        if (allTextures && (mask || SMS_GX2_TEV_UNTEXTURED)) tevShader = tevShaderForKey(tevKey);
     }
     const bool tevPath = tevShader != nullptr;
     if (SMS_GX2_DEBUG_DUMP && !tevPath) {
