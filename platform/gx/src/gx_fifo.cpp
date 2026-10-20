@@ -265,7 +265,11 @@ void resetState() {
     (void)be;
 }
 
-void writeBP(uint32_t value) { SMS_PORT_HEAP_SCOPE();
+// No heap scope in the register writers: they run ~25k times a frame and a
+// scope is four coreinit calls (~2.5 ms/frame on the airstrip). The callees
+// that allocate (onStateChange's flush, executeCopy, the vertex batch) open
+// their own; the draw-sync callback is game code and must stay unscoped.
+void writeBP(uint32_t value) {
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
     if (reg == BP_MASK) {
@@ -330,7 +334,7 @@ void writeBP(uint32_t value) { SMS_PORT_HEAP_SCOPE();
     }
 }
 
-void writeCP(uint8_t reg, uint32_t value) { SMS_PORT_HEAP_SCOPE();
+void writeCP(uint8_t reg, uint32_t value) {
     switch (reg & 0xF0) {
     case CP_MATIDX_A: g.cpMatA = value; break;
     case CP_MATIDX_B: g.cpMatB = value; break;
@@ -370,7 +374,7 @@ void writeCP(uint8_t reg, uint32_t value) { SMS_PORT_HEAP_SCOPE();
     }
 }
 
-void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) { SMS_PORT_HEAP_SCOPE();
+void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
     for (uint32_t i = 0; i < count; i++, addr++) {
         uint32_t v = words[i];
         if (addr < XF_MEM_WORDS) {
