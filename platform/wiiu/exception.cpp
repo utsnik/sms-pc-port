@@ -32,16 +32,10 @@ volatile int sms_wiiu_crash_stage;
 
 namespace {
 
-/* A non-main thread that faulted: ask the main thread to leave, then wait.
- * If the main thread never reaches a frame boundary (it may be waiting on this
- * thread), fall back to the error screen after 10 seconds. */
-void park_crashed_thread(void)
+void park_forever(void)
 {
-	sms_wiiu_crash_stage = 10;
-	sms_wiiu_crash_pending = 1;
-	WHBLogPrint("[crash] game thread parked; the main thread returns to the Menu");
-	OSSleepTicks(OSSecondsToTicks(10));
-	OSFatal("SMS Wii U: crashed (see the UDP log); the main thread did not exit");
+	for (;;)
+		OSSleepTicks(OSSecondsToTicks(1));
 }
 
 char s_message[512];
@@ -127,13 +121,23 @@ BOOL fatal(const char* type, OSContext* context)
 	 * frame boundary. OSThread starts with its OSContext, so the context
 	 * address identifies the thread. */
 	bool main_thread = (void*)context == sms_wiiu_vi_owner_thread();
-	context->srr0 = main_thread ? (uint32_t)&sms_wiiu_crash_return_to_menu : (uint32_t)&park_crashed_thread;
+	/* Measured 2026-10-20 (SMS_CRASHTEST): a thread resumed this way never runs
+	 * again; its saved pc stayed on the new srr0 and nothing after it executed.
+	 * So the faulting thread only gets a harmless place to be, and the work is
+	 * done elsewhere: a main-thread fault by the rescue thread, any other by
+	 * the main thread at its next frame boundary. */
+	context->srr0 = (uint32_t)&park_forever;
 	context->lr = 0;
 	context->gpr[1] &= ~0xFu; // keep the stack, 16-byte aligned
 	context->gpr[1] -= 0x100;   // below the faulting frame's red zone
-	WHBLogPrintf("[crash] resuming %s thread: context=%p owner=%p", main_thread ? "main" : "other",
+	WHBLogPrintf("[crash] %s thread faulted: context=%p owner=%p", main_thread ? "main" : "other",
 	             (void*)context, sms_wiiu_vi_owner_thread());
-	sms_wiiu_crash_stage = 1;
+	if (main_thread) {
+		sms_wiiu_crash_stage = 1;
+	} else {
+		sms_wiiu_crash_stage = 10;
+		sms_wiiu_crash_pending = 1;
+	}
 	return TRUE;
 }
 
@@ -143,8 +147,29 @@ BOOL on_program(OSContext* c) { return fatal("PROGRAM", c); }
 
 } // namespace
 
+namespace {
+/* Waits on core 1 (ProcUI's core) at the top priority for a main-thread fault,
+ * then takes the main thread's place: Menu, ProcUI, exit. */
+OSThread s_rescue;
+alignas(16) uint8_t s_rescue_stack[16 * 1024];
+
+int rescue(int, const char**)
+{
+	while (sms_wiiu_crash_stage != 1)
+		OSSleepTicks(OSMillisecondsToTicks(100));
+	WHBLogPrint("[crash] rescue thread takes over");
+	sms_wiiu_crash_return_to_menu();
+	return 0;
+}
+} // namespace
+
 extern "C" void sms_wiiu_install_exception_handlers(void)
 {
+	if (OSCreateThread(&s_rescue, rescue, 0, nullptr, s_rescue_stack + sizeof s_rescue_stack,
+	                   sizeof s_rescue_stack, 0, OS_THREAD_ATTRIB_AFFINITY_CPU1))
+		OSResumeThread(&s_rescue);
+	else
+		WHBLogPrint("[crash] could not start the rescue thread");
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_DSI, on_dsi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ISI, on_isi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_PROGRAM, on_program);
