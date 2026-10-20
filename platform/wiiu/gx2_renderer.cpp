@@ -3914,7 +3914,10 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     const uint32_t total = (ioff + nidx * 4 + 255) & ~255u;  // 256-aligned: no GPU cache line spans two runs
     if (total > kDlArenaBytes / 8) return false;
     if (!s_dlArena) {
+        const uint32_t freeBefore = sms_wiiu_heap_free();
         s_dlArena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
+        port_log("SMS Wii U: display-list arena %p (%u bytes), system free %u -> %u\n", s_dlArena,
+                 kDlArenaBytes, freeBefore, sms_wiiu_heap_free());
         if (!s_dlArena) return false;
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
     }

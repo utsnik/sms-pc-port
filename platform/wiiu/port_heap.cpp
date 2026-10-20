@@ -55,6 +55,27 @@ static bool port_free(void* p)
 	return true;
 }
 
+/* A scoped allocation the system heap could not satisfy falls back to the
+ * game heaps; count those, and log the first few, since port data living in
+ * a JKR heap is freed and reused under the port when the game resets it. */
+extern "C" uint32_t sms_wiiu_heap_free(void);
+extern "C" void port_log(const char* fmt, ...);
+static uint32_t s_fallbacks, s_fallbackBytes;
+static bool s_logging;
+static void note_fallback(size_t n)
+{
+	++s_fallbacks;
+	s_fallbackBytes += uint32_t(n);
+	if (s_fallbacks <= 8 && !s_logging) {
+		s_logging = true;
+		port_log("[heap] port allocation of %u bytes fell back to the game heap (#%u, system free %u)\n",
+		         unsigned(n), unsigned(s_fallbacks), unsigned(sms_wiiu_heap_free()));
+		s_logging = false;
+	}
+}
+extern "C" uint32_t sms_port_heap_fallbacks(void) { return s_fallbacks; }
+extern "C" uint32_t sms_port_heap_fallback_bytes(void) { return s_fallbackBytes; }
+
 /* Linked with -Wl,--wrap for each symbol below. */
 extern "C" {
 void* __real__Znwj(size_t);
@@ -67,12 +88,18 @@ void __real__ZdlPvj(void*, size_t);
  * falls back to the game heaps rather than returning null. */
 void* __wrap__Znwj(size_t n)
 {
-	void* p = in_scope() ? port_alloc(n, 8) : nullptr;
+	const bool scoped = in_scope();
+	void* p = scoped ? port_alloc(n, 8) : nullptr;
+	if (!p && scoped)
+		note_fallback(n);
 	return p ? p : __real__Znwj(n);
 }
 void* __wrap__Znaj(size_t n)
 {
-	void* p = in_scope() ? port_alloc(n, 8) : nullptr;
+	const bool scoped = in_scope();
+	void* p = scoped ? port_alloc(n, 8) : nullptr;
+	if (!p && scoped)
+		note_fallback(n);
 	return p ? p : __real__Znaj(n);
 }
 void __wrap__ZdlPv(void* p) { if (!port_free(p)) __real__ZdlPv(p); }

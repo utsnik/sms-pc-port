@@ -7,6 +7,7 @@
 #include <coreinit/memory.h>
 #include <coreinit/memblockheap.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/memexpheap.h>
 #include <coreinit/memheap.h>
 #include <whb/log.h>
 #include <whb/proc.h>
@@ -56,8 +57,9 @@ bool pointer_above_32(const void* ptr)
 
 uint32_t default_heap_free()
 {
+	/* MEM2's base heap is an expanded heap: the block-heap query always said 0. */
 	MEMHeapHandle heap = MEMGetBaseHeapHandle(MEM_BASE_HEAP_MEM2);
-	return heap ? MEMGetAllocatableSizeForBlockHeapEx(heap, 0x40) : 0;
+	return heap ? MEMGetAllocatableSizeForExpHeapEx(heap, 0x40) : 0;
 }
 
 void resolve_app_root()
