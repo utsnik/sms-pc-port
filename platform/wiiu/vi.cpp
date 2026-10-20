@@ -1,4 +1,6 @@
 #include "runtime.h"
+extern "C" uint32_t sms_port_heap_fallbacks(void);
+extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 
 #include "port_os.h"
 #include "port_framerate.h"
@@ -133,8 +135,9 @@ void sms_wiiu_frame_boundary(void)
 		sms_wiiu_dump_threads();
 	if (s_frame_count - s_last_heartbeat >= 60) {
 		s_last_heartbeat = s_frame_count;
-		port_log("SMS Wii U: frame=%u stage=%s heap_free=%u dvd=%s\n",
+		port_log("SMS Wii U: frame=%u stage=%s heap_free=%u port_fallbacks=%u/%u dvd=%s\n",
 		         s_frame_count, s_stage_path, sms_wiiu_heap_free(),
+		         sms_port_heap_fallbacks(), sms_port_heap_fallback_bytes(),
 		         port_dvd_busy() ? "busy" : "idle");
 	}
 	if (!s_soak_reported && s_frame_count >= 18000) {
