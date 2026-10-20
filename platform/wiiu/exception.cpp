@@ -17,6 +17,15 @@
 #include <cstdio>
 #include <cstring>
 
+/* The build maps OSCreateThread & co. to the GameCube adapters for every port
+ * file (SMS_WIIU_OS_ADAPTER_DEFS); the crash path needs coreinit's own. */
+extern "C" {
+BOOL cafe_OSCreateThread(OSThread*, OSThreadEntryPointFn, int32_t, char*, void*, uint32_t, int32_t,
+                         OSThreadAttributes) __asm__("OSCreateThread");
+int32_t cafe_OSResumeThread(OSThread*) __asm__("OSResumeThread");
+OSThread* cafe_OSGetCurrentThread(void) __asm__("OSGetCurrentThread");
+}
+
 extern "C" void* sms_wiiu_vi_owner_thread(void);
 extern "C" void sms_wiiu_crash_return_to_menu(void);
 extern "C" void sms_wiiu_exit(void);
@@ -170,9 +179,9 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 	static const int kPriorities[] = {1, 8, 15};
 	bool started = false;
 	for (int prio : kPriorities) {
-		if (OSCreateThread(&s_rescue, rescue, 0, nullptr, s_rescue_stack + sizeof s_rescue_stack,
+		if (cafe_OSCreateThread(&s_rescue, rescue, 0, nullptr, s_rescue_stack + sizeof s_rescue_stack,
 		                   sizeof s_rescue_stack, prio, OS_THREAD_ATTRIB_AFFINITY_CPU1)) {
-			OSResumeThread(&s_rescue);
+			cafe_OSResumeThread(&s_rescue);
 			WHBLogPrintf("[crash] rescue thread started at priority %d", prio);
 			started = true;
 			break;
@@ -193,7 +202,7 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 extern "C" void sms_wiiu_crash_return_to_menu(void)
 {
 	sms_wiiu_crash_stage = 2;
-	OSSetThreadPriority(OSGetCurrentThread(), 0);
+	OSSetThreadPriority(cafe_OSGetCurrentThread(), 1);
 	WHBLogPrint("[crash] returning to the Wii U Menu");
 	sms_wiiu_audio_shutdown();
 	sms_wiiu_crash_stage = 3;
