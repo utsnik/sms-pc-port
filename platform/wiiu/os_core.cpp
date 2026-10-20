@@ -347,19 +347,26 @@ void __wrap_DCFlushRange(void* p, uint32_t n) { __real_DCFlushRange(p, n); GXPC_
 uint32_t sms_wiiu_watch_addr;
 static uint32_t s_watch_logs;
 uint32_t cafe_OSGetSymbolName(uint32_t, char*, uint32_t) __asm__("OSGetSymbolName");
+/* The list head stays valid; a node's link is what goes bad. Watch the
+ * manager and its emitter pools: arena + 0x4F0000 .. + 0x580000. */
 static bool covers(const void* p, uint32_t n)
 {
+	if (!sms_wiiu_watch_addr)
+		return false;
 	const uint32_t a = uint32_t(uintptr_t(p)) & ~31u, e = (uint32_t(uintptr_t(p)) + n + 31u) & ~31u;
-	return sms_wiiu_watch_addr && sms_wiiu_watch_addr >= a && sms_wiiu_watch_addr < e;
+	const uint32_t lo = sms_wiiu_watch_addr - 0xF534u, hi = sms_wiiu_watch_addr + 0x80ACCu;
+	return a < hi && e > lo;
 }
 static void note(const char* what, const void* p, uint32_t n, uint32_t before, void* caller)
 {
-	if (s_watch_logs >= 64)
+	if (s_watch_logs >= 200)
 		return;
 	++s_watch_logs;
 	char name[96] = "";
 	cafe_OSGetSymbolName(uint32_t(uintptr_t(caller)), name, sizeof(name));
-	port_log("[watch] %s %p+0x%x word %08x -> %08x from %s\n", what, p, unsigned(n), unsigned(before),
+	const uint32_t s0 = uint32_t(uintptr_t(p)), s1 = s0 + n;
+	port_log("[watch] %s %p+0x%x%s%s head %08x -> %08x from %s\n", what, p, unsigned(n),
+	         (s0 & 31u) ? " PARTIAL-START" : "", (s1 & 31u) ? " PARTIAL-END" : "", unsigned(before),
 	         unsigned(*reinterpret_cast<volatile uint32_t*>(uintptr_t(sms_wiiu_watch_addr))), name);
 }
 void sms_wiiu_watch_range(const char* what, const void* p, uint32_t n, uint32_t before)
