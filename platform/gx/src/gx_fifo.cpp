@@ -562,6 +562,8 @@ static const uint8_t* arrayElem(int slot, uint32_t idx) {
 
 static uint32_t s_vertsLoaded = 0;
 uint32_t g_dlReplayIdx = 0;  // indices drawn from cached display lists (perf counter)
+uint64_t g_dlTicks = 0;
+bool g_perfStages = false;
 double g_decodeSeconds = 0;  // detailed timers: time in the vertex loader
 extern double g_flushSeconds;
 
@@ -1318,7 +1320,23 @@ static void dlReplayState(const DlEntry& e) {
     }
 }
 
-void callDisplayList(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
+static void callDisplayListImpl(const uint8_t* data, uint32_t size);
+#ifdef __WIIU__
+extern "C" int64_t sms_gx_wut_time(void) __asm__("OSGetTime");
+#endif
+void callDisplayList(const uint8_t* data, uint32_t size) {
+#ifdef __WIIU__
+    if (g_perfStages) {
+        const int64_t t0 = sms_gx_wut_time();
+        callDisplayListImpl(data, size);
+        g_dlTicks += uint64_t(sms_gx_wut_time() - t0);
+        return;
+    }
+#endif
+    callDisplayListImpl(data, size);
+}
+
+static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
         runCommands(data, size);
         return;
