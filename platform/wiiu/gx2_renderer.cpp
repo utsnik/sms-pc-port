@@ -1032,7 +1032,9 @@ static void vertexLoadRelativeMatrix(std::vector<uint64_t>& ops, uint32_t indexR
     // legacy decompiler handles relative constant reads and PV arithmetic,
     // while a converted integer held in a GPR is rejected by its MOVA path.
     vertexEmit(ops, {ALU_FLT_TO_INT(__, _x, _R(indexReg), indexChan)});
-    vertexEmit(ops, {ALU_MOV(__, _y, ALU_SRC_PV, _x)});
+    // FLT_TO_INT is a transcendental-unit instruction, so its no-GPR result
+    // is PS rather than PV.  Copy it into PV before the integer address math.
+    vertexEmit(ops, {ALU_MOV(__, _y, ALU_SRC_PS, _x)});
     vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _x)});
     if (stride == 3)
         vertexEmit(ops, {ALU_ADD_INT(__, _x, ALU_SRC_PV, _x, ALU_SRC_PV, _y)});
