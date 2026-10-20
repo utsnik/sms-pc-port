@@ -109,6 +109,7 @@ void GXPC_PrepareStage(int stage);
  * GXSetArray, GXCopyTex, ...) keep full host pointers and work for memory
  * outside the window too. */
 void GXPC_SetMemoryWindow(void* base, uint32_t size);
+void GXPC_SetWriteStampWindow(void* base);  // the start of the 128 MiB that write stamps track (default: the window base)
 uint32_t GXPC_PtrToPhys(const void* ptr);
 void* GXPC_PhysToPtr(uint32_t phys);
 

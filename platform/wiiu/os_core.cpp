@@ -328,3 +328,18 @@ void setLogMessage_f(u32 device, char* file, int line, const char* fmt, ...)
 }
 
 } // namespace JUTAssertion
+
+/* The game's cache flushes (made for the GameCube's GPU to see CPU writes)
+ * stamp the pages they cover, so the GX layer's caches know what changed.
+ * Linked with -Wl,--wrap for these four names; the real ones are coreinit's. */
+extern "C" {
+void __real_DCFlushRange(void*, uint32_t);
+void __real_DCStoreRange(void*, uint32_t);
+void __real_DCFlushRangeNoSync(void*, uint32_t);
+void __real_DCStoreRangeNoSync(void*, uint32_t);
+void GXPC_MemoryWritten(const void* p, uint32_t size);
+void __wrap_DCFlushRange(void* p, uint32_t n) { __real_DCFlushRange(p, n); GXPC_MemoryWritten(p, n); }
+void __wrap_DCStoreRange(void* p, uint32_t n) { __real_DCStoreRange(p, n); GXPC_MemoryWritten(p, n); }
+void __wrap_DCFlushRangeNoSync(void* p, uint32_t n) { __real_DCFlushRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
+void __wrap_DCStoreRangeNoSync(void* p, uint32_t n) { __real_DCStoreRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
+}

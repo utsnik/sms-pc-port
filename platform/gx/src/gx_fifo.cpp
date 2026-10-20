@@ -160,12 +160,16 @@ uint32_t ptrToPhys(const void* p) {
 // cached decode can tell cheaply whether its source bytes may have changed.
 // The first 64 MiB from the memory window's base are tracked (MEM1); other
 // memory always counts as written.
-enum : uint32_t { kStampShift = 12, kStampPages = (64u << 20) >> kStampShift };
+// A platform whose game memory is not at the window's base (the Wii U's
+// window is at address zero and the game arena in MEM2) points the tracked
+// range at it with GXPC_SetWriteStampWindow.
+enum : uint32_t { kStampShift = 12, kStampPages = (128u << 20) >> kStampShift };
 static std::atomic<uint32_t> s_pageStamp[kStampPages];
 static std::atomic<uint32_t> s_writeClock{1};
+static uint8_t* s_stampBase = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x80000000u));
 
 void memoryWritten(const void* p, size_t n) {
-    uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_memBase);
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_stampBase);
     const uintptr_t span = uintptr_t(kStampPages) << kStampShift;
     if (!n || a >= span) return;
     uintptr_t last = (std::min<uintptr_t>(a + n, span) - 1) >> kStampShift;
@@ -189,7 +193,7 @@ bool trustWriteStamps() {
 // True when no page of [p, p + n) was stamped after `since` (a writeClock()
 // value); false for memory outside the tracked range.
 bool unwrittenSince(const void* p, size_t n, uint32_t since) {
-    uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_memBase);
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_stampBase);
     const uintptr_t span = uintptr_t(kStampPages) << kStampShift;
     if (a >= span || a + n > span) return false;
     if (!n) return true;
@@ -1480,11 +1484,14 @@ extern "C" {
 
 void GXPC_SetMemoryWindow(void* base, uint32_t size) {
     s_memBase = static_cast<uint8_t*>(base);
+    s_stampBase = s_memBase;
     s_memSize = size;
     ensureBeRanges();
 }
 
 void GXPC_MemoryWritten(const void* p, uint32_t size) { memoryWritten(p, size); }
+
+void GXPC_SetWriteStampWindow(void* base) { s_stampBase = static_cast<uint8_t*>(base); }
 
 void GXPC_AddBigEndianRange(const void* p, uint32_t size) {
     if (!p || !size) return;
