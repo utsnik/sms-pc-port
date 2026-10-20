@@ -987,12 +987,17 @@ static void vertexEmit(std::vector<uint64_t>& ops, std::initializer_list<uint64_
 
 static void vertexEmitDot4(std::vector<uint64_t>& ops, uint32_t dst, uint32_t dstChan,
                            uint32_t src0, uint32_t src1) {
+    // Latte requires the four reduction instructions to occupy distinct
+    // destination channels.  Reduce into scratch so DOT4's broadcast does
+    // not overwrite the other components of the value being built.
+    constexpr uint32_t scratch = 59;
     vertexEmit(ops, {
-        ALU_DOT4(_R(dst), dstChan, src0, _x, src1, _x),
-        ALU_DOT4(__, dstChan, src0, _y, src1, _y),
-        ALU_DOT4(__, dstChan, src0, _z, src1, _z),
-        ALU_DOT4(__, dstChan, src0, _w, src1, _w),
+        ALU_DOT4(_R(scratch), _x, src0, _x, src1, _x),
+        ALU_DOT4(__, _y, src0, _y, src1, _y),
+        ALU_DOT4(__, _z, src0, _z, src1, _z),
+        ALU_DOT4(__, _w, src0, _w, src1, _w),
     });
+    vertexEmit(ops, {ALU_MOV(_R(dst), dstChan, _R(scratch), _x)});
 }
 
 static uint32_t vertexInputForRow(uint32_t row) {
