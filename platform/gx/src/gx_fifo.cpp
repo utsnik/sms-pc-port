@@ -65,6 +65,28 @@ void fatal(const char* fmt, ...) {
     abort();
 }
 
+#if defined(__WIIU__)
+// Espresso is a 32-bit CPU: every 64-bit multiply below costs several
+// instructions.  Same contract (equality checks within one run, 64-bit
+// result) with four 32-bit multiply/xor-shift lanes over 16-byte blocks.
+uint64_t hashBytes(const void* data, size_t n, uint64_t seed) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint32_t a = uint32_t(seed) ^ uint32_t(n) * 0x9E3779B1u, b = uint32_t(seed >> 32) ^ 0x85EBCA77u,
+             c = a ^ 0xC2B2AE3Du, d = b ^ 0x27D4EB2Fu;
+    for (; n >= 16; n -= 16, p += 16) {
+        uint32_t w[4];
+        memcpy(w, p, 16);
+        a = (a ^ w[0]) * 0x9E3779B1u; a ^= a >> 15;
+        b = (b ^ w[1]) * 0x85EBCA77u; b ^= b >> 13;
+        c = (c ^ w[2]) * 0xC2B2AE3Du; c ^= c >> 16;
+        d = (d ^ w[3]) * 0x27D4EB2Fu; d ^= d >> 15;
+    }
+    for (; n; --n, ++p) { a = (a ^ *p) * 0x9E3779B1u; a ^= a >> 15; }
+    uint32_t lo = (a ^ (c >> 7)) * 0x85EBCA77u, hi = (b ^ (d >> 9)) * 0xC2B2AE3Du;
+    lo ^= hi >> 13; hi ^= lo >> 16;
+    return uint64_t(hi) << 32 | lo;
+}
+#else
 uint64_t hashBytes(const void* data, size_t n, uint64_t seed) {
     // 64-bit multiply/xor-shift hash over 8-byte words; not cryptographic.
     // Four independent lanes over 32-byte blocks, so the multiplies overlap
@@ -106,6 +128,7 @@ uint64_t hashBytes(const void* data, size_t n, uint64_t seed) {
     h ^= h >> 32;
     return h;
 }
+#endif
 
 // Default window: MEM1 mapped at the GameCube's own cached base, which is what
 // the unmodified OSCachedToPhysical macro (addr - 0x80000000) assumes.
