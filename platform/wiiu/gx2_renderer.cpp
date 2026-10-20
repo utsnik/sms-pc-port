@@ -3012,7 +3012,11 @@ void flushBatch() {
             tevTextures[map] = getTexture(map);
             if (!tevTextures[map]) allTextures = false;
         }
-        if (allTextures) tevShader = tevShaderForKey(tevKey);
+        // The packed untextured pixel shader is the stable path for raster
+        // colour-only geometry. Keep the generated TEV path for every draw
+        // that actually samples a texture; no-texture draws still use the
+        // CPU TEV evaluator when they are priming a generated fixed program.
+        if (mask && allTextures) tevShader = tevShaderForKey(tevKey);
     }
     const bool tevPath = tevShader != nullptr;
     if (SMS_GX2_DEBUG_DUMP && !tevPath) {
