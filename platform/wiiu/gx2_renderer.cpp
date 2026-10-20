@@ -2724,16 +2724,20 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
     const float* xfViewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
     memcpy(&s_vtxLive[0], proj, 6 * sizeof(float));
     s_vtxLive[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
-    memcpy(&s_vtxLive[8], g.viewport, 6 * sizeof(float));
+    memcpy(&s_vtxLive[8], g.viewport, 4 * sizeof(float));
+    // C187 is the viewport mapping block consumed by the generated vertex
+    // program: game scale/X followed by the target dimensions.  Do not leave
+    // the XF viewport's depth pair in front of it; that made the generated
+    // path use z-offset/scale as its 2D scale and sent every vertex offscreen.
     s_vtxLive[14] = s_gameScale;
     s_vtxLive[15] = s_gameX;
     s_vtxLive[16] = s_tvW;
     s_vtxLive[17] = s_tvH;
-    // C188.zw are already divided by the XF 24-bit depth scale; this keeps
-    // the live block self-contained without spending a constant register on
-    // 1 / 16777215.
-    s_vtxLive[18] = xfViewport[2] / 16777215.0f;
-    s_vtxLive[19] = xfViewport[5] / 16777215.0f;
+    // C188.xy are depth offset/scale, already divided by the XF 24-bit
+    // depth range.  This keeps the live block self-contained without
+    // spending a constant register on 1 / 16777215.
+    s_vtxLive[18] = xfViewport[5] / 16777215.0f;
+    s_vtxLive[19] = xfViewport[2] / 16777215.0f;
     auto colour = [](uint32_t value, float* out) {
         out[0] = float((value >> 24) & 255) / 255.0f;
         out[1] = float((value >> 16) & 255) / 255.0f;
