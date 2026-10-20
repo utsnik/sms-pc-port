@@ -1,3 +1,6 @@
+#ifndef SMS_WIIU_PIPELINED_PRESENT
+#define SMS_WIIU_PIPELINED_PRESENT 1
+#endif
 #include "include/dolphin/gx/GXVert.h"
 #include "../gx/include/sms_gx/gx_pc.h"
 #include "runtime.h"
@@ -370,6 +373,7 @@ void present_diagnostics()
 	take_shots(p);
 	if (!(p == 2 || p == 120 || p == 1800 || p == 3600 || p % 18000 == 0))
 		return;
+	GX2DrawDone(); /* the reads below assume a finished frame */
 	uint32_t swaps = 0, flips = 0;
 	OSTime lastFlip = 0, lastVsync = 0;
 	GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
@@ -460,6 +464,40 @@ extern "C" int64_t wut_OSGetTime_stub(void) __asm__("OSGetTime");
 static int64_t s_presentFinish, s_presentBegin;
 static uint32_t s_presentFrames;
 
+/* Pipelined present: WHBGfxFinishRender ends in GX2DrawDone and
+ * WHBGfxBeginRender waits for the previous flip, so the CPU never built a frame
+ * while the GPU drew one.  Here the swap is queued without draining, and the
+ * next frame starts once at most one swap is still outstanding.  The vertex
+ * arenas are fenced and GXPeekARGB is asynchronous, so one frame in flight is
+ * safe. */
+static void present_finish_pipelined(void)
+{
+	GX2SwapScanBuffers();
+	GX2Flush();
+	static bool s_enabled;
+	if (!s_enabled) {
+		GX2SetTVEnable(TRUE);
+		GX2SetDRCEnable(TRUE);
+		s_enabled = true;
+	}
+}
+static void present_begin_pipelined(void)
+{
+	for (uint32_t wait = 0;; ++wait) {
+		uint32_t swaps = 0, flips = 0;
+		OSTime lastFlip = 0, lastVsync = 0;
+		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+		if (flips + 1 >= swaps)
+			break;
+		if (wait >= 10) {
+			port_log("[present] wait for swap timed out (swaps=%u flips=%u)\n", unsigned(swaps), unsigned(flips));
+			break;
+		}
+		GX2WaitForVsync();
+	}
+	GX2SetContextState(WHBGfxGetTVContextState());
+}
+
 extern "C" void sms_wiiu_gfx_frame(void)
 {
 	log_active_once();
@@ -487,11 +525,13 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	sms_wiiu_gx2_renderer_end();
 	const int64_t t0 = wut_OSGetTime_stub();
 	sms_wiiu_gx2_target_present();
-	WHBGfxFinishRender();
+	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
+	else WHBGfxFinishRender();
 	const int64_t t1 = wut_OSGetTime_stub();
 	drc_register_scan_buffer();
 	present_diagnostics();
-	WHBGfxBeginRender();
+	if (SMS_WIIU_PIPELINED_PRESENT) present_begin_pipelined();
+	else WHBGfxBeginRender();
 	const int64_t t2 = wut_OSGetTime_stub();
 	s_presentFinish += t1 - t0;
 	s_presentBegin += t2 - t1;
