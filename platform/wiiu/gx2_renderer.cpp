@@ -321,6 +321,13 @@ static constexpr XfUniformSegment kXfSegments[] = {
     {0x600, kXfLightBase, 128, 4}, // eight light records -> C160..C191
 };
 static bool s_xfMemoryDirty = true;
+// Clears, copies and context-state restores run GX2's own programs and
+// replace the vertex constant registers, so the uniform shadow must forget
+// what it believes the GPU holds after any of them.
+static void invalidateVertexUniforms() {
+    s_xfUniformValid = false;
+    s_xfMemoryDirty = true;
+}
 
 /*
  * GX2 uniform writes are vector-register writes.  Compare the packed source
@@ -1552,8 +1559,11 @@ static VertexProgram* vertexShaderForKey(const VertexKey& key) {
                      (unsigned)s_vertexPrograms.size());
         return nullptr;
     }
-    WHBLogPrintf("SMS Wii U: generated GPU vertex program texgens=%u bytes=%u cache=%u",
-                 (unsigned)key.numTexGens, (unsigned)shader->vertex.size, (unsigned)s_vertexPrograms.size());
+    WHBLogPrintf("SMS Wii U: generated GPU vertex program texgens=%u bytes=%u cache=%u chans=%u cc=%08x/%08x tg=%08x/%08x/%08x/%08x dual=%u",
+                 (unsigned)key.numTexGens, (unsigned)shader->vertex.size, (unsigned)s_vertexPrograms.size(),
+                 (unsigned)key.numChans, (unsigned)key.colorCtrl[0], (unsigned)key.colorCtrl[1],
+                 (unsigned)key.texgen[0], (unsigned)key.texgen[1], (unsigned)key.texgen[2], (unsigned)key.texgen[3],
+                 (unsigned)key.dualTex);
     return shader;
 }
 
@@ -2133,7 +2143,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
                          unsigned(t.texture.surface.imageSize), t.texture.surface.image);
     }
     if (cemu) {
-        GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0);
+        GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0); invalidateVertexUniforms();
     } else {
         GX2Rect source = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
         GX2Point destination = {0, 0};
@@ -2214,7 +2224,7 @@ static void retileTexture(GX2Texture& texture) {
     if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
     GX2InitTextureRegs(&tiled);
     for (uint32_t level = 0; level < t.mipLevels; ++level)
-        GX2CopySurface(&linear, level, 0, &t, level, 0);
+        GX2CopySurface(&linear, level, 0, &t, level, 0); invalidateVertexUniforms();
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, t.image, t.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, t.image, t.imageSize);
     if (t.mipmaps) {
@@ -2441,13 +2451,13 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
         WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
         return;
     }
-    GX2SetContextState(WHBGfxGetTVContextState());
-    GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f);
-    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
+    GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f); invalidateVertexUniforms();
+    GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
-    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV);
-    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC);
+    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
 }
 
 // TV target size (WHBGfx picks 720p or 1080p) and the 4:3 game rectangle in it:
@@ -3255,6 +3265,7 @@ void flushBatch() {
                 float reference[28] = {};
                 if (tevPath) transformTev(hv, reference, tevKey, tevTextures);
                 else transform(hv, reference, coord, useTex, texture);
+                if (SMS_GX2_VX_ORACLE != 8)
                 memcpy(reinterpret_cast<RawVertex*>(out)->tex[6],
                        reference + (SMS_GX2_VX_ORACLE == 2 ? 4 : SMS_GX2_VX_ORACLE == 6 ? 24 : 0), 4 * sizeof(float));
                 if (SMS_GX2_VX_ORACLE == 6)
@@ -3364,7 +3375,7 @@ void flushBatch() {
 static float s_frameClear[4];
 static bool s_frameClearPending = false;
 static void rebindTvTarget() {
-    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
 }
@@ -3479,9 +3490,9 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     // Make every queued draw land in memory before the copy reads the target.
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
     GX2DrawDone();
-    GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0);
+    GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
     GX2DrawDone();
-    if (cemu) GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0);
+    if (cemu) GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms();
     rebindTvTarget();
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
     for (uint32_t i = 0; i < count; ++i) {
@@ -3552,18 +3563,18 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
     beginVertexArena();
-    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
-    GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
-    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH); invalidateVertexUniforms();
+    GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     updateTarget();
     if (s_frameClearPending) {
-        GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]);
+        GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]); invalidateVertexUniforms();
         s_frameClearPending = false;
-        GX2SetContextState(WHBGfxGetTVContextState());
+        GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
         GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
         GX2SetDepthBuffer(renderDepth());
     }
