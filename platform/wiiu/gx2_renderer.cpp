@@ -4535,11 +4535,12 @@ void executeCopy(uint32_t ctrl) {
     }
     if (!clear) return;
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
-    if ((g.bp[BP_CMODE0] >> 3) & 1)
+    if ((g.bp[BP_CMODE0] >> 3) & 1) {  // colour update enabled: GX clears colour only then
         ++s_perfClears;
         GX2ClearColor(renderColour(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
                       float(gb & 255) / 255.0f,
                       ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f);
+    }
     if ((g.bp[BP_ZMODE] >> 4) & 1)
         GX2ClearDepthStencilEx(renderDepth(), float(z & 0xffffff) / 16777215.0f, 0,
                                GX2_CLEAR_FLAGS_DEPTH);
