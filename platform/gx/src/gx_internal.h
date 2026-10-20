@@ -204,6 +204,9 @@ bool batchUsesArena();
 void onStateChange();  // called before any register write that changes state
 void executeCopy(uint32_t execReg);
 void markXfMemDirty();
+// XF memory words changed since the backend last consumed them (inclusive;
+// lo > hi = none). writeXF keeps them; a backend resets them after upload.
+extern uint32_t g_xfDirtyLo, g_xfDirtyHi;
 uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
 uint32_t peekZ(int x, int y);      // 24-bit
 void pixMetricClear();
