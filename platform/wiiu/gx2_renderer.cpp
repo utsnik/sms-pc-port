@@ -392,7 +392,14 @@ static bool s_xfMemoryDirty = true;
 // Clears, copies and context-state restores run GX2's own programs and
 // replace the vertex constant registers, so the uniform shadow must forget
 // what it believes the GPU holds after any of them.
+/* What the TEV path last wrote to the pixel uniform registers: setTevShader
+ * sends only the vectors that changed. Everything that clobbers GPU state
+ * (copies, clears, context switches) goes through invalidateVertexUniforms,
+ * which drops this shadow too. */
+static bool s_tevPixelValid;
+
 static void invalidateVertexUniforms() {
+    s_tevPixelValid = false;
     s_xfUniformValid = false;
     s_xfMemoryDirty = true;
 }
@@ -2689,7 +2696,23 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     // C43-C46: the TEV registers' low 8 bits (the A/B/C view of a register no
     // stage has written yet).
     for (int i = 0; i < 16; ++i) params[172 + i] = float(int(params[i]) & 255);
-    GX2SetPixelUniformReg(0, kTevUniforms * 4, params);
+    // Only the changed vectors, in coalesced runs (a full upload was 47
+    // registers per draw; most of them are constants).
+    static float s_tevPixelShadow[kTevUniforms * 4];
+    if (!s_tevPixelValid) {
+        GX2SetPixelUniformReg(0, kTevUniforms * 4, params);
+        memcpy(s_tevPixelShadow, params, sizeof(s_tevPixelShadow));
+        s_tevPixelValid = true;
+    } else {
+        for (uint32_t r = 0; r < kTevUniforms;) {
+            if (!memcmp(&params[4 * r], &s_tevPixelShadow[4 * r], 16)) { ++r; continue; }
+            uint32_t end = r + 1;
+            while (end < kTevUniforms && memcmp(&params[4 * end], &s_tevPixelShadow[4 * end], 16)) ++end;
+            GX2SetPixelUniformReg(4 * r, 4 * (end - r), &params[4 * r]);
+            memcpy(&s_tevPixelShadow[4 * r], &params[4 * r], 16 * (end - r));
+            r = end;
+        }
+    }
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
         GX2SetPixelTexture(&textures[map]->texture, map);
@@ -3214,6 +3237,7 @@ static void setShader(FixedShader& shader, TextureEntry* texture, VertexProgram*
     GX2SetPixelShader(&shader.pixel);
     static const float windowParams[4] = {1, 0, 0, 0};
     GX2SetPixelUniformReg(shader.pixel.uniformVars[0].offset, 4, windowParams);
+    s_tevPixelValid = false;  // overlaps the TEV path's registers
     if (shader.textured && texture) {
         GX2SetPixelTexture(&texture->texture, 0);
         GX2SetPixelSampler(&texture->sampler, 0);
