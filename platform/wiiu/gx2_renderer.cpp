@@ -2757,11 +2757,12 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
     s_vtxLive[15] = s_gameX;
     s_vtxLive[16] = s_tvW;
     s_vtxLive[17] = s_tvH;
-    // C188.xy are depth offset/scale, already divided by the XF 24-bit
+    // C188.xy are depth scale/offset, already divided by the XF 24-bit
     // depth range.  This keeps the live block self-contained without
-    // spending a constant register on 1 / 16777215.
-    s_vtxLive[18] = xfViewport[5] / 16777215.0f;
-    s_vtxLive[19] = xfViewport[2] / 16777215.0f;
+    // spending a constant register on 1 / 16777215.  The generated shader
+    // evaluates C188.x * z + C188.y * w, matching transformPosition.
+    s_vtxLive[18] = xfViewport[2] / 16777215.0f;
+    s_vtxLive[19] = xfViewport[5] / 16777215.0f;
     auto colour = [](uint32_t value, float* out) {
         out[0] = float((value >> 24) & 255) / 255.0f;
         out[1] = float((value >> 16) & 255) / 255.0f;
