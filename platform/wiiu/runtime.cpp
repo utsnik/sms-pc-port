@@ -229,6 +229,9 @@ void sms_wiiu_runtime_init(void)
 	 * the FIFO, so an arena-relative window sent every J3D vertex array to the
 	 * wrong place. The Wii U heap (0x1xxxxxxx) fits the decoder's 30-bit mask. */
 	GXPC_SetMemoryWindow(nullptr, 0x40000000u);
+	/* Cached display lists and decodes skip re-hashing pages that no cache
+	 * flush has touched since; track the game arena for that. */
+	GXPC_SetWriteStampWindow(arena);
 	resolve_app_root();
 	std::strncpy(s_files_root, kAppRootCandidates[kAppRootIndex],
 	             sizeof(s_files_root));
