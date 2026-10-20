@@ -2132,16 +2132,21 @@ static void tevEmitIndirectStage(std::vector<uint64_t>& program, const TevKey& k
     // Wrap: 256 >> (n - 1) texels, or 0 for 6.
     const TevSource wrapSize[6] = {{ALU_SRC_0, 0}, tevC(39, _x), tevC(39, _y), tevC(39, _z), tevC(39, _w), tevC(40, _x)};
     const TevSource wrapInv[6] = {{ALU_SRC_0, 0}, tevC(40, _y), tevC(40, _z), tevC(40, _w), tevC(41, _x), tevC(41, _y)};
+    // Both coordinates step together.
     const uint32_t wrap[2] = {sw, tw};
-    for (uint32_t c = 0; c < 2; ++c) {
-        if (wrap[c] == 6 || wrap[c] == 7) {
-            g.push_back(tevOp1(kOpMov, B, c, {ALU_SRC_0, _x})); flush();
-        } else if (wrap[c]) {
-            g.push_back(tevOp(kOpMul, U, c, tevG(B, c), wrapInv[wrap[c]])); flush();
-            g.push_back(tevOp1(kOpFloor, U, c, tevG(U, c))); flush();
-            g.push_back(tevOp(kOpMul, U, c, tevG(U, c), wrapSize[wrap[c]])); flush();
-            g.push_back(tevOp(kOpAdd, B, c, tevG(B, c), tevNeg(tevG(U, c)))); flush();
-        }
+    auto wraps = [&](uint32_t c) { return wrap[c] != 0 && wrap[c] != 6 && wrap[c] != 7; };
+    for (uint32_t c = 0; c < 2; ++c)
+        if (wrap[c] == 6 || wrap[c] == 7) g.push_back(tevOp1(kOpMov, B, c, {ALU_SRC_0, _x}));
+    flush();
+    if (wraps(0) || wraps(1)) {
+        for (uint32_t c = 0; c < 2; ++c) if (wraps(c)) g.push_back(tevOp(kOpMul, U, c, tevG(B, c), wrapInv[wrap[c]]));
+        flush();
+        for (uint32_t c = 0; c < 2; ++c) if (wraps(c)) g.push_back(tevOp1(kOpFloor, U, c, tevG(U, c)));
+        flush();
+        for (uint32_t c = 0; c < 2; ++c) if (wraps(c)) g.push_back(tevOp(kOpMul, U, c, tevG(U, c), wrapSize[wrap[c]]));
+        flush();
+        for (uint32_t c = 0; c < 2; ++c) if (wraps(c)) g.push_back(tevOp(kOpAdd, B, c, tevG(B, c), tevNeg(tevG(U, c))));
+        flush();
     }
     if (mid >= 1 && mid <= 3) {
         // The offset: s.10 matrix rows times the lookup, >> 3, shifted by the
