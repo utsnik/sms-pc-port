@@ -398,13 +398,20 @@ void sms_wiiu_input_poll(void)
 				s_script_start = OSGetTime();
 			const uint32_t wall = (uint32_t)(OSTicksToMilliseconds(OSGetTime() - s_script_start) * 5994 / 100000);
 			const uint32_t field = s_field > wall ? s_field : wall;
+			/* A press starts at the first poll on or after its field (polls
+			 * stall during loads) and lasts its hold, but at least 3 polls. */
+			static uint32_t s_began[48], s_polls[48];
 			for (int i = 0; i < s_script_count; i++) {
 				const ScriptPress& p = s_script[i];
-				if (field < p.at || field >= p.until)
+				if (field < p.at)
 					continue;
-				static uint64_t s_logged;
-				if (!(s_logged & (1ull << i)) && (s_logged |= 1ull << i))
+				if (!s_began[i]) {
+					s_began[i] = field;
 					port_log("[pad] autoplay press %d at field %u\n", i, (unsigned)field);
+				}
+				if (field >= s_began[i] + (p.until - p.at) && s_polls[i] >= 3)
+					continue;
+				s_polls[i]++;
 				s_status[0].button |= p.button;
 				if (p.sx) s_status[0].stickX = p.sx;
 				if (p.sy) s_status[0].stickY = p.sy;
