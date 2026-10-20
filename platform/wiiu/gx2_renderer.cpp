@@ -185,9 +185,8 @@ static constexpr uint32_t kRawVertexFloats = sizeof(RawVertex) / sizeof(float);
 
 enum RawAttrib : uint32_t {
     RAW_ATTR_POS = 0, RAW_ATTR_NRM, RAW_ATTR_BIN, RAW_ATTR_TAN,
-    RAW_ATTR_CLR0, RAW_ATTR_CLR1, RAW_ATTR_TEX0, RAW_ATTR_TEX1,
-    RAW_ATTR_TEX2, RAW_ATTR_TEX3, RAW_ATTR_TEX4, RAW_ATTR_TEX5,
-    RAW_ATTR_TEX6, RAW_ATTR_TEX7, RAW_ATTR_MTX0, RAW_ATTR_MTX1, RAW_ATTR_MTX2,
+    RAW_ATTR_CLR0, RAW_ATTR_CLR1, RAW_ATTR_TEX01, RAW_ATTR_TEX23,
+    RAW_ATTR_TEX45, RAW_ATTR_TEX67, RAW_ATTR_MTX0, RAW_ATTR_MTX1, RAW_ATTR_MTX2,
     RAW_ATTR_COUNT,
 };
 
@@ -991,7 +990,7 @@ static uint32_t vertexInputForRow(uint32_t row) {
     if (row == 1) return 2; // normal
     if (row == 3) return 3; // binormal
     if (row == 4) return 4; // tangent
-    if (row >= 5) return 7 + (row - 5); // source texcoord
+    if (row >= 5) return RAW_ATTR_TEX01 + (row - 5) / 2; // packed source texcoord pair
     return 29; // raster colour 0, selected by the caller for row 2
 }
 
@@ -1000,6 +999,15 @@ static void vertexCopySource(std::vector<uint64_t>& ops, uint32_t source, uint32
     vertexEmit(ops, {ALU_MOV(_R(dst), _y, _R(source), _y)});
     vertexEmit(ops, {ALU_MOV(_R(dst), _z, colour ? _R(source) : ALU_SRC_1, colour ? _z : _x)});
     vertexEmit(ops, {ALU_MOV(_R(dst), _w, colour ? _R(source) : ALU_SRC_1, colour ? _w : _x)});
+}
+
+static void vertexCopyTexSource(std::vector<uint64_t>& ops, uint32_t coord, uint32_t dst) {
+    const uint32_t source = RAW_ATTR_TEX01 + coord / 2;
+    const uint32_t chan = (coord & 1) * 2;
+    vertexEmit(ops, {ALU_MOV(_R(dst), _x, _R(source), chan)});
+    vertexEmit(ops, {ALU_MOV(_R(dst), _y, _R(source), chan + 1)});
+    vertexEmit(ops, {ALU_MOV(_R(dst), _z, ALU_SRC_1, _x)});
+    vertexEmit(ops, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
 }
 
 static void vertexLoadRelativeMatrix(std::vector<uint64_t>& ops, uint32_t indexReg, uint32_t indexChan,
@@ -1241,7 +1249,7 @@ static bool initVertexProgram(VertexProgram& shader) {
         // PARAM0 is the selected UV and PARAM4 is the vertex colour.  Keep
         // the other three slots defined so their existing register layout is
         // unchanged on both Cafe and Cemu.
-        if (key.fixedTextured) vertexCopySource(alu, 7 + key.fixedCoord, 21, false);
+        if (key.fixedTextured) vertexCopyTexSource(alu, key.fixedCoord, 21);
         else {
             vertexEmit(alu, {ALU_MOV(_R(21), _x, ALU_SRC_0, _x)});
             vertexEmit(alu, {ALU_MOV(_R(21), _y, ALU_SRC_0, _x)});
@@ -1278,8 +1286,11 @@ static bool initVertexProgram(VertexProgram& shader) {
         const uint32_t row = (tg >> 7) & 31;
         const uint32_t form = (tg >> 2) & 1;
         if (type == 0) {
-            const uint32_t source = row == 2 ? 29 : vertexInputForRow(row);
-            vertexCopySource(alu, source, 52, row == 2);
+            if (row >= 5) vertexCopyTexSource(alu, row - 5, 52);
+            else {
+                const uint32_t source = row == 2 ? 29 : vertexInputForRow(row);
+                vertexCopySource(alu, source, 52, row == 2);
+            }
             const uint32_t index = matrixIndexBase + (coord + 1) / 4;
             const uint32_t indexChan = (coord + 1) & 3;
             vertexMatrixTransform(alu, 52, index, indexChan, 55, 0, true);
@@ -1404,14 +1415,12 @@ static bool initVertexProgram(VertexProgram& shader) {
         uint32_t(offsetof(RawVertex, pos)), uint32_t(offsetof(RawVertex, nrm)),
         uint32_t(offsetof(RawVertex, bin)), uint32_t(offsetof(RawVertex, tan)),
         uint32_t(offsetof(RawVertex, clr[0])), uint32_t(offsetof(RawVertex, clr[1])),
-        uint32_t(offsetof(RawVertex, tex[0])), uint32_t(offsetof(RawVertex, tex[1])),
-        uint32_t(offsetof(RawVertex, tex[2])), uint32_t(offsetof(RawVertex, tex[3])),
-        uint32_t(offsetof(RawVertex, tex[4])), uint32_t(offsetof(RawVertex, tex[5])),
-        uint32_t(offsetof(RawVertex, tex[6])), uint32_t(offsetof(RawVertex, tex[7])),
+        uint32_t(offsetof(RawVertex, tex[0])), uint32_t(offsetof(RawVertex, tex[2])),
+        uint32_t(offsetof(RawVertex, tex[4])), uint32_t(offsetof(RawVertex, tex[6])),
         uint32_t(offsetof(RawVertex, mtx[0])), uint32_t(offsetof(RawVertex, mtx[4])),
         uint32_t(offsetof(RawVertex, mtx[8])),
     };
-    const uint32_t components[RAW_ATTR_COUNT] = {3, 3, 3, 3, 4, 4, 2, 2, 2, 2, 2, 2, 2, 2, 4, 4, 4};
+    const uint32_t components[RAW_ATTR_COUNT] = {3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4};
     for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) {
         shader.attribVars[i] = {"raw", GX2_SHADER_VAR_TYPE_FLOAT4, 0, i};
         GX2AttribStream& attr = shader.attrs[i];
