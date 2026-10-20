@@ -3878,11 +3878,104 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
     for (uint32_t i = 0; i < nidx; ++i) s_batch.indices.push_back(idx[i] + base);
 }
 
-bool arenaEnabled() { return false; }
-uint32_t arenaGeneration() { return 0; }
-bool arenaUpload(const uint8_t*, uint32_t, uint32_t, const uint32_t*, uint32_t, ArenaRef&) { return false; }
-void appendArena(PrimClass, uint32_t, uint32_t, const ArenaRef&, uint32_t, uint32_t, const uint8_t*) {}
-bool batchUsesArena() { return false; }
+// --- Display-list vertex cache -------------------------------------------
+// Runs of a cached display list are decoded into the fetch layout once and
+// kept, with their indices, in a persistent MEM2 pool; a replay draws them in
+// place, with no per-frame unpack, copy or cache flush.  When the pool is
+// full it starts over as a new generation and every run is stored again.
+// Vertices without matrix indices take the current matrix registers, so a
+// run is stored for one register set (ArenaRef::key) and decoded per frame
+// whenever it is drawn with another.
+static constexpr uint32_t kDlArenaBytes = 32u << 20;
+static uint8_t* s_dlArena;
+static uint32_t s_dlArenaUsed;
+static uint32_t s_dlArenaGen = 1;
+static uint32_t s_perfDlDraws, s_perfDlUploads, s_perfDlDecoded;
+// arenaUpload's arguments, for the store appendArena makes right after it.
+static struct { const uint8_t* verts; const uint32_t* idx; } s_dlStash;
+static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; } s_dlPending;
+
+static void matrixDefaults(uint8_t out[9]) {
+    const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
+    for (int i = 0; i < 5; ++i) out[i] = uint8_t((ma >> (6 * i)) & 63);
+    for (int i = 0; i < 4; ++i) out[5 + i] = uint8_t((mb >> (6 * i)) & 63);
+}
+
+static uint64_t matrixDefaultsKey() {
+    return (uint64_t(g.xfReg[XFR_MATIDX_A] & 0x3fffffff) << 32) | (g.xfReg[XFR_MATIDX_B] & 0xffffff);
+}
+
+static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t n, const uint8_t* verts,
+                         const uint32_t* idx, uint32_t nidx) {
+    const uint32_t vbytes = (n + 1) * kRawVertexStride;  // + a zeroed slot for out-of-range indices
+    const uint32_t ioff = (vbytes + 255) & ~255u;
+    const uint32_t total = (ioff + nidx * 4 + 255) & ~255u;  // 256-aligned: no GPU cache line spans two runs
+    if (total > kDlArenaBytes / 8) return false;
+    if (!s_dlArena) {
+        s_dlArena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
+        if (!s_dlArena) return false;
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
+    }
+    if (s_dlArenaUsed + total > kDlArenaBytes) {
+        // Every stored run goes: let the GPU finish reading them first.
+        GX2DrawDone();
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
+        s_dlArenaUsed = 0;
+        if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
+    }
+    uint8_t* base = s_dlArena + s_dlArenaUsed;
+    for (uint32_t off = 0; off < ioff; off += 32)
+        asm volatile("dcbz 0,%0" : : "r"(base + off) : "memory");
+    uint8_t defaults[9];
+    matrixDefaults(defaults);
+    for (uint32_t i = 0; i < n; ++i)
+        unpackVertex(fmt, verts + size_t(i) * stride, defaults,
+                     *reinterpret_cast<HostVertex*>(base + size_t(i) * kRawVertexStride), true);
+    uint32_t* ib = reinterpret_cast<uint32_t*>(base + ioff);
+    for (uint32_t i = 0; i < nidx; ++i) ib[i] = idx[i] < n ? idx[i] : n;
+    DCFlushRange(base, total);
+    ref.gen = s_dlArenaGen;
+    ref.baseVertex = int32_t(s_dlArenaUsed);  // byte offset of the run's vertices
+    ref.iOff = s_dlArenaUsed + ioff;
+    ref.key = matrixDefaultsKey();
+    s_dlArenaUsed += total;
+    ++s_perfDlUploads;
+    return true;
+}
+
+bool arenaEnabled() { return s_gpuXfEnabled; }
+uint32_t arenaGeneration() { return s_dlArenaGen; }
+bool arenaUpload(const uint8_t* verts, uint32_t, uint32_t, const uint32_t* idx, uint32_t, ArenaRef& out) {
+    // The decode needs the run's format and matrix registers, which only
+    // appendArena (called next, for this run) has; it stores the run.
+    s_dlStash = {verts, idx};
+    out.gen = 0;
+    return true;
+}
+
+void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& cref, uint32_t n, uint32_t nidx,
+                 const uint8_t* verts) {
+    SMS_PORT_HEAP_SCOPE();
+    // The cache's own run record: this backend keeps its stored form there.
+    ArenaRef& ref = const_cast<ArenaRef&>(cref);
+    const bool stored = ref.gen == s_dlArenaGen;
+    const uint32_t* idx = stored ? reinterpret_cast<const uint32_t*>(s_dlArena + ref.iOff)
+                                 : (s_dlStash.verts == verts ? s_dlStash.idx : nullptr);
+    if (!idx) return;  // not reached: arenaUpload always precedes an unstored run
+    const bool usable = cls == PRIM_TRIS && (stored ? ref.key == matrixDefaultsKey()
+                                                     : dlArenaStore(ref, fmt, stride, n, verts, idx, nidx));
+    if (!usable) {
+        ++s_perfDlDecoded;
+        appendDecoded(cls, fmt, stride, verts, n, idx, nidx);
+        return;
+    }
+    if (!s_batch.indices.empty()) flushBatch();
+    s_batch.cls = cls; s_batch.fmt = fmt; s_batch.stride = stride;
+    s_dlPending = {&ref, n, nidx, verts};
+    flushBatch();
+}
+
+bool batchUsesArena() { return false; }  // stored runs are drawn at once, never left in the batch
 
 static uint32_t s_drawsThisFrame;
 static uint32_t s_debugDrawNo;
@@ -3898,9 +3991,10 @@ struct PerfScope {
 
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
-    if (s_batch.indices.empty()) return;
+    if (s_batch.indices.empty() && !s_dlPending.ref) return;
     if (!s_ready || !s_frameActive || !ProcUIInForeground()) {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+        s_dlPending = {};
         return;
     }
     PerfScope perfFlush(s_perfFlush);
@@ -3959,6 +4053,37 @@ void flushBatch() {
     if (gpuPath) {
         uploadXfUniformRanges();
         packVertexLiveUniforms(tevKey, tevTextures);
+    }
+    if (s_dlPending.ref) {
+        const auto pend = s_dlPending;
+        s_dlPending = {};
+        const uint32_t* storedIdx = reinterpret_cast<const uint32_t*>(s_dlArena + pend.ref->iOff);
+        if (gpuPath && vertex->stride == kRawVertexStride) {
+            ++s_perfDraws; ++s_perfGpuDraws; ++s_perfDlDraws;
+            s_perfVerts += pend.nidx; s_perfGpuVerts += pend.nidx;
+            const uint32_t debugDrawNo = s_debugDrawNo++;
+            GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
+                               s_dlArena + pend.ref->baseVertex);
+            GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                             const_cast<uint32_t*>(storedIdx), 0, 1);
+            ++s_drawsThisFrame;
+            GpuDrawInfo info = {};
+            info.verts = pend.nidx;
+            info.stages = tevKey.stages;
+            info.texMask = tevTextureMask(tevKey);
+            info.blend = g.bp[BP_CMODE0];
+            info.zmode = g.bp[BP_ZMODE] & 0xff;
+            info.drawNo = debugDrawNo;
+            for (int m = 0; m < 8; ++m)
+                if (tevTextures[m]) { info.texW = tevTextures[m]->width; info.texH = tevTextures[m]->height; break; }
+            gpuStamp(s_vertexArenaIndex, &info);
+            return;
+        }
+        // Not on the generated program (its first, priming draw, or the fixed
+        // path): decode the run like any other batch.
+        s_batch.vertices.assign(pend.verts, pend.verts + size_t(pend.n) * s_batch.stride);
+        s_batch.indices.assign(storedIdx, storedIdx + pend.nidx);
+        s_batch.count = pend.n;
     }
     // Indexed draw over the batch's unique vertices: each is transformed once,
     // straight into the arena, and the GPU reuses it per index (expanding the
@@ -4416,7 +4541,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -4425,13 +4550,14 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
-                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30));
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)s_perfDlUploads, (unsigned)s_perfDlDecoded);
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
         static uint32_t s_gpuReportEvery;
         if (++s_gpuReportEvery >= 4) { s_gpuReportEvery = 0; gpuReport(); }
         s_vertexFenceWait = 0;
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         g_dlReplayIdx = 0;
+        s_perfDlDraws = s_perfDlUploads = s_perfDlDecoded = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }

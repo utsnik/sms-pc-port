@@ -190,6 +190,7 @@ struct ArenaRef {
     uint32_t gen = 0;  // arenaGeneration() it was stored in (0: not stored)
     int32_t baseVertex = 0;
     size_t iOff = 0;   // byte offset of its indices
+    uint64_t key = 0;  // backend's own tag for what the stored form depends on (Wii U: matrix defaults)
 };
 extern uint32_t g_dlReplayIdx;
 bool arenaEnabled();

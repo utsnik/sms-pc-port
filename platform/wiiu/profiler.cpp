@@ -46,6 +46,7 @@ alignas(64) uint8_t s_alarm[0x80];
 Table s_tables[2];
 volatile uint32_t s_active;
 void* s_mainThread;  // an OSThread starts with its OSContext
+volatile uint32_t s_frameTicks;  // frame boundaries seen, for the hang check
 bool s_running;
 WutTime s_lastReport;
 
@@ -107,6 +108,7 @@ void report(Table& t)
 extern "C" void sms_wiiu_profiler_tick(void)
 {
 	const WutTime now = wut_OSGetTime();
+	++s_frameTicks;
 	if (!s_running) {
 		std::memset(s_tables, 0, sizeof(s_tables));
 		s_mainThread = wut_OSGetCurrentThread();
@@ -121,6 +123,47 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	const uint32_t done = s_active & 1;
 	s_active = done ^ 1;
 	report(s_tables[done]);
+}
+
+/* Hang report, from another thread (the audio pacer's 10 s stats): when the
+ * frame boundary has not run since the last check, log where the main thread
+ * is parked, from its saved context (an OSThread starts with its OSContext:
+ * gpr1 at 0x0C, lr at 0x8C, srr0 at 0x98) and its stack's back chain. A
+ * thread spinning on its core shows its last switch-out instead. */
+extern "C" void sms_wiiu_hang_check(void)
+{
+	static uint32_t s_lastTicks, s_reported;
+	const uint32_t ticks = s_frameTicks;
+	if (ticks != s_lastTicks || !s_mainThread) {
+		s_lastTicks = ticks;
+		s_reported = 0;
+		return;
+	}
+	if (s_reported >= 3) return;
+	++s_reported;
+	const uint8_t* ctx = static_cast<const uint8_t*>(s_mainThread);
+	auto word = [](uint32_t addr) { return *reinterpret_cast<const volatile uint32_t*>(addr); };
+	auto name = [](uint32_t pc, char* out, uint32_t size) {
+		out[0] = 0;
+		wut_OSGetSymbolName(pc, out, size);
+	};
+	char sym[64];
+	const uint32_t srr0 = *reinterpret_cast<const uint32_t*>(ctx + 0x98);
+	const uint32_t lr = *reinterpret_cast<const uint32_t*>(ctx + 0x8C);
+	name(srr0, sym, sizeof(sym));
+	port_log("[hang] no frame for 10 s: main pc=%08x %s\n", (unsigned)srr0, sym);
+	name(lr, sym, sizeof(sym));
+	port_log("[hang]   lr=%08x %s\n", (unsigned)lr, sym);
+	uint32_t sp = *reinterpret_cast<const uint32_t*>(ctx + 0x0C);
+	for (int depth = 0; depth < 14; ++depth) {
+		if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 3)) break;
+		const uint32_t next = word(sp);
+		if (next <= sp || next >= 0x50000000u) break;
+		const uint32_t ret = word(next + 4);
+		name(ret, sym, sizeof(sym));
+		port_log("[hang]   #%d %08x %s\n", depth, (unsigned)ret, sym);
+		sp = next;
+	}
 }
 
 /* Every exit path cancels the alarm, or it fires into an unmapped process. */
