@@ -348,8 +348,10 @@ void render_subframe()
 #ifdef TARGET_WIIU
 	if (s_async.active) {
 		s_async.subframesRendered++;
-		if (g.sub >= g.subframes)
+		if (g.sub >= g.subframes) {
+			__sync_synchronize();  // the samples are visible to core 1 before the flag clears
 			s_async.framePending = 0;
+		}
 	}
 #endif
 	reply(0xFF00);
@@ -365,6 +367,12 @@ void execute()
 			return;
 		command->words = g.words;
 		command->release = g.release;
+		/* A frame is pending from its 0x82 command, as in the synchronous
+		 * path: the pacer must not start another DMA block in the window
+		 * before the mixer reaches the frame's first subframe. */
+		if (!g.release && !g.words.empty() && (g.words[0] >> 24) == 0x82 && g.words.size() >= 3 &&
+		    ((g.words[0] >> 16) & 0xFF) != 0)
+			s_async.framePending = 1;
 		if (!wut_OSSendMessage(&s_async.commandQueue, command, kWutMessageBlock)) {
 			delete command;
 			port_log("[audio] DSP command queue failed\n");
@@ -496,8 +504,11 @@ extern "C" u64 port_audio_dsp_subframes(void)
 extern "C" int port_audio_dsp_frame_pending(void)
 {
 #ifdef TARGET_WIIU
-	if (s_async.active)
-		return s_async.framePending != 0;
+	if (s_async.active) {
+		const int pending = s_async.framePending != 0;
+		__sync_synchronize();  // reads of the frame's samples come after the flag
+		return pending;
+	}
 #endif
 	return g.outA && g.sub < g.subframes;
 }
