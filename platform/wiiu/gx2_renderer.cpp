@@ -443,7 +443,6 @@ static bool s_xfMemoryDirty = true;
  *  - s_stateValid: applyState's GX2 state;
  *  - s_bound*: the fetch, vertex and pixel shaders. */
 static bool s_tevPixelValid, s_vtxLiveValid, s_stateValid;
-static bool s_vtxLiveInputsValid;
 static const void* s_boundFetch;
 static const void* s_boundVertex;
 static const void* s_boundPixel;
@@ -479,7 +478,6 @@ static void bindPixelTexture(GX2Texture* texture, GX2Sampler* sampler, uint32_t 
 static void invalidateVertexUniforms() {
     for (BoundPixelTexture& b : s_boundPixelTex) b.valid = false;
     s_tevPixelValid = s_vtxLiveValid = s_stateValid = false;
-    s_vtxLiveInputsValid = false;
     s_boundFetch = s_boundVertex = s_boundPixel = nullptr;
     s_xfUniformValid = false;
     s_xfMemoryDirty = true;
@@ -4000,45 +3998,7 @@ static TextureEntry* textureForCoord(const TevKey& key, TextureEntry* const* tex
     return nullptr;
 }
 
-struct VertexLiveInputs {
-    uint32_t projection[7], xfViewport[6], viewport[4];
-    uint32_t target[4], colour[4], manual[8], scale[16];
-    const TextureEntry* textures[8];
-    uint32_t textureSize[16];
-    uint32_t stages, genmode, order[16], iref, copyGeneration;
-};
-
 static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textures) {
-    VertexLiveInputs inputs = {};
-    memcpy(inputs.projection, &g.xfReg[XFR_PROJ], sizeof(inputs.projection));
-    memcpy(inputs.xfViewport, &g.xfReg[XFR_VIEWPORT], sizeof(inputs.xfViewport));
-    memcpy(inputs.viewport, g.viewport, sizeof(g.viewport[0]) * 4);
-    memcpy(&inputs.target[0], &s_gameScale, sizeof(float));
-    memcpy(&inputs.target[1], &s_gameX, sizeof(float));
-    memcpy(&inputs.target[2], &s_tvW, sizeof(float));
-    memcpy(&inputs.target[3], &s_tvH, sizeof(float));
-    inputs.colour[0] = g.xfReg[XFR_MAT0 + 0];
-    inputs.colour[1] = g.xfReg[XFR_AMB0 + 0];
-    inputs.colour[2] = g.xfReg[XFR_MAT0 + 1];
-    inputs.colour[3] = g.xfReg[XFR_AMB0 + 1];
-    for (int coord = 0; coord < 8; ++coord) {
-        inputs.manual[coord] = g.tcManual[coord];
-        inputs.scale[coord * 2] = g.bp[BP_SU_SSIZE + coord * 2];
-        inputs.scale[coord * 2 + 1] = g.bp[BP_SU_SSIZE + coord * 2 + 1];
-    }
-    for (int map = 0; map < 8; ++map) {
-        inputs.textures[map] = textures[map];
-        inputs.textureSize[map * 2] = textures[map] ? textures[map]->width : 0;
-        inputs.textureSize[map * 2 + 1] = textures[map] ? textures[map]->height : 0;
-    }
-    inputs.stages = key.stages;
-    inputs.genmode = key.genmode;
-    memcpy(inputs.order, key.order, sizeof(inputs.order));
-    inputs.iref = key.iref;
-    inputs.copyGeneration = s_copyGeneration;
-    static VertexLiveInputs s_lastInputs;
-    if (s_vtxLiveValid && s_vtxLiveInputsValid && !memcmp(&inputs, &s_lastInputs, sizeof(inputs))) return;
-
     memset(s_vtxLive, 0, sizeof(s_vtxLive));
     const float* proj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
     const float* xfViewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
@@ -4090,8 +4050,6 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
         }
     }
     static float s_vtxLiveShadow[sizeof(s_vtxLive) / sizeof(float)];
-    s_lastInputs = inputs;
-    s_vtxLiveInputsValid = true;
     if (s_vtxLiveValid && !memcmp(s_vtxLive, s_vtxLiveShadow, sizeof(s_vtxLiveShadow))) return;
     memcpy(s_vtxLiveShadow, s_vtxLive, sizeof(s_vtxLiveShadow));
     s_vtxLiveValid = true;
