@@ -44,7 +44,10 @@ uint32_t wut_OSGetSymbolName(uint32_t, char*, uint32_t) __asm__("OSGetSymbolName
 /* GameCube code guards shared state by disabling interrupts, which only
  * excludes other threads on the same core. Run every game thread on core 1,
  * beside the main thread, so those single-core rules still hold. */
-const uint8_t kGameThreadAffinityCpu1 = 1u << 1;
+uint8_t kGameThreadAffinityCpu1 = 1u << 1;
+/* SD marker "core2" (main.cpp): the whole game runs on core 2 instead, every
+ * game thread with it, so the single-core interrupt rule still holds. */
+extern "C" void sms_wiiu_set_game_core(unsigned core) { kGameThreadAffinityCpu1 = uint8_t(1u << core); }
 
 const uint32_t kWutThreadBytes = 0x6a0;
 const unsigned kMaxThreads = 64;
