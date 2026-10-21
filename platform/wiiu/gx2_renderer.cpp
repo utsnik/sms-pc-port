@@ -406,7 +406,7 @@ static const void* s_boundFetch;
 static const void* s_boundVertex;
 static const void* s_boundPixel;
 static bool s_noDiff, s_noDiffMarker;
-static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets
+static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets, 5 = 3 plus GX2DrawDone per draw
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
 static void invalidateVertexUniforms() {
@@ -2766,7 +2766,7 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     // C128-C174 are read by no shader: the same 47 vectors a full upload
     // sends, so mode 2 matches its command volume without changing any input.
     if (s_padUniforms == 2) GX2SetPixelUniformReg(4 * 128, kTevUniforms * 4, s_tevPixelShadowPtr());
-    if (s_padUniforms == 3)
+    if (s_padUniforms == 3 || s_padUniforms == 5)
         for (uint32_t r = 0; r < kTevUniforms; ++r) GX2SetPixelUniformReg(4 * (128 + r), 4, s_tevPixelShadowPtr() + 4 * r);
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
@@ -4294,6 +4294,7 @@ void flushBatch() {
                                s_dlArena + pend.ref->baseVertex);
             GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                              const_cast<uint32_t*>(storedIdx), 0, 1);
+            if (s_padUniforms == 5) GX2DrawDone();
             ++s_drawsThisFrame;
             if (s_gpuDiag) {
                 GpuDrawInfo info = {};
@@ -4454,6 +4455,7 @@ void flushBatch() {
                      (unsigned)k.numTexGens, (unsigned)k.dualTex, (unsigned)k.postTex[0], (unsigned)k.projectionOrtho);
     }
     GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+    if (s_padUniforms == 5) GX2DrawDone();  // shot A/B mode 5: no GPU lag at all
     if (bracket) {
         GX2DrawDone();
         WHBLogPrintf("SMS Wii U: [vxbracket] done");
