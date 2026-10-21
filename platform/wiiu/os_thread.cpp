@@ -430,9 +430,11 @@ void sms_wiiu_OSLockMutex(OSMutex* mutex)
 			return;
 		}
 		QueueRecord* q = queue_for(&mutex->queue, true);
-		wut_OSRestoreInterrupts(level);
+		// Sleep before re-enabling interrupts: a wakeup sent in between found no
+		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
 			wut_OSSleepThread(&q->wut);
+		wut_OSRestoreInterrupts(level);
 	}
 }
 
@@ -473,9 +475,9 @@ void sms_wiiu_OSWaitCond(struct OSCond* cond, OSMutex* mutex)
 	BOOL level = wut_OSDisableInterrupts();
 	unlock_mutex_without_switch(mutex, current_game_thread());
 	QueueRecord* q = queue_for(&cond->queue, true);
-	wut_OSRestoreInterrupts(level);
 	if (q)
-		wut_OSSleepThread(&q->wut);
+		wut_OSSleepThread(&q->wut);  // before re-enabling interrupts (lost wakeup)
+	wut_OSRestoreInterrupts(level);
 	sms_wiiu_OSLockMutex(mutex);
 }
 
@@ -527,9 +529,11 @@ int send_message(OSMessageQueue* mq, void* msg, long flags, bool front)
 			return FALSE;
 		}
 		QueueRecord* q = queue_for(&mq->queueSend, true);
-		wut_OSRestoreInterrupts(level);
+		// Sleep before re-enabling interrupts: a wakeup sent in between found no
+		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
 			wut_OSSleepThread(&q->wut);
+		wut_OSRestoreInterrupts(level);
 	}
 }
 
@@ -566,9 +570,11 @@ int sms_wiiu_OSReceiveMessage(OSMessageQueue* mq, void* msg, long flags)
 			return FALSE;
 		}
 		QueueRecord* q = queue_for(&mq->queueReceive, true);
-		wut_OSRestoreInterrupts(level);
+		// Sleep before re-enabling interrupts: a wakeup sent in between found no
+		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
 			wut_OSSleepThread(&q->wut);
+		wut_OSRestoreInterrupts(level);
 	}
 }
 
