@@ -164,6 +164,7 @@ struct AsyncState {
 };
 
 AsyncState s_async;
+volatile u32 s_syncFrames;
 // Async-path debug counters (logged with the 10 s audio stats).
 volatile u32 s_dbgMails, s_dbgAsserts, s_dbgLastAssertMail, s_dbgSkippedMails;
 volatile u32 s_dbgQueued[4], s_dbgExec[4], s_dbgReleaseIdle, s_dbgReplies, s_dbgReplyPosts;
@@ -460,6 +461,7 @@ void execute(bool fromWorker)
 			u32 frame    = (w[2] - w[1]) / 2;
 			g.subSamples = g.subframes ? frame / g.subframes : 0;
 			g.sub        = 0;
+			++s_syncFrames;
 #ifdef TARGET_WIIU
 			if (s_async.active)
 				s_async.framePending = g.subframes != 0;
@@ -575,6 +577,16 @@ extern "C" void port_audio_dsp_debug_log(void)
 	         (unsigned)JASystem::AudioThread::getDSPSyncCount(),
 	         sms_wiiu_OSIsThreadTerminated(&JASystem::AudioThread::jac_audioThread));
 #endif
+}
+
+// 0x82 frame commands seen so far (queued, in the asynchronous mode).
+extern "C" u32 port_audio_dsp_frames_started(void)
+{
+#ifdef TARGET_WIIU
+	if (s_async.active)
+		return s_dbgQueued[1];
+#endif
+	return s_syncFrames;
 }
 
 extern "C" int port_audio_dsp_frame_pending(void)

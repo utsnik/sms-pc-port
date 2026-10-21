@@ -499,6 +499,14 @@ void sms_wiiu_OSInitMessageQueue(OSMessageQueue* mq, void* array, long count)
 	queue_for(&mq->queueReceive, true);
 }
 
+/* Non-blocking sends refused by a full queue. JAudio forwards each DSP 0xFF00
+ * reply to its audio thread with one; a refused one stalls audio for good. */
+volatile uint32_t sms_wiiu_msg_drops;
+/* The queue JAudio's audio thread waits on, learned from its first receive,
+ * so the audio pacer can start a DMA block only once that queue is empty. */
+extern OSThread sms_jac_audioThread __asm__("_ZN8JASystem11AudioThread15jac_audioThreadE");
+OSMessageQueue* volatile sms_wiiu_audio_mq;
+
 int send_message(OSMessageQueue* mq, void* msg, long flags, bool front)
 {
 	if (!mq || mq->msgCount <= 0)
@@ -514,6 +522,7 @@ int send_message(OSMessageQueue* mq, void* msg, long flags, bool front)
 			return TRUE;
 		}
 		if (flags == OS_MESSAGE_NOBLOCK) {
+			++sms_wiiu_msg_drops;
 			wut_OSRestoreInterrupts(level);
 			return FALSE;
 		}
@@ -538,6 +547,8 @@ int sms_wiiu_OSReceiveMessage(OSMessageQueue* mq, void* msg, long flags)
 {
 	if (!mq || mq->msgCount <= 0)
 		return FALSE;
+	if (!sms_wiiu_audio_mq && current_game_thread() == &sms_jac_audioThread)
+		sms_wiiu_audio_mq = mq;
 	for (;;) {
 		BOOL level = wut_OSDisableInterrupts();
 		if (mq->usedCount > 0) {
@@ -559,6 +570,13 @@ int sms_wiiu_OSReceiveMessage(OSMessageQueue* mq, void* msg, long flags)
 		if (q)
 			wut_OSSleepThread(&q->wut);
 	}
+}
+
+// Messages the audio thread has not taken yet (0 before it first waits).
+int sms_wiiu_audio_mq_used(void)
+{
+	OSMessageQueue* mq = sms_wiiu_audio_mq;
+	return mq ? int(mq->usedCount) : 0;
 }
 
 } // extern "C"

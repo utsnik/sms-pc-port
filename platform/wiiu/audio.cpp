@@ -35,6 +35,9 @@
 #include <cstring>
 
 extern "C" int port_audio_dsp_frame_pending(void);
+extern "C" u32 port_audio_dsp_frames_started(void);
+extern "C" int sms_wiiu_audio_mq_used(void);
+extern "C" volatile uint32_t sms_wiiu_msg_drops;
 extern "C" int sms_wiiu_sdl_audio_open(int rate);
 extern "C" void sms_wiiu_sdl_audio_queue(const void* data, uint32_t bytes);
 extern "C" uint32_t sms_wiiu_sdl_audio_queued(void);
@@ -169,6 +172,7 @@ void log_stats(int64_t now)
 		sms_wiiu_ax_load(&ppc, &dsp);
 		port_log("[audio] AX load ppc=%u dsp=%u\n", (unsigned)ppc, (unsigned)dsp);
 		port_audio_dsp_debug_log();
+		port_log("[audio] message drops %u, audio queue %d\n", (unsigned)sms_wiiu_msg_drops, sms_wiiu_audio_mq_used());
 	}
 	g.sumSquares = g.samples = 0;
 	g.peak       = 0;
@@ -180,6 +184,43 @@ void log_stats(int64_t now)
 	g.blocks = g.underruns = g.pendingWaits = 0;
 	g.minQueued = 0xFFFFFFFFu;
 	g.maxQueued = 0;
+}
+
+/* With the asynchronous DSP mixer a DMA block's frame becomes "pending" only
+ * once JAudio's audio thread has queued its 0x82 command; before that the
+ * pacer saw no frame in flight and could start a second block, overlapping two
+ * frames: JAudio's subframe count went out of step and its audio thread exited
+ * on a stray 0xFF00 (hardware stall after ~650 frames). So after each block
+ * wait for its frame to start (bounded, in case a block starts none). */
+u32 s_framesAtDma;
+int64_t s_dmaAt;
+bool s_awaitFrame;
+const int64_t kFrameStartTimeout = kTicksPerSec / 125;  // 8 ms
+
+void issue_block()
+{
+	s_framesAtDma = port_audio_dsp_frames_started();
+	s_dmaAt       = sms_wiiu_audio_system_time();
+	s_awaitFrame  = true;
+	dma_block();
+}
+
+bool frame_busy()
+{
+	if (port_audio_dsp_frame_pending())
+		return true;
+	// JAudio's audio thread still has messages to take: another DMA callback
+	// now could fill its 16-slot queue, and a full queue drops the DSP reply
+	// that drives the next subframe (non-blocking send), stalling audio.
+	if (sms_wiiu_audio_mq_used() > 0)
+		return true;
+	if (s_awaitFrame) {
+		if (port_audio_dsp_frames_started() == s_framesAtDma &&
+		    sms_wiiu_audio_system_time() - s_dmaAt < kFrameStartTimeout)
+			return true;
+		s_awaitFrame = false;
+	}
+	return false;
 }
 
 void* pacer(void*)
@@ -213,7 +254,7 @@ void* pacer(void*)
 		// hardware the DSP finishes a frame within a block period, and
 		// starting blocks faster than JAudio makes frames repeats DSPBuf's
 		// stale samples. The audio thread outranks this one, so this is rare.
-		if (port_audio_dsp_frame_pending()) {
+		if (frame_busy()) {
 			g.pendingWaits++;
 			continue;
 		}
@@ -232,8 +273,8 @@ void* pacer(void*)
 		if (!g.dev || g.stalled) {
 			if (!g.nextDue || now - g.nextDue > kBlockTicks * 4)
 				g.nextDue = now; // a stalled game does not get a burst later
-			while (now >= g.nextDue && !port_audio_dsp_frame_pending()) {
-				dma_block();
+			while (now >= g.nextDue && !frame_busy()) {
+				issue_block();
 				g.nextDue += kBlockTicks;
 			}
 			g.queuedAfter = g.dev ? sms_wiiu_sdl_audio_queued() : 0;
@@ -266,8 +307,8 @@ void* pacer(void*)
 		// thread and mixes before the next block is started.
 		int n = 0;
 		while (queued < (u32)target_blocks() * kBlockBytes && n < kBaseBlocks + kMaxExtra &&
-		       !port_audio_dsp_frame_pending() && g.running) {
-			dma_block();
+		       !frame_busy() && g.running) {
+			issue_block();
 			n++;
 			queued = sms_wiiu_sdl_audio_queued();
 		}
