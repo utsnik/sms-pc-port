@@ -564,7 +564,26 @@ static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
-static constexpr uint32_t kGx2DlReserveBytes = 64u << 10;
+static constexpr uint32_t kGx2DlReserveBytes = 512u << 10;
+// One list stays open across consecutive draws (at most kGx2DlMaxDraws, so
+// ~10 KiB a draw fits the reservation) and is closed and called in place
+// before anything that may not sit inside a list or must see the GPU caught
+// up: copies, clears, context/render-target changes, waits, flushes.  Every
+// such call in this file goes through the macros below.
+static constexpr uint32_t kGx2DlMaxDraws = 48;
+enum { kDlSplitCopy, kDlSplitClear, kDlSplitContext, kDlSplitFrame };
+static void gx2DlSplit(int reason);
+#define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurface(__VA_ARGS__))
+#define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurfaceEx(__VA_ARGS__))
+#define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopyColorBufferToScanBuffer(__VA_ARGS__))
+#define GX2ClearColor(...) (gx2DlSplit(kDlSplitClear), ::GX2ClearColor(__VA_ARGS__))
+#define GX2ClearDepthStencilEx(...) (gx2DlSplit(kDlSplitClear), ::GX2ClearDepthStencilEx(__VA_ARGS__))
+#define GX2SetContextState(...) (gx2DlSplit(kDlSplitContext), ::GX2SetContextState(__VA_ARGS__))
+#define GX2SetColorBuffer(...) (gx2DlSplit(kDlSplitContext), ::GX2SetColorBuffer(__VA_ARGS__))
+#define GX2SetDepthBuffer(...) (gx2DlSplit(kDlSplitContext), ::GX2SetDepthBuffer(__VA_ARGS__))
+#define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__))
+#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__))
+#define GX2GetLastSubmittedTimeStamp(...) (gx2DlSplit(kDlSplitFrame), ::GX2GetLastSubmittedTimeStamp(__VA_ARGS__))
 static uint8_t* s_gx2DlArena[kVertexArenas];
 static uint32_t s_gx2DlUsed[kVertexArenas];
 
@@ -4481,6 +4500,41 @@ static bool gx2DlEndCall(void* list) {
     GX2DirectCallDisplayList(list, bytes);
     return true;
 }
+
+static void* s_gx2DlOpen;
+static uint32_t s_gx2DlOpenDraws;
+
+static void gx2DlClose() {
+    if (!s_gx2DlOpen) return;
+    void* list = s_gx2DlOpen;
+    s_gx2DlOpen = nullptr;
+    if (!gx2DlEndCall(list))
+        WHBLogPrintf("SMS Wii U: [gx2dl] merged list (%u draws) failed validation; its draws are lost",
+                     (unsigned)s_gx2DlOpenDraws);
+}
+
+static void gx2DlSplit(int reason) {
+    if (!s_gx2DlOpen) return;
+    switch (reason) {
+    case kDlSplitCopy: ++s_perfDlSplitsCopy; break;
+    case kDlSplitClear: ++s_perfDlSplitsClear; break;
+    case kDlSplitContext: ++s_perfDlSplitsContext; break;
+    default: ++s_perfDlSplitsFrame; break;
+    }
+    gx2DlClose();
+}
+
+// Returns the open list, opening one when none is (or the open one is full).
+static bool gx2DlOpenForDraw() {
+    if (s_gx2DlOpen && s_gx2DlOpenDraws >= kGx2DlMaxDraws) gx2DlClose();
+    if (!s_gx2DlOpen) {
+        void* list = nullptr;
+        if (!gx2DlBegin(&list)) return false;
+        s_gx2DlOpen = list;
+        s_gx2DlOpenDraws = 0;
+    }
+    return true;
+}
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
 // perfdiag only: flushBatch's stages (key = TEV key, textures and pixel shader
@@ -4589,8 +4643,7 @@ void flushBatch() {
         s_dlPending = {};
         const uint32_t* storedIdx = reinterpret_cast<const uint32_t*>(s_dlArena + pend.ref->iOff);
         if (gpuPath && vertex->stride == kRawVertexStride) {
-            void* gx2List = nullptr;
-            bool listReady = s_gx2DlEnabled && gx2DlBegin(&gx2List);
+            bool listReady = s_gx2DlEnabled && gx2DlOpenForDraw();
             if (s_gx2DlEnabled && !listReady) {
                 if (!s_gx2DlFallback) {
                     WHBLogPrintf("SMS Wii U: [gx2dl] unable to record draw segment; fallback disabled");
@@ -4610,19 +4663,7 @@ void flushBatch() {
                                    s_dlArena + pend.ref->baseVertex);
                 GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
-                if (!gx2DlEndCall(gx2List)) {
-                    if (!s_gx2DlFallback) {
-                        WHBLogPrintf("SMS Wii U: [gx2dl] list validation failed; fallback disabled");
-                        s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
-                        return;
-                    }
-                    ++s_perfDlFallbacks;
-                    prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
-                    GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
-                                       s_dlArena + pend.ref->baseVertex);
-                    GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
-                                     const_cast<uint32_t*>(storedIdx), 0, 1);
-                }
+                ++s_gx2DlOpenDraws;
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
@@ -4774,8 +4815,7 @@ void flushBatch() {
     // the whole arena when the frame began (a GPU invalidate per draw stalls
     // the pipeline).
     DCFlushRange(block, blockBytes);
-    void* gx2List = nullptr;
-    bool listReady = s_gx2DlEnabled && gpuPath && gx2DlBegin(&gx2List);
+    bool listReady = s_gx2DlEnabled && gpuPath && gx2DlOpenForDraw();
     if (s_gx2DlEnabled && gpuPath && !listReady) {
         if (!s_gx2DlFallback) {
             WHBLogPrintf("SMS Wii U: [gx2dl] unable to record materialized draw; fallback disabled");
@@ -4804,17 +4844,7 @@ void flushBatch() {
     }
     if (listReady) {
         GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
-        if (!gx2DlEndCall(gx2List)) {
-            if (!s_gx2DlFallback) {
-                WHBLogPrintf("SMS Wii U: [gx2dl] materialized list validation failed; fallback disabled");
-                s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
-                return;
-            }
-            ++s_perfDlFallbacks;
-            prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
-            GX2SetAttribBuffer(0, vboBytes, vertex->stride, vbo);
-            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
-        }
+        ++s_gx2DlOpenDraws;
     } else {
         GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
     }
