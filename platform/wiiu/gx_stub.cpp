@@ -4,6 +4,7 @@
 #include "include/dolphin/gx/GXVert.h"
 #include "../gx/include/sms_gx/gx_pc.h"
 #include "runtime.h"
+#include "gx2_texture_pack.h"
 
 #include <dolphin/gx/GXCpu2Efb.h>
 #include <dolphin/gx/GXFrameBuffer.h>
@@ -489,6 +490,7 @@ extern "C" void sms_wiiu_exit(void)
 	/* Step logs: an exit to the Menu froze once (2026-10-19 21:49) with no
 	 * "exiting" line, so a repeat must show which step never returned. */
 	WHBLogPrintf("SMS Wii U: exit: audio shutdown");
+	gx::texturePackShutdown();
 	sms_wiiu_audio_shutdown();
 	sms_wiiu_vsync_pace_stop();
 	if (s_gfx_initialized) {

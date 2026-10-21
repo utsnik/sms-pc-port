@@ -12,6 +12,7 @@
 #include <proc_ui/procui.h>
 #include <cstdlib>
 #include <whb/log.h>
+#include "gx2_texture_pack.h"
 
 #include <cstdarg>
 #include <cstdint>
@@ -229,6 +230,7 @@ extern "C" void sms_wiiu_crash_return_to_menu(void)
 	sms_wiiu_crash_stage = 2;
 	OSSetThreadPriority(cafe_OSGetCurrentThread(), 1);
 	WHBLogPrint("[crash] returning to the Wii U Menu");
+	gx::texturePackShutdown();
 	sms_wiiu_audio_shutdown();
 	sms_wiiu_crash_stage = 3;
 	SYSLaunchMenu();
