@@ -282,7 +282,15 @@ bool shots_wanted(uint32_t p)
 		return p >= uint32_t(s_from) && (p - uint32_t(s_from)) % 400 < 3 && s_shots_written < 6;
 	if (s_from > 0)
 		return p >= uint32_t(s_from) && (p - uint32_t(s_from)) % 400 == 0 && s_shots_written < 4;
-	return p == 120 || p == 600 || p == 1800 || (p >= 3600 && p % 3600 == 0);
+	/* The default schedule only with SMS_SHOTS=1: the shots/ folder alone
+	 * (left on the card by an earlier batch) stalled timing runs ~0.5 s per
+	 * shot. */
+	static int s_default = -1;
+	if (s_default < 0) {
+		const char* v = std::getenv("SMS_SHOTS");
+		s_default = v && *v == '1';
+	}
+	return s_default && (p == 120 || p == 600 || p == 1800 || (p >= 3600 && p % 3600 == 0));
 }
 
 void put32(uint8_t* d, uint32_t v) { d[0] = v; d[1] = v >> 8; d[2] = v >> 16; d[3] = v >> 24; }
