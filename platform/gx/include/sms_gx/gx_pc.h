@@ -140,6 +140,7 @@ void GXPC_Write8(uint8_t v);
 void GXPC_Write16(uint16_t v);
 void GXPC_Write32(uint32_t v);
 void GXPC_WriteF32(float v);
+void GXPC_WriteBytes(const uint8_t* bytes, uint32_t n);
 
 /* The same, inline: while the bytes cannot complete a command
  * (GXPC_PipeLen + n <= GXPC_PipeFast; 0 while the pipe is redirected) they
@@ -174,9 +175,95 @@ static inline void GXPC_Put32(uint32_t v) {
     }
 }
 static inline void GXPC_PutF32(float v) {
-    union { float f; uint32_t u; } b;
-    b.f = v;
-    GXPC_Put32(b.u);
+    uint32_t u;
+    __builtin_memcpy(&u, &v, sizeof(u));
+    GXPC_Put32(u);
+}
+static inline void GXPC_PutBytes(const uint8_t* bytes, uint32_t n) {
+    if (GXPC_PipeLen + n <= GXPC_PipeFast) {
+        __builtin_memcpy(GXPC_PipeBuf + GXPC_PipeLen, bytes, n);
+        GXPC_PipeLen += n;
+    } else {
+        GXPC_WriteBytes(bytes, n);
+    }
+}
+static inline void GXPC_EncodeF32(uint8_t* p, float v) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    __builtin_memcpy(p, &v, 4);
+#else
+    uint32_t u;
+    __builtin_memcpy(&u, &v, 4);
+    p[0] = (uint8_t)(u >> 24);
+    p[1] = (uint8_t)(u >> 16);
+    p[2] = (uint8_t)(u >> 8);
+    p[3] = (uint8_t)u;
+#endif
+}
+static inline void GXPC_Put2U8(uint8_t x, uint8_t y) {
+    const uint8_t b[2] = {x, y};
+    GXPC_PutBytes(b, 2);
+}
+static inline void GXPC_Put3U8(uint8_t x, uint8_t y, uint8_t z) {
+    const uint8_t b[3] = {x, y, z};
+    GXPC_PutBytes(b, 3);
+}
+static inline void GXPC_Put4U8(uint8_t x, uint8_t y, uint8_t z, uint8_t w) {
+    const uint8_t b[4] = {x, y, z, w};
+    GXPC_PutBytes(b, 4);
+}
+static inline void GXPC_Put2U16(uint16_t x, uint16_t y) {
+    const uint8_t b[4] = {(uint8_t)(x >> 8), (uint8_t)x, (uint8_t)(y >> 8), (uint8_t)y};
+    GXPC_PutBytes(b, 4);
+}
+static inline void GXPC_Put3U16(uint16_t x, uint16_t y, uint16_t z) {
+    const uint8_t b[6] = {(uint8_t)(x >> 8), (uint8_t)x, (uint8_t)(y >> 8), (uint8_t)y,
+                          (uint8_t)(z >> 8), (uint8_t)z};
+    GXPC_PutBytes(b, 6);
+}
+static inline void GXPC_Put2F32(float x, float y) {
+    if (GXPC_PipeLen + 8 <= GXPC_PipeFast) {
+        uint8_t* p = GXPC_PipeBuf + GXPC_PipeLen;
+        GXPC_EncodeF32(p, x);
+        GXPC_EncodeF32(p + 4, y);
+        GXPC_PipeLen += 8;
+    } else {
+        uint8_t b[8];
+        GXPC_EncodeF32(b, x);
+        GXPC_EncodeF32(b + 4, y);
+        GXPC_WriteBytes(b, 8);
+    }
+}
+static inline void GXPC_Put3F32(float x, float y, float z) {
+    if (GXPC_PipeLen + 12 <= GXPC_PipeFast) {
+        uint8_t* p = GXPC_PipeBuf + GXPC_PipeLen;
+        GXPC_EncodeF32(p, x);
+        GXPC_EncodeF32(p + 4, y);
+        GXPC_EncodeF32(p + 8, z);
+        GXPC_PipeLen += 12;
+    } else {
+        uint8_t b[12];
+        GXPC_EncodeF32(b, x);
+        GXPC_EncodeF32(b + 4, y);
+        GXPC_EncodeF32(b + 8, z);
+        GXPC_WriteBytes(b, 12);
+    }
+}
+static inline void GXPC_Put4F32(float x, float y, float z, float w) {
+    if (GXPC_PipeLen + 16 <= GXPC_PipeFast) {
+        uint8_t* p = GXPC_PipeBuf + GXPC_PipeLen;
+        GXPC_EncodeF32(p, x);
+        GXPC_EncodeF32(p + 4, y);
+        GXPC_EncodeF32(p + 8, z);
+        GXPC_EncodeF32(p + 12, w);
+        GXPC_PipeLen += 16;
+    } else {
+        uint8_t b[16];
+        GXPC_EncodeF32(b, x);
+        GXPC_EncodeF32(b + 4, y);
+        GXPC_EncodeF32(b + 8, z);
+        GXPC_EncodeF32(b + 12, w);
+        GXPC_WriteBytes(b, 16);
+    }
 }
 
 /* Presentation.  GXCopyDisp(dest, ...) records the EFB region as the XFB at
