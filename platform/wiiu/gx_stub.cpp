@@ -49,6 +49,7 @@ extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
+extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
 
 void log_active_once()
@@ -492,6 +493,7 @@ extern "C" void sms_wiiu_exit(void)
 			sms_wiiu_gx2_renderer_end();
 			s_frame_open = false;
 		}
+		sms_wiiu_gx2_renderer_shutdown();
 		s_gfx_initialized = false;
 		WHBLogPrintf("SMS Wii U: exit: WHBGfxShutdown");
 		WHBGfxShutdown();

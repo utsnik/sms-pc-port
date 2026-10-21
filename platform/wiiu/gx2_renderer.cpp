@@ -39,6 +39,7 @@
 #include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
+#include "gx2_texture_pack.h"
 
 #include <gx2/draw.h>
 #include <gx2/swap.h>
@@ -3964,6 +3965,7 @@ static void vertexSelfCheckDraw(const VertexKey& key, const TevKey& tevKey, bool
 void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
+    texturePackInit();
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
@@ -4773,6 +4775,10 @@ uint32_t g_traceLastVat = 0;
 extern "C" int sms_wiiu_gx2_renderer_init(void) {
     rendererInit(1.0f);
     return s_ready ? 1 : 0;
+}
+
+extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
+    texturePackShutdown();
 }
 /* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
  * presenting thread, between frames, so one run shows the same game state
