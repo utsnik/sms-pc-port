@@ -1530,12 +1530,13 @@ static bool initVertexProgram(VertexProgram& shader) {
     std::vector<uint64_t> alu;
     alu.reserve(512);
     const VertexKey& key = shader.key;
-    // Cemu uploads only the uniform registers a program names statically,
-    // so matrices reached through AR read stale values there.  Name every XF
-    // vector once under Cemu; hardware reads the register file directly.
-    if (runningUnderCemu())
-        for (uint32_t r = 0; r < kXfUniformRegs; ++r)
-            vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
+    // Only the uniform registers a program names statically are valid for
+    // it, so matrices reached through AR read stale values otherwise.  Name
+    // every XF vector once.  Hardware needs this too, not only Cemu: without
+    // it the title logo was a black M and the file-select sky had black
+    // wedges on the console (sms-vb-xf vs default, 2026-10-21).
+    for (uint32_t r = 0; r < kXfUniformRegs; ++r)
+        vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
 
     // Position: raw position -> the per-vertex model matrix selected through
     // MOVA/AR-indexed constant reads -> live projection and target mapping.
