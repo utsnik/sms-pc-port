@@ -8,6 +8,7 @@
 #include <sndcore2/core.h>
 #include <sndcore2/voice.h>
 #include <sndcore2/drcvs.h>
+#include <sndcore2/device.h>
 
 #include <cstdint>
 #include <cstring>
@@ -152,6 +153,11 @@ static int open_ax(int rate)
 		AXGetDRCVSMode(&vs);
 		if (sms_wiiu_sd_marker("axvsoff"))
 			AXSetDRCVSMode(0);
+		if (sms_wiiu_sd_marker("axnocomp")) {
+			AXSetDeviceCompressor(AX_DEVICE_TYPE_TV, 0);
+			AXSetDeviceCompressor(AX_DEVICE_TYPE_DRC, 0);
+			port_log("[audio] SD marker axnocomp: TV and DRC compressors off\n");
+		}
 		port_log("[audio] AX experiment: tvonly=%d idle=%d 32k=%d pipe4=%d drcvs=%u%s\n", (int)s_axTvOnly,
 		         (int)s_axIdle, (int)ax32k, (int)pipe4, (unsigned)vs, sms_wiiu_sd_marker("axvsoff") ? "->0" : "");
 	}
@@ -237,10 +243,37 @@ static int open_thread(int, const char** argv)
 	return 0;
 }
 
+/* SD marker axcore2: AXInit (and AXQuit) from a core-2 thread, so the
+ * {SYS AX IST} it creates may run on core 2 instead of the game's core 1. */
+static bool s_axOnCore2;
+static int open_ax_thread(int, const char** argv)
+{
+	OpenJob* job = reinterpret_cast<OpenJob*>(argv);
+	job->result = open_ax(job->rate);
+	return 0;
+}
+static int close_ax_thread(int, const char**);
+
 extern "C" int sms_wiiu_sdl_audio_open(int rate)
 {
-	if (!sms_wiiu_sd_marker("sdlaudio"))
+	if (!sms_wiiu_sd_marker("sdlaudio")) {
+		if (sms_wiiu_sd_marker("axcore2")) {
+			static OSThread thread __attribute__((aligned(16)));
+			static uint8_t stack[0x8000] __attribute__((aligned(16)));
+			OpenJob job = {rate, 0};
+			if (cafe_OSCreateThread(&thread, open_ax_thread, 0, reinterpret_cast<char*>(&job), stack + sizeof stack,
+			                        sizeof stack, 16, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
+				cafe_OSResumeThread(&thread);
+				int ret = 0;
+				cafe_OSJoinThread(&thread, &ret);
+				s_axOnCore2 = job.result != 0;
+				port_log("[audio] SD marker axcore2: AX initialised on core 2 (%s)\n", job.result ? "ok" : "failed");
+				return job.result;
+			}
+			port_log("[audio] axcore2: core-2 thread failed; initialising AX here\n");
+		}
 		return open_ax(rate);
+	}
 
 	port_log("[audio] SD marker sdlaudio: selecting SDL output\n");
 	if (sms_wiiu_sd_marker("axcore1")) {
@@ -380,7 +413,17 @@ static int close_thread(int, const char**)
 extern "C" void sms_wiiu_sdl_audio_close(void)
 {
 	if (s_output == OUTPUT_AX) {
-		close_ax();
+		static OSThread thread __attribute__((aligned(16)));
+		static uint8_t stack[0x8000] __attribute__((aligned(16)));
+		if (s_axOnCore2 && cafe_OSCreateThread(&thread, close_ax_thread, 0, nullptr, stack + sizeof stack, sizeof stack,
+		                                       16, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
+			cafe_OSResumeThread(&thread);
+			int ret = 0;
+			cafe_OSJoinThread(&thread, &ret);
+		} else {
+			close_ax();
+		}
+		s_axOnCore2 = false;
 		s_output = OUTPUT_NONE;
 		return;
 	}
@@ -400,6 +443,12 @@ extern "C" void sms_wiiu_sdl_audio_close(void)
 	}
 	s_openedOnCore2 = false;
 	s_output = OUTPUT_NONE;
+}
+
+static int close_ax_thread(int, const char**)
+{
+	close_ax();
+	return 0;
 }
 
 } // namespace
