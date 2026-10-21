@@ -55,6 +55,7 @@ BOOL wut_OSJoinThread(WutThread*, int*) __asm__("OSJoinThread");
 void wut_OSInitMessageQueue(WutMessageQueue*, void*, int32_t) __asm__("OSInitMessageQueue");
 BOOL wut_OSSendMessage(WutMessageQueue*, void*, int32_t) __asm__("OSSendMessage");
 BOOL wut_OSReceiveMessage(WutMessageQueue*, void**, int32_t) __asm__("OSReceiveMessage");
+void wut_OSYieldThread(void) __asm__("OSYieldThread");
 }
 static const uint8_t kWorkerAffinityCpu2 = 1u << 2;
 static const int32_t kMessageBlock = 1;
@@ -64,6 +65,9 @@ static void* s_workerSlots[kTexturePackMaxQueue] __attribute__((aligned(32)));
 static uint8_t s_workerStack[0x10000] __attribute__((aligned(32)));
 static bool s_workerStarted;
 static volatile bool s_workerStop;
+static uint8_t s_staging[kTexturePackMaxChunk] __attribute__((aligned(64)));
+static TexturePackUploadChunk s_chunk;
+static volatile bool s_chunkReady;
 
 static uint16_t get16(const uint8_t* p) { return uint16_t(uint16_t(p[0]) << 8 | p[1]); }
 static uint32_t get32(const uint8_t* p) {
@@ -137,6 +141,13 @@ static void publishResult(const TexturePackResult& result) {
     s_resultWrite = write + 1;
 }
 
+static void publishChunk(const TexturePackUploadChunk& chunk) {
+    s_chunk = chunk;
+    __sync_synchronize();
+    s_chunkReady = true;
+    while (s_chunkReady && !s_workerStop) wut_OSYieldThread();
+}
+
 static void matchRequest(const TexturePackRequest& request) {
     TexturePackResult result = {};
     result.request = request;
@@ -147,7 +158,6 @@ static void matchRequest(const TexturePackRequest& request) {
         publishResult(result);
         return;
     }
-    const OSTime start = OSGetTime();
     result.key.dataHash = xxh64(request.source, bytes, 0);
     if (request.format >= 8 && request.format <= 10 && request.tlut) {
         uint32_t lo = 0, hi = 0;
@@ -174,8 +184,23 @@ static void matchRequest(const TexturePackRequest& request) {
     }
     result.entry = entry;
     result.found = entry != nullptr;
-    (void)start;
     publishResult(result);
+    if (!entry) return;
+    for (uint32_t level = 0; level != entry->mipCount; ++level) {
+        const TexturePackLevel& source = entry->levels[level];
+        for (uint32_t offset = 0; offset < source.rgbaSize; ) {
+            const uint32_t bytesToRead = std::min<uint32_t>(kTexturePackMaxChunk, source.rgbaSize - offset);
+            TexturePackUploadChunk chunk = {};
+            chunk.requestId = request.requestId; chunk.level = level; chunk.offset = offset;
+            chunk.bytes = bytesToRead; chunk.data = s_staging; chunk.entry = entry;
+            chunk.last = offset + bytesToRead == source.rgbaSize;
+            chunk.ok = readAt(source.rgbaOffset + offset, s_staging, bytesToRead);
+            if (chunk.ok) s_state.readBytes += bytesToRead;
+            publishChunk(chunk);
+            if (!chunk.ok) return;
+            offset += bytesToRead;
+        }
+    }
 }
 
 static int texturePackWorker(int, const char**) {
@@ -274,6 +299,7 @@ bool texturePackInit() {
     }
     s_state.enabled = true;
     s_workerStop = false;
+    s_chunkReady = false;
     s_resultRead = s_resultWrite = 0;
     s_requests.clear();
     wut_OSInitMessageQueue(&s_workerWake, s_workerSlots, kTexturePackMaxQueue);
@@ -301,6 +327,7 @@ void texturePackShutdown() {
     if (s_state.file) std::fclose(s_state.file);
     s_state.file = nullptr; freeIndex(); s_state = State();
     s_requests.clear(); s_resultRead = s_resultWrite = 0;
+    s_chunkReady = false;
 }
 bool texturePackEnabled() { return s_state.enabled; }
 uint32_t texturePackMaxDimension() { return s_state.maxDimension; }
@@ -323,6 +350,18 @@ bool texturePackPopResult(TexturePackResult* result) {
     *result = s_results[read % kTexturePackMaxQueue];
     s_resultRead = read + 1;
     return true;
+}
+
+bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk) {
+    if (!chunk || !s_chunkReady) return false;
+    __sync_synchronize();
+    *chunk = s_chunk;
+    return true;
+}
+
+void texturePackReleaseUploadChunk() {
+    __sync_synchronize();
+    s_chunkReady = false;
 }
 
 void texturePackNoteFrame(uint32_t) {}

@@ -50,6 +50,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
+extern "C" void sms_wiiu_gx2_texture_pack_pump(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
 
 void log_active_once()
@@ -648,6 +649,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		s_presentFinish = s_presentBegin = 0;
 		s_presentFrames = 0;
 	}
+	sms_wiiu_gx2_texture_pack_pump();
 	sms_wiiu_gx2_target_begin();
 	sms_wiiu_gx2_renderer_begin();
 	s_frame_open = true;

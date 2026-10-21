@@ -350,9 +350,23 @@ struct TextureEntry {
     bool valid = false;
     uint32_t packRequestId = 0;
     uint8_t packState = 0; // 0: disabled, 1: pending, 2: negative, 3: resident
+    const TexturePackEntry* packEntry = nullptr;
+    GX2Texture packLinear;
+    GX2Texture packTiled;
+    GX2Texture packFallback;
+    uint32_t packLevelBytes[16] = {};
+    uint32_t packLevelDone;
+    uint64_t packStagingBytes;
+    uint64_t packResidentBytes;
     uint32_t next = UINT32_MAX;  // older entry with the same source (textureIndex chain)
 };
 static uint32_t s_nextPackRequestId;
+static TexturePackLru s_packLru;
+static uint64_t s_packResidentBudget;
+static uint32_t s_packFrame;
+static uint32_t s_packStagingPeak;
+static uint32_t s_packCompleted;
+static uint32_t s_packEvictions;
 // A deque, not a vector: getTexture hands out pointers, and a draw binds up to
 // eight maps; a vector growing on the second map's miss moved the first map's
 // entry under its pointer.
@@ -3083,6 +3097,17 @@ static const float kArbitraryMipThreshold = 14.0f;
 // inside a frame (flushBatch), before applyState/setTevShader re-apply state.
 static void rebindTvTarget();
 static bool s_retileTextures = true;
+static bool retileTextureLevel(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
+    if (level >= tiled.surface.mipLevels) return false;
+    GX2CopySurface(&linear.surface, level, 0, &tiled.surface, level, 0); invalidateVertexUniforms();
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tiled.surface.image, tiled.surface.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tiled.surface.image, tiled.surface.imageSize);
+    if (tiled.surface.mipmaps) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tiled.surface.mipmaps, tiled.surface.mipmapSize);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tiled.surface.mipmaps, tiled.surface.mipmapSize);
+    }
+    return true;
+}
 static void retileTexture(GX2Texture& texture) {
     if (!s_retileTextures || runningUnderCemu()) return;
     GX2Surface& linear = texture.surface;
@@ -3104,7 +3129,7 @@ static void retileTexture(GX2Texture& texture) {
     if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
     GX2InitTextureRegs(&tiled);
     for (uint32_t level = 0; level < t.mipLevels; ++level)
-        GX2CopySurface(&linear, level, 0, &t, level, 0); invalidateVertexUniforms();
+        retileTextureLevel(texture, tiled, level);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, t.image, t.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, t.image, t.imageSize);
     if (t.mipmaps) {
@@ -3141,6 +3166,7 @@ static TextureEntry* getTexture(int map) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.fmt == fmt && e.width == w && e.height == h &&
             e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
+            if (e.packState == 3) s_packLru.touch(e.packRequestId, g_displayFrames);
             // The sampler state belongs to the texmap, not the image: the same
             // texture may be bound with other wrap or filter modes.
             initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips);
@@ -3267,6 +3293,141 @@ static TextureEntry* getTexture(int map) {
         e.packState = texturePackEnqueue(request) ? 1 : 2;
     }
     return &e;
+}
+
+static TextureEntry* packTextureForRequest(uint32_t requestId) {
+    for (TextureEntry& e : s_textures)
+        if (e.packRequestId == requestId) return &e;
+    return nullptr;
+}
+
+static void packFreeLoading(TextureEntry& e) {
+    if (e.packLinear.surface.image) MEMFreeToDefaultHeap(e.packLinear.surface.image);
+    if (e.packLinear.surface.mipmaps) MEMFreeToDefaultHeap(e.packLinear.surface.mipmaps);
+    if (e.packTiled.surface.image) MEMFreeToDefaultHeap(e.packTiled.surface.image);
+    if (e.packTiled.surface.mipmaps) MEMFreeToDefaultHeap(e.packTiled.surface.mipmaps);
+    std::memset(&e.packLinear, 0, sizeof e.packLinear);
+    std::memset(&e.packTiled, 0, sizeof e.packTiled);
+    e.packEntry = nullptr; e.packLevelDone = 0; e.packStagingBytes = 0;
+}
+
+static void packEvict(TextureEntry& e) {
+    if (!e.packState || !e.packResidentBytes) return;
+    deferFree(e.texture.surface.image);
+    deferFree(e.texture.surface.mipmaps);
+    e.texture = e.packFallback;
+    std::memset(&e.packFallback, 0, sizeof e.packFallback);
+    e.packState = 2;
+    e.packResidentBytes = 0;
+    ++s_packEvictions;
+}
+
+static bool packStart(TextureEntry& e, const TexturePackEntry* entry) {
+    if (!entry || entry->mipCount > 16) return false;
+    std::memset(&e.packLinear, 0, sizeof e.packLinear);
+    e.packLinear.surface.use = GX2_SURFACE_USE_TEXTURE;
+    e.packLinear.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    e.packLinear.surface.width = entry->width; e.packLinear.surface.height = entry->height;
+    e.packLinear.surface.depth = 1; e.packLinear.surface.mipLevels = entry->mipCount;
+    e.packLinear.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    e.packLinear.surface.aa = GX2_AA_MODE1X;
+    e.packLinear.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&e.packLinear.surface);
+    const uint64_t staging = uint64_t(e.packLinear.surface.imageSize) + e.packLinear.surface.mipmapSize;
+    if (!staging || staging > (16u << 20)) return false;
+    e.packLinear.surface.image = alignedZero(e.packLinear.surface.alignment, e.packLinear.surface.imageSize);
+    if (!e.packLinear.surface.image) return false;
+    if (e.packLinear.surface.mipLevels > 1) {
+        e.packLinear.surface.mipmaps = alignedZero(e.packLinear.surface.alignment, e.packLinear.surface.mipmapSize);
+        if (!e.packLinear.surface.mipmaps) { MEMFreeToDefaultHeap(e.packLinear.surface.image); e.packLinear.surface.image = nullptr; return false; }
+    }
+    e.packLinear.viewNumMips = e.packLinear.surface.mipLevels; e.packLinear.viewNumSlices = 1;
+    e.packLinear.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    std::memset(&e.packTiled, 0, sizeof e.packTiled);
+    e.packTiled = e.packLinear;
+    e.packTiled.surface.tileMode = GX2_TILE_MODE_DEFAULT;
+    e.packTiled.surface.swizzle = 0; e.packTiled.surface.image = nullptr; e.packTiled.surface.mipmaps = nullptr;
+    GX2CalcSurfaceSizeAndAlignment(&e.packTiled.surface);
+    e.packTiled.surface.image = alignedZero(e.packTiled.surface.alignment, e.packTiled.surface.imageSize);
+    if (!e.packTiled.surface.image) { packFreeLoading(e); return false; }
+    if (e.packTiled.surface.mipLevels > 1) {
+        e.packTiled.surface.mipmaps = alignedZero(e.packTiled.surface.alignment, e.packTiled.surface.mipmapSize);
+        if (!e.packTiled.surface.mipmaps) { packFreeLoading(e); return false; }
+    }
+    GX2InitTextureRegs(&e.packTiled);
+    std::memset(e.packLevelBytes, 0, sizeof e.packLevelBytes);
+    e.packLevelDone = 0; e.packEntry = entry; e.packStagingBytes = staging;
+    s_packStagingPeak = std::max<uint32_t>(s_packStagingPeak, uint32_t(staging));
+    return true;
+}
+
+static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) {
+    if (!e.packEntry || e.packEntry != chunk.entry || chunk.level >= e.packEntry->mipCount ||
+        !chunk.data || chunk.offset + chunk.bytes > e.packEntry->levels[chunk.level].rgbaSize) return false;
+    const TexturePackLevel& level = e.packEntry->levels[chunk.level];
+    const uint32_t rowBytes = level.width * 4;
+    uint32_t offset = chunk.offset, copied = 0;
+    uint8_t* base = chunk.level == 0 ? static_cast<uint8_t*>(e.packLinear.surface.image) :
+        static_cast<uint8_t*>(e.packLinear.surface.mipmaps) + e.packLinear.surface.mipLevelOffset[chunk.level - 1];
+    const uint32_t pitch = chunk.level == 0 ? e.packLinear.surface.pitch : ((level.width + 63) & ~63u);
+    while (copied < chunk.bytes) {
+        const uint32_t row = offset / rowBytes, col = offset % rowBytes;
+        const uint32_t n = std::min(chunk.bytes - copied, rowBytes - col);
+        std::memcpy(base + size_t(row) * pitch * 4 + col, chunk.data + copied, n);
+        DCFlushRange(base + size_t(row) * pitch * 4 + col, n);
+        offset += n; copied += n;
+    }
+    e.packLevelBytes[chunk.level] += chunk.bytes;
+    if (chunk.last) {
+        if (e.packLevelBytes[chunk.level] != level.rgbaSize || !retileTextureLevel(e.packLinear, e.packTiled, chunk.level)) return false;
+        e.packLevelDone |= 1u << chunk.level;
+    }
+    return true;
+}
+
+static void packInstall(TextureEntry& e) {
+    uint64_t bytes = uint64_t(e.packTiled.surface.imageSize) + e.packTiled.surface.mipmapSize;
+    uint32_t evicted[kTexturePackMaxResidents];
+    const uint32_t n = s_packLru.evict(s_packFrame, bytes, evicted, kTexturePackMaxResidents);
+    for (uint32_t i = 0; i < n; ++i) if (TextureEntry* old = packTextureForRequest(evicted[i])) packEvict(*old);
+    if (!s_packLru.add(e.packRequestId, bytes, s_packFrame)) {
+        packFreeLoading(e); e.packState = 2; return;
+    }
+    e.packFallback = e.texture;
+    e.texture = e.packTiled; std::memset(&e.packTiled, 0, sizeof e.packTiled);
+    deferFree(e.packLinear.surface.image); deferFree(e.packLinear.surface.mipmaps);
+    std::memset(&e.packLinear, 0, sizeof e.packLinear);
+    e.packResidentBytes = bytes; e.packStagingBytes = 0; e.packState = 3;
+    ++s_packCompleted;
+}
+
+extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
+    if (!texturePackEnabled()) return;
+    ++s_packFrame;
+    TexturePackResult result;
+    for (unsigned i = 0; i != 8 && texturePackPopResult(&result); ++i) {
+        TextureEntry* e = packTextureForRequest(result.request.requestId);
+        if (!e) continue;
+        if (result.changed) {
+            if (result.retry <= 1) {
+                result.request.retry = result.retry; result.request.writeClock = writeClock();
+                e->packState = texturePackEnqueue(result.request) ? 1 : 2;
+            } else e->packState = 2;
+        } else if (!result.found) e->packState = 2;
+        else if (!packStart(*e, result.entry)) e->packState = 2;
+    }
+    TexturePackUploadBudget budget(512u << 10);
+    TexturePackUploadChunk chunk;
+    while (texturePackPopUploadChunk(&chunk)) {
+        if (!budget.consume(chunk.bytes)) break;
+        TextureEntry* e = packTextureForRequest(chunk.requestId);
+        if (!e || e->packState != 1 || !packCopyChunk(*e, chunk)) {
+            if (e) { packFreeLoading(*e); e->packState = 2; }
+            texturePackReleaseUploadChunk(); continue;
+        }
+        texturePackReleaseUploadChunk();
+        if (e->packEntry && e->packLevelDone == ((1u << e->packEntry->mipCount) - 1u)) packInstall(*e);
+    }
 }
 
 static void setShader(FixedShader& shader, TextureEntry* texture, VertexProgram* vertex = nullptr) {
@@ -3980,6 +4141,17 @@ void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
     texturePackInit();
+    if (texturePackEnabled()) {
+        uint64_t cap = 128u << 20;
+        const char* configured = std::getenv("SMS_GX2_TEXPACK_MB");
+        if (configured && *configured) cap = uint64_t(std::strtoul(configured, nullptr, 10)) << 20;
+        const uint64_t headroom = sms_wiiu_heap_free();
+        if (headroom < cap) cap = headroom;
+        s_packResidentBudget = cap;
+        s_packLru.reset(cap);
+        WHBLogPrintf("SMS Wii U: [texpack] MEM2 headroom=%llu resident-cap=%llu staging-cap=%u",
+                     (unsigned long long)headroom, (unsigned long long)cap, unsigned(16u << 20));
+    }
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
