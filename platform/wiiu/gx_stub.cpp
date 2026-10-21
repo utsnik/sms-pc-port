@@ -46,6 +46,7 @@ bool s_gfx_initialized;
 bool s_frame_open;
 
 extern "C" int sms_wiiu_gx2_renderer_init(void);
+extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
@@ -428,8 +429,8 @@ void present_diagnostics()
 	uint32_t swaps = 0, flips = 0;
 	OSTime lastFlip = 0, lastVsync = 0;
 	GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
-	port_log("[drc] present=%u swaps=%u flips=%u retrace=%u\n", unsigned(p), unsigned(swaps),
-	         unsigned(flips), unsigned(sms_wiiu_frame_count()));
+	port_log("[drc] present=%u swaps=%u flips=%u retrace=%u gx2dl=%d\n", unsigned(p), unsigned(swaps),
+	         unsigned(flips), unsigned(sms_wiiu_frame_count()), sms_wiiu_gx2_display_list_enabled());
 	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
 	/* WHBGfx's buffer descriptors live in our .bss: a stray write shows here. */
 	log_surface("tvColour", tv->surface);
@@ -465,6 +466,8 @@ extern "C" void sms_wiiu_gfx_init(void)
 	else if (!sms_wiiu_gx2_renderer_init())
 		WHBLogPrintf("SMS Wii U: GX2 renderer setup failed");
 	else {
+		WHBLogPrintf("SMS Wii U: [gx2dl] display-list path %s",
+		             sms_wiiu_gx2_display_list_enabled() ? "enabled" : "disabled");
 		drc_setup(true);
 		WHBGfxBeginRender();
 		sms_wiiu_gx2_target_begin();
