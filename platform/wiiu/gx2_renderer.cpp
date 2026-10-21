@@ -562,6 +562,7 @@ static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
+extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
 static constexpr uint32_t kGx2DlReserveBytes = 512u << 10;
@@ -4248,6 +4249,7 @@ void rendererInit(float) {
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");

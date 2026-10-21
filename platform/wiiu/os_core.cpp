@@ -343,3 +343,25 @@ void __wrap_DCStoreRange(void* p, uint32_t n) { __real_DCStoreRange(p, n); GXPC_
 void __wrap_DCFlushRangeNoSync(void* p, uint32_t n) { __real_DCFlushRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
 void __wrap_DCStoreRangeNoSync(void* p, uint32_t n) { __real_DCStoreRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
 }
+
+/* Large zero fills by dcbz (-Wl,--wrap=memset). newlib's memset stores words,
+ * and every store miss first reads the line from RAM; dcbz claims a zeroed
+ * line without the read. TMap::perform's per-frame collision-grid clear alone
+ * was ~1.5% of all samples in Delfino Plaza. Only cacheable heap memory is
+ * ever memset here. The SD marker "nodcbz" (read at renderer init) turns it
+ * off for A/B runs. */
+extern "C" {
+void* __real_memset(void*, int, size_t);
+int sms_wiiu_memset_dcbz = 1;
+__attribute__((optimize("no-tree-loop-distribute-patterns")))
+void* __wrap_memset(void* dst, int c, size_t n)
+{
+	if (c != 0 || n < 256 || !sms_wiiu_memset_dcbz) return __real_memset(dst, c, n);
+	uint8_t* p = static_cast<uint8_t*>(dst);
+	const size_t head = (0u - reinterpret_cast<uintptr_t>(p)) & 31u;
+	if (head) { __real_memset(p, 0, head); p += head; n -= head; }
+	for (size_t lines = n >> 5; lines; --lines, p += 32) __asm__ volatile("dcbz 0,%0" : : "r"(p) : "memory");
+	if (n & 31) __real_memset(p, 0, n & 31);
+	return dst;
+}
+}
