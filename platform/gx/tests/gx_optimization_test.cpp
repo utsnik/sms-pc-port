@@ -40,6 +40,39 @@ static void referencePureBP(gx::State& s, uint32_t reg, uint32_t data) {
 static int s_drawSyncCalls;
 static void countDrawSync(uint16_t) { ++s_drawSyncCalls; }
 
+static float referenceVertexComponent(uint8_t type, bool be, const uint8_t* p, float scale) {
+    if (type == 0) return float(p[0]) * scale;
+    if (type == 1) return float(int8_t(p[0])) * scale;
+    if (type == 2 || type == 3) {
+        uint16_t v = be ? uint16_t(uint32_t(p[0]) << 8 | p[1]) : uint16_t(uint32_t(p[1]) << 8 | p[0]);
+        return float(type == 3 ? int16_t(v) : v) * scale;
+    }
+    uint32_t v = be ? uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3]
+                    : uint32_t(p[3]) << 24 | uint32_t(p[2]) << 16 | uint32_t(p[1]) << 8 | p[0];
+    float f;
+    memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
+static void testVertexLoadReference() {
+    const uint8_t bytes[] = {0x00, 0x01, 0x7F, 0x80, 0xFF, 0x12, 0x34, 0x80,
+                             0x00, 0x00, 0x80, 0x3F, 0x3F, 0x80, 0x00, 0x01};
+    for (bool be : {false, true}) {
+        for (uint8_t type = 0; type < 5; type++) {
+            const uint8_t* p = bytes + (type == 4 ? 8 : type + 1);
+            float scale = type < 2 ? 0.5f : 1.0f / 32768.0f;
+            float got = gx::decodeVertexComponentForTest(type, be, p, scale);
+            float expected = referenceVertexComponent(type, be, p, scale);
+            uint32_t gotBits, expectedBits;
+            memcpy(&gotBits, &got, sizeof(gotBits));
+            memcpy(&expectedBits, &expected, sizeof(expectedBits));
+            assert(gotBits == expectedBits);
+        }
+        assert(gx::decodeVertexIndexForTest(2, bytes) == bytes[0]);
+        assert(gx::decodeVertexIndexForTest(3, bytes + 5) == (uint32_t(bytes[5]) << 8 | bytes[6]));
+    }
+}
+
 static void testBPFastPaths() {
     gx::resetState();
     gx::State expected = gx::g;
@@ -153,6 +186,7 @@ static uint64_t referenceHash(const void* data, size_t n, uint64_t seed) {
 
 int main() {
     testBPFastPaths();
+    testVertexLoadReference();
     std::vector<uint8_t> bytes(512 + 3);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i * 37 + 11);
     for (size_t offset = 0; offset < 4; ++offset) {
@@ -198,6 +232,6 @@ int main() {
     assert(memcmp(pipe, expectedPipe, sizeof(expectedPipe)) == 0);
     GXPC_PipeBuf = nullptr;
     GXPC_PipeLen = GXPC_PipeFast = 0;
-    std::puts("gx_optimization_test: BP, hashBytes, unpackVertex, and vertex-writer reference comparisons passed");
+    std::puts("gx_optimization_test: BP, vertex loads, hashBytes, unpackVertex, and vertex-writer reference comparisons passed");
     return 0;
 }
