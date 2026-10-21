@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "../gx/src/gx_texture_pack_common.h"
+
 namespace gx {
 
 static inline uint16_t be16(const uint8_t* p) { return uint16_t(p[0] << 8 | p[1]); }
@@ -42,13 +44,6 @@ static inline void ia8(uint16_t v, uint8_t* o) {
 static const uint8_t kTileW[16] = {8, 8, 8, 4, 4, 4, 4, 0, 8, 8, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileH[16] = {8, 4, 4, 4, 4, 4, 4, 0, 8, 4, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileBytes[16] = {32, 32, 32, 32, 32, 32, 64, 0, 32, 32, 32, 0, 0, 0, 32, 0};
-
-uint32_t gx2TexLevelBytes(uint32_t fmt, uint32_t w, uint32_t h) {
-    fmt &= 15;
-    if (!kTileW[fmt]) return 0;
-    return ((w + kTileW[fmt] - 1) / kTileW[fmt]) *
-           ((h + kTileH[fmt] - 1) / kTileH[fmt]) * kTileBytes[fmt];
-}
 
 static void palette(const uint8_t* tlut, uint32_t tlutFmt, uint32_t idx, uint8_t* o) {
     if (!tlut) {

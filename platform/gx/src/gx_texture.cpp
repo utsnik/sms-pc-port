@@ -2,6 +2,7 @@
 #include "gx_internal.h"
 #include "gl_funcs.h"
 #include "gx_glcache.h"
+#include "gx_texture_pack_common.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -43,14 +44,6 @@ static inline void ia8(uint16_t v, uint8_t* o) {
 static const uint8_t kTileW[16] = {8, 8, 8, 4, 4, 4, 4, 0, 8, 8, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileH[16] = {8, 4, 4, 4, 4, 4, 4, 0, 8, 4, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileBytes[16] = {32, 32, 32, 32, 32, 32, 64, 0, 32, 32, 32, 0, 0, 0, 32, 0};
-
-uint32_t texLevelBytes(uint32_t fmt, uint32_t w, uint32_t h) {
-    fmt &= 15;
-    if (!kTileW[fmt]) return 0;
-    uint32_t cols = (w + kTileW[fmt] - 1) / kTileW[fmt];
-    uint32_t rows = (h + kTileH[fmt] - 1) / kTileH[fmt];
-    return cols * rows * kTileBytes[fmt];
-}
 
 static void palette(const uint8_t* tlut, uint32_t tlutFmt, uint32_t idx, uint8_t* o) {
     uint16_t v = be16(tlut + 2 * idx);

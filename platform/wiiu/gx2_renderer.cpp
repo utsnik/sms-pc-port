@@ -36,6 +36,7 @@
  * one texture-modulate pass cover the title and most early menu geometry.
  */
 #include "../gx/src/gx_internal.h"
+#include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
 
@@ -74,7 +75,6 @@ namespace gx {
 
 static GX2ColorBuffer* renderColour();
 static GX2DepthBuffer* renderDepth();
-uint32_t gx2TexLevelBytes(uint32_t fmt, uint32_t w, uint32_t h);
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
 
@@ -2817,41 +2817,6 @@ static FILE* debugFile() {
     return f;
 }
 
-static uint64_t debugXxh64(const void* data, size_t len) {
-    static const uint64_t p1 = 0x9E3779B185EBCA87ull, p2 = 0xC2B2AE3D27D4EB4Full,
-                          p3 = 0x165667B19E3779F9ull, p4 = 0x85EBCA77C2B2AE63ull,
-                          p5 = 0x27D4EB2F165667C5ull;
-    const uint8_t* p = static_cast<const uint8_t*>(data);
-    const uint8_t* end = p + len;
-    auto rotl = [](uint64_t x, int r) { return (x << r) | (x >> (64 - r)); };
-    auto rd64 = [](const uint8_t* q) {
-        uint64_t v = 0;
-        for (int i = 7; i >= 0; --i) v = (v << 8) | q[i];
-        return v;
-    };
-    auto rd32 = [](const uint8_t* q) {
-        return uint32_t(q[0]) | (uint32_t(q[1]) << 8) | (uint32_t(q[2]) << 16) | (uint32_t(q[3]) << 24);
-    };
-    auto round = [&](uint64_t acc, uint64_t in) { return rotl(acc + in * p2, 31) * p1; };
-    auto merge = [&](uint64_t acc, uint64_t v) { return (acc ^ round(0, v)) * p1 + p4; };
-    uint64_t h;
-    if (len >= 32) {
-        uint64_t v1 = p1 + p2, v2 = p2, v3 = 0, v4 = -p1;
-        do {
-            v1 = round(v1, rd64(p)); v2 = round(v2, rd64(p + 8));
-            v3 = round(v3, rd64(p + 16)); v4 = round(v4, rd64(p + 24)); p += 32;
-        } while (end - p >= 32);
-        h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
-        h = merge(h, v1); h = merge(h, v2); h = merge(h, v3); h = merge(h, v4);
-    } else h = p5;
-    h += uint64_t(len);
-    while (end - p >= 8) { h ^= round(0, rd64(p)); h = rotl(h, 27) * p1 + p4; p += 8; }
-    if (end - p >= 4) { h ^= uint64_t(rd32(p)) * p1; h = rotl(h, 23) * p2 + p3; p += 4; }
-    while (p < end) { h ^= uint64_t(*p++) * p5; h = rotl(h, 11) * p1; }
-    h ^= h >> 33; h *= p2; h ^= h >> 29; h *= p3; h ^= h >> 32;
-    return h;
-}
-
 static uint64_t debugDecodedHash(const TextureEntry* texture) {
     if (!texture || !texture->valid || !texture->texture.surface.image) return 0;
     const uint32_t w = texture->width, h = texture->height;
@@ -2864,7 +2829,7 @@ static uint64_t debugDecodedHash(const TextureEntry* texture) {
         const uint8_t* p = image + (size_t(y) * pitch + x) * 4;
         memcpy(first + i * 4, p, 4);
     }
-    return debugXxh64(first, size_t(n) * 4);
+    return xxh64(first, size_t(n) * 4, 0);
 }
 
 static void debugTexture(FILE* f, int map, const TextureEntry* texture) {
@@ -2874,7 +2839,7 @@ static void debugTexture(FILE* f, int map, const TextureEntry* texture) {
     }
     const CopyEntry* copy = copyEntryForTexture(texture);
     const uint8_t* source = texture->source;
-    const uint32_t bytes = gx2TexLevelBytes(texture->fmt, texture->width, texture->height);
+    const uint32_t bytes = texLevelBytes(texture->fmt, texture->width, texture->height);
     const uint32_t addr = reinterpret_cast<uint32_t>(source);
     const bool readable = source && bytes && addr + bytes > addr &&
         ((addr >= 0x10000000u && addr + bytes <= 0x50000000u) ||
@@ -3246,7 +3211,7 @@ static TextureEntry* getTexture(int map) {
     // address 0 and corrupted newlib's heap.
     uint32_t srcBytes = 0;
     for (uint32_t l = 0; l < surf.mipLevels; ++l)
-        srcBytes += gx2TexLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
+        srcBytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
     // A texture address that did not survive the 30-bit GX physical address
     // (outside the main heap) must not be read: in Cemu that kills the title.
     // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
@@ -3275,7 +3240,7 @@ static TextureEntry* getTexture(int map) {
             if (l > 0) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
             if (prev) std::swap(prev, rgba);
             pw = lw; ph = lh;
-            src += gx2TexLevelBytes(fmt, lw, lh);
+            src += texLevelBytes(fmt, lw, lh);
         }
         e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
     }

@@ -25,6 +25,7 @@
 #include "gl_funcs.h"
 #include "gx_glcache.h"
 #include "gx_glthread.h"
+#include "gx_texture_pack_common.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -73,63 +74,8 @@
 
 namespace gx {
 
-// ------------------------------------------------------------------ XXH64
-// From the xxHash specification (Yann Collet): 64-bit lanes over 32-byte
-// stripes, then the tail and the avalanche.
-static const uint64_t P1 = 0x9E3779B185EBCA87ull, P2 = 0xC2B2AE3D27D4EB4Full, P3 = 0x165667B19E3779F9ull,
-                      P4 = 0x85EBCA77C2B2AE63ull, P5 = 0x27D4EB2F165667C5ull;
-static inline uint64_t rotl(uint64_t x, int r) { return x << r | x >> (64 - r); }
-static inline uint64_t rd64(const uint8_t* p) {
-    uint64_t v = 0;
-    for (int i = 7; i >= 0; i--) v = v << 8 | p[i];
-    return v;
-}
-static inline uint32_t rd32(const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; }
-static inline uint64_t xround(uint64_t acc, uint64_t in) { return rotl(acc + in * P2, 31) * P1; }
-static inline uint64_t xmerge(uint64_t acc, uint64_t v) { return (acc ^ xround(0, v)) * P1 + P4; }
-
-uint64_t xxh64(const void* data, size_t len, uint64_t seed) {
-    const uint8_t* p = static_cast<const uint8_t*>(data);
-    const uint8_t* end = p + len;
-    uint64_t h;
-    if (len >= 32) {
-        uint64_t v1 = seed + P1 + P2, v2 = seed + P2, v3 = seed, v4 = seed - P1;
-        do {
-            v1 = xround(v1, rd64(p));
-            v2 = xround(v2, rd64(p + 8));
-            v3 = xround(v3, rd64(p + 16));
-            v4 = xround(v4, rd64(p + 24));
-            p += 32;
-        } while (end - p >= 32);
-        h = rotl(v1, 1) + rotl(v2, 7) + rotl(v3, 12) + rotl(v4, 18);
-        h = xmerge(h, v1);
-        h = xmerge(h, v2);
-        h = xmerge(h, v3);
-        h = xmerge(h, v4);
-    } else {
-        h = seed + P5;
-    }
-    h += uint64_t(len);
-    while (end - p >= 8) {
-        h ^= xround(0, rd64(p));
-        h = rotl(h, 27) * P1 + P4;
-        p += 8;
-    }
-    if (end - p >= 4) {
-        h ^= uint64_t(rd32(p)) * P1;
-        h = rotl(h, 23) * P2 + P3;
-        p += 4;
-    }
-    while (p < end) {
-        h ^= uint64_t(*p++) * P5;
-        h = rotl(h, 11) * P1;
-    }
-    h ^= h >> 33;
-    h *= P2;
-    h ^= h >> 29;
-    h *= P3;
-    h ^= h >> 32;
-    return h;
+static inline uint32_t rd32(const uint8_t* p) {
+    return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
 }
 
 // ------------------------------------------------------------------ the index
@@ -277,55 +223,18 @@ void hiresDump(const std::string& name, const uint8_t* rgba, uint32_t w, uint32_
 }
 
 // ------------------------------------------------------------------ names
-// The palette entries a colour-indexed texture's base level uses.
-static void paletteRange(const uint8_t* data, size_t bytes, uint32_t fmt, uint32_t* lo, uint32_t* hi) {
-    uint32_t mn = 0xFFFF, mx = 0;
-    if (fmt == 8) {  // C4: two indices per byte
-        for (size_t i = 0; i < bytes; i++) {
-            uint32_t a = data[i] & 15, b = data[i] >> 4;
-            mn = std::min(mn, std::min(a, b));
-            mx = std::max(mx, std::max(a, b));
-        }
-    } else if (fmt == 9) {  // C8
-        for (size_t i = 0; i < bytes; i++) {
-            mn = std::min<uint32_t>(mn, data[i]);
-            mx = std::max<uint32_t>(mx, data[i]);
-        }
-    } else {  // C14X2: big-endian halfwords
-        for (size_t i = 0; i + 1 < bytes; i += 2) {
-            uint32_t v = (uint32_t(data[i]) << 8 | data[i + 1]) & 0x3FFF;
-            mn = std::min(mn, v);
-            mx = std::max(mx, v);
-        }
-    }
-    if (mn > mx) mn = mx = 0;
-    *lo = mn;
-    *hi = mx;
-}
-
 std::string hiresName(const uint8_t* data, uint32_t fmt, uint32_t w, uint32_t h, bool mipmapped, const uint8_t* tlut,
                       uint32_t tlutBytes, bool onlyIfPresent) {
-    size_t bytes = texLevelBytes(fmt, w, h);
-    char base[96];
-    snprintf(base, sizeof base, "tex1_%ux%u%s_%016llx", w, h, mipmapped ? "_m" : "",
-             (unsigned long long)xxh64(data, bytes, 0));
-    char fmtPart[8];
-    snprintf(fmtPart, sizeof fmtPart, "_%u", fmt);
-    bool ci = fmt == 8 || fmt == 9 || fmt == 10;
+    const std::string exact = hiresName(data, fmt, w, h, mipmapped, tlut, tlutBytes);
+    const bool ci = fmt == 8 || fmt == 9 || fmt == 10;
     if (ci && tlut) {
-        uint32_t lo, hi;
-        paletteRange(data, bytes, fmt, &lo, &hi);
-        uint32_t off = 2 * lo, len = 2 * (hi + 1 - lo);
-        if (off + len > tlutBytes) len = off < tlutBytes ? tlutBytes - off : 0;
-        char tl[24];
-        snprintf(tl, sizeof tl, "_%016llx", (unsigned long long)xxh64(tlut + off, len, 0));
-        std::string full = std::string(base) + tl + fmtPart;
-        if (!onlyIfPresent || s_index.count(full)) return full;
-        std::string wild = std::string(base) + "_$" + fmtPart;
+        if (!onlyIfPresent || s_index.count(exact)) return exact;
+        const size_t hash = exact.rfind('_');
+        const size_t palette = exact.rfind('_', hash - 1);
+        const std::string wild = exact.substr(0, palette) + "_$" + exact.substr(hash);
         if (s_index.count(wild)) return wild;
     }
-    std::string plain = std::string(base) + fmtPart;
-    if (!onlyIfPresent || s_index.count(plain)) return plain;
+    if (!onlyIfPresent || s_index.count(exact)) return exact;
     return std::string();
 }
 
