@@ -235,7 +235,7 @@ static int open_sdl_here(int rate)
 }
 
 /* AX's interrupt service thread and SDL's audio thread run on the core that
- * initialized AX. Keep the old core-2 placement only for the SDL A/B path. */
+ * initialized AX. AX defaults to core 2; SDL keeps its separate A/B choice. */
 static bool s_openedOnCore2;
 struct OpenJob { int rate; int result; };
 static int open_thread(int, const char** argv)
@@ -245,8 +245,9 @@ static int open_thread(int, const char** argv)
 	return 0;
 }
 
-/* SD marker axcore2: AXInit (and AXQuit) from a core-2 thread, so the
- * {SYS AX IST} it creates may run on core 2 instead of the game's core 1. */
+/* AXInit (and AXQuit) from a core-2 thread makes the {SYS AX IST} run on
+ * core 2 instead of the game's core 1. The axcore2 marker remains accepted
+ * for compatibility, but core 2 is now the default placement. */
 static bool s_axOnCore2;
 static bool s_axPreopened;
 static int s_axPreopenResult;
@@ -269,16 +270,16 @@ static int open_ax_core2(int rate)
 		int ret = 0;
 		cafe_OSJoinThread(&thread, &ret);
 		s_axOnCore2 = job.result != 0;
-		port_log("[audio] SD marker axcore2: AX initialised on core 2 (%s)\n", job.result ? "ok" : "failed");
+		port_log("[audio] AX initialised on core 2 (default placement, %s)\n", job.result ? "ok" : "failed");
 		return job.result;
 	}
-	port_log("[audio] axcore2: core-2 thread failed; initialising AX here\n");
+	port_log("[audio] AX core-2 open failed; initialising on the game's core\n");
 	return open_ax(rate);
 }
 
 extern "C" void sms_wiiu_sdl_audio_preopen(int rate)
 {
-	if (s_axPreopened || !sms_wiiu_sd_marker("axcore2") || sms_wiiu_sd_marker("noaudio") ||
+	if (s_axPreopened || sms_wiiu_sd_marker("axonc1") || sms_wiiu_sd_marker("noaudio") ||
 	    sms_wiiu_sd_marker("sdlaudio"))
 		return;
 	s_axPreopened = true;
@@ -288,12 +289,15 @@ extern "C" void sms_wiiu_sdl_audio_preopen(int rate)
 extern "C" int sms_wiiu_sdl_audio_open(int rate)
 {
 	if (!sms_wiiu_sd_marker("sdlaudio")) {
-		if (sms_wiiu_sd_marker("axcore2")) {
-			if (s_axPreopened)
-				return s_axPreopenResult;
-			return open_ax_core2(rate);
+		if (sms_wiiu_sd_marker("axonc1")) {
+			int result = open_ax(rate);
+			port_log("[audio] AX initialised on the game's core (SD marker axonc1, %s)\n",
+			         result ? "ok" : "failed");
+			return result;
 		}
-		return open_ax(rate);
+		if (s_axPreopened)
+			return s_axPreopenResult;
+		return open_ax_core2(rate);
 	}
 
 	port_log("[audio] SD marker sdlaudio: selecting SDL output\n");

@@ -286,8 +286,9 @@ void port_init(int, char**)
 	sms_wiiu_gfx_init();
 	port_vi_init();
 	port_pad_init();
-	/* axcore2 must finish AX setup before SMS_main can race JAudio's DSP map
-	 * creation with the pacer thread. SDL and noaudio remain lazy/unchanged. */
+	/* AX normally opens here on core 2 before SMS_main can race JAudio's DSP
+	 * map creation with the pacer thread. axonc1, noaudio, and sdlaudio keep
+	 * the preopen disabled; axcore2 remains accepted for compatibility. */
 	if (!port_no_audio)
 		sms_wiiu_sdl_audio_preopen(32000);
 	port_log("SMS Wii U: target OS, threads, FST/DV, audio, VI, "
