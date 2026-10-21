@@ -65,8 +65,9 @@ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
 }
 static void apiXF1(uint16_t addr, uint32_t v) { apiXF(addr, 1, &v); }
 static void apiXFf(uint16_t addr, uint32_t n, const float* f) {
-    typedef uint32_t gx_u32_alias __attribute__((__may_alias__));
-    apiXF(addr, n, reinterpret_cast<const gx_u32_alias*>(f));
+    uint32_t w[16];
+    memcpy(w, f, n * 4);
+    apiXF(addr, n, w);
 }
 static inline uint32_t fbits(float f) {
     uint32_t u;
