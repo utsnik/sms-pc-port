@@ -294,12 +294,6 @@ void resetState() {
 // their own; the draw-sync callback is game code and must stay unscoped.
 uint32_t g_xfDirtyLo = ~0u, g_xfDirtyHi = 0;
 
-static inline bool bpWriteHasSideEffect(uint32_t reg, uint32_t data) {
-    return reg == BP_COPY_EXEC || reg == BP_PE_TOKEN_INT || reg == BP_PE_TOKEN || reg == BP_DRAWDONE ||
-           reg == BP_LOADTLUT1 || reg == BP_TEXINVALIDATE ||
-           (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000));
-}
-
 void writeBP(uint32_t value) {
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
@@ -311,7 +305,6 @@ void writeBP(uint32_t value) {
         data = (g.bp[reg] & ~g.bpMask) | (data & g.bpMask);
         g.bpMask = 0xFFFFFF;
     }
-    if (g.bp[reg] == data && !bpWriteHasSideEffect(reg, data)) return;
     if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) {
         if (g.kreg[reg & 7] != data) {
             onStateChange();
@@ -355,8 +348,10 @@ void writeBP(uint32_t value) {
     default:
         break;
     }
-    onStateChange();
-    g.bp[reg] = data;
+    if (g.bp[reg] != data) {
+        onStateChange();
+        g.bp[reg] = data;
+    }
     if (reg == BP_COPY_DST) g.copyDest = physToPtr(data << 5);
     if ((reg >= BP_TX_IMAGE3 && reg < BP_TX_IMAGE3 + 4) || (reg >= BP_TX_IMAGE3 + 0x20 && reg < BP_TX_IMAGE3 + 0x24)) {
         int map = (reg & 3) + ((reg & 0x20) ? 4 : 0);
