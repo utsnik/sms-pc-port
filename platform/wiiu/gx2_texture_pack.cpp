@@ -59,7 +59,7 @@ struct WutMessage { void* message; uint32_t args[3]; };
 void wut_OSInitMessageQueue(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSInitMessageQueue");
 BOOL wut_OSSendMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSSendMessage");
 BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSReceiveMessage");
-void wut_OSYieldThread(void) __asm__("OSYieldThread");
+void wut_OSSleepTicks(int64_t ticks) __asm__("OSSleepTicks");
 }
 static const uint8_t kWorkerAffinityCpu2 = 1u << 2;
 static const int32_t kMessageBlock = 1;
@@ -151,7 +151,7 @@ static void publishChunk(const TexturePackUploadChunk& chunk) {
     s_chunk = chunk;
     __sync_synchronize();
     s_chunkReady = true;
-    while (s_chunkReady && !s_workerStop) wut_OSYieldThread();
+    while (s_chunkReady && !s_workerStop) wut_OSSleepTicks(62156250 / 1000); // about 1 ms
 }
 
 static void matchRequest(const TexturePackRequest& request) {

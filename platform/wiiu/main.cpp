@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "gx2_texture_pack.h"
 
 #include <whb/log.h>
 #include <whb/log_cafe.h>
@@ -61,6 +62,7 @@ int main(int argc, char** argv)
 			cafe_OSResumeThread(&thread);
 			int ret = 0;
 			cafe_OSJoinThread(&thread, &ret);
+			gx::texturePackShutdown();
 			sms_wiiu_audio_shutdown();
 			WHBProcShutdown();
 			return 0;
@@ -73,6 +75,7 @@ int main(int argc, char** argv)
 	s_game_entry();
 	port_log("SMS Wii U: SMS_main returned; shutting down\n");
 
+	gx::texturePackShutdown();
 	sms_wiiu_audio_shutdown();
 	WHBProcShutdown();
 	return 0;
