@@ -726,15 +726,37 @@ template <> inline float loadComp<uint8_t, true>(const uint8_t* p, float s) { re
 template <> inline float loadComp<uint8_t, false>(const uint8_t* p, float s) { return float(p[0]) * s; }
 template <> inline float loadComp<int8_t, true>(const uint8_t* p, float s) { return float(int8_t(p[0])) * s; }
 template <> inline float loadComp<int8_t, false>(const uint8_t* p, float s) { return float(int8_t(p[0])) * s; }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+template <> inline float loadComp<uint16_t, true>(const uint8_t* p, float s) {
+    uint16_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return float(v) * s;
+}
+#else
 template <> inline float loadComp<uint16_t, true>(const uint8_t* p, float s) { return float(uint16_t(p[0] << 8 | p[1])) * s; }
+#endif
 template <> inline float loadComp<uint16_t, false>(const uint8_t* p, float s) { return float(uint16_t(p[1] << 8 | p[0])) * s; }
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+template <> inline float loadComp<int16_t, true>(const uint8_t* p, float s) {
+    int16_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return float(v) * s;
+}
+#else
 template <> inline float loadComp<int16_t, true>(const uint8_t* p, float s) { return float(int16_t(p[0] << 8 | p[1])) * s; }
+#endif
 template <> inline float loadComp<int16_t, false>(const uint8_t* p, float s) { return float(int16_t(p[1] << 8 | p[0])) * s; }
 template <> inline float loadComp<float, true>(const uint8_t* p, float) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    float f;
+    __builtin_memcpy(&f, p, sizeof(f));
+    return f;
+#else
     uint32_t v = be32(p);
     float f;
     memcpy(&f, &v, 4);
     return f;
+#endif
 }
 template <> inline float loadComp<float, false>(const uint8_t* p, float) {
     float f;
@@ -745,7 +767,18 @@ template <> inline float loadComp<float, false>(const uint8_t* p, float) {
 // The attribute's data for the vertex at `in` (its place in the stream).
 template <int MODE> static inline const uint8_t* fetch(const DecOp& o, const uint8_t* in) {
     if (MODE == 1) return in;
-    uint32_t idx = MODE == 2 ? in[0] : uint32_t(in[0]) << 8 | in[1];
+    uint32_t idx;
+    if (MODE == 2) {
+        idx = in[0];
+    } else {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        uint16_t v;
+        __builtin_memcpy(&v, in, sizeof(v));
+        idx = v;
+#else
+        idx = uint32_t(in[0]) << 8 | in[1];
+#endif
+    }
     return o.base + size_t(idx) * o.stride;
 }
 
@@ -763,6 +796,27 @@ static void readVec(const DecOp& o, const uint8_t* in, uint32_t is, uint8_t* out
         for (int i = 0; i < N; i++) d[i] = loadComp<T, BE>(src + i * sizeof(T), o.scale);
         for (int i = N; i < NOUT; i++) d[i] = o.def[i];
     }
+}
+
+// Host tests use the same component and index paths as readVec/fetch, then
+// compare them with the former byte-assembly implementation.
+float decodeVertexComponentForTest(uint8_t type, bool be, const uint8_t* p, float scale) {
+    switch (type) {
+    case 0: return be ? loadComp<uint8_t, true>(p, scale) : loadComp<uint8_t, false>(p, scale);
+    case 1: return be ? loadComp<int8_t, true>(p, scale) : loadComp<int8_t, false>(p, scale);
+    case 2: return be ? loadComp<uint16_t, true>(p, scale) : loadComp<uint16_t, false>(p, scale);
+    case 3: return be ? loadComp<int16_t, true>(p, scale) : loadComp<int16_t, false>(p, scale);
+    default: return be ? loadComp<float, true>(p, scale) : loadComp<float, false>(p, scale);
+    }
+}
+
+uint32_t decodeVertexIndexForTest(uint8_t mode, const uint8_t* p) {
+    DecOp o = {};
+    o.base = p;
+    o.stride = 1;
+    if (mode == 1) return uint32_t(fetch<1>(o, p) - p);
+    if (mode == 2) return uint32_t(fetch<2>(o, p) - p);
+    return uint32_t(fetch<3>(o, p) - p);
 }
 
 template <int MODE, int TYPE, bool BE> static inline void readClr1(const uint8_t* src, uint8_t* c) {
