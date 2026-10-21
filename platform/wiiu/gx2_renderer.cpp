@@ -1520,6 +1520,8 @@ static bool vertexKeySupported(const VertexKey& key) {
 
 static bool runningUnderCemu();
 static bool s_vertexOneClause;
+static bool s_vertexNameXf;
+static bool s_vertexOneXf;
 
 static bool initVertexProgram(VertexProgram& shader) {
     s_vertexRejectReason = "unknown";
@@ -1532,11 +1534,13 @@ static bool initVertexProgram(VertexProgram& shader) {
     const VertexKey& key = shader.key;
     // Only the uniform registers a program names statically are valid for
     // it, so matrices reached through AR read stale values otherwise.  Name
-    // every XF vector once.  Hardware needs this too, not only Cemu: without
-    // it the title logo was a black M and the file-select sky had black
-    // wedges on the console (sms-vb-xf vs default, 2026-10-21).
-    for (uint32_t r = 0; r < kXfUniformRegs; ++r)
-        vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
+    // every XF vector under Cemu or when explicitly enabled for hardware.
+    if (runningUnderCemu() || s_vertexNameXf) {
+        for (uint32_t r = 0; r < kXfUniformRegs; ++r)
+            vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
+    } else if (s_vertexOneXf) {
+        vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(0), _x)});
+    }
 
     // Position: raw position -> the per-vertex model matrix selected through
     // MOVA/AR-indexed constant reads -> live projection and target mapping.
@@ -4322,6 +4326,8 @@ void rendererInit(float) {
     s_noVtxLiveCache = s_noDiff || sdMarkerPresent("nc_vlive");
     s_noBindCache = s_noDiff || sdMarkerPresent("nc_bind");
     s_noXfUniformCache = s_noDiff || sdMarkerPresent("nc_xfu");
+    s_vertexNameXf = sdMarkerPresent("xfname");
+    s_vertexOneXf = sdMarkerPresent("xfone");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
