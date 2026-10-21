@@ -20,11 +20,6 @@
 
 namespace gx {
 
-/* Task 4 moves this narrow declaration into the shared header; retaining the
- * forward declaration here keeps the converter target independently useful at
- * the end of Task 3. */
-void encodeBlock(int format, const uint8_t* rgba, uint8_t* out);
-
 namespace {
 
 struct Image {
