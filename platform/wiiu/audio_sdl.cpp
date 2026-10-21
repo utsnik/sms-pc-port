@@ -8,6 +8,15 @@
 
 extern "C" void port_log(const char* fmt, ...);
 extern "C" int sms_wiiu_sd_marker(const char* name);
+/* The build maps OSCreateThread & co. to the GameCube adapters for every port
+ * file (SMS_WIIU_OS_ADAPTER_DEFS): through them the core-2 open thread failed
+ * on hardware and AX stayed on core 1 (2026-10-21). Bind coreinit's own. */
+extern "C" {
+BOOL cafe_OSCreateThread(OSThread*, OSThreadEntryPointFn, int32_t, char*, void*, uint32_t, int32_t,
+                         OSThreadAttributes) __asm__("OSCreateThread");
+int32_t cafe_OSResumeThread(OSThread*) __asm__("OSResumeThread");
+BOOL cafe_OSJoinThread(OSThread*, int*) __asm__("OSJoinThread");
+}
 
 namespace {
 SDL_AudioDeviceID s_dev;
@@ -64,14 +73,14 @@ extern "C" int sms_wiiu_sdl_audio_open(int rate)
 	static OSThread thread __attribute__((aligned(16)));
 	static uint8_t stack[0x8000] __attribute__((aligned(16)));
 	OpenJob job = {rate, 0};
-	if (!OSCreateThread(&thread, open_thread, 0, reinterpret_cast<char*>(&job), stack + sizeof stack, sizeof stack,
+	if (!cafe_OSCreateThread(&thread, open_thread, 0, reinterpret_cast<char*>(&job), stack + sizeof stack, sizeof stack,
 	                    16, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
 		port_log("[audio] core-2 open thread failed; opening AX/SDL here\n");
 		return open_here(rate);
 	}
-	OSResumeThread(&thread);
+	cafe_OSResumeThread(&thread);
 	int ret = 0;
-	OSJoinThread(&thread, &ret);
+	cafe_OSJoinThread(&thread, &ret);
 	s_openedOnCore2 = job.result != 0;
 	port_log("[audio] AX/SDL opened from core 2: %s\n", job.result ? "ok" : "failed");
 	return job.result;
@@ -107,11 +116,11 @@ extern "C" void sms_wiiu_sdl_audio_close(void)
 	/* AX shuts down on the core that initialised it. */
 	static OSThread thread __attribute__((aligned(16)));
 	static uint8_t stack[0x8000] __attribute__((aligned(16)));
-	if (s_openedOnCore2 && OSCreateThread(&thread, close_thread, 0, nullptr, stack + sizeof stack, sizeof stack, 16,
+	if (s_openedOnCore2 && cafe_OSCreateThread(&thread, close_thread, 0, nullptr, stack + sizeof stack, sizeof stack, 16,
 	                                      OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
-		OSResumeThread(&thread);
+		cafe_OSResumeThread(&thread);
 		int ret = 0;
-		OSJoinThread(&thread, &ret);
+		cafe_OSJoinThread(&thread, &ret);
 		return;
 	}
 	close_here();
