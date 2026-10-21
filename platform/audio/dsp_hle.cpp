@@ -46,6 +46,10 @@ namespace {
 
 const u32 kPrefix = 0xF3550000u; // JASystem::DSPInterface::JAS_DSP_PREFIX << 16
 
+#ifdef TARGET_WIIU
+volatile u32 s_dsp_setup_ready;
+#endif
+
 struct Hle {
 	std::deque<u32> fromDsp; // mailbox DSP -> CPU
 	// command assembly
@@ -446,6 +450,10 @@ void execute(bool fromWorker)
 			port_dspmix_set_aram(aram_lookup);
 			port_dspmix_setup(w[0] & 0xFFFF, (void*)(uintptr_t)w[1], (const uint32_t*)(uintptr_t)w[2],
 			                  (const uint32_t*)(uintptr_t)w[3], (void*)(uintptr_t)w[4]);
+#ifdef TARGET_WIIU
+			__sync_synchronize();
+			s_dsp_setup_ready = 1;
+#endif
 			port_log("[audio] DSP setup: %u voices at 0x%08x, FX lines at 0x%08x\n", (unsigned)(w[0] & 0xFFFF),
 			         (unsigned)w[1], (unsigned)w[4]);
 		}
@@ -481,6 +489,17 @@ void execute(bool fromWorker)
 }
 
 } // namespace
+
+#ifdef TARGET_WIIU
+extern "C" void port_audio_dsp_wait_for_setup(void)
+{
+	const OSTime deadline = OSGetTime() + OSMicrosecondsToTicks(1000000);
+	while (!s_dsp_setup_ready && OSGetTime() < deadline)
+		OSYieldThread();
+	if (!s_dsp_setup_ready)
+		port_log("[audio] DSP setup wait timed out after 1000 ms\n");
+}
+#endif
 
 extern "C" void port_audio_dsp_boot(DSPTaskInfo* task)
 {
