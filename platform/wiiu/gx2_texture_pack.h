@@ -88,7 +88,7 @@ public:
         const uint32_t read = read_, write = write_;
         for (uint32_t i = read; i != write; ++i) {
             const TexturePackRequest& q = slots_[i % kTexturePackMaxQueue];
-            if (q.requestId == r.requestId && q.source == r.source && q.tlut == r.tlut && q.tlutBytes == r.tlutBytes && q.width == r.width &&
+            if (q.source == r.source && q.tlut == r.tlut && q.tlutBytes == r.tlutBytes && q.width == r.width &&
                 q.height == r.height && q.format == r.format && q.levels == r.levels && q.tlutFormat == r.tlutFormat)
                 return true;
         }
@@ -159,14 +159,6 @@ public:
     }
     void touch(uint32_t id, uint32_t frame) {
         for (TexturePackLruNode& n : nodes_) if (n.resident && n.id == id) { n.lastUsedFrame = frame; return; }
-    }
-    void remove(uint32_t id) {
-        for (TexturePackLruNode& n : nodes_) {
-            if (!n.resident || n.id != id) continue;
-            bytes_ -= n.bytes;
-            n = TexturePackLruNode();
-            return;
-        }
     }
     uint64_t residentBytes() const { return bytes_; }
     uint64_t budget() const { return budget_; }
