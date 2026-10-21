@@ -28,20 +28,6 @@ namespace gx {
 State g;
 extern uint32_t g_traceLastVat;
 void (*drawSyncCallback)(uint16_t) = nullptr;
-#if defined(__WIIU__)
-extern "C" int sms_wiiu_gx2_nodiff_enabled(void) __attribute__((weak));
-#endif
-
-static uint64_t s_dlReplayEpoch;
-static inline void dlStateChanged() { ++s_dlReplayEpoch; }
-static inline void dlReplayBarrier() { ++s_dlReplayEpoch; }
-static bool dlReplayCacheEnabled() {
-#if defined(__WIIU__)
-    return !sms_wiiu_gx2_nodiff_enabled || !sms_wiiu_gx2_nodiff_enabled();
-#else
-    return true;
-#endif
-}
 
 // ------------------------------------------------------------------ utilities
 double monoSeconds() {
@@ -277,7 +263,6 @@ void resetState() {
         memcpy(&g.xfMem[0x500 + 61 * 4 + i], &ident[i], 4);
     }
     (void)be;
-    dlStateChanged();
 }
 
 // No heap scope in the register writers: they run ~25k times a frame and a
@@ -301,20 +286,17 @@ void writeBP(uint32_t value) {
         if (g.kreg[reg & 7] != data) {
             onStateChange();
             g.kreg[reg & 7] = data;
-            dlStateChanged();
         }
         return;
     }
     switch (reg) {
     case BP_COPY_EXEC:
-        dlReplayBarrier();
         onStateChange();
         g.bp[reg] = data;
         executeCopy(data);
         return;
     case BP_PE_TOKEN_INT:
     case BP_PE_TOKEN:
-        dlReplayBarrier();
         g.bp[reg] = data;
         g.drawSyncToken = uint16_t(data & 0xFFFF);
         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
@@ -323,13 +305,10 @@ void writeBP(uint32_t value) {
         }
         return;
     case BP_DRAWDONE:
-        dlReplayBarrier();
         flushBatch();
         g.bp[reg] = data;
         return;
-    case BP_LOADTLUT1:
-        dlReplayBarrier();
-        {
+    case BP_LOADTLUT1: {
         g.bp[reg] = data;
         uint32_t tmemOff = (data & 0x3FF) << 9;
         uint32_t bytes = ((data >> 10) & 0x7FF) * 32;
@@ -340,7 +319,6 @@ void writeBP(uint32_t value) {
         return;
     }
     case BP_TEXINVALIDATE:
-        dlReplayBarrier();
         g.bp[reg] = data;
         textureInvalidateAll();
         return;
@@ -350,7 +328,6 @@ void writeBP(uint32_t value) {
     if (g.bp[reg] != data) {
         onStateChange();
         g.bp[reg] = data;
-        dlStateChanged();
     }
     if (reg == BP_COPY_DST) g.copyDest = physToPtr(data << 5);
     if ((reg >= BP_TX_IMAGE3 && reg < BP_TX_IMAGE3 + 4) || (reg >= BP_TX_IMAGE3 + 0x20 && reg < BP_TX_IMAGE3 + 0x24)) {
@@ -361,27 +338,13 @@ void writeBP(uint32_t value) {
 
 void writeCP(uint8_t reg, uint32_t value) {
     switch (reg & 0xF0) {
-    case CP_MATIDX_A:
-        if (g.cpMatA != value) { g.cpMatA = value; dlStateChanged(); }
-        break;
-    case CP_MATIDX_B:
-        if (g.cpMatB != value) { g.cpMatB = value; dlStateChanged(); }
-        break;
-    case CP_VCD_LO:
-        if (g.cpVcdLo != value) { g.cpVcdLo = value; dlStateChanged(); }
-        break;
-    case CP_VCD_HI:
-        if (g.cpVcdHi != value) { g.cpVcdHi = value; dlStateChanged(); }
-        break;
-    case CP_VAT_A:
-        if (g.cpVatA[reg & 7] != value) { g.cpVatA[reg & 7] = value; dlStateChanged(); }
-        break;
-    case CP_VAT_B:
-        if (g.cpVatB[reg & 7] != value) { g.cpVatB[reg & 7] = value; dlStateChanged(); }
-        break;
-    case CP_VAT_C:
-        if (g.cpVatC[reg & 7] != value) { g.cpVatC[reg & 7] = value; dlStateChanged(); }
-        break;
+    case CP_MATIDX_A: g.cpMatA = value; break;
+    case CP_MATIDX_B: g.cpMatB = value; break;
+    case CP_VCD_LO: g.cpVcdLo = value; break;
+    case CP_VCD_HI: g.cpVcdHi = value; break;
+    case CP_VAT_A: g.cpVatA[reg & 7] = value; break;
+    case CP_VAT_B: g.cpVatB[reg & 7] = value; break;
+    case CP_VAT_C: g.cpVatC[reg & 7] = value; break;
     case CP_ARRAY_BASE: {
         // J3D sets every array again for each shape: unchanged ones keep the
         // vertex loader's setups (and skip the byte-order lookup)
@@ -402,14 +365,12 @@ void writeCP(uint8_t reg, uint32_t value) {
         g.arrayBigEndian[slot] = s_defaultArrayBE || isBigEndianData(base);
         l = Last{base, s_beGen, s_defaultArrayBE, g.arrayBigEndian[slot]};
         g_arrayGen++;
-        dlStateChanged();
         break;
     }
     case CP_ARRAY_STRIDE:
         if (g.arrayStride[reg & 15] == (value & 0xFF)) break;
         g.arrayStride[reg & 15] = value & 0xFF;
         g_arrayGen++;
-        dlStateChanged();
         break;
     default: break;
     }
@@ -425,14 +386,12 @@ void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
                 if (addr < g_xfDirtyLo) g_xfDirtyLo = addr;
                 if (addr > g_xfDirtyHi) g_xfDirtyHi = addr;
                 markXfMemDirty();
-                dlStateChanged();
             }
         } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
             uint32_t r = addr - XF_REG_BASE;
             if (g.xfReg[r] != v) {
                 onStateChange();
                 g.xfReg[r] = v;
-                dlStateChanged();
             }
         }
     }
@@ -1143,7 +1102,6 @@ struct DlArray {  // the part of an attribute array the list reads
 struct DlEntry {
     bool valid = false;
     bool stateOnly = false;  // no draws: replayed from `ops`
-    bool sideEffecting = false;  // contains an operation that must run every call
     uint32_t size = 0;
     uint64_t hash = 0;  // the list's bytes
     uint32_t vcdLo = 0, vcdHi = 0, matA = 0, matB = 0;
@@ -1159,7 +1117,6 @@ struct DlEntry {
     uint32_t misses = 0;  // consecutive calls that could not reuse it
     uint32_t skip = 0;    // calls left to run without the cache
     uint32_t checkedClock = 0, checkedFrame = 0;  // when its source bytes were last compared
-    uint64_t replayEpoch = ~uint64_t(0);  // state/barrier epoch of the last replay
     bool hashAlways = false;  // its bytes once changed with no write reported: compared on every call
 };
 // The entries (stable addresses) and an open-addressing index of them by
@@ -1287,20 +1244,6 @@ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
     return true;
 }
 
-static bool dlBpHasSideEffect(uint32_t value) {
-    switch (value >> 24) {
-    case BP_COPY_EXEC:
-    case BP_PE_TOKEN_INT:
-    case BP_PE_TOKEN:
-    case BP_DRAWDONE:
-    case BP_LOADTLUT1:
-    case BP_TEXINVALIDATE:
-        return true;
-    default:
-        return false;
-    }
-}
-
 // Decodes a list made only of state commands into e.ops; false if it draws
 // (or ends inside a command).
 static bool dlCompileState(DlEntry& e, const uint8_t* p, uint32_t size) {
@@ -1323,7 +1266,6 @@ static bool dlCompileState(DlEntry& e, const uint8_t* p, uint32_t size) {
             len = 5;
             if (avail < len) return false;
             s.v = be32(p + 1);
-            e.sideEffecting |= dlBpHasSideEffect(s.v);
         } else if (op == 0x10) {
             if (avail < 5) return false;
             uint32_t hdr = be32(p + 1), cnt = (hdr >> 16) + 1;
@@ -1343,7 +1285,6 @@ static bool dlCompileState(DlEntry& e, const uint8_t* p, uint32_t size) {
             if (avail < len) return false;
             s.n = be32(p + 1);
             s.v = be32(p + 5);
-            e.sideEffecting = true;  // nested lists may contain effects
         } else {
             return false;  // draws, or an unknown opcode
         }
@@ -1368,7 +1309,6 @@ static void dlReplayState(const DlEntry& e) {
         case 0x40: {
             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(s.n));
             if (s_dlDepth < 4 && dl) {
-                dlReplayBarrier();
                 s_dlDepth++;
                 runCommands(dl, s.v);
                 s_dlDepth--;
@@ -1409,10 +1349,7 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
     }
     if (dlReusable(e, data, size)) {
         if (e.stateOnly) {
-            if (!dlReplayCacheEnabled() || e.sideEffecting || e.replayEpoch != s_dlReplayEpoch) {
-                dlReplayState(e);
-                e.replayEpoch = s_dlReplayEpoch;
-            }
+            dlReplayState(e);
             e.misses = 0;
             return;
         }
