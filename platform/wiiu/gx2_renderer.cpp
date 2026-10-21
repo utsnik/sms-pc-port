@@ -4418,8 +4418,9 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
         asm volatile("dcbz 0,%0" : : "r"(base + off) : "memory");
     uint8_t defaults[9];
     matrixDefaults(defaults);
+    const VtxFmtLayout& layout = vtxFmtLayout(fmt);
     for (uint32_t i = 0; i < n; ++i)
-        unpackVertex(fmt, verts + size_t(i) * stride, defaults,
+        unpackVertex(layout, fmt, verts + size_t(i) * stride, defaults,
                      *reinterpret_cast<HostVertex*>(base + size_t(i) * kRawVertexStride), true);
     uint32_t* ib = reinterpret_cast<uint32_t*>(base + ioff);
     for (uint32_t i = 0; i < nidx; ++i) ib[i] = idx[i] < n ? idx[i] : n;
@@ -4763,6 +4764,7 @@ void flushBatch() {
     const uint8_t defaults[9] = {uint8_t(ma & 63), uint8_t((ma >> 6) & 63), uint8_t((ma >> 12) & 63),
                                  uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
                                  uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
+    const VtxFmtLayout& layout = vtxFmtLayout(s_batch.fmt);
     for (uint32_t i = 0; i < indexCount; ++i) {
         const uint32_t index = s_batch.indices[i];
         if (index >= vertexCount) {
@@ -4775,7 +4777,7 @@ void flushBatch() {
             const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
             float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
             HostVertex& dec = gpuPath ? *reinterpret_cast<HostVertex*>(out) : hv;
-            unpackVertex(s_batch.fmt, packed, defaults, dec, gpuPath);
+            unpackVertex(layout, s_batch.fmt, packed, defaults, dec, gpuPath);
             if (gpuPath && s_vertexSelfCheck)
                 vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
                                     dec, s_debugDrawNo);
