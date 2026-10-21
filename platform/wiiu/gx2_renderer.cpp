@@ -361,6 +361,10 @@ static Batch& batchObject() {
 struct TextureEntry {
     const uint8_t* source = nullptr;
     uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0, levels = 1;
+    uint64_t dataHash = 0, tlutHash = 0;
+    uint32_t sourceBytes = 0, tlutBytes = 0;
+    uint32_t checkedGen = 0, checkedClock = 0, checkedFrame = 0;
+    bool hashAlways = false;
     bool arbitraryMips = false;
     GX2Texture texture;
     GX2Sampler sampler;
@@ -409,6 +413,7 @@ static std::unordered_map<const uint8_t*, uint32_t>& textureIndex() {
         s_textureIndexObject = new (s_textureIndexStorage) std::unordered_map<const uint8_t*, uint32_t>();
     return *s_textureIndexObject;
 }
+static uint32_t s_textureGeneration = 1;
 
 // GPU buffers come from the system default heap: newlib's memalign draws on
 // wut's small sbrk area and crashed in _memalign_r once real textures loaded.
@@ -3156,6 +3161,29 @@ static uint32_t textureLevels(uint32_t mode0, uint32_t mode1, uint32_t w, uint32
     return levels;
 }
 
+static uint32_t textureDataBytes(uint32_t fmt, uint32_t w, uint32_t h, uint32_t levels) {
+    uint32_t bytes = 0;
+    for (uint32_t l = 0; l < levels; ++l)
+        bytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
+    return bytes;
+}
+
+static uint32_t textureTlutBytes(uint32_t fmt, uint32_t tlut) {
+    if (fmt < 8 || fmt > 10) return 0;
+    const uint32_t bytes = fmt == 8 ? 32 : fmt == 9 ? 512 : 0x8000;
+    const uint32_t offset = tlut << 9;
+    return offset < sizeof g.tlutMem ? std::min(bytes, uint32_t(sizeof g.tlutMem) - offset) : 0;
+}
+
+static bool textureSourceReadable(const uint8_t* source, uint32_t bytes) {
+    const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + bytes;
+    return source && bytes && a1 > a0 &&
+        ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
+}
+
+static void packFreeLoading(TextureEntry& e);
+static void packEvict(TextureEntry& e);
+
 // How far a decoded level is from a 2x2 box reduction of the level above it
 // (mean difference per channel, 0..255). Textures whose smaller levels are an
 // effect rather than reductions (the sea's sparkle map: a dark level 0 with
@@ -3253,30 +3281,85 @@ static TextureEntry* getTexture(int map) {
         return c;
     }
     const uint32_t levels = textureLevels(mode0, mode1, w, h);
+    const uint32_t sourceBytes = textureDataBytes(fmt, w, h, levels);
+    const uint32_t tlutBytes = textureTlutBytes(fmt, tlut);
+    const uint32_t tlutOffset = tlut << 9;
+    const uint8_t* tlutPtr = indexed && tlutOffset < sizeof g.tlutMem ? g.tlutMem + tlutOffset : nullptr;
     auto& index = textureIndex();
     const auto head = index.find(source);
     const uint32_t first = head == index.end() ? UINT32_MAX : head->second;
+    TextureEntry* existing = nullptr;
     for (uint32_t i = first; i != UINT32_MAX; i = s_textures[i].next) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.fmt == fmt && e.width == w && e.height == h &&
             e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
-            if (e.packState == 3 && e.packTouchedFrame != g_displayFrames) {
-                e.packTouchedFrame = g_displayFrames;
-                e.packLruHint = s_packLru.touchHint(e.packRequestId, g_displayFrames, e.packLruHint);
+            bool unwritten = false;
+            const uint64_t currentTlutHash = tlutPtr ? xxh64(tlutPtr, tlutBytes, 0) : 0;
+            if (e.checkedGen != s_textureGeneration && e.checkedGen != 0 && trustWriteStamps() &&
+                !e.hashAlways && e.sourceBytes == sourceBytes && textureSourceReadable(source, sourceBytes) &&
+                unwrittenSince(source, sourceBytes, e.checkedClock)) {
+                unwritten = true;
+                if (g_displayFrames - e.checkedFrame < kRecheckFrames && currentTlutHash == e.tlutHash)
+                    e.checkedGen = s_textureGeneration;
             }
-            // The sampler state belongs to the texmap, not the image: the same
-            // texture may be bound with other wrap or filter modes.
-            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips);
-            return &e;
+            if (e.checkedGen != s_textureGeneration) {
+                const uint64_t currentDataHash = textureSourceReadable(source, sourceBytes)
+                    ? xxh64(source, sourceBytes, 0) : 0;
+                if (unwritten && currentDataHash != e.dataHash) e.hashAlways = true;
+                if (currentDataHash != e.dataHash || currentTlutHash != e.tlutHash) existing = &e;
+                e.dataHash = currentDataHash;
+                e.tlutHash = currentTlutHash;
+                e.checkedClock = writeClock();
+                e.checkedFrame = g_displayFrames;
+                e.checkedGen = s_textureGeneration;
+                e.sourceBytes = sourceBytes;
+                e.tlutBytes = tlutBytes;
+            }
+            if (!existing) {
+                if (e.packState == 3 && e.packTouchedFrame != g_displayFrames) {
+                    e.packTouchedFrame = g_displayFrames;
+                    e.packLruHint = s_packLru.touchHint(e.packRequestId, g_displayFrames, e.packLruHint);
+                }
+                // The sampler state belongs to the texmap, not the image: the same
+                // texture may be bound with other wrap or filter modes.
+                initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips);
+                return &e;
+            }
+            break;
         }
     }
     SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
-    s_textures.push_back(TextureEntry());
-    TextureEntry& e = s_textures.back();
-    e.next = first;
-    index[source] = uint32_t(s_textures.size() - 1);
-    e.source = source; e.fmt = fmt; e.width = w; e.height = h; e.tlut = tlut; e.tlutFmt = tlutFmt;
-    e.levels = levels;
+    TextureEntry* ePtr = existing;
+    if (!ePtr) {
+        s_textures.push_back(TextureEntry());
+        ePtr = &s_textures.back();
+        ePtr->next = first;
+        index[source] = uint32_t(s_textures.size() - 1);
+        ePtr->source = source; ePtr->fmt = fmt; ePtr->width = w; ePtr->height = h;
+        ePtr->tlut = tlut; ePtr->tlutFmt = tlutFmt; ePtr->levels = levels;
+        ePtr->sourceBytes = sourceBytes; ePtr->tlutBytes = tlutBytes;
+        ePtr->dataHash = textureSourceReadable(source, sourceBytes) ? xxh64(source, sourceBytes, 0) : 0;
+        ePtr->tlutHash = tlutPtr ? xxh64(tlutPtr, tlutBytes, 0) : 0;
+        ePtr->checkedClock = writeClock();
+        ePtr->checkedFrame = g_displayFrames;
+        ePtr->checkedGen = s_textureGeneration;
+    } else {
+        TextureEntry& old = *ePtr;
+        if (old.packState == 1) packFreeLoading(old);
+        else if (old.packState == 3) {
+            s_packLru.remove(old.packRequestId);
+            packEvict(old);
+        }
+        deferFree(old.texture.surface.image);
+        deferFree(old.texture.surface.mipmaps);
+        std::memset(&old.texture, 0, sizeof old.texture);
+        old.valid = false;
+        old.packState = 2;
+        old.packResidentBytes = 0;
+        old.packEntry = nullptr;
+        old.arbitraryMips = false;
+    }
+    TextureEntry& e = *ePtr;
     e.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
     e.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
     e.texture.surface.width = w;
@@ -3336,16 +3419,12 @@ static TextureEntry* getTexture(int map) {
     // Decode through explicitly checked buffers: a failed allocation returns
     // null here (no exceptions), and the decoder then wrote megabytes from
     // address 0 and corrupted newlib's heap.
-    uint32_t srcBytes = 0;
-    for (uint32_t l = 0; l < surf.mipLevels; ++l)
-        srcBytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
     // A texture address that did not survive the 30-bit GX physical address
     // (outside the main heap) must not be read: in Cemu that kills the title.
     // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
     // texture came out white), so check the app's MEM2/MEM1 ranges directly.
-    const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
-    const bool readable = source && srcBytes && a1 > a0 &&
-        ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
+    const uint32_t a0 = reinterpret_cast<uint32_t>(source);
+    const bool readable = textureSourceReadable(source, sourceBytes);
     uint8_t* rgba = readable ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     uint8_t* prev = (readable && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
@@ -3360,7 +3439,6 @@ static TextureEntry* getTexture(int map) {
         memset(surf.image, 0xff, surf.imageSize);
         if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
     } else {
-        const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
         const uint8_t* src = source;
         float mipDiff = 0.0f;
         uint32_t pw = w, ph = h;
@@ -3388,8 +3466,8 @@ static TextureEntry* getTexture(int map) {
     if (texturePackEnabled()) {
         TexturePackRequest request = {};
         request.source = source;
-        request.tlut = indexed ? g.tlutMem + (tlut << 9) : nullptr;
-        request.tlutBytes = indexed ? uint32_t(sizeof g.tlutMem) - (tlut << 9) : 0;
+        request.tlut = tlutPtr;
+        request.tlutBytes = tlutBytes;
         request.width = w; request.height = h; request.format = fmt; request.levels = levels;
         request.tlutFormat = tlutFmt; request.writeClock = writeClock(); request.generation = s_copyGeneration;
         request.requestId = ++s_nextPackRequestId; request.retry = 0;
@@ -3406,10 +3484,10 @@ static TextureEntry* packTextureForRequest(uint32_t requestId) {
 }
 
 static void packFreeLoading(TextureEntry& e) {
-    if (e.packLinear.surface.image) MEMFreeToDefaultHeap(e.packLinear.surface.image);
-    if (e.packLinear.surface.mipmaps) MEMFreeToDefaultHeap(e.packLinear.surface.mipmaps);
-    if (e.packTiled.surface.image) MEMFreeToDefaultHeap(e.packTiled.surface.image);
-    if (e.packTiled.surface.mipmaps) MEMFreeToDefaultHeap(e.packTiled.surface.mipmaps);
+    deferFree(e.packLinear.surface.image);
+    deferFree(e.packLinear.surface.mipmaps);
+    deferFree(e.packTiled.surface.image);
+    deferFree(e.packTiled.surface.mipmaps);
     std::memset(&e.packLinear, 0, sizeof e.packLinear);
     std::memset(&e.packTiled, 0, sizeof e.packTiled);
     e.packEntry = nullptr; e.packLevelDone = 0; e.packStagingBytes = 0;
@@ -5249,12 +5327,36 @@ uint32_t peekZ(int x, int y) {
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
 
-void textureInvalidateAll() {}
-void textureInvalidateRange(const void*, uint32_t) {}
-void textureCpuWrote(const void*, uint32_t) {}
+void textureInvalidateAll() {
+    if (++s_textureGeneration == 0) s_textureGeneration = 1;
+}
+
+static bool textureRangesOverlap(const void* a, uint32_t aBytes, const void* b, uint32_t bBytes) {
+    if (!a || !b || !aBytes || !bBytes) return false;
+    const uintptr_t alo = reinterpret_cast<uintptr_t>(a), blo = reinterpret_cast<uintptr_t>(b);
+    const uintptr_t ahi = alo + aBytes, bhi = blo + bBytes;
+    return ahi > alo && bhi > blo && alo < bhi && blo < ahi;
+}
+
+void textureInvalidateRange(const void* p, uint32_t size) {
+    if (!p || !size) return;
+    for (TextureEntry& e : s_textures) {
+        const uint8_t* tlut = e.tlutBytes ? g.tlutMem + (e.tlut << 9) : nullptr;
+        if (textureRangesOverlap(p, size, e.source, e.sourceBytes) ||
+            textureRangesOverlap(p, size, tlut, e.tlutBytes))
+            e.checkedGen = 0;
+    }
+}
+
+void textureCpuWrote(const void* p, uint32_t size) { textureInvalidateRange(p, size); }
 
 void* physToPtr(uint32_t);
 uint32_t ptrToPhys(const void*);
+
+extern "C" void GXPC_InvalidateRange(const void* p, uint32_t size) {
+    memoryWritten(p, size);
+    textureInvalidateRange(p, size);
+}
 
 FILE* traceFile() { return nullptr; }
 void traceNoteBegin() {}
