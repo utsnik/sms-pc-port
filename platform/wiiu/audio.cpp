@@ -40,6 +40,7 @@ extern "C" void sms_wiiu_sdl_audio_queue(const void* data, uint32_t bytes);
 extern "C" uint32_t sms_wiiu_sdl_audio_queued(void);
 extern "C" void sms_wiiu_sdl_audio_close(void);
 extern "C" u64 port_audio_dsp_subframes(void);
+extern "C" void port_audio_dsp_shutdown(void);
 
 extern "C" {
 /* wut symbols bound by name (the game's OS names are remapped by CMake). */
@@ -276,17 +277,18 @@ void* pacer(void*)
 // about to end anyway) rather than closed under a live SDL_QueueAudio.
 extern "C" void sms_wiiu_audio_shutdown(void)
 {
-	if (!g.inited || !g.enabled)
-		return;
 	g.running = false;
 	g.quit    = true;
-	for (int i = 0; i < 100 && !g.stopped; i++)
-		sms_wiiu_audio_sleep_ticks(kTicksPerSec / 100); // up to 1 s
-	if (g.stopped) {
-		g.dev = false;
-		sms_wiiu_sdl_audio_close();
+	if (g.inited && g.enabled) {
+		for (int i = 0; i < 100 && !g.stopped; i++)
+			sms_wiiu_audio_sleep_ticks(kTicksPerSec / 100); // up to 1 s
+		if (g.stopped) {
+			g.dev = false;
+			sms_wiiu_sdl_audio_close();
+		}
+		port_log("[audio] shut down (pacer %s)\n", g.stopped ? "stopped, SDL closed" : "did not stop; SDL left open");
 	}
-	port_log("[audio] shut down (pacer %s)\n", g.stopped ? "stopped, SDL closed" : "did not stop; SDL left open");
+	port_audio_dsp_shutdown();
 }
 
 extern "C" void AIInit(u8*)

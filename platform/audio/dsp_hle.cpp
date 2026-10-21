@@ -27,6 +27,8 @@
  * first step on file select (2026-10-20). */
 #include "../wiiu/port_heap.h"
 #include "../wiiu/runtime.h"
+#include <dolphin/os.h>
+#include <dolphin/os/OSThread.h>
 #else
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
@@ -52,6 +54,9 @@ struct Hle {
 	bool release; // header word 0: DSPReleaseHalt's two map words
 	u32 want;
 	std::vector<u32> words;
+#ifdef TARGET_WIIU
+	std::vector<u32> workerWords;
+#endif
 	// frame state from the 0x82 command
 	int16_t* outA;
 	int16_t* outB;
@@ -87,10 +92,205 @@ void post(u32 m)
 	g.fromDsp.push_back(m);
 }
 
+#ifdef TARGET_WIIU
+/* wut's coreinit ABI is deliberately kept separate from the decomp's
+ * GameCube OS types. These declarations mirror the boundary in
+ * platform/wiiu/os_thread.cpp and are bound to wut by symbol name. */
+struct WutThread {
+	unsigned char bytes[0x6a0];
+} __attribute__((aligned(32)));
+struct WutMessageQueue {
+	unsigned char bytes[0x100];
+} __attribute__((aligned(32)));
+typedef int (*WutEntry)(int, const char**);
+
+extern "C" {
+BOOL wut_OSCreateThread(WutThread*, WutEntry, int32_t, char*, void*, uint32_t,
+	                        int32_t, uint8_t) __asm__("OSCreateThread");
+int32_t wut_OSResumeThread(WutThread*) __asm__("OSResumeThread");
+BOOL wut_OSJoinThread(WutThread*, int*) __asm__("OSJoinThread");
+void wut_OSInitMessageQueue(WutMessageQueue*, void*, int32_t) __asm__("OSInitMessageQueue");
+BOOL wut_OSSendMessage(WutMessageQueue*, void*, int32_t) __asm__("OSSendMessage");
+BOOL wut_OSReceiveMessage(WutMessageQueue*, void*, int32_t) __asm__("OSReceiveMessage");
+
+int sms_wiiu_OSCreateThread(OSThread*, void* (*)(void*), void*, void*, u32, s32, u16);
+long sms_wiiu_OSResumeThread(OSThread*);
+int sms_wiiu_OSJoinThread(OSThread*, void**);
+}
+
+#ifndef OS_THREAD_ATTRIB_AFFINITY_CPU0
+#define OS_THREAD_ATTRIB_AFFINITY_CPU0 (1u << 0)
+#endif
+
+const int32_t kWutMessageBlock = 1;
+const int kCommandQueueCount = 32;
+const int kReplyQueueCount = 32;
+const s32 kMixerPriority = 2;
+const s32 kReplyPriority = 1; // above JAudio's priority 2
+
+struct Command {
+	std::vector<u32> words;
+	bool release;
+};
+
+struct Reply {
+	u32 first;
+	u32 second;
+};
+
+struct AsyncState {
+	WutMessageQueue commandQueue;
+	WutMessageQueue replyQueue;
+	void* commandSlots[kCommandQueueCount] __attribute__((aligned(32)));
+	void* replySlots[kReplyQueueCount] __attribute__((aligned(32)));
+	WutThread mixerThread;
+	OSThread replyThread;
+	u8 mixerStack[0x10000] __attribute__((aligned(32)));
+	u8 replyStack[0x10000] __attribute__((aligned(32)));
+	volatile u32 framePending;
+	volatile u32 subframesRendered;
+	bool checked;
+	bool active;
+	bool mixerStarted;
+	bool replyStarted;
+};
+
+AsyncState s_async;
+bool s_workerExecuting;
+bool s_workerRelease;
+
+void execute();
+
+void queue_reply(u32 first, u32 second)
+{
+	SMS_PORT_HEAP_SCOPE();
+	Reply* reply = new Reply;
+	if (!reply)
+		return;
+	reply->first = first;
+	reply->second = second;
+	if (!wut_OSSendMessage(&s_async.replyQueue, reply, kWutMessageBlock)) {
+		delete reply;
+		port_log("[audio] DSP reply queue failed\n");
+	}
+}
+
+void* reply_thread(void*)
+{
+	for (;;) {
+		Reply* reply = nullptr;
+		if (!wut_OSReceiveMessage(&s_async.replyQueue, &reply, kWutMessageBlock))
+			continue;
+		if (!reply)
+			break;
+		BOOL level = OSDisableInterrupts();
+		post(reply->first);
+		post(reply->second);
+		__DSPHandler(0, NULL);
+		OSRestoreInterrupts(level);
+		{
+			SMS_PORT_HEAP_SCOPE();
+			delete reply;
+		}
+	}
+	return nullptr;
+}
+
+int mixer_thread(int, const char** argv)
+{
+	AsyncState* state = reinterpret_cast<AsyncState*>(
+		const_cast<void*>(reinterpret_cast<const void*>(argv)));
+	for (;;) {
+		Command* command = nullptr;
+		if (!wut_OSReceiveMessage(&state->commandQueue, &command, kWutMessageBlock))
+			continue;
+		if (!command)
+			break;
+		{
+			SMS_PORT_HEAP_SCOPE();
+			g.workerWords.swap(command->words);
+			s_workerRelease = command->release;
+			s_workerExecuting = true;
+			execute();
+			s_workerExecuting = false;
+			g.workerWords.clear();
+			delete command;
+		}
+	}
+	return 0;
+}
+
+bool start_async()
+{
+	if (s_async.checked)
+		return s_async.active;
+	s_async.checked = true;
+	if (sms_wiiu_sd_marker("syncmix")) {
+		port_log("[audio] DSP HLE mode: synchronous (SD marker syncmix)\n");
+		return false;
+	}
+	std::memset(&s_async, 0, sizeof(s_async));
+	s_async.checked = true;
+	wut_OSInitMessageQueue(&s_async.commandQueue, s_async.commandSlots, kCommandQueueCount);
+	wut_OSInitMessageQueue(&s_async.replyQueue, s_async.replySlots, kReplyQueueCount);
+	if (!sms_wiiu_OSCreateThread(&s_async.replyThread, reply_thread, nullptr,
+	                            s_async.replyStack + sizeof(s_async.replyStack),
+	                            sizeof(s_async.replyStack), kReplyPriority, 0)) {
+		port_log("[audio] DSP HLE: reply thread creation failed; using synchronous mode\n");
+		return false;
+	}
+	s_async.replyStarted = true;
+	s_async.active = true;
+	sms_wiiu_OSResumeThread(&s_async.replyThread);
+	if (!wut_OSCreateThread(&s_async.mixerThread, mixer_thread, 0,
+	                        reinterpret_cast<char*>(&s_async),
+	                        s_async.mixerStack + sizeof(s_async.mixerStack),
+	                        sizeof(s_async.mixerStack), kMixerPriority,
+	                        OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+		s_async.active = false;
+		wut_OSSendMessage(&s_async.replyQueue, nullptr, kWutMessageBlock);
+		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
+		s_async.replyStarted = false;
+		port_log("[audio] DSP HLE: mixer thread creation failed; using synchronous mode\n");
+		return false;
+	}
+	s_async.mixerStarted = true;
+	wut_OSResumeThread(&s_async.mixerThread);
+	port_log("[audio] DSP HLE mode: asynchronous (mixer core 0, replies core 1)\n");
+	return true;
+}
+
+void stop_async()
+{
+	if (!s_async.active)
+		return;
+	/* Stop follows all queued commands, so the reply stop marker follows all
+	 * mails produced by the mixer. */
+	wut_OSSendMessage(&s_async.commandQueue, nullptr, kWutMessageBlock);
+	if (s_async.mixerStarted) {
+		wut_OSJoinThread(&s_async.mixerThread, nullptr);
+		s_async.mixerStarted = false;
+	}
+	s_async.active = false;
+	if (s_async.replyStarted) {
+		wut_OSSendMessage(&s_async.replyQueue, nullptr, kWutMessageBlock);
+		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
+		s_async.replyStarted = false;
+	}
+	port_log("[audio] DSP HLE asynchronous threads stopped\n");
+}
+#endif
+
 // Raise the DSP interrupt: runs the decomp's __DSPHandler in interrupt
 // context at the next check point (the sender still has interrupts off).
 void raise_irq(u32 first, u32 second)
 {
+#ifdef TARGET_WIIU
+	if (s_async.active) {
+		queue_reply(first, second);
+		return;
+	}
+#endif
 	port_irq_defer([first, second]() {
 		post(first);
 		post(second);
@@ -145,14 +345,45 @@ void render_subframe()
 	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
 	g.sub++;
 	g.subframesRendered++;
+#ifdef TARGET_WIIU
+	if (s_async.active) {
+		s_async.subframesRendered++;
+		if (g.sub >= g.subframes)
+			s_async.framePending = 0;
+	}
+#endif
 	reply(0xFF00);
 }
 
 void execute()
 {
+	#ifdef TARGET_WIIU
+	if (s_async.active && !s_workerExecuting) {
+		SMS_PORT_HEAP_SCOPE();
+		Command* command = new Command;
+		if (!command)
+			return;
+		command->words = g.words;
+		command->release = g.release;
+		if (!wut_OSSendMessage(&s_async.commandQueue, command, kWutMessageBlock)) {
+			delete command;
+			port_log("[audio] DSP command queue failed\n");
+		}
+		return;
+	}
+	const std::vector<u32>& w = s_workerExecuting ? g.workerWords : g.words;
+	bool release = s_workerExecuting ? s_workerRelease : g.release;
+	#else
 	const std::vector<u32>& w = g.words;
+	#endif
 	u32 op = w[0] >> 24;
-	if (g.release) {
+	if (
+#ifdef TARGET_WIIU
+		release
+#else
+		g.release
+#endif
+	) {
 		// DSPReleaseHalt: the 64-bit active-voice map. The microcode renders
 		// the next subframe of the current frame and reports 0xFF00.
 		if (g.outA && g.sub < g.subframes)
@@ -180,6 +411,10 @@ void execute()
 			u32 frame    = (w[2] - w[1]) / 2;
 			g.subSamples = g.subframes ? frame / g.subframes : 0;
 			g.sub        = 0;
+#ifdef TARGET_WIIU
+			if (s_async.active)
+				s_async.framePending = g.subframes != 0;
+#endif
 			if (!g.traced) {
 				g.traced = true;
 				port_log("[audio] first DSP frame: %u subframes x %u samples, mixer level 0x%04x\n",
@@ -201,6 +436,9 @@ extern "C" void port_audio_dsp_boot(DSPTaskInfo* task)
 	// Task start: the microcode mails 0xDCD10000 (the handler then runs the
 	// task's init_cb, DspHandShake, which waits for one more mail).
 	(void)task;
+#ifdef TARGET_WIIU
+	start_async();
+#endif
 	raise_irq(0xDCD10000u, kPrefix);
 	port_log("[audio] DSP HLE: audio task booted (software mixer)\n");
 }
@@ -241,14 +479,32 @@ extern "C" void port_audio_dsp_assert_int(void)
 	g.words.clear();
 }
 
-extern "C" u64 port_audio_dsp_subframes(void) { return g.subframesRendered; }
+extern "C" u64 port_audio_dsp_subframes(void)
+{
+#ifdef TARGET_WIIU
+	if (s_async.active)
+		return s_async.subframesRendered;
+#endif
+	return g.subframesRendered;
+}
 
 // True while a frame started by 0x82 still has subframes to render. The AI
 // layer does not start another DMA block until it is done: on hardware the
 // DSP always finishes a frame within one block period, and consuming blocks
 // faster than JAudio produces frames makes DSPBuf repeat stale samples (gaps)
 // while the sequencer falls behind.
-extern "C" int port_audio_dsp_frame_pending(void) { return g.outA && g.sub < g.subframes; }
+extern "C" int port_audio_dsp_frame_pending(void)
+{
+#ifdef TARGET_WIIU
+	if (s_async.active)
+		return s_async.framePending != 0;
+#endif
+	return g.outA && g.sub < g.subframes;
+}
+
+#ifdef TARGET_WIIU
+extern "C" void port_audio_dsp_shutdown(void) { stop_async(); }
+#endif
 
 #ifdef SMS_AUDIO_DSP_HLE
 // SDK surface (replaces the handshake-only fake in platform/misc/sdk_data.cpp).
