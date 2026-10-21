@@ -4457,6 +4457,13 @@ static bool gx2DlEndCall(void* list) {
     if (!s_gx2DlRecording) return false;
     const uint32_t bytes = GX2EndDisplayList(list);
     s_gx2DlRecording = false;
+    // Give back the unused part of the 64 KiB reservation: keeping all of it
+    // fit only 64 lists in the 4 MiB arena per frame, and every later draw
+    // was dropped (fallback off), which also broke the file-select load.
+    {
+        const uint32_t start = uint32_t(static_cast<uint8_t*>(list) - s_gx2DlArena[s_vertexArenaIndex]);
+        s_gx2DlUsed[s_vertexArenaIndex] = start + (bytes <= kGx2DlReserveBytes ? bytes : kGx2DlReserveBytes);
+    }
     if (!bytes || bytes > kGx2DlReserveBytes) {
         ++s_perfDlOverflows;
         return false;
