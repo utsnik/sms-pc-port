@@ -172,7 +172,7 @@ set_source_files_properties(${SMS_DECOMP}/libs/JSystem/src/JKernel/JKRHeap.cpp
   COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/debug_os.h")
 target_compile_options(sms PRIVATE
   -mcpu=750 -meabi -mhard-float -fno-strict-aliasing -fwrapv
-  -ffunction-sections -fdata-sections -fno-omit-frame-pointer
+  -ffunction-sections -fdata-sections ${SMS_WIIU_FP_FLAG}
   -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
   -std=gnu++11)
 

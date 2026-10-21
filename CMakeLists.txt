@@ -97,8 +97,16 @@ if(SMS_WIIU)
       VERSION_GMSE01 BUILD_VERSION=2 NDEBUG=1)
   set(SMS_GAME_INCLUDE_DIRS ${SMS_DECOMP_INCLUDE_DIRS})
   set(SMS_GAME_PCH_DIR ${SMS_DECOMP}/include)
+  # PowerPC keeps the stack back chain at 0(r1) either way (the profiler and
+  # crash walks follow it), so a frame pointer only costs r31 and prologue work.
+  option(SMS_WIIU_FRAME_POINTER "Keep -fno-omit-frame-pointer on the Wii U" ON)
+  if(SMS_WIIU_FRAME_POINTER)
+    set(SMS_WIIU_FP_FLAG -fno-omit-frame-pointer)
+  else()
+    set(SMS_WIIU_FP_FLAG -fomit-frame-pointer)
+  endif()
   set(SMS_GAME_FLAGS
-    -w -fno-strict-aliasing -fwrapv -fno-omit-frame-pointer
+    -w -fno-strict-aliasing -fwrapv ${SMS_WIIU_FP_FLAG}
     -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector
     -ffunction-sections -fdata-sections -ffp-contract=off
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics>
