@@ -3190,6 +3190,7 @@ static const float kArbitraryMipThreshold = 14.0f;
 // inside a frame (flushBatch), before applyState/setTevShader re-apply state.
 static void rebindTvTarget();
 static bool s_retileTextures = true;
+static uint32_t s_whiteFillLogs;
 static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
     if (level >= tiled.surface.mipLevels) return false;
     GX2CopySurface(&linear.surface, level, 0, &tiled.surface, level, 0); invalidateVertexUniforms();
@@ -3349,6 +3350,13 @@ static TextureEntry* getTexture(int map) {
     uint8_t* prev = (readable && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     if (!rgba || (surf.mipLevels > 1 && !prev)) {
+        if (s_whiteFillLogs < 40) {
+            ++s_whiteFillLogs;
+            WHBLogPrintf("SMS Wii U: white-fill source=%08x gxFormat=%u width=%u height=%u mipLevels=%u unreadable=%u allocationFailure=%u requestedBytes=%u",
+                         (unsigned)a0, (unsigned)fmt, (unsigned)w, (unsigned)h, (unsigned)surf.mipLevels,
+                         readable ? 0u : 1u, readable ? 1u : 0u,
+                         (unsigned)(w * h * 4 * (surf.mipLevels > 1 ? 2 : 1)));
+        }
         memset(surf.image, 0xff, surf.imageSize);
         if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
     } else {
@@ -4288,6 +4296,7 @@ void rendererInit(float) {
     }
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
+    s_retileTextures = !sdMarkerPresent("noretile");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
