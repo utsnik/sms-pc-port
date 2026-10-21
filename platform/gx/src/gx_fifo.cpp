@@ -241,10 +241,23 @@ bool isBigEndianData(const void* p) {
     return true;
 }
 
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+static inline uint16_t be16(const uint8_t* p) {
+    uint16_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline uint32_t be32(const uint8_t* p) {
+    uint32_t v;
+    __builtin_memcpy(&v, p, sizeof(v));
+    return v;
+}
+#else
 static inline uint16_t be16(const uint8_t* p) { return uint16_t(p[0] << 8 | p[1]); }
 static inline uint32_t be32(const uint8_t* p) {
     return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
 }
+#endif
 
 // ------------------------------------------------------------------ register writes
 // On a big-endian host (Wii U) disc data and game-built arrays are both
@@ -1004,8 +1017,15 @@ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
     int slot = 12 + ((op - 0x20) >> 3);
     const uint8_t* src = arrayElem(slot, idx);
     if (!src) return;
-    uint32_t words[16];
     bool be = g.arrayBigEndian[slot];
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    if (be && (reinterpret_cast<uintptr_t>(src) & 3) == 0) {
+        typedef uint32_t gx_command_word __attribute__((__may_alias__));
+        writeXF(uint16_t(addr), cnt, reinterpret_cast<const gx_command_word*>(src));
+        return;
+    }
+#endif
+    uint32_t words[16];
     for (uint32_t k = 0; k < cnt; k++)
         words[k] = be ? be32(src + k * 4)
                       : (uint32_t(src[k * 4]) | uint32_t(src[k * 4 + 1]) << 8 | uint32_t(src[k * 4 + 2]) << 16 |
@@ -1041,8 +1061,16 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
             uint32_t cnt = (hdr >> 16) + 1;
             len = 5 + cnt * 4;
             if (avail < len) break;
-            uint32_t words[64];
             uint16_t addr = uint16_t(hdr & 0xFFFF);
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            if ((reinterpret_cast<uintptr_t>(p + 5) & 3) == 0) {
+                typedef uint32_t gx_command_word __attribute__((__may_alias__));
+                writeXF(addr, cnt, reinterpret_cast<const gx_command_word*>(p + 5));
+                p += len;
+                continue;
+            }
+#endif
+            uint32_t words[64];
             for (uint32_t i = 0; i < cnt;) {
                 uint32_t m = cnt - i > 64 ? 64 : cnt - i;
                 for (uint32_t k = 0; k < m; k++) words[k] = be32(p + 5 + (i + k) * 4);
