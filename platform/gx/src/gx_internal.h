@@ -182,8 +182,6 @@ const VtxFmtLayout& vtxFmtLayout(uint32_t fmt);
 void unpackVertex(const VtxFmtLayout& layout, uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9],
                   HostVertex& out, bool zeroed = false);
 void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& out, bool zeroed = false);
-float decodeVertexComponentForTest(uint8_t type, bool bigEndian, const uint8_t* p, float scale);
-uint32_t decodeVertexIndexForTest(uint8_t mode, const uint8_t* p);
 
 // The loader decodes a primitive's vertices straight into the batch:
 // primitiveBegin returns room for `count` vertices of format `fmt` (after
