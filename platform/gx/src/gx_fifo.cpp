@@ -74,22 +74,12 @@ uint64_t hashBytes(const void* data, size_t n, uint64_t seed) {
     uint32_t a = uint32_t(seed) ^ uint32_t(n) * 0x9E3779B1u, b = uint32_t(seed >> 32) ^ 0x85EBCA77u,
              c = a ^ 0xC2B2AE3Du, d = b ^ 0x27D4EB2Fu;
     for (; n >= 16; n -= 16, p += 16) {
-        if ((reinterpret_cast<uintptr_t>(p) & 3) == 0) {
-            typedef uint32_t gx_hash_word __attribute__((__may_alias__));
-            const gx_hash_word* wp = reinterpret_cast<const gx_hash_word*>(p);
-            const uint32_t w0 = wp[0], w1 = wp[1], w2 = wp[2], w3 = wp[3];
-            a = (a ^ w0) * 0x9E3779B1u; a ^= a >> 15;
-            b = (b ^ w1) * 0x85EBCA77u; b ^= b >> 13;
-            c = (c ^ w2) * 0xC2B2AE3Du; c ^= c >> 16;
-            d = (d ^ w3) * 0x27D4EB2Fu; d ^= d >> 15;
-        } else {
-            uint32_t w[4];
-            memcpy(w, p, 16);
-            a = (a ^ w[0]) * 0x9E3779B1u; a ^= a >> 15;
-            b = (b ^ w[1]) * 0x85EBCA77u; b ^= b >> 13;
-            c = (c ^ w[2]) * 0xC2B2AE3Du; c ^= c >> 16;
-            d = (d ^ w[3]) * 0x27D4EB2Fu; d ^= d >> 15;
-        }
+        uint32_t w[4];
+        memcpy(w, p, 16);
+        a = (a ^ w[0]) * 0x9E3779B1u; a ^= a >> 15;
+        b = (b ^ w[1]) * 0x85EBCA77u; b ^= b >> 13;
+        c = (c ^ w[2]) * 0xC2B2AE3Du; c ^= c >> 16;
+        d = (d ^ w[3]) * 0x27D4EB2Fu; d ^= d >> 15;
     }
     for (; n; --n, ++p) { a = (a ^ *p) * 0x9E3779B1u; a ^= a >> 15; }
     uint32_t lo = (a ^ (c >> 7)) * 0x85EBCA77u, hi = (b ^ (d >> 9)) * 0xC2B2AE3Du;
@@ -1131,7 +1121,6 @@ struct DlArray {  // the part of an attribute array the list reads
     uint64_t hash;
     uint8_t slot;
     bool be;
-    bool staticData;
 };
 struct DlEntry {
     bool valid = false;
@@ -1152,7 +1141,6 @@ struct DlEntry {
     uint32_t skip = 0;    // calls left to run without the cache
     uint32_t checkedClock = 0, checkedFrame = 0;  // when its source bytes were last compared
     bool hashAlways = false;  // its bytes once changed with no write reported: compared on every call
-    bool staticData = false;  // command bytes are in an immutable registered resource range
 };
 // The entries (stable addresses) and an open-addressing index of them by
 // list address (a thousand lookups a frame).
@@ -1259,16 +1247,13 @@ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
         if ((e.vatMask >> v) & 1)
             if (e.vat[v][0] != g.cpVatA[v] || e.vat[v][1] != g.cpVatB[v] || e.vat[v][2] != g.cpVatC[v]) return false;
     if (e.usesMtx && (e.matA != g.xfReg[XFR_MATIDX_A] || e.matB != g.xfReg[XFR_MATIDX_B])) return false;
-    bool staticSources = e.staticData;
-    for (const DlArray& a : e.arrays) {
+    for (const DlArray& a : e.arrays)
         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
             return false;
-        staticSources = staticSources && a.staticData;
-    }
     bool unwritten = trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
-    if (unwritten && (staticSources || g_displayFrames - e.checkedFrame < kDlRecheckFrames)) return true;
+    if (unwritten && g_displayFrames - e.checkedFrame < kDlRecheckFrames) return true;
     uint32_t clock = writeClock();
     bool same = hashBytes(data, size) == e.hash;
     for (size_t i = 0; same && i < e.arrays.size(); i++)
@@ -1455,7 +1440,6 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         for (int i = 0; i < 16; i++) s_dlElem[i] = 0;  // arrays read by lists it called: not its own
     }
     e.hash = hashBytes(data, size);
-    e.staticData = isBigEndianData(data);
     for (int i = 0; i < 16; i++) {
         if (!s_dlElem[i]) continue;
         DlArray a;
@@ -1466,7 +1450,6 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         a.hash = hashBytes(a.base + a.lo, a.hi - a.lo);
         a.slot = uint8_t(i);
         a.be = g.arrayBigEndian[i];
-        a.staticData = isBigEndianData(a.base + a.lo);
         e.arrays.push_back(a);
     }
     for (const DlRun& r : e.runs) e.bytes += r.verts.size() + r.idx.size() * 4;
