@@ -109,9 +109,17 @@ BOOL wut_OSCreateThread(WutThread*, WutEntry, int32_t, char*, void*, uint32_t,
 	                        int32_t, uint8_t) __asm__("OSCreateThread");
 int32_t wut_OSResumeThread(WutThread*) __asm__("OSResumeThread");
 BOOL wut_OSJoinThread(WutThread*, int*) __asm__("OSJoinThread");
-void wut_OSInitMessageQueue(WutMessageQueue*, void*, int32_t) __asm__("OSInitMessageQueue");
-BOOL wut_OSSendMessage(WutMessageQueue*, void*, int32_t) __asm__("OSSendMessage");
-BOOL wut_OSReceiveMessage(WutMessageQueue*, void*, int32_t) __asm__("OSReceiveMessage");
+/* wut's OSMessage: a pointer and three words (16 bytes). The queue calls copy
+ * whole messages, so a bare pointer passed as one made the receiver read the
+ * Reply's first mail word (0xDCD10000) as its pointer: a DSI at boot
+ * (2026-10-21 03:12). */
+struct WutMessage {
+	void* message;
+	uint32_t args[3];
+};
+void wut_OSInitMessageQueue(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSInitMessageQueue");
+BOOL wut_OSSendMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSSendMessage");
+BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSReceiveMessage");
 
 int sms_wiiu_OSCreateThread(OSThread*, void* (*)(void*), void*, void*, u32, s32, u16);
 long sms_wiiu_OSResumeThread(OSThread*);
@@ -141,8 +149,8 @@ struct Reply {
 struct AsyncState {
 	WutMessageQueue commandQueue;
 	WutMessageQueue replyQueue;
-	void* commandSlots[kCommandQueueCount] __attribute__((aligned(32)));
-	void* replySlots[kReplyQueueCount] __attribute__((aligned(32)));
+	WutMessage commandSlots[kCommandQueueCount] __attribute__((aligned(32)));
+	WutMessage replySlots[kReplyQueueCount] __attribute__((aligned(32)));
 	WutThread mixerThread;
 	OSThread replyThread;
 	u8 mixerStack[0x10000] __attribute__((aligned(32)));
@@ -156,6 +164,20 @@ struct AsyncState {
 };
 
 AsyncState s_async;
+
+BOOL send_ptr(WutMessageQueue* q, void* p)
+{
+	WutMessage m = {p, {0, 0, 0}};
+	return wut_OSSendMessage(q, &m, kWutMessageBlock);
+}
+
+BOOL receive_ptr(WutMessageQueue* q, void** p)
+{
+	WutMessage m = {nullptr, {0, 0, 0}};
+	const BOOL ok = wut_OSReceiveMessage(q, &m, kWutMessageBlock);
+	*p = m.message;
+	return ok;
+}
 bool s_workerExecuting;
 bool s_workerRelease;
 
@@ -169,7 +191,7 @@ void queue_reply(u32 first, u32 second)
 		return;
 	reply->first = first;
 	reply->second = second;
-	if (!wut_OSSendMessage(&s_async.replyQueue, reply, kWutMessageBlock)) {
+	if (!send_ptr(&s_async.replyQueue, reply)) {
 		delete reply;
 		port_log("[audio] DSP reply queue failed\n");
 	}
@@ -179,7 +201,7 @@ void* reply_thread(void*)
 {
 	for (;;) {
 		Reply* reply = nullptr;
-		if (!wut_OSReceiveMessage(&s_async.replyQueue, &reply, kWutMessageBlock))
+		if (!receive_ptr(&s_async.replyQueue, reinterpret_cast<void**>(&reply)))
 			continue;
 		if (!reply)
 			break;
@@ -202,7 +224,7 @@ int mixer_thread(int, const char** argv)
 		const_cast<void*>(reinterpret_cast<const void*>(argv)));
 	for (;;) {
 		Command* command = nullptr;
-		if (!wut_OSReceiveMessage(&state->commandQueue, &command, kWutMessageBlock))
+		if (!receive_ptr(&state->commandQueue, reinterpret_cast<void**>(&command)))
 			continue;
 		if (!command)
 			break;
@@ -248,7 +270,7 @@ bool start_async()
 	                        sizeof(s_async.mixerStack), kMixerPriority,
 	                        OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
 		s_async.active = false;
-		wut_OSSendMessage(&s_async.replyQueue, nullptr, kWutMessageBlock);
+		send_ptr(&s_async.replyQueue, nullptr);
 		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
 		s_async.replyStarted = false;
 		port_log("[audio] DSP HLE: mixer thread creation failed; using synchronous mode\n");
@@ -266,14 +288,14 @@ void stop_async()
 		return;
 	/* Stop follows all queued commands, so the reply stop marker follows all
 	 * mails produced by the mixer. */
-	wut_OSSendMessage(&s_async.commandQueue, nullptr, kWutMessageBlock);
+	send_ptr(&s_async.commandQueue, nullptr);
 	if (s_async.mixerStarted) {
 		wut_OSJoinThread(&s_async.mixerThread, nullptr);
 		s_async.mixerStarted = false;
 	}
 	s_async.active = false;
 	if (s_async.replyStarted) {
-		wut_OSSendMessage(&s_async.replyQueue, nullptr, kWutMessageBlock);
+		send_ptr(&s_async.replyQueue, nullptr);
 		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
 		s_async.replyStarted = false;
 	}
@@ -373,7 +395,7 @@ void execute()
 		if (!g.release && !g.words.empty() && (g.words[0] >> 24) == 0x82 && g.words.size() >= 3 &&
 		    ((g.words[0] >> 16) & 0xFF) != 0)
 			s_async.framePending = 1;
-		if (!wut_OSSendMessage(&s_async.commandQueue, command, kWutMessageBlock)) {
+		if (!send_ptr(&s_async.commandQueue, command)) {
 			delete command;
 			port_log("[audio] DSP command queue failed\n");
 		}
