@@ -151,7 +151,9 @@ static int open_ax(int rate)
 	{
 		AXDRCVSMode vs = 0xffffffffu;
 		AXGetDRCVSMode(&vs);
-		if (sms_wiiu_sd_marker("axvsoff"))
+		// GamePad virtual surround runs on core 1 in the AX IST: off by
+		// default (~1.5 ms of plaza p90, 2026-10-21); SD marker axvson keeps it.
+		if (!sms_wiiu_sd_marker("axvson"))
 			AXSetDRCVSMode(0);
 		if (sms_wiiu_sd_marker("axnocomp")) {
 			AXSetDeviceCompressor(AX_DEVICE_TYPE_TV, 0);
@@ -159,7 +161,7 @@ static int open_ax(int rate)
 			port_log("[audio] SD marker axnocomp: TV and DRC compressors off\n");
 		}
 		port_log("[audio] AX experiment: tvonly=%d idle=%d 32k=%d pipe4=%d drcvs=%u%s\n", (int)s_axTvOnly,
-		         (int)s_axIdle, (int)ax32k, (int)pipe4, (unsigned)vs, sms_wiiu_sd_marker("axvsoff") ? "->0" : "");
+		         (int)s_axIdle, (int)ax32k, (int)pipe4, (unsigned)vs, sms_wiiu_sd_marker("axvson") ? "" : "->0");
 	}
 	if (!AXIsInit()) {
 		port_log("[audio] AX voice init failed\n");
