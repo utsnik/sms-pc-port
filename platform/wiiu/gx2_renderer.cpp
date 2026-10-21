@@ -3429,9 +3429,11 @@ static bool packStart(TextureEntry& e, const TexturePackEntry* entry) {
     GX2CalcSurfaceSizeAndAlignment(&e.packTiled.surface);
     e.packTiled.surface.image = alignedZero(e.packTiled.surface.alignment, e.packTiled.surface.imageSize);
     if (!e.packTiled.surface.image) { packFreeLoading(e); return false; }
+    DCFlushRange(e.packTiled.surface.image, e.packTiled.surface.imageSize);
     if (e.packTiled.surface.mipLevels > 1) {
         e.packTiled.surface.mipmaps = alignedZero(e.packTiled.surface.alignment, e.packTiled.surface.mipmapSize);
         if (!e.packTiled.surface.mipmaps) { packFreeLoading(e); return false; }
+        DCFlushRange(e.packTiled.surface.mipmaps, e.packTiled.surface.mipmapSize);
     }
     GX2InitTextureRegs(&e.packTiled);
     std::memset(e.packLevelBytes, 0, sizeof e.packLevelBytes);
@@ -3465,7 +3467,10 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
     }
     e.packLevelBytes[chunk.level] += chunk.bytes;
     if (chunk.last) {
-        if (e.packLevelBytes[chunk.level] != level.rgbaSize || !retileTexture(e.packLinear, e.packTiled, chunk.level)) return false;
+        if (e.packLevelBytes[chunk.level] != level.rgbaSize) return false;
+        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, base,
+                      static_cast<uint32_t>(levelEnd - (chunk.level == 0 ? 0 : mipOff)));
+        if (!retileTexture(e.packLinear, e.packTiled, chunk.level)) return false;
         e.packLevelDone |= 1u << chunk.level;
     }
     return true;
