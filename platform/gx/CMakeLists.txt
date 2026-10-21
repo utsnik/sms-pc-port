@@ -166,6 +166,11 @@ if(SMS_GX_BUILD_TESTS)
     add_test(NAME gx_hires_all_test COMMAND gx_hires_test --all)
     set_tests_properties(gx_hires_test gx_hires_fallback_test gx_hires_sync_test gx_hires_no_preload_test
         gx_hires_all_test PROPERTIES SKIP_RETURN_CODE 77)
+    add_executable(gx2_texture_pack_format_test tests/gx2_texture_pack_format_test.cpp
+        src/gx2_texture_pack_format.cpp)
+    target_include_directories(gx2_texture_pack_format_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(gx2_texture_pack_format_test PRIVATE cxx_std_17)
+    add_test(NAME gx2_texture_pack_format_test COMMAND gx2_texture_pack_format_test)
 
     add_executable(gx_windowtest tests/gx_windowtest.cpp)
     target_include_directories(gx_windowtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
