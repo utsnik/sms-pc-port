@@ -9,6 +9,7 @@ namespace gx {
 
 static const uint32_t kTexturePackMaxLevels = 16;
 static const uint32_t kTexturePackMaxQueue = 64;
+static const uint32_t kTexturePackMaxResidents = 512;
 static const uint32_t kTexturePackMaxChunk = 256u << 10;
 
 struct TexturePackKey {
@@ -66,6 +67,14 @@ struct TexturePackResult {
     uint32_t retry;
     bool found;
     bool changed;
+};
+
+struct TexturePackUploadChunk {
+    uint32_t requestId, level, offset, bytes;
+    const uint8_t* data;
+    const TexturePackEntry* entry;
+    bool last;
+    bool ok;
 };
 
 class TexturePackRequestQueue {
@@ -138,7 +147,7 @@ public:
         uint32_t count = 0;
         while (bytes_ + needed > budget_) {
             int victim = -1;
-            for (unsigned i = 0; i != kTexturePackMaxQueue; ++i) {
+            for (unsigned i = 0; i != kTexturePackMaxResidents; ++i) {
                 const TexturePackLruNode& n = nodes_[i];
                 if (!n.resident || n.lastUsedFrame + 1 >= frame) continue;
                 if (victim < 0 || n.lastUsedFrame < nodes_[victim].lastUsedFrame) victim = int(i);
@@ -152,7 +161,7 @@ public:
     }
 
 private:
-    TexturePackLruNode nodes_[kTexturePackMaxQueue];
+    TexturePackLruNode nodes_[kTexturePackMaxResidents];
     uint64_t budget_, bytes_;
 };
 
@@ -178,6 +187,8 @@ const TexturePackEntry* texturePackLookup(const TexturePackKey& key);
 bool texturePackReadChunk(uint64_t offset, uint32_t bytes, void* out);
 bool texturePackEnqueue(const TexturePackRequest& request);
 bool texturePackPopResult(TexturePackResult* result);
+bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk);
+void texturePackReleaseUploadChunk();
 void texturePackNoteFrame(uint32_t frame);
 uint32_t texturePackMaxDimension();
 uint32_t texturePackEntryCount();
