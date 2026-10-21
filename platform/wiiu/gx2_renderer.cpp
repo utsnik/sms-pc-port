@@ -3063,11 +3063,10 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         t.texture.surface.height = copyH;
         t.texture.surface.depth = 1;
         t.texture.surface.mipLevels = 1;
-        // GXCopyTex converts the EFB to the requested GX texture format. In
-        // particular, RGB565 has an implicit alpha of one; retaining the TV
-        // RGBA8 surface here leaks the EFB's alpha into the title's screen
-        // blend and washes out the logo.
-        t.texture.surface.format = fmt == 4 ? GX2_SURFACE_FORMAT_UNORM_R5_G6_B5 : cb->surface.format;
+        // GX2CopySurface is a surface copy, not a format-converting blit. Keep
+        // the copy surface in the color buffer's format; compMap supplies the
+        // GX texture-format semantics below (including RGB565's alpha of one).
+        t.texture.surface.format = cb->surface.format;
         t.texture.surface.aa = GX2_AA_MODE1X;
         // LINEAR_SPECIAL makes Cemu complete the color-buffer copy through
         // its synchronous CPU path; the texture coordinates below still
@@ -3079,6 +3078,8 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         GX2CalcSurfaceSizeAndAlignment(&t.texture.surface);
         t.texture.surface.image = alignedZero(t.texture.surface.alignment, t.texture.surface.imageSize);
         if (!t.texture.surface.image) return;
+        // The zero fill must not be written back over the GPU's copy later.
+        DCFlushRange(t.texture.surface.image, t.texture.surface.imageSize);
         GX2InitTextureRegs(&t.texture);
         t.valid = true;
         static unsigned s_copyEntryLogs;
