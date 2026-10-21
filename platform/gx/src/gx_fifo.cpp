@@ -1654,7 +1654,6 @@ void GXPC_WriteF32(float f) {
     memcpy(&v, &f, 4);
     GXPC_Write32(v);
 }
-void GXPC_WriteBytes(const uint8_t* bytes, uint32_t n) { pipePut(bytes, n); }
 
 }  // extern "C"
 

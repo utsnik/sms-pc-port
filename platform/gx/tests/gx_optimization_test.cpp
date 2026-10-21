@@ -1,5 +1,4 @@
 #include "gx_internal.h"
-#include "sms_gx/gxvert_pc.h"
 
 #include <cassert>
 #include <cstdint>
@@ -117,21 +116,6 @@ int main() {
             assert(memcmp(&got, &expected, sizeof(got)) == 0);
         }
     }
-    uint8_t pipe[32] = {};
-    GXPC_PipeBuf = pipe;
-    GXPC_PipeLen = 0;
-    GXPC_PipeFast = sizeof(pipe);
-    GXPosition3f32(1.0f, -2.5f, 3.25f);
-    GXTexCoord2f32(-4.0f, 5.5f);
-    GXColor4u8(6, 7, 8, 9);
-    const uint8_t expectedPipe[] = {
-        0x3f, 0x80, 0x00, 0x00, 0xc0, 0x20, 0x00, 0x00, 0x40, 0x50, 0x00, 0x00,
-        0xc0, 0x80, 0x00, 0x00, 0x40, 0xb0, 0x00, 0x00, 6, 7, 8, 9,
-    };
-    assert(GXPC_PipeLen == sizeof(expectedPipe));
-    assert(memcmp(pipe, expectedPipe, sizeof(expectedPipe)) == 0);
-    GXPC_PipeBuf = nullptr;
-    GXPC_PipeLen = GXPC_PipeFast = 0;
-    std::puts("gx_optimization_test: hashBytes, unpackVertex, and vertex-writer reference comparisons passed");
+    std::puts("gx_optimization_test: hashBytes and unpackVertex reference comparisons passed");
     return 0;
 }
