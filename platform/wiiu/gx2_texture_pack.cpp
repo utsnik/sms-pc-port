@@ -1,8 +1,11 @@
 #include "gx2_texture_pack.h"
 
 #include "runtime.h"
+#include "../gx/src/gx_internal.h"
+#include "../gx/src/gx_texture_pack_common.h"
 
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/time.h>
 #include <whb/log.h>
 
 #include <algorithm>
@@ -37,6 +40,30 @@ struct State {
 };
 
 State s_state = {};
+TexturePackRequestQueue s_requests;
+TexturePackResult s_results[kTexturePackMaxQueue];
+volatile uint32_t s_resultRead;
+volatile uint32_t s_resultWrite;
+
+struct WutThread { unsigned char bytes[0x6a0]; } __attribute__((aligned(32)));
+struct WutMessageQueue { unsigned char bytes[0x100]; } __attribute__((aligned(32)));
+typedef int (*WutEntry)(int, const char**);
+extern "C" {
+BOOL wut_OSCreateThread(WutThread*, WutEntry, int32_t, char*, void*, uint32_t, int32_t, uint8_t) __asm__("OSCreateThread");
+int32_t wut_OSResumeThread(WutThread*) __asm__("OSResumeThread");
+BOOL wut_OSJoinThread(WutThread*, int*) __asm__("OSJoinThread");
+void wut_OSInitMessageQueue(WutMessageQueue*, void*, int32_t) __asm__("OSInitMessageQueue");
+BOOL wut_OSSendMessage(WutMessageQueue*, void*, int32_t) __asm__("OSSendMessage");
+BOOL wut_OSReceiveMessage(WutMessageQueue*, void**, int32_t) __asm__("OSReceiveMessage");
+}
+static const uint8_t kWorkerAffinityCpu2 = 1u << 2;
+static const int32_t kMessageBlock = 1;
+static WutThread s_worker;
+static WutMessageQueue s_workerWake;
+static void* s_workerSlots[kTexturePackMaxQueue] __attribute__((aligned(32)));
+static uint8_t s_workerStack[0x10000] __attribute__((aligned(32)));
+static bool s_workerStarted;
+static volatile bool s_workerStop;
 
 static uint16_t get16(const uint8_t* p) { return uint16_t(uint16_t(p[0]) << 8 | p[1]); }
 static uint32_t get32(const uint8_t* p) {
@@ -96,6 +123,72 @@ static void freeIndex() {
     s_state.entries = nullptr;
 }
 
+static bool readableSource(const uint8_t* source, uint32_t bytes) {
+    const uint32_t a = reinterpret_cast<uint32_t>(source), end = a + bytes;
+    return source && bytes && end > a &&
+           ((a >= 0x10000000u && end <= 0x50000000u) || (a >= 0xF4000000u && end <= 0xF6000000u));
+}
+
+static void publishResult(const TexturePackResult& result) {
+    const uint32_t write = s_resultWrite, read = s_resultRead;
+    if (write - read >= kTexturePackMaxQueue) return;
+    s_results[write % kTexturePackMaxQueue] = result;
+    __sync_synchronize();
+    s_resultWrite = write + 1;
+}
+
+static void matchRequest(const TexturePackRequest& request) {
+    TexturePackResult result = {};
+    result.request = request;
+    const uint32_t bytes = texLevelBytes(request.format, request.width, request.height);
+    result.key.width = request.width; result.key.height = request.height; result.key.format = request.format;
+    result.key.mipmapped = request.levels > 1; result.key.wildcardTlut = 0;
+    if (!readableSource(request.source, bytes)) {
+        publishResult(result);
+        return;
+    }
+    const OSTime start = OSGetTime();
+    result.key.dataHash = xxh64(request.source, bytes, 0);
+    if (request.format >= 8 && request.format <= 10 && request.tlut) {
+        uint32_t lo = 0, hi = 0;
+        paletteRange(request.source, bytes, request.format, &lo, &hi);
+        const uint32_t offset = lo * 2;
+        uint32_t length = (hi + 1 - lo) * 2;
+        if (offset + length > request.tlutBytes) length = offset < request.tlutBytes ? request.tlutBytes - offset : 0;
+        result.key.tlutHash = xxh64(request.tlut + offset, length, 0);
+    }
+    const bool sourceUnchanged = unwrittenSince(request.source, bytes, request.writeClock);
+    const bool tlutUnchanged = !request.tlut || !readableSource(request.tlut, request.tlutBytes) ||
+                                unwrittenSince(request.tlut, request.tlutBytes, request.writeClock);
+    if (!sourceUnchanged || !tlutUnchanged) {
+        result.changed = true;
+        result.retry = request.retry + 1;
+        publishResult(result);
+        return;
+    }
+    const TexturePackEntry* entry = texturePackLookup(result.key);
+    if (!entry) {
+        result.key.mipmapped = !result.key.mipmapped;
+        entry = texturePackLookup(result.key);
+        result.key.mipmapped = !result.key.mipmapped;
+    }
+    result.entry = entry;
+    result.found = entry != nullptr;
+    (void)start;
+    publishResult(result);
+}
+
+static int texturePackWorker(int, const char**) {
+    while (!s_workerStop) {
+        void* message = nullptr;
+        if (!wut_OSReceiveMessage(&s_workerWake, &message, kMessageBlock)) continue;
+        if (!message) break;
+        TexturePackRequest request;
+        while (s_requests.pop(&request)) matchRequest(request);
+    }
+    return 0;
+}
+
 static void reject(const char* why) {
     WHBLogPrintf("SMS Wii U: [texpack] rejected archive: %s", why);
     if (s_state.file) std::fclose(s_state.file);
@@ -125,91 +218,6 @@ static bool parseEntry(const uint8_t* p, TexturePackEntry* e) {
 }
 
 } // namespace
-
-bool texturePackKeyEqual(const TexturePackKey& a, const TexturePackKey& b) {
-    return a.width == b.width && a.height == b.height && a.format == b.format &&
-           a.mipmapped == b.mipmapped && a.dataHash == b.dataHash && a.tlutHash == b.tlutHash &&
-           a.wildcardTlut == b.wildcardTlut;
-}
-
-bool texturePackKeySameSource(const TexturePackKey& a, const TexturePackKey& b) {
-    return a.width == b.width && a.height == b.height && a.format == b.format &&
-           a.mipmapped == b.mipmapped;
-}
-
-bool texturePackWildcardMatch(const TexturePackKey& stored, const TexturePackKey& query) {
-    return stored.width == query.width && stored.height == query.height && stored.format == query.format &&
-           stored.mipmapped == query.mipmapped && stored.dataHash == query.dataHash && stored.wildcardTlut;
-}
-
-TexturePackRequestQueue::TexturePackRequestQueue() : read_(0), write_(0) {}
-
-bool TexturePackRequestQueue::contains(const TexturePackRequest& r) const {
-    const uint32_t read = read_, write = write_;
-    for (uint32_t i = read; i != write; ++i) {
-        const TexturePackRequest& q = slots_[i % kTexturePackMaxQueue];
-        if (q.source == r.source && q.tlut == r.tlut && q.width == r.width && q.height == r.height &&
-            q.format == r.format && q.levels == r.levels && q.tlutFormat == r.tlutFormat)
-            return true;
-    }
-    return false;
-}
-
-bool TexturePackRequestQueue::push(const TexturePackRequest& r) {
-    if (contains(r)) return true;
-    const uint32_t write = write_, read = read_;
-    if (write - read >= kTexturePackMaxQueue) return false;
-    slots_[write % kTexturePackMaxQueue] = r;
-    __sync_synchronize();
-    write_ = write + 1;
-    return true;
-}
-
-bool TexturePackRequestQueue::pop(TexturePackRequest* r) {
-    if (!r) return false;
-    const uint32_t read = read_;
-    if (read == write_) return false;
-    __sync_synchronize();
-    *r = slots_[read % kTexturePackMaxQueue];
-    read_ = read + 1;
-    return true;
-}
-
-uint32_t TexturePackRequestQueue::size() const { return write_ - read_; }
-void TexturePackRequestQueue::clear() { read_ = write_; }
-
-TexturePackLru::TexturePackLru() : budget_(0), bytes_(0) { reset(0); }
-void TexturePackLru::reset(uint64_t budget) {
-    budget_ = budget; bytes_ = 0;
-    std::memset(nodes_, 0, sizeof nodes_);
-}
-bool TexturePackLru::add(uint32_t id, uint64_t bytes, uint32_t frame) {
-    for (TexturePackLruNode& n : nodes_)
-        if (n.resident && n.id == id) { bytes_ -= n.bytes; n.bytes = bytes; n.lastUsedFrame = frame; bytes_ += bytes; return bytes_ <= budget_; }
-    for (TexturePackLruNode& n : nodes_) if (!n.resident) {
-        n.id = id; n.bytes = bytes; n.lastUsedFrame = frame; n.resident = true; bytes_ += bytes; return bytes_ <= budget_;
-    }
-    return false;
-}
-void TexturePackLru::touch(uint32_t id, uint32_t frame) {
-    for (TexturePackLruNode& n : nodes_) if (n.resident && n.id == id) { n.lastUsedFrame = frame; return; }
-}
-uint32_t TexturePackLru::evict(uint32_t frame, uint64_t needed, uint32_t* evicted, uint32_t capacity) {
-    uint32_t count = 0;
-    while (bytes_ + needed > budget_) {
-        int victim = -1;
-        for (unsigned i = 0; i != kTexturePackMaxQueue; ++i) {
-            const TexturePackLruNode& n = nodes_[i];
-            if (!n.resident || n.lastUsedFrame + 1 >= frame) continue;
-            if (victim < 0 || n.lastUsedFrame < nodes_[victim].lastUsedFrame) victim = int(i);
-        }
-        if (victim < 0) break;
-        TexturePackLruNode& n = nodes_[victim];
-        if (evicted && count < capacity) evicted[count] = n.id;
-        ++count; bytes_ -= n.bytes; n = TexturePackLruNode();
-    }
-    return count;
-}
 
 bool texturePackInit() {
     if (s_state.enabled) return true;
@@ -265,19 +273,59 @@ bool texturePackInit() {
         }
     }
     s_state.enabled = true;
+    s_workerStop = false;
+    s_resultRead = s_resultWrite = 0;
+    s_requests.clear();
+    wut_OSInitMessageQueue(&s_workerWake, s_workerSlots, kTexturePackMaxQueue);
+    if (!wut_OSCreateThread(&s_worker, texturePackWorker, 0, reinterpret_cast<char*>(&s_state),
+                            s_workerStack + sizeof s_workerStack, sizeof s_workerStack, 2,
+                            kWorkerAffinityCpu2)) {
+        reject("worker creation failed");
+        return false;
+    }
+    s_workerStarted = true;
+    wut_OSResumeThread(&s_worker);
     WHBLogPrintf("SMS Wii U: [texpack] archive v%u entries=%u max=%u codec=RGBA8-linear index=%u",
                  unsigned(version), unsigned(s_state.entryCount), unsigned(s_state.maxDimension), unsigned(s_state.slotCount));
     return true;
 }
 
 void texturePackShutdown() {
+    if (s_workerStarted) {
+        s_workerStop = true;
+        wut_OSSendMessage(&s_workerWake, nullptr, kMessageBlock);
+        int result = 0;
+        wut_OSJoinThread(&s_worker, &result);
+        s_workerStarted = false;
+    }
     if (s_state.file) std::fclose(s_state.file);
     s_state.file = nullptr; freeIndex(); s_state = State();
+    s_requests.clear(); s_resultRead = s_resultWrite = 0;
 }
 bool texturePackEnabled() { return s_state.enabled; }
 uint32_t texturePackMaxDimension() { return s_state.maxDimension; }
 uint32_t texturePackEntryCount() { return s_state.entryCount; }
 uint64_t texturePackReadBytes() { return s_state.readBytes; }
+
+bool texturePackEnqueue(const TexturePackRequest& request) {
+    if (!s_state.enabled || !s_workerStarted) return false;
+    if (s_requests.contains(request)) return true;
+    if (!s_requests.push(request)) return false;
+    if (!wut_OSSendMessage(&s_workerWake, reinterpret_cast<void*>(uintptr_t(1)), kMessageBlock)) return false;
+    return true;
+}
+
+bool texturePackPopResult(TexturePackResult* result) {
+    if (!result) return false;
+    const uint32_t read = s_resultRead;
+    if (read == s_resultWrite) return false;
+    __sync_synchronize();
+    *result = s_results[read % kTexturePackMaxQueue];
+    s_resultRead = read + 1;
+    return true;
+}
+
+void texturePackNoteFrame(uint32_t) {}
 
 const TexturePackEntry* texturePackLookup(const TexturePackKey& query) {
     if (!s_state.enabled || !s_state.slotCount) return nullptr;

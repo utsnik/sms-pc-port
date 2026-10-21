@@ -348,8 +348,11 @@ struct TextureEntry {
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
+    uint32_t packRequestId = 0;
+    uint8_t packState = 0; // 0: disabled, 1: pending, 2: negative, 3: resident
     uint32_t next = UINT32_MAX;  // older entry with the same source (textureIndex chain)
 };
+static uint32_t s_nextPackRequestId;
 // A deque, not a vector: getTexture hands out pointers, and a draw binds up to
 // eight maps; a vector growing on the second map's miss moved the first map's
 // entry under its pointer.
@@ -3252,6 +3255,17 @@ static TextureEntry* getTexture(int map) {
     retileTexture(e.texture);
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
     e.valid = true;
+    if (texturePackEnabled()) {
+        TexturePackRequest request = {};
+        request.source = source;
+        request.tlut = indexed ? g.tlutMem + (tlut << 9) : nullptr;
+        request.tlutBytes = indexed ? uint32_t(sizeof g.tlutMem) - (tlut << 9) : 0;
+        request.width = w; request.height = h; request.format = fmt; request.levels = levels;
+        request.tlutFormat = tlutFmt; request.writeClock = writeClock(); request.generation = s_copyGeneration;
+        request.requestId = ++s_nextPackRequestId; request.retry = 0;
+        e.packRequestId = request.requestId;
+        e.packState = texturePackEnqueue(request) ? 1 : 2;
+    }
     return &e;
 }
 
