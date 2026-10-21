@@ -406,6 +406,7 @@ static const void* s_boundFetch;
 static const void* s_boundVertex;
 static const void* s_boundPixel;
 static bool s_noDiff, s_noDiffMarker;
+static bool s_padUniforms;  // shot A/B mode 2: a full upload's command volume, to unused registers
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
 static void invalidateVertexUniforms() {
@@ -2630,6 +2631,10 @@ struct TevParamInputs {
     uint32_t copyGeneration;
 };
 
+static float* s_tevPixelShadowPtr() {
+    static float s_shadow[kTevUniforms * 4];
+    return s_shadow;
+}
 static void setTevShader(TevShader& shader, TextureEntry* const* textures, VertexProgram* vertex = nullptr) {
     if (vertex) bindShaders(&vertex->fetch, &vertex->vertex, &shader.pixel);
     else bindShaders(&s_tevFetch, &s_tevVertex, &shader.pixel);
@@ -2736,10 +2741,10 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     for (int i = 0; i < 16; ++i) params[172 + i] = float(int(params[i]) & 255);
     // Only the changed vectors, in coalesced runs (a full upload was 47
     // registers per draw; most of them are constants).
-    static float s_tevPixelShadow[kTevUniforms * 4];
+    float* const s_tevPixelShadow = s_tevPixelShadowPtr();
     if (!s_tevPixelValid) {
         GX2SetPixelUniformReg(0, kTevUniforms * 4, params);
-        memcpy(s_tevPixelShadow, params, sizeof(s_tevPixelShadow));
+        memcpy(s_tevPixelShadow, params, sizeof(params));
         s_tevPixelValid = true;
     } else {
         for (uint32_t r = 0; r < kTevUniforms;) {
@@ -2752,6 +2757,9 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
         }
     }
     }  // !sameInputs
+    // C128-C174 are read by no shader: the same 47 vectors a full upload
+    // sends, so mode 2 matches its command volume without changing any input.
+    if (s_padUniforms) GX2SetPixelUniformReg(4 * 128, kTevUniforms * 4, s_tevPixelShadowPtr());
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
         GX2SetPixelTexture(&textures[map]->texture, map);
@@ -4794,8 +4802,11 @@ extern "C" int sms_wiiu_gx2_renderer_init(void) {
 /* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
  * presenting thread, between frames, so one run shows the same game state
  * with and without the redundancy caches. */
-extern "C" void sms_wiiu_gx2_force_nodiff(int on) {
-    s_noDiff = s_noDiffMarker || on;
+extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
+    // 0: as configured; 1: nodiff (every cache off); 2: caches on, plus a full
+    // upload's worth of pixel-uniform writes to unused registers.
+    s_noDiff = s_noDiffMarker || mode == 1;
+    s_padUniforms = mode == 2;
     invalidateVertexUniforms();
 }
 

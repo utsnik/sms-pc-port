@@ -276,7 +276,7 @@ bool shots_wanted(uint32_t p)
 	static int s_aba = -1;
 	if (s_aba < 0) {
 		const char* v = std::getenv("SMS_SHOTS_ABA");
-		s_aba = v && *v == '1';
+		s_aba = v && (*v == '1' || *v == '2') ? *v - '0' : 0;
 	}
 	if (s_from > 0 && s_aba)
 		return p >= uint32_t(s_from) && (p - uint32_t(s_from)) % 400 < 3 && s_shots_written < 6;
@@ -402,10 +402,13 @@ void take_shots(uint32_t p)
 		port_log("[shots] DRC GX2GetLastFrame failed\n");
 	}
 	/* SMS_SHOTS_ABA: the frame after the first of each triple is the B frame. */
-	if (std::getenv("SMS_SHOTS_ABA")) {
+	/* SMS_SHOTS_ABA=2: the B frame keeps the caches and pads the command
+	 * stream to a full upload's size instead (timing versus data). */
+	if (const char* aba = std::getenv("SMS_SHOTS_ABA")) {
 		const bool b = (n - s_base) % 3 == 0;
-		sms_wiiu_gx2_force_nodiff(b ? 1 : 0);
-		port_log("[shots] shot%02u taken; next frame nodiff=%d\n", unsigned(n), int(b));
+		const int mode = b ? (*aba == '2' ? 2 : 1) : 0;
+		sms_wiiu_gx2_force_nodiff(mode);
+		port_log("[shots] shot%02u taken; next frame B mode=%d\n", unsigned(n), mode);
 	}
 }
 
