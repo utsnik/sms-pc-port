@@ -22,7 +22,8 @@ set(SMS_GX_SOURCES
     src/gx_shader.cpp
     src/gx_texture.cpp
     src/gx_trace.cpp
-    src/gx_vert.cpp)
+    src/gx_vert.cpp
+    src/gx_texture_pack_common.cpp)
 
 # GD is compiled from the decompiled SDK sources: it only emits command bytes.
 set(SMS_GX_GD_SOURCES
@@ -165,6 +166,7 @@ if(SMS_GX_BUILD_TESTS)
     add_test(NAME gx_hires_all_test COMMAND gx_hires_test --all)
     set_tests_properties(gx_hires_test gx_hires_fallback_test gx_hires_sync_test gx_hires_no_preload_test
         gx_hires_all_test PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(gx_windowtest tests/gx_windowtest.cpp)
     target_include_directories(gx_windowtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(gx_windowtest PRIVATE cxx_std_17)

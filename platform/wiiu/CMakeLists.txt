@@ -149,6 +149,7 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_api.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_fifo.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_vert.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_texture_pack_common.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx2_texture.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx2_renderer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/port_heap.cpp

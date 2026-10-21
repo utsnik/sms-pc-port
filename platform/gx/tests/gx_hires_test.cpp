@@ -1,6 +1,7 @@
 // HD pack regressions: exercise actual GL uploads with generated DDS/resources.
 #include "sms_gx/gx_pc.h"
 #include "gx_internal.h"
+#include "gx_texture_pack_common.h"
 #include "gl_funcs.h"
 #include <algorithm>
 #include <chrono>
@@ -214,11 +215,26 @@ static void checkEncoder() {
     expect(punch, "BC1 keeps transparent pixels transparent");
 }
 
+static void checkTexturePackHashVectors() {
+    uint8_t sequence[32];
+    for (int i = 0; i < 32; ++i) sequence[i] = uint8_t(i);
+    uint8_t padded[64];
+    for (int i = 0; i < 64; ++i) padded[i] = uint8_t(i ^ 0xa5);
+    expect(gx::xxh64(nullptr, 0, 0) == 0xef46db3751d8e999ull, "shared XXH64 empty vector");
+    expect(gx::xxh64("abc", 3, 0) == 0x44bc2cf5ad770999ull, "shared XXH64 short vector");
+    expect(gx::xxh64(sequence, sizeof sequence, 0) == 0xcbf59c5116ff32b4ull, "shared XXH64 32-byte vector");
+    expect(gx::xxh64(padded, sizeof padded, 0) == 0xf03259a6f9ffc792ull, "shared XXH64 GX-padded vector");
+    const std::string name = gx::hiresName(padded, 6, 4, 4, false, nullptr, 0);
+    expect(name.find("tex1_4x4_") == 0 && name.rfind("_6") == name.size() - 2,
+           "shared PC/Wii U lower-case Dolphin key");
+}
+
 int main(int argc, char** argv) {
     const bool fallback = argc > 1 && std::strcmp(argv[1], "--fallback") == 0;
     const bool sync = argc > 1 && std::strcmp(argv[1], "--sync") == 0;
     const bool disabled = argc > 1 && std::strcmp(argv[1], "--no-preload") == 0;
     const bool whole = argc > 1 && std::strcmp(argv[1], "--all") == 0;
+    checkTexturePackHashVectors();
     checkEncoder();
     env("SMS_TEXTURE_PACK_SYNC", sync ? "1" : "0");
     env("SMS_TEXTURE_PACK_PRELOAD", disabled ? "0" : whole ? "all" : "1");
