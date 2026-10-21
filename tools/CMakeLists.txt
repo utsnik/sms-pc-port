@@ -24,3 +24,9 @@ add_executable(gx2_texture_pack_format_test
     "${SMS_GX_SRC}/gx2_texture_pack_format.cpp")
 target_include_directories(gx2_texture_pack_format_test PRIVATE "${SMS_GX_SRC}")
 add_test(NAME gx2_texture_pack_format_test COMMAND gx2_texture_pack_format_test)
+
+add_executable(gx2_texture_pack_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/../platform/gx/tests/gx2_texture_pack_test.cpp")
+target_link_libraries(gx2_texture_pack_test PRIVATE gx2_texture_pack_core)
+target_include_directories(gx2_texture_pack_test PRIVATE "${SMS_GX_SRC}" "${CMAKE_CURRENT_SOURCE_DIR}")
+add_test(NAME gx2_texture_pack_test COMMAND gx2_texture_pack_test)

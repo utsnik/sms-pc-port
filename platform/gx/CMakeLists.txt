@@ -184,6 +184,12 @@ if(SMS_GX_BUILD_TESTS)
     target_link_libraries(gx2_texture_pack PRIVATE gx2_texture_pack_core)
     target_include_directories(gx2_texture_pack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(gx2_texture_pack PRIVATE cxx_std_17)
+    add_executable(gx2_texture_pack_test tests/gx2_texture_pack_test.cpp)
+    target_link_libraries(gx2_texture_pack_test PRIVATE gx2_texture_pack_core)
+    target_include_directories(gx2_texture_pack_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tools)
+    target_compile_features(gx2_texture_pack_test PRIVATE cxx_std_17)
+    add_test(NAME gx2_texture_pack_test COMMAND gx2_texture_pack_test)
 
     add_executable(gx_windowtest tests/gx_windowtest.cpp)
     target_include_directories(gx_windowtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
