@@ -77,6 +77,10 @@ struct TexturePackUploadChunk {
     bool ok;
 };
 
+struct TexturePackStats {
+    uint32_t hashBytes, hashMicros, archiveReadBytes, queuedJobs;
+};
+
 class TexturePackRequestQueue {
 public:
     TexturePackRequestQueue() : read_(0), write_(0) {}
@@ -189,6 +193,7 @@ bool texturePackEnqueue(const TexturePackRequest& request);
 bool texturePackPopResult(TexturePackResult* result);
 bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk);
 void texturePackReleaseUploadChunk();
+void texturePackGetStats(TexturePackStats* stats);
 void texturePackNoteFrame(uint32_t frame);
 uint32_t texturePackMaxDimension();
 uint32_t texturePackEntryCount();

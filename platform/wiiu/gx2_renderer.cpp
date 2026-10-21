@@ -367,6 +367,10 @@ static uint32_t s_packFrame;
 static uint32_t s_packStagingPeak;
 static uint32_t s_packCompleted;
 static uint32_t s_packEvictions;
+static uint32_t s_packFallback;
+static uint32_t s_packUploadBytes;
+static uint32_t s_packUploadMicros;
+static uint32_t s_packDiagFrames;
 // A deque, not a vector: getTexture hands out pointers, and a draw binds up to
 // eight maps; a vector growing on the second map's miss moved the first map's
 // entry under its pointer.
@@ -3403,6 +3407,7 @@ static void packInstall(TextureEntry& e) {
 
 extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     if (!texturePackEnabled()) return;
+    const OSTime pumpStart = OSGetTime();
     ++s_packFrame;
     TexturePackResult result;
     for (unsigned i = 0; i != 8 && texturePackPopResult(&result); ++i) {
@@ -3413,8 +3418,8 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
                 result.request.retry = result.retry; result.request.writeClock = writeClock();
                 e->packState = texturePackEnqueue(result.request) ? 1 : 2;
             } else e->packState = 2;
-        } else if (!result.found) e->packState = 2;
-        else if (!packStart(*e, result.entry)) e->packState = 2;
+        } else if (!result.found) { e->packState = 2; ++s_packFallback; }
+        else if (!packStart(*e, result.entry)) { e->packState = 2; ++s_packFallback; }
     }
     TexturePackUploadBudget budget(512u << 10);
     TexturePackUploadChunk chunk;
@@ -3422,11 +3427,25 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
         if (!budget.consume(chunk.bytes)) break;
         TextureEntry* e = packTextureForRequest(chunk.requestId);
         if (!e || e->packState != 1 || !packCopyChunk(*e, chunk)) {
-            if (e) { packFreeLoading(*e); e->packState = 2; }
+            if (e) { packFreeLoading(*e); e->packState = 2; ++s_packFallback; }
             texturePackReleaseUploadChunk(); continue;
         }
         texturePackReleaseUploadChunk();
         if (e->packEntry && e->packLevelDone == ((1u << e->packEntry->mipCount) - 1u)) packInstall(*e);
+    }
+    s_packUploadBytes += budget.bytes;
+    s_packUploadMicros += uint32_t(OSTicksToMicroseconds(OSGetTime() - pumpStart));
+    if (++s_packDiagFrames == 30) {
+        TexturePackStats stats = {};
+        texturePackGetStats(&stats);
+        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u fallback=%u cap=%u",
+                     unsigned(g_displayFrames), unsigned(stats.hashBytes), unsigned(stats.hashMicros),
+                     unsigned(stats.archiveReadBytes), unsigned(stats.queuedJobs),
+                     unsigned(s_packLru.residentBytes()), unsigned(s_packStagingPeak), unsigned(s_packCompleted),
+                     unsigned(s_packEvictions), unsigned(s_packUploadBytes), unsigned(s_packUploadMicros),
+                     unsigned(s_packFallback), unsigned(s_packResidentBudget));
+        s_packDiagFrames = 0;
+        s_packUploadBytes = s_packUploadMicros = s_packFallback = 0;
     }
 }
 

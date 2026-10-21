@@ -40,6 +40,7 @@ struct State {
 };
 
 State s_state = {};
+volatile TexturePackStats s_stats = {};
 TexturePackRequestQueue s_requests;
 TexturePackResult s_results[kTexturePackMaxQueue];
 volatile uint32_t s_resultRead;
@@ -115,7 +116,9 @@ static uint64_t keyHash(const TexturePackKey& k) {
 static bool readAt(uint64_t offset, void* out, uint32_t bytes) {
     if (!s_state.file || !rangeOk(offset, bytes, s_state.archiveSize)) return false;
     if (std::fseek(s_state.file, long(offset), SEEK_SET) != 0) return false;
-    return bytes == 0 || std::fread(out, 1, bytes, s_state.file) == bytes;
+    const bool ok = bytes == 0 || std::fread(out, 1, bytes, s_state.file) == bytes;
+    if (ok) s_stats.archiveReadBytes += bytes;
+    return ok;
 }
 
 static void freeIndex() {
@@ -158,7 +161,10 @@ static void matchRequest(const TexturePackRequest& request) {
         publishResult(result);
         return;
     }
+    const OSTime hashStart = OSGetTime();
     result.key.dataHash = xxh64(request.source, bytes, 0);
+    s_stats.hashBytes += bytes;
+    s_stats.hashMicros += uint32_t(OSTicksToMicroseconds(OSGetTime() - hashStart));
     if (request.format >= 8 && request.format <= 10 && request.tlut) {
         uint32_t lo = 0, hi = 0;
         paletteRange(request.source, bytes, request.format, &lo, &hi);
@@ -195,7 +201,6 @@ static void matchRequest(const TexturePackRequest& request) {
             chunk.bytes = bytesToRead; chunk.data = s_staging; chunk.entry = entry;
             chunk.last = offset + bytesToRead == source.rgbaSize;
             chunk.ok = readAt(source.rgbaOffset + offset, s_staging, bytesToRead);
-            if (chunk.ok) s_state.readBytes += bytesToRead;
             publishChunk(chunk);
             if (!chunk.ok) return;
             offset += bytesToRead;
@@ -338,6 +343,7 @@ bool texturePackEnqueue(const TexturePackRequest& request) {
     if (!s_state.enabled || !s_workerStarted) return false;
     if (s_requests.contains(request)) return true;
     if (!s_requests.push(request)) return false;
+    ++s_stats.queuedJobs;
     if (!wut_OSSendMessage(&s_workerWake, reinterpret_cast<void*>(uintptr_t(1)), kMessageBlock)) return false;
     return true;
 }
@@ -362,6 +368,15 @@ bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk) {
 void texturePackReleaseUploadChunk() {
     __sync_synchronize();
     s_chunkReady = false;
+}
+
+void texturePackGetStats(TexturePackStats* stats) {
+    if (!stats) return;
+    __sync_synchronize();
+    stats->hashBytes = s_stats.hashBytes;
+    stats->hashMicros = s_stats.hashMicros;
+    stats->archiveReadBytes = s_stats.archiveReadBytes;
+    stats->queuedJobs = s_stats.queuedJobs;
 }
 
 void texturePackNoteFrame(uint32_t) {}
