@@ -71,6 +71,7 @@
 #include <new>
 #include <initializer_list>
 #include <deque>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
@@ -1523,6 +1524,107 @@ static bool s_vertexOneClause;
 static bool s_vertexNameXf;
 static bool s_vertexOneXf;
 
+struct VertexAluGroup {
+    size_t begin;
+    size_t end;
+    bool readsPvPs;
+};
+
+struct VertexAluClause {
+    size_t offset;
+    size_t count;
+};
+
+static bool vertexAluPvPs(uint32_t sel) {
+    return sel == ALU_SRC_PV || sel == ALU_SRC_PS;
+}
+
+static bool vertexAluReadsPvPs(uint64_t op) {
+    const uint32_t word0 = __builtin_bswap32(uint32_t(op >> 32));
+    const uint32_t word1 = __builtin_bswap32(uint32_t(op));
+    if (vertexAluPvPs(word0 & 0x1ff) || vertexAluPvPs((word0 >> 13) & 0x1ff))
+        return true;
+    // OP3 puts its third source in word1.  OP2 uses these bits for the
+    // instruction flags, so only inspect them when the OP3 encoding field is
+    // nonzero.
+    return ((word1 >> 15) & 7) != 0 && vertexAluPvPs(word1 & 0x1ff);
+}
+
+static bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
+                                  std::vector<VertexAluClause>& clauses) {
+    const uint64_t aluLast = to_QWORD(to_LE(1ull << 31), 0);
+    std::vector<VertexAluGroup> groups;
+    for (size_t begin = 0; begin < alu.size();) {
+        bool readsPvPs = false, hasLiteral = false, ended = false;
+        size_t end = begin;
+        while (end < alu.size()) {
+            readsPvPs = readsPvPs || vertexAluReadsPvPs(alu[end]);
+            const uint32_t word0 = __builtin_bswap32(uint32_t(alu[end] >> 32));
+            const uint32_t word1 = __builtin_bswap32(uint32_t(alu[end]));
+            hasLiteral = hasLiteral || ((word0 & 0x1ff) == ALU_SRC_LITERAL) ||
+                         (((word0 >> 13) & 0x1ff) == ALU_SRC_LITERAL);
+            hasLiteral = hasLiteral || (((word1 >> 15) & 7) != 0 &&
+                                        (word1 & 0x1ff) == ALU_SRC_LITERAL);
+            ended = (alu[end] & aluLast) != 0;
+            ++end;
+            if (ended) break;
+        }
+        if (!ended) return false;
+        // A literal is a slot belonging to the group, immediately following
+        // its LAST-marked instruction.  Vertex programs currently do not emit
+        // literals, but keep the splitter correct if one is added later.
+        if (hasLiteral) {
+            if (end == alu.size()) return false;
+            ++end;
+        }
+        groups.push_back({begin, end, readsPvPs});
+        begin = end;
+    }
+    if (groups.empty()) return false;
+
+    // A boundary before a PV/PS reader would discard the producer's value.
+    // Turn each such adjacency into an indivisible component, then pack whole
+    // components.  This also naturally keeps every boundary at a LAST bit.
+    std::vector<std::pair<size_t, size_t>> components;
+    size_t componentBegin = 0;
+    for (size_t i = 1; i < groups.size(); ++i) {
+        if (groups[i].readsPvPs) continue;
+        components.push_back({componentBegin, i});
+        componentBegin = i;
+    }
+    components.push_back({componentBegin, groups.size()});
+
+    std::vector<uint64_t> rebuilt;
+    rebuilt.reserve(alu.size() + components.size());
+    clauses.clear();
+    size_t clauseBegin = 0, clauseCount = 0;
+    for (const auto& component : components) {
+        const size_t first = component.first, last = component.second;
+        const size_t componentSlots = groups[last - 1].end - groups[first].begin;
+        if (componentSlots > 128) return false;
+        if (clauseCount && clauseCount + componentSlots > 128) {
+            clauses.push_back({clauseBegin, clauseCount});
+            clauseBegin = rebuilt.size();
+            clauseCount = 0;
+        }
+        // This is only reachable for a malformed/hand-built program whose
+        // first group itself consumes PV/PS.  Start it with a harmless scratch
+        // group so the reader is never the first group in a clause.
+        if (!clauseCount && groups[first].readsPvPs) {
+            if (componentSlots == 128) return false;
+            vertexEmit(rebuilt, {ALU_MOV(_R(57), _x, ALU_SRC_0, _x)});
+            ++clauseCount;
+        }
+        if (clauseCount + componentSlots > 128) return false;
+        rebuilt.insert(rebuilt.end(), alu.begin() + groups[first].begin,
+                       alu.begin() + groups[last - 1].end);
+        clauseCount += componentSlots;
+    }
+    if (clauseCount) clauses.push_back({clauseBegin, clauseCount});
+    alu.swap(rebuilt);
+    return !clauses.empty();
+}
+
 static bool initVertexProgram(VertexProgram& shader) {
     s_vertexRejectReason = "unknown";
     if (!vertexKeySupported(shader.key)) {
@@ -1744,12 +1846,13 @@ static bool initVertexProgram(VertexProgram& shader) {
         vertexEmit(alu, {ALU_MOV(_R(22), _y, _R(10), _w)});
     }
 #endif
-    if (alu.size() > 2048) {
-        s_vertexRejectReason = "alu-limit";
+    std::vector<VertexAluClause> aluClauses;
+    if (!vertexBuildAluClauses(alu, aluClauses) || alu.size() > 2048) {
+        s_vertexRejectReason = alu.size() > 2048 ? "alu-limit" : "clause-layout";
         return false;
     }
     shader.aluCount = uint32_t(alu.size());
-    const size_t clauses = (alu.size() + 127) / 128;
+    const size_t clauses = aluClauses.size();
     if (!clauses || clauses > 16) {
         s_vertexRejectReason = "clause-limit";
         return false;
@@ -1776,11 +1879,9 @@ static bool initVertexProgram(VertexProgram& shader) {
     const size_t aluOffset = (cfCount + 1) & ~size_t(1);
     std::vector<uint64_t> program(aluOffset, 0);
     program[0] = CALL_FS NO_BARRIER;
-    for (size_t clause = 0; clause < clauses; ++clause) {
-        const size_t at = clause * 128;
-        const size_t count = std::min<size_t>(128, alu.size() - at);
-        program[1 + clause] = ALU(aluOffset + at, count);
-    }
+    for (size_t clause = 0; clause < clauses; ++clause)
+        program[1 + clause] = ALU(aluOffset + aluClauses[clause].offset,
+                                  aluClauses[clause].count);
     for (size_t i = 0; i < exports.size(); ++i) program[1 + clauses + i] = exports[i];
     program.insert(program.end(), alu.begin(), alu.end());
     const size_t bytes = program.size() * sizeof(uint64_t);
