@@ -53,6 +53,7 @@
 #include <gx2/surface.h>
 #include <gx2/texture.h>
 #include <gx2/utils.h>
+#include <gx2/displaylist.h>
 #include <coreinit/title.h>
 #include <coreinit/cache.h>
 #include <coreinit/core.h>
@@ -93,6 +94,8 @@ static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display
 // This is separate from the vertex/index arena above.  The GX2 command-list
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
+static bool s_gx2DlFallback;
+static uint32_t s_perfDlCoreInit;
 static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
@@ -559,6 +562,11 @@ static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
+static constexpr uint32_t kGx2DlAlignment = 32;
+static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
+static constexpr uint32_t kGx2DlReserveBytes = 64u << 10;
+static uint8_t* s_gx2DlArena[kVertexArenas];
+static uint32_t s_gx2DlUsed[kVertexArenas];
 
 // Per-draw GPU cost: the bottom-of-pipe GPU clock is stamped after every draw
 // (and once at frame start) into this arena's slots; once the arena's fence
@@ -679,6 +687,9 @@ static void beginVertexArena() {
         GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
         s_vertexFenceWait += OSGetTime() - t0;
     }
+    // The matching vertex fence also covers every command list submitted from
+    // this slot.  Only now may the bounded list arena be reused.
+    s_gx2DlUsed[s_vertexArenaIndex] = 0;
     gpuCollect(s_vertexArenaIndex);
     gpuStamp(s_vertexArenaIndex, nullptr);
     // That fence also covers everything queued while this arena was last used.
@@ -4215,6 +4226,7 @@ void rendererInit(float) {
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
+    s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     g_perfStages = s_gpuDiag;
@@ -4223,8 +4235,8 @@ void rendererInit(float) {
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
-    WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s core-init=%u",
-                 s_gx2DlEnabled ? "on" : "off", (unsigned)s_perfDlCoreInit);
+    WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s fallback=%s core-init=%u",
+                 s_gx2DlEnabled ? "on" : "off", s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit);
     s_ready = initShaders();
     if (!s_ready) WHBLogPrintf("SMS Wii U: GX2 shader setup failed");
 }
@@ -4411,7 +4423,57 @@ static uint32_t s_debugDrawNo;
 static uint32_t s_perfDlRecorded, s_perfDlCalled, s_perfDlBytes, s_perfDlMaxBytes;
 static uint32_t s_perfDlFallbacks, s_perfDlForbidden, s_perfDlOverflows, s_perfDlBadAlignment;
 static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, s_perfDlSplitsFrame;
-static uint32_t s_perfDlCoreInit, s_perfDlCoreRecord, s_perfDlCoreCall;
+static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
+static bool s_gx2DlRecording;
+
+static bool gx2DlBegin(void** outList) {
+    if (!s_gx2DlEnabled) return false;
+    if (OSGetCoreId() != 1) {
+        ++s_perfDlForbidden;
+        WHBLogPrintf("SMS Wii U: [gx2dl] recorder on unexpected core=%u", (unsigned)OSGetCoreId());
+    }
+    uint8_t*& arena = s_gx2DlArena[s_vertexArenaIndex];
+    if (!arena) arena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kGx2DlArenaBytes, 256));
+    if (!arena) { ++s_perfDlOverflows; return false; }
+    const uint32_t offset = (s_gx2DlUsed[s_vertexArenaIndex] + (kGx2DlAlignment - 1)) & ~(kGx2DlAlignment - 1);
+    if (offset + kGx2DlReserveBytes > kGx2DlArenaBytes) {
+        ++s_perfDlOverflows;
+        return false;
+    }
+    void* list = arena + offset;
+    if (reinterpret_cast<uintptr_t>(list) & (kGx2DlAlignment - 1)) {
+        ++s_perfDlBadAlignment;
+        return false;
+    }
+    s_gx2DlUsed[s_vertexArenaIndex] = offset + kGx2DlReserveBytes;
+    GX2BeginDisplayListEx(list, kGx2DlReserveBytes, FALSE);
+    s_gx2DlRecording = true;
+    s_perfDlCoreRecord = OSGetCoreId();
+    *outList = list;
+    return true;
+}
+
+static bool gx2DlEndCall(void* list) {
+    if (!s_gx2DlRecording) return false;
+    const uint32_t bytes = GX2EndDisplayList(list);
+    s_gx2DlRecording = false;
+    if (!bytes || bytes > kGx2DlReserveBytes) {
+        ++s_perfDlOverflows;
+        return false;
+    }
+    if ((reinterpret_cast<uintptr_t>(list) & (kGx2DlAlignment - 1)) || (bytes & (kGx2DlAlignment - 1))) {
+        ++s_perfDlBadAlignment;
+        return false;
+    }
+    DCFlushRange(list, bytes);
+    ++s_perfDlRecorded;
+    ++s_perfDlCalled;
+    s_perfDlBytes += bytes;
+    s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
+    s_perfDlCoreCall = OSGetCoreId();
+    GX2DirectCallDisplayList(list, bytes);
+    return true;
+}
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
 // perfdiag only: flushBatch's stages (key = TEV key, textures and pixel shader
@@ -4431,6 +4493,22 @@ struct PerfScope {
     explicit PerfScope(OSTime& a) : acc(a), t0(OSGetTime()) {}
     ~PerfScope() { acc += OSGetTime() - t0; }
 };
+
+static void prepareDrawState(const TevKey& tevKey, TevShader* tevShader, FixedShader& shader,
+                             TextureEntry* const* tevTextures, TextureEntry* texture, VertexProgram* vertex,
+                             bool gpuPath) {
+    OSTime t = g_perfStages ? OSGetTime() : 0;
+    applyState();
+    t = stageLap(s_stState, t);
+    if (tevShader) setTevShader(*tevShader, tevTextures, gpuPath ? vertex : nullptr);
+    else setShader(shader, texture, gpuPath ? vertex : nullptr);
+    t = stageLap(s_stShader, t);
+    if (gpuPath) {
+        uploadXfUniformRanges();
+        packVertexLiveUniforms(tevKey, tevTextures);
+    }
+    stageLap(s_stXfu, t);
+}
 
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
@@ -4494,28 +4572,56 @@ void flushBatch() {
     // frame.  Each key is primed once, so steady-state draws stay GPU-only.
     const bool gpuPath = vertex != nullptr && vertex->warmed;
     stT = stageLap(s_stVkey, stT);
-    applyState();
-    stT = stageLap(s_stState, stT);
-    if (tevPath) setTevShader(*tevShader, tevTextures, gpuPath ? vertex : nullptr);
-    else setShader(shader, texture, gpuPath ? vertex : nullptr);
-    stT = stageLap(s_stShader, stT);
-    if (gpuPath) {
-        uploadXfUniformRanges();
-        packVertexLiveUniforms(tevKey, tevTextures);
-    }
-    stageLap(s_stXfu, stT);
+    // Keep the control build's direct ordering.  The opt-in command-list path
+    // defers these GX2 packets until after resource materialisation so no
+    // arena-wrap fence can occur while a list is open.
+    if (!s_gx2DlEnabled || !gpuPath)
+        prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, gpuPath);
     if (s_dlPending.ref) {
         const auto pend = s_dlPending;
         s_dlPending = {};
         const uint32_t* storedIdx = reinterpret_cast<const uint32_t*>(s_dlArena + pend.ref->iOff);
         if (gpuPath && vertex->stride == kRawVertexStride) {
+            void* gx2List = nullptr;
+            bool listReady = s_gx2DlEnabled && gx2DlBegin(&gx2List);
+            if (s_gx2DlEnabled && !listReady) {
+                if (!s_gx2DlFallback) {
+                    WHBLogPrintf("SMS Wii U: [gx2dl] unable to record draw segment; fallback disabled");
+                    s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+                    return;
+                }
+                ++s_perfDlFallbacks;
+                prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+            } else if (listReady) {
+                prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+            }
             ++s_perfDraws; ++s_perfGpuDraws; ++s_perfDlDraws;
             s_perfVerts += pend.nidx; s_perfGpuVerts += pend.nidx;
             const uint32_t debugDrawNo = s_debugDrawNo++;
-            GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
-                               s_dlArena + pend.ref->baseVertex);
-            GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
-                             const_cast<uint32_t*>(storedIdx), 0, 1);
+            if (listReady) {
+                GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
+                                   s_dlArena + pend.ref->baseVertex);
+                GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                                 const_cast<uint32_t*>(storedIdx), 0, 1);
+                if (!gx2DlEndCall(gx2List)) {
+                    if (!s_gx2DlFallback) {
+                        WHBLogPrintf("SMS Wii U: [gx2dl] list validation failed; fallback disabled");
+                        s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+                        return;
+                    }
+                    ++s_perfDlFallbacks;
+                    prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+                    GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
+                                       s_dlArena + pend.ref->baseVertex);
+                    GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                                     const_cast<uint32_t*>(storedIdx), 0, 1);
+                }
+            } else {
+                GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
+                                   s_dlArena + pend.ref->baseVertex);
+                GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                                 const_cast<uint32_t*>(storedIdx), 0, 1);
+            }
             if (s_padUniforms == 5) GX2DrawDone();
             ++s_drawsThisFrame;
             if (s_gpuDiag) {
@@ -4661,6 +4767,19 @@ void flushBatch() {
     // the whole arena when the frame began (a GPU invalidate per draw stalls
     // the pipeline).
     DCFlushRange(block, blockBytes);
+    void* gx2List = nullptr;
+    bool listReady = s_gx2DlEnabled && gpuPath && gx2DlBegin(&gx2List);
+    if (s_gx2DlEnabled && gpuPath && !listReady) {
+        if (!s_gx2DlFallback) {
+            WHBLogPrintf("SMS Wii U: [gx2dl] unable to record materialized draw; fallback disabled");
+            s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+            return;
+        }
+        ++s_perfDlFallbacks;
+        prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+    } else if (listReady) {
+        prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+    }
     GX2SetAttribBuffer(0, vboBytes, gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
@@ -4676,8 +4795,23 @@ void flushBatch() {
                      (unsigned)k.texgen[0], (unsigned)k.texgen[1], (unsigned)k.texgen[2], (unsigned)k.texgen[3],
                      (unsigned)k.numTexGens, (unsigned)k.dualTex, (unsigned)k.postTex[0], (unsigned)k.projectionOrtho);
     }
-    GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
-    if (s_padUniforms == 5) GX2DrawDone();  // shot A/B mode 5: no GPU lag at all
+    if (listReady) {
+        GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        if (!gx2DlEndCall(gx2List)) {
+            if (!s_gx2DlFallback) {
+                WHBLogPrintf("SMS Wii U: [gx2dl] materialized list validation failed; fallback disabled");
+                s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+                return;
+            }
+            ++s_perfDlFallbacks;
+            prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+            GX2SetAttribBuffer(0, vboBytes, vertex->stride, vbo);
+            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        }
+    } else {
+        GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+    }
+    if (s_padUniforms == 5) GX2DrawDone();  // diagnostic fence stays outside a list
     if (bracket) {
         GX2DrawDone();
         WHBLogPrintf("SMS Wii U: [vxbracket] done");
