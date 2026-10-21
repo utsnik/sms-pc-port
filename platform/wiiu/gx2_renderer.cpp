@@ -322,9 +322,19 @@ static GX2SamplerVar s_samplerVars[] = {
 };
 static GX2UniformVar s_pixelUniform = {"window_params", GX2_SHADER_VAR_TYPE_FLOAT2, 1, 0, -1};
 
+// resize() without the zero fill: primitiveBegin/End grow the batch and the
+// caller (vertex decode, index generation) writes every new element at once.
+// The fill was most of the 3.3% memset on core 1 in Delfino Plaza.
+template <class T> struct NoInitAlloc : std::allocator<T> {
+    template <class U> struct rebind { typedef NoInitAlloc<U> other; };
+    NoInitAlloc() {}
+    template <class U> NoInitAlloc(const NoInitAlloc<U>&) {}
+    template <class U> void construct(U* p) { ::new (static_cast<void*>(p)) U; }
+    template <class U, class... A> void construct(U* p, A&&... a) { ::new (static_cast<void*>(p)) U(std::forward<A>(a)...); }
+};
 struct Batch {
-    std::vector<uint8_t> vertices;
-    std::vector<uint32_t> indices;
+    std::vector<uint8_t, NoInitAlloc<uint8_t>> vertices;
+    std::vector<uint32_t, NoInitAlloc<uint32_t>> indices;
     uint32_t fmt = 0;
     uint32_t stride = 0;
     uint32_t count = 0;
