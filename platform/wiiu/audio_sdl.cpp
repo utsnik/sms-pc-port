@@ -7,6 +7,7 @@
 #include <coreinit/thread.h>
 #include <sndcore2/core.h>
 #include <sndcore2/voice.h>
+#include <sndcore2/drcvs.h>
 
 #include <cstdint>
 #include <cstring>
@@ -20,6 +21,10 @@ extern "C" {
 BOOL cafe_OSCreateThread(OSThread*, OSThreadEntryPointFn, int32_t, char*, void*, uint32_t, int32_t,
                          OSThreadAttributes) __asm__("OSCreateThread");
 int32_t cafe_OSResumeThread(OSThread*) __asm__("OSResumeThread");
+/* sndcore2 exports missing from wut's headers. Mixer select 0 = DSP, 1 = PPC,
+ * 2 = auto; it applies to voices acquired afterwards. Loads are percent. */
+uint32_t AXGetPpcLoad(void);
+uint32_t AXGetDspLoad(void);
 BOOL cafe_OSJoinThread(OSThread*, int*) __asm__("OSJoinThread");
 }
 
@@ -45,6 +50,11 @@ uint32_t s_writeFrames;
 uint32_t s_playFrames;
 uint32_t s_lastOffset;
 bool s_playing;
+/* AX cost experiments (SD markers, 2026-10-21): the SYS AX IST takes ~13% of
+ * core 1 and noaudio saves ~3.7 ms of plaza p90. axtvonly: no GamePad mix;
+ * axvsoff: GamePad virtual surround off; ax32k: 32 kHz renderer; axpipe4:
+ * four-stage pipeline; axidle: voices configured but never started. */
+bool s_axTvOnly, s_axIdle;
 
 static void clear_ring()
 {
@@ -92,7 +102,8 @@ static void set_voice_mix(AXVoice* voice, uint32_t bus)
 	std::memset(&mix, 0, sizeof mix);
 	mix.bus[bus].volume = 0x8000;
 	AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_TV, 0, &mix);
-	AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_DRC, 0, &mix); // GamePad
+	if (!s_axTvOnly)
+		AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_DRC, 0, &mix); // GamePad
 }
 
 static bool configure_voice(AXVoice* voice, int16_t* data, uint32_t sourceRate, uint32_t bus)
@@ -117,7 +128,7 @@ static bool configure_voice(AXVoice* voice, int16_t* data, uint32_t sourceRate, 
 	 * source, so conversion is performed by the DSP rather than SDL. */
 	AXVoiceSrc src;
 	std::memset(&src, 0, sizeof src);
-	src.ratio = (sourceRate << 16) / kAxRate;
+	src.ratio = (sourceRate << 16) / (sms_wiiu_sd_marker("ax32k") ? 32000u : kAxRate);
 	AXSetVoiceSrc(voice, &src);
 	AXSetVoiceSrcType(voice, AX_VOICE_SRC_TYPE_LINEAR);
 	set_voice_mix(voice, bus);
@@ -130,15 +141,30 @@ static int open_ax(int rate)
 {
 	AXInitParams params;
 	std::memset(&params, 0, sizeof params);
-	params.renderer = AX_INIT_RENDERER_48KHZ;
-	params.pipeline  = AX_INIT_PIPELINE_SINGLE;
+	s_axTvOnly = sms_wiiu_sd_marker("axtvonly") != 0;
+	s_axIdle   = sms_wiiu_sd_marker("axidle") != 0;
+	const bool ax32k = sms_wiiu_sd_marker("ax32k") != 0, pipe4 = sms_wiiu_sd_marker("axpipe4") != 0;
+	params.renderer = ax32k ? AX_INIT_RENDERER_32KHZ : AX_INIT_RENDERER_48KHZ;
+	params.pipeline  = pipe4 ? AX_INIT_PIPELINE_FOUR_STAGE : AX_INIT_PIPELINE_SINGLE;
 	AXInitWithParams(&params);
+	{
+		AXDRCVSMode vs = 0xffffffffu;
+		AXGetDRCVSMode(&vs);
+		if (sms_wiiu_sd_marker("axvsoff"))
+			AXSetDRCVSMode(0);
+		port_log("[audio] AX experiment: tvonly=%d idle=%d 32k=%d pipe4=%d drcvs=%u%s\n", (int)s_axTvOnly,
+		         (int)s_axIdle, (int)ax32k, (int)pipe4, (unsigned)vs, sms_wiiu_sd_marker("axvsoff") ? "->0" : "");
+	}
 	if (!AXIsInit()) {
 		port_log("[audio] AX voice init failed\n");
 		return 0;
 	}
 
 	clear_ring();
+	if (sms_wiiu_sd_marker("axdsp")) {
+		AXSetDefaultMixerSelect(0);
+		port_log("[audio] SD marker axdsp: default mixer select = DSP\n");
+	}
 	s_voice[0] = AXAcquireVoice(kVoicePriority, nullptr, nullptr);
 	s_voice[1] = AXAcquireVoice(kVoicePriority, nullptr, nullptr);
 	if (!configure_voice(s_voice[0], s_ring[0], (uint32_t)rate, 0) ||
@@ -158,6 +184,8 @@ static int open_ax(int rate)
 	s_lastOffset  = 0;
 	s_playing     = false;
 	s_output      = OUTPUT_AX;
+	port_log("[audio] AX voice renderer=%u/%u max voices=%d\n", (unsigned)s_voice[0]->renderer,
+	         (unsigned)s_voice[1]->renderer, (int)AXGetMaxVoices());
 	if (!s_outputLogged) {
 		port_log("[audio] AX voice output: TV and GamePad, 2 x mono %u Hz s16 voices (DSP -> %u Hz)\n",
 		         (unsigned)rate, (unsigned)kAxRate);
@@ -270,7 +298,7 @@ static void queue_ax(const void* data, uint32_t bytes)
 		DCFlushRange(s_ring[1], (frames - first) * sizeof(int16_t));
 	}
 	s_writeFrames += frames;
-	if (!s_playing) {
+	if (!s_playing && !s_axIdle) {
 		/* An underrun stopped AX at the producer position, after clearing the
 		 * ring. Both voices therefore restart on the same sample. */
 		uint32_t offset = s_writeFrames % kRingFrames;
@@ -281,6 +309,15 @@ static void queue_ax(const void* data, uint32_t bytes)
 		AXSetVoiceState(s_voice[1], AX_VOICE_STATE_PLAYING);
 		s_playing = true;
 	}
+}
+
+extern "C" void sms_wiiu_ax_load(uint32_t* ppc, uint32_t* dsp)
+{
+	*ppc = *dsp = 0;
+	if (s_output != OUTPUT_AX)
+		return;
+	*ppc = AXGetPpcLoad();
+	*dsp = AXGetDspLoad();
 }
 
 extern "C" void sms_wiiu_sdl_audio_queue(const void* data, uint32_t bytes)
