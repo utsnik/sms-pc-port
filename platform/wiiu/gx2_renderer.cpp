@@ -3065,8 +3065,15 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
     e->tex.source = static_cast<const uint8_t*>(dest);
     e->tex.fmt = fmt;
-    e->tex.width = cemu ? logicalW : copyW;
-    e->tex.height = cemu ? logicalH : copyH;
+    // TextureEntry dimensions are the dimensions encoded in GXCopyTex's
+    // destination, not the scaled GX2 storage dimensions.  The latter are
+    // needed for the bounded hardware copy, but using them here makes manual
+    // coordinates (and the generated TEV path) address only a fraction of
+    // the copied rectangle at native render scales.  This is especially
+    // visible for half-scale copies, whose logical dimensions are already
+    // halved above.
+    e->tex.width = logicalW;
+    e->tex.height = logicalH;
     e->sourceX = cemu ? tx : 0; e->sourceY = cemu ? ty : 0;
     e->sourceW = cemu ? tw : 0; e->sourceH = cemu ? th : 0;
     if (!e->tex.valid) {
@@ -3136,6 +3143,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         GX2Point destination = {0, 0};
         GX2CopySurfaceEx(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0, 1,
                         &source, &destination);
+        invalidateVertexUniforms();
     }
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, e->tex.texture.surface.image,
                   e->tex.texture.surface.imageSize);
