@@ -164,6 +164,16 @@ struct AsyncState {
 };
 
 AsyncState s_async;
+// Async-path debug counters (logged with the 10 s audio stats).
+volatile u32 s_dbgMails, s_dbgAsserts, s_dbgLastAssertMail, s_dbgSkippedMails;
+volatile u32 s_dbgQueued[4], s_dbgExec[4], s_dbgReleaseIdle, s_dbgReplies, s_dbgReplyPosts;
+inline int dbg_kind(bool release, const std::vector<u32>& w)
+{
+	if (release) return 0;
+	if (w.empty()) return 3;
+	const u32 op = w[0] >> 24;
+	return op == 0x82 ? 1 : op == 0x81 ? 2 : 3;
+}
 
 BOOL send_ptr(WutMessageQueue* q, void* p)
 {
@@ -178,10 +188,13 @@ BOOL receive_ptr(WutMessageQueue* q, void** p)
 	*p = m.message;
 	return ok;
 }
-bool s_workerExecuting;
 bool s_workerRelease;
 
-void execute();
+/* fromWorker: called by the mixer thread. It is an argument, not a shared flag:
+ * a ReleaseHalt arriving on core 1 while the worker ran the 0x82 frame command
+ * read the worker's flag, re-ran the 0x82 inline and dropped the release, so no
+ * subframe was ever rendered and the game was silent from the first frame. */
+void execute(bool fromWorker = false);
 
 void queue_reply(u32 first, u32 second)
 {
@@ -205,6 +218,7 @@ void* reply_thread(void*)
 			continue;
 		if (!reply)
 			break;
+		++s_dbgReplyPosts;
 		BOOL level = OSDisableInterrupts();
 		post(reply->first);
 		post(reply->second);
@@ -232,9 +246,8 @@ int mixer_thread(int, const char** argv)
 			SMS_PORT_HEAP_SCOPE();
 			g.workerWords.swap(command->words);
 			s_workerRelease = command->release;
-			s_workerExecuting = true;
-			execute();
-			s_workerExecuting = false;
+			++s_dbgExec[dbg_kind(s_workerRelease, g.workerWords)];
+			execute(true);
 			g.workerWords.clear();
 			delete command;
 		}
@@ -309,6 +322,7 @@ void raise_irq(u32 first, u32 second)
 {
 #ifdef TARGET_WIIU
 	if (s_async.active) {
+		++s_dbgReplies;
 		queue_reply(first, second);
 		return;
 	}
@@ -379,16 +393,17 @@ void render_subframe()
 	reply(0xFF00);
 }
 
-void execute()
+void execute(bool fromWorker)
 {
 	#ifdef TARGET_WIIU
-	if (s_async.active && !s_workerExecuting) {
+	if (s_async.active && !fromWorker) {
 		SMS_PORT_HEAP_SCOPE();
 		Command* command = new Command;
 		if (!command)
 			return;
 		command->words = g.words;
 		command->release = g.release;
+		++s_dbgQueued[dbg_kind(g.release, g.words)];
 		/* A frame is pending from its 0x82 command, as in the synchronous
 		 * path: the pacer must not start another DMA block in the window
 		 * before the mixer reaches the frame's first subframe. */
@@ -401,8 +416,8 @@ void execute()
 		}
 		return;
 	}
-	const std::vector<u32>& w = s_workerExecuting ? g.workerWords : g.words;
-	bool release = s_workerExecuting ? s_workerRelease : g.release;
+	const std::vector<u32>& w = fromWorker ? g.workerWords : g.words;
+	bool release = fromWorker ? s_workerRelease : g.release;
 	#else
 	const std::vector<u32>& w = g.words;
 	#endif
@@ -418,6 +433,10 @@ void execute()
 		// the next subframe of the current frame and reports 0xFF00.
 		if (g.outA && g.sub < g.subframes)
 			render_subframe();
+#ifdef TARGET_WIIU
+		else
+			++s_dbgReleaseIdle;
+#endif
 		return;
 	}
 	switch (op) {
@@ -490,6 +509,11 @@ extern "C" u32 port_audio_dsp_read_mail_from(void)
 extern "C" void port_audio_dsp_mail_to(u32 mail)
 {
 	g.lastMail = mail;
+#ifdef TARGET_WIIU
+	++s_dbgMails;
+	if (!g.inCmd)
+		++s_dbgSkippedMails;
+#endif
 	if (!g.inCmd)
 		return;
 	SMS_PORT_HEAP_SCOPE();
@@ -503,6 +527,10 @@ extern "C" void port_audio_dsp_mail_to(u32 mail)
 extern "C" void port_audio_dsp_assert_int(void)
 {
 	// DSPSendCommands2 sends the word count, then asserts; 0 means 2 words.
+#ifdef TARGET_WIIU
+	++s_dbgAsserts;
+	s_dbgLastAssertMail = g.lastMail;
+#endif
 	g.release = g.lastMail == 0;
 	g.want    = g.lastMail ? g.lastMail : 2;
 	g.inCmd   = true;
@@ -523,6 +551,22 @@ extern "C" u64 port_audio_dsp_subframes(void)
 // DSP always finishes a frame within one block period, and consuming blocks
 // faster than JAudio produces frames makes DSPBuf repeat stale samples (gaps)
 // while the sequencer falls behind.
+extern "C" void port_audio_dsp_debug_log(void)
+{
+#ifdef TARGET_WIIU
+	if (!s_async.active)
+		return;
+	port_log("[audio] async: queued rel/82/81/other %u/%u/%u/%u exec %u/%u/%u/%u releaseIdle %u replies %u posts %u "
+	         "pending %u sub %u/%u fromDsp %u mails %u skipped %u asserts %u lastAssertMail %u inCmd %d want %u have %u\n",
+	         (unsigned)s_dbgQueued[0], (unsigned)s_dbgQueued[1], (unsigned)s_dbgQueued[2], (unsigned)s_dbgQueued[3],
+	         (unsigned)s_dbgExec[0], (unsigned)s_dbgExec[1], (unsigned)s_dbgExec[2], (unsigned)s_dbgExec[3],
+	         (unsigned)s_dbgReleaseIdle, (unsigned)s_dbgReplies, (unsigned)s_dbgReplyPosts,
+	         (unsigned)s_async.framePending, (unsigned)g.sub, (unsigned)g.subframes, (unsigned)g.fromDsp.size(),
+	         (unsigned)s_dbgMails, (unsigned)s_dbgSkippedMails, (unsigned)s_dbgAsserts, (unsigned)s_dbgLastAssertMail,
+	         (int)g.inCmd, (unsigned)g.want, (unsigned)g.words.size());
+#endif
+}
+
 extern "C" int port_audio_dsp_frame_pending(void)
 {
 #ifdef TARGET_WIIU
