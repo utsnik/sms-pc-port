@@ -26,6 +26,23 @@ void be32(std::vector<uint8_t>* out, uint32_t v) {
     out->push_back(uint8_t(v >> 24)); out->push_back(uint8_t(v >> 16)); out->push_back(uint8_t(v >> 8)); out->push_back(uint8_t(v));
 }
 
+void putLe32(std::vector<uint8_t>* out, size_t offset, uint32_t v) {
+    (*out)[offset] = uint8_t(v); (*out)[offset + 1] = uint8_t(v >> 8);
+    (*out)[offset + 2] = uint8_t(v >> 16); (*out)[offset + 3] = uint8_t(v >> 24);
+}
+
+void writeDds(const std::filesystem::path& path, uint32_t width, uint32_t height, const char fourcc[4],
+              const std::vector<std::vector<uint8_t>>& levels) {
+    std::vector<uint8_t> dds(128, 0);
+    std::copy_n(reinterpret_cast<const uint8_t*>("DDS "), 4, dds.data());
+    putLe32(&dds, 4, 124); putLe32(&dds, 8, 0x00021007); putLe32(&dds, 12, height); putLe32(&dds, 16, width);
+    putLe32(&dds, 28, uint32_t(levels.size())); putLe32(&dds, 76, 32); putLe32(&dds, 80, 4);
+    std::copy_n(reinterpret_cast<const uint8_t*>(fourcc), 4, dds.data() + 84);
+    putLe32(&dds, 108, 0x00401008);
+    for (const auto& level : levels) dds.insert(dds.end(), level.begin(), level.end());
+    std::ofstream out(path, std::ios::binary); out.write(reinterpret_cast<const char*>(dds.data()), dds.size());
+}
+
 uint32_t crc32(const uint8_t* data, size_t size) {
     uint32_t crc = 0xffffffffu;
     for (size_t i = 0; i < size; ++i) {
@@ -144,14 +161,72 @@ void checkArchiveAndConversion() {
     std::vector<uint8_t> raw; { std::ifstream in(archive, std::ios::binary); in.seekg(0, std::ios::end); const size_t n = size_t(in.tellg()); raw.resize(n); in.seekg(0); in.read(reinterpret_cast<char*>(raw.data()), n); }
     raw.pop_back(); gx::TexturePackReader corrupt; expect(!corrupt.openBytes(raw, &error), "truncated archive rejected");
     raw.push_back(0); raw[5] = 2; expect(!corrupt.openBytes(raw, &error), "bad-version archive rejected");
-    writePng(pack / "nested" / (normal + ".png"), 4, 4, 4); expect(!gx::convertTexturePack(pack.string(), (root / "duplicate.gx2pack").string(), options, &stats, &error), "duplicate level rejected");
+    writePng(pack / "nested" / (normal + ".png"), 4, 4, 4); expect(gx::convertTexturePack(pack.string(), (root / "duplicate.gx2pack").string(), options, &stats, &error), "duplicate level keeps first match: " + error);
+    std::filesystem::remove_all(root);
+}
+
+void checkDdsConversion() {
+    const auto root = std::filesystem::temp_directory_path() / ("sms-gx2-dds-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    const auto dxt1Dir = root / "dxt1"; std::filesystem::create_directories(dxt1Dir / "environment/secrets");
+    auto source = bytes(gx::texLevelBytes(6, 4, 4), 101);
+    const std::string dxt1Name = keyName(source, 6, 4, 4, true);
+    const std::vector<uint8_t> redBlock = {0x00, 0xf8, 0xe0, 0x07, 0, 0, 0, 0};
+    std::vector<uint8_t> dxt1Base; for (int i = 0; i < 4; ++i) dxt1Base.insert(dxt1Base.end(), redBlock.begin(), redBlock.end());
+    writeDds(dxt1Dir / (dxt1Name + ".dds"), 8, 8, "DXT1", {dxt1Base, redBlock});
+    writePng(dxt1Dir / "environment/secrets/w2048 - rend 2.png", 2, 2, 7);
+
+    gx::TexturePackConversionOptions options; options.maxSize = 16; options.bcCodec = gx::TEXTURE_PACK_CODEC_BC1;
+    gx::TexturePackConversionStats stats; std::string error; const auto dxt1Archive = root / "dxt1.gx2pack";
+    expect(gx::convertTexturePack(dxt1Dir.string(), dxt1Archive.string(), options, &stats, &error), "DXT1 conversion: " + error);
+    expect(stats.files == 1 && stats.entries == 1, "non-texture PNG ignored during DDS collection");
+    gx::TexturePackReader reader; expect(reader.open(dxt1Archive.string(), &error), "DXT1 archive opens: " + error);
+    const gx::TexturePackEntry* entry = reader.entries().empty() ? nullptr : &reader.entries()[0];
+    expect(entry && entry->key.sourceWidth == 4 && entry->key.sourceHeight == 4 && entry->width == 8 && entry->height == 8,
+           "DDS header dimensions drive image while filename dimensions remain key");
+    if (entry) {
+        std::vector<uint8_t> payload, rgba;
+        expect(reader.read(entry->levels[0].bcOffset, entry->levels[0].bcSize, &payload, &error) && payload == dxt1Base,
+               "DXT1 base blocks pass through unchanged");
+        expect(reader.read(entry->levels[1].bcOffset, entry->levels[1].bcSize, &payload, &error) && payload == redBlock,
+               "DXT1 embedded mip blocks pass through unchanged");
+        expect(reader.read(entry->levels[0].rgbaOffset, entry->levels[0].rgbaSize, &rgba, &error) && rgba.size() >= 4 &&
+                   rgba[0] == 255 && rgba[1] == 0 && rgba[2] == 0 && rgba[3] == 255,
+               "DXT1 decodes to RGBA8");
+    }
+
+    options.maxSize = 4; const auto scaledArchive = root / "scaled.gx2pack";
+    expect(gx::convertTexturePack(dxt1Dir.string(), scaledArchive.string(), options, &stats, &error), "size-capped DXT1 conversion: " + error);
+    gx::TexturePackReader scaled; expect(scaled.open(scaledArchive.string(), &error), "size-capped DXT1 archive opens: " + error);
+    expect(!scaled.entries().empty() && scaled.entries()[0].width == 4 && scaled.entries()[0].height == 4 &&
+               scaled.entries()[0].levels[0].bcSize == 8,
+           "DDS obeys size cap and recompresses scaled level");
+
+    const auto dxt5Dir = root / "dxt5"; std::filesystem::create_directories(dxt5Dir);
+    auto alphaSource = bytes(gx::texLevelBytes(6, 4, 4), 119); const std::string dxt5Name = keyName(alphaSource, 6, 4, 4);
+    const std::vector<uint8_t> dxt5Block = {255, 0, 0, 0, 0, 0, 0, 0, 0x1f, 0x00, 0x00, 0xf8, 0, 0, 0, 0};
+    writeDds(dxt5Dir / (dxt5Name + ".dds"), 4, 4, "DXT5", {dxt5Block});
+    options.maxSize = 512; options.bcCodec = gx::TEXTURE_PACK_CODEC_BC3; const auto dxt5Archive = root / "dxt5.gx2pack";
+    expect(gx::convertTexturePack(dxt5Dir.string(), dxt5Archive.string(), options, &stats, &error), "DXT5 conversion: " + error);
+    gx::TexturePackReader dxt5; expect(dxt5.open(dxt5Archive.string(), &error), "DXT5 archive opens: " + error);
+    if (!dxt5.entries().empty()) {
+        std::vector<uint8_t> payload, rgba; const auto& level = dxt5.entries()[0].levels[0];
+        expect(dxt5.read(level.bcOffset, level.bcSize, &payload, &error) && payload == dxt5Block, "DXT5 blocks pass through unchanged");
+        expect(dxt5.read(level.rgbaOffset, level.rgbaSize, &rgba, &error) && rgba.size() >= 4 &&
+                   rgba[0] == 0 && rgba[1] == 0 && rgba[2] == 255 && rgba[3] == 255,
+               "DXT5 decodes color and alpha to RGBA8");
+    }
+
+    const auto badDir = root / "bad"; std::filesystem::create_directories(badDir);
+    writeDds(badDir / (dxt1Name + ".dds"), 4, 4, "DXT3", {std::vector<uint8_t>(16)});
+    expect(!gx::convertTexturePack(badDir.string(), (root / "bad.gx2pack").string(), options, &stats, &error),
+           "unsupported DDS FourCC rejected");
     std::filesystem::remove_all(root);
 }
 
 } // namespace
 
 int main() {
-    checkHashesAndNames(); checkBc(); checkArchiveAndConversion();
+    checkHashesAndNames(); checkBc(); checkArchiveAndConversion(); checkDdsConversion();
     if (failures) return failures;
     std::cout << "gx2_texture_pack_test: PASS\n";
     return 0;

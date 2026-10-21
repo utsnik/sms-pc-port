@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +29,12 @@ struct Image {
     std::vector<uint8_t> pixels;
 };
 
+struct DecodedSource {
+    std::vector<Image> levels;
+    std::vector<std::vector<uint8_t>> bcLevels;
+    uint32_t bcCodec = TEXTURE_PACK_CODEC_NONE;
+};
+
 struct SourceFile {
     std::filesystem::path path;
     int level;
@@ -47,11 +54,11 @@ static bool fail(std::string* error, const std::string& message) {
 
 static bool readFile(const std::filesystem::path& path, std::vector<uint8_t>* out, std::string* error) {
     std::ifstream in(path, std::ios::binary | std::ios::ate);
-    if (!in) return fail(error, "cannot open PNG " + path.string());
+    if (!in) return fail(error, "cannot open image " + path.string());
     std::streamsize n = in.tellg();
-    if (n < 0) return fail(error, "invalid PNG size " + path.string());
+    if (n < 0) return fail(error, "invalid image size " + path.string());
     out->resize(size_t(n)); in.seekg(0); in.read(reinterpret_cast<char*>(out->data()), n);
-    return bool(in) || n == 0 ? true : fail(error, "cannot read PNG " + path.string());
+    return bool(in) || n == 0 ? true : fail(error, "cannot read image " + path.string());
 }
 
 static bool decodePng(const std::filesystem::path& path, Image* out, std::string* error) {
@@ -66,6 +73,108 @@ static bool decodePng(const std::filesystem::path& path, Image* out, std::string
     }
     out->width = uint32_t(w); out->height = uint32_t(h);
     out->pixels.assign(decoded, decoded + size_t(w) * h * 4); stbi_image_free(decoded);
+    return true;
+}
+
+static uint32_t readLe32(const uint8_t* p) {
+    return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+}
+
+static void decode565(uint16_t c, uint8_t* out) {
+    const uint32_t r = (c >> 11) & 31, g = (c >> 5) & 63, b = c & 31;
+    out[0] = uint8_t((r << 3) | (r >> 2));
+    out[1] = uint8_t((g << 2) | (g >> 4));
+    out[2] = uint8_t((b << 3) | (b >> 2));
+    out[3] = 255;
+}
+
+static void decodeDxtColor(const uint8_t* block, bool dxt1, uint8_t* rgba) {
+    const uint16_t c0 = uint16_t(block[0] | block[1] << 8), c1 = uint16_t(block[2] | block[3] << 8);
+    uint8_t colors[4][4]; decode565(c0, colors[0]); decode565(c1, colors[1]);
+    if (!dxt1 || c0 > c1) {
+        for (int k = 0; k < 3; ++k) {
+            colors[2][k] = uint8_t((2 * uint32_t(colors[0][k]) + colors[1][k]) / 3);
+            colors[3][k] = uint8_t((uint32_t(colors[0][k]) + 2 * uint32_t(colors[1][k])) / 3);
+        }
+        colors[2][3] = colors[3][3] = 255;
+    } else {
+        for (int k = 0; k < 3; ++k) colors[2][k] = uint8_t((uint32_t(colors[0][k]) + colors[1][k]) / 2);
+        colors[2][3] = 255;
+        std::fill(colors[3], colors[3] + 4, uint8_t(0));
+    }
+    const uint32_t indices = readLe32(block + 4);
+    for (uint32_t i = 0; i < 16; ++i) std::copy_n(colors[(indices >> (2 * i)) & 3], 4, rgba + i * 4);
+}
+
+static void decodeDxtBlock(const uint8_t* block, uint32_t codec, uint8_t* rgba) {
+    if (codec == TEXTURE_PACK_CODEC_BC1) {
+        decodeDxtColor(block, true, rgba);
+        return;
+    }
+    decodeDxtColor(block + 8, false, rgba);
+    uint8_t alpha[8] = {block[0], block[1], 0, 0, 0, 0, 0, 0};
+    if (alpha[0] > alpha[1]) {
+        for (uint32_t i = 1; i <= 6; ++i) alpha[i + 1] = uint8_t(((7 - i) * uint32_t(alpha[0]) + i * uint32_t(alpha[1])) / 7);
+    } else {
+        for (uint32_t i = 1; i <= 4; ++i) alpha[i + 1] = uint8_t(((5 - i) * uint32_t(alpha[0]) + i * uint32_t(alpha[1])) / 5);
+        alpha[6] = 0; alpha[7] = 255;
+    }
+    uint64_t indices = 0;
+    for (uint32_t i = 0; i < 6; ++i) indices |= uint64_t(block[2 + i]) << (8 * i);
+    for (uint32_t i = 0; i < 16; ++i) rgba[i * 4 + 3] = alpha[(indices >> (3 * i)) & 7];
+}
+
+static Image decodeDxtLevel(const std::vector<uint8_t>& blocks, uint32_t width, uint32_t height, uint32_t codec) {
+    const uint32_t bw = (width + 3) / 4, bh = (height + 3) / 4, blockSize = codec == TEXTURE_PACK_CODEC_BC1 ? 8 : 16;
+    Image out; out.width = width; out.height = height; out.pixels.resize(size_t(width) * height * 4);
+    uint8_t rgba[64];
+    for (uint32_t by = 0; by < bh; ++by) for (uint32_t bx = 0; bx < bw; ++bx) {
+        decodeDxtBlock(blocks.data() + (size_t(by) * bw + bx) * blockSize, codec, rgba);
+        for (uint32_t y = 0; y < 4 && by * 4 + y < height; ++y)
+            for (uint32_t x = 0; x < 4 && bx * 4 + x < width; ++x)
+                std::copy_n(rgba + (y * 4 + x) * 4, 4, &out.pixels[(size_t(by * 4 + y) * width + bx * 4 + x) * 4]);
+    }
+    return out;
+}
+
+static bool decodeDds(const std::filesystem::path& path, DecodedSource* out, std::string* error) {
+    std::vector<uint8_t> bytes;
+    if (!readFile(path, &bytes, error)) return false;
+    if (bytes.size() < 128 || std::memcmp(bytes.data(), "DDS ", 4) != 0 || readLe32(bytes.data() + 4) != 124 ||
+        readLe32(bytes.data() + 76) != 32 || !(readLe32(bytes.data() + 80) & 4))
+        return fail(error, "malformed DDS header: " + path.string());
+    const uint32_t height = readLe32(bytes.data() + 12), width = readLe32(bytes.data() + 16);
+    const uint32_t fourcc = readLe32(bytes.data() + 84);
+    if (!width || !height) return fail(error, "invalid DDS dimensions: " + path.string());
+    if (fourcc == 0x31545844u) out->bcCodec = TEXTURE_PACK_CODEC_BC1; // DXT1
+    else if (fourcc == 0x35545844u) out->bcCodec = TEXTURE_PACK_CODEC_BC3; // DXT5
+    else return fail(error, "unsupported DDS FourCC: " + path.string());
+    uint32_t mipCount = readLe32(bytes.data() + 28);
+    if (!mipCount) mipCount = 1;
+    uint32_t maxMips = 1, longest = std::max(width, height);
+    while (longest > 1) { longest >>= 1; ++maxMips; }
+    if (mipCount > maxMips) return fail(error, "invalid DDS mip count: " + path.string());
+    size_t offset = 128;
+    for (uint32_t level = 0; level < mipCount; ++level) {
+        const uint32_t w = std::max(1u, width >> level), h = std::max(1u, height >> level);
+        const uint32_t blockSize = out->bcCodec == TEXTURE_PACK_CODEC_BC1 ? 8 : 16;
+        const uint64_t size64 = uint64_t((w + 3) / 4) * ((h + 3) / 4) * blockSize;
+        if (size64 > bytes.size() - offset) return fail(error, "truncated DDS payload: " + path.string());
+        const size_t size = size_t(size64);
+        out->bcLevels.emplace_back(bytes.begin() + offset, bytes.begin() + offset + size);
+        out->levels.push_back(decodeDxtLevel(out->bcLevels.back(), w, h, out->bcCodec));
+        offset += size;
+    }
+    return true;
+}
+
+static bool decodeSource(const std::filesystem::path& path, DecodedSource* out, std::string* error) {
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    if (ext == ".dds") return decodeDds(path, out, error);
+    Image image;
+    if (!decodePng(path, &image, error)) return false;
+    out->levels.push_back(std::move(image));
     return true;
 }
 
@@ -156,20 +265,28 @@ static bool collect(const std::string& input, std::map<std::string, SourceGroup>
     if (!std::filesystem::is_directory(root, ec)) return fail(error, "input is not a directory: " + input);
     for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
          !ec && it != end; it.increment(ec)) {
-        if (!it->is_regular_file(ec) || it->path().extension() != ".png") continue;
-        ++stats->files;
+        if (it->is_directory(ec) && it->path().filename() == "widescreen_stars_fix") {
+            it.disable_recursion_pending();
+            continue;
+        }
+        std::string extension = it->path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        if (!it->is_regular_file(ec) || (extension != ".png" && extension != ".dds")) continue;
+        if (it->path().stem().string().compare(0, 5, "tex1_") != 0) continue;
         SourceGroup parsed; int level = 0; std::string canonical;
-        if (!parseName(it->path().stem().string(), &parsed, &level, &canonical, error)) return false;
+        std::string parseError;
+        if (!parseName(it->path().stem().string(), &parsed, &level, &canonical, &parseError)) continue;
+        ++stats->files;
         SourceGroup& g = (*groups)[canonical];
         if (!g.files.empty() && !(g.key == TexturePackKey())) {
             if (!(g.key == parsed.key)) return fail(error, "conflicting texture key: " + canonical);
         } else g.key = parsed.key;
         g.arbitrary = g.arbitrary || parsed.arbitrary;
-        if (g.files.count(level)) return fail(error, "duplicate texture level: " + canonical);
+        if (g.files.count(level)) continue;
         g.files[level] = SourceFile{it->path(), level};
     }
     if (ec) return fail(error, "cannot scan input directory: " + ec.message());
-    if (groups->empty()) return fail(error, "input contains no texture PNGs");
+    if (groups->empty()) return fail(error, "input contains no texture PNGs or DDS files");
     for (const auto& item : *groups) if (!item.second.files.count(0)) return fail(error, "missing level 0: " + item.first);
     return true;
 }
@@ -179,8 +296,10 @@ static bool makeEntry(const SourceGroup& group, const TexturePackConversionOptio
     if (!options.maxSize || (options.bcCodec != TEXTURE_PACK_CODEC_BC1 && options.bcCodec != TEXTURE_PACK_CODEC_BC2 &&
                              options.bcCodec != TEXTURE_PACK_CODEC_BC3 && options.bcCodec != TEXTURE_PACK_CODEC_BC7))
         return fail(error, "invalid converter options");
-    Image base;
-    if (!decodePng(group.files.at(0).path, &base, error)) return false;
+    DecodedSource baseSource;
+    if (!decodeSource(group.files.at(0).path, &baseSource, error)) return false;
+    Image base = baseSource.levels[0];
+    const bool downscaled = std::max(base.width, base.height) > options.maxSize;
     if (std::max(base.width, base.height) > options.maxSize) {
         const uint32_t longest = std::max(base.width, base.height);
         const uint32_t w = std::max(1u, uint32_t((uint64_t(base.width) * options.maxSize + longest / 2) / longest));
@@ -188,23 +307,35 @@ static bool makeEntry(const SourceGroup& group, const TexturePackConversionOptio
         base = scaleBox(base, w, h);
     }
     std::vector<Image> levels;
+    std::vector<std::vector<uint8_t>> sourceBc;
     levels.push_back(std::move(base));
+    sourceBc.push_back(!downscaled && baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[0] : std::vector<uint8_t>());
     const uint32_t chain = [&] { uint32_t n = 1, longest = std::max(levels[0].width, levels[0].height); while (longest > 1) { longest >>= 1; ++n; } return n; }();
     for (uint32_t i = 1; i < chain; ++i) {
         auto explicitMip = group.files.find(int(i));
         if (explicitMip != group.files.end()) {
-            Image supplied;
-            if (!decodePng(explicitMip->second.path, &supplied, error)) return false;
+            DecodedSource suppliedSource;
+            if (!decodeSource(explicitMip->second.path, &suppliedSource, error)) return false;
+            Image supplied = suppliedSource.levels[0];
             const uint32_t w = std::max(1u, levels[0].width >> i), h = std::max(1u, levels[0].height >> i);
+            sourceBc.push_back(supplied.width == w && supplied.height == h && suppliedSource.bcCodec == options.bcCodec
+                                   ? suppliedSource.bcLevels[0] : std::vector<uint8_t>());
             levels.push_back(scaleBox(supplied, w, h));
-        } else levels.push_back(nextMip(levels.back()));
+        } else if (!downscaled && i < baseSource.levels.size()) {
+            sourceBc.push_back(baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[i] : std::vector<uint8_t>());
+            levels.push_back(baseSource.levels[i]);
+        } else {
+            sourceBc.emplace_back();
+            levels.push_back(nextMip(levels.back()));
+        }
     }
     TexturePackEntry e; e.key = group.key; e.width = levels[0].width; e.height = levels[0].height;
     e.mipCount = uint32_t(levels.size()); e.rgbaCodec = TEXTURE_PACK_CODEC_RGBA8_LINEAR; e.bcCodec = options.bcCodec;
     e.surfaceFormat = 0x1a; e.surfacePitch = e.width * 4;
-    for (const Image& image : levels) {
+    for (size_t i = 0; i < levels.size(); ++i) {
+        const Image& image = levels[i];
         TexturePackLevel l; l.width = image.width; l.height = image.height;
-        l.rgbaPayload = image.pixels; l.bcPayload = encodeBc(image, options.bcCodec);
+        l.rgbaPayload = image.pixels; l.bcPayload = sourceBc[i].empty() ? encodeBc(image, options.bcCodec) : sourceBc[i];
         stats->rgbaBytes += l.rgbaPayload.size(); stats->bcBytes += l.bcPayload.size(); ++stats->levels;
         e.levels.push_back(std::move(l));
     }
@@ -231,7 +362,7 @@ bool convertTexturePack(const std::string& inputDirectory, const std::string& ou
 #ifndef GX2_TEXTURE_PACK_NO_MAIN
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <GMSE01-png-dir> <output.gx2pack> [--max-size N] [--bc 1|2|3|7]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <GMSE01-texture-dir> <output.gx2pack> [--max-size N] [--bc 1|2|3|7]\n", argv[0]);
         return 2;
     }
     gx::TexturePackConversionOptions options;
