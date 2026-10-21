@@ -551,19 +551,29 @@ extern "C" u64 port_audio_dsp_subframes(void)
 // DSP always finishes a frame within one block period, and consuming blocks
 // faster than JAudio produces frames makes DSPBuf repeat stale samples (gaps)
 // while the sequencer falls behind.
+#ifdef TARGET_WIIU
+namespace JASystem { namespace AudioThread {
+u32 getDSPSyncCount();
+extern OSThread jac_audioThread;
+} }
+extern "C" int sms_wiiu_OSIsThreadTerminated(OSThread*);
+#endif
 extern "C" void port_audio_dsp_debug_log(void)
 {
 #ifdef TARGET_WIIU
 	if (!s_async.active)
 		return;
 	port_log("[audio] async: queued rel/82/81/other %u/%u/%u/%u exec %u/%u/%u/%u releaseIdle %u replies %u posts %u "
-	         "pending %u sub %u/%u fromDsp %u mails %u skipped %u asserts %u lastAssertMail %u inCmd %d want %u have %u\n",
+	         "pending %u sub %u/%u fromDsp %u mails %u skipped %u asserts %u lastAssertMail %u inCmd %d want %u have %u "
+	         "intcount %u audioThreadDead %d\n",
 	         (unsigned)s_dbgQueued[0], (unsigned)s_dbgQueued[1], (unsigned)s_dbgQueued[2], (unsigned)s_dbgQueued[3],
 	         (unsigned)s_dbgExec[0], (unsigned)s_dbgExec[1], (unsigned)s_dbgExec[2], (unsigned)s_dbgExec[3],
 	         (unsigned)s_dbgReleaseIdle, (unsigned)s_dbgReplies, (unsigned)s_dbgReplyPosts,
 	         (unsigned)s_async.framePending, (unsigned)g.sub, (unsigned)g.subframes, (unsigned)g.fromDsp.size(),
 	         (unsigned)s_dbgMails, (unsigned)s_dbgSkippedMails, (unsigned)s_dbgAsserts, (unsigned)s_dbgLastAssertMail,
-	         (int)g.inCmd, (unsigned)g.want, (unsigned)g.words.size());
+	         (int)g.inCmd, (unsigned)g.want, (unsigned)g.words.size(),
+	         (unsigned)JASystem::AudioThread::getDSPSyncCount(),
+	         sms_wiiu_OSIsThreadTerminated(&JASystem::AudioThread::jac_audioThread));
 #endif
 }
 
