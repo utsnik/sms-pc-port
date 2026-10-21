@@ -450,7 +450,33 @@ static bool s_noDiff, s_noDiffMarker;
 static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets, 5 = 3 plus GX2DrawDone per draw
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
+// What each pixel texture unit holds, so an unchanged texture or sampler is
+// not bound again on every draw (the image pointers and GX2 register words,
+// not the TextureEntry, since the pack replaces surfaces in place).
+struct BoundPixelTexture {
+    const void* image; const void* mipmaps;
+    uint32_t texRegs[5], samplerRegs[3];
+    bool valid;
+};
+static BoundPixelTexture s_boundPixelTex[8];
+static void bindPixelTexture(GX2Texture* texture, GX2Sampler* sampler, uint32_t unit) {
+    BoundPixelTexture& b = s_boundPixelTex[unit];
+    if (!b.valid || b.image != texture->surface.image || b.mipmaps != texture->surface.mipmaps ||
+        memcmp(b.texRegs, texture->regs, sizeof(b.texRegs))) {
+        GX2SetPixelTexture(texture, unit);
+        b.image = texture->surface.image;
+        b.mipmaps = texture->surface.mipmaps;
+        memcpy(b.texRegs, texture->regs, sizeof(b.texRegs));
+    }
+    if (!b.valid || memcmp(b.samplerRegs, sampler->regs, sizeof(b.samplerRegs))) {
+        GX2SetPixelSampler(sampler, unit);
+        memcpy(b.samplerRegs, sampler->regs, sizeof(b.samplerRegs));
+    }
+    b.valid = true;
+}
+
 static void invalidateVertexUniforms() {
+    for (BoundPixelTexture& b : s_boundPixelTex) b.valid = false;
     s_tevPixelValid = s_vtxLiveValid = s_stateValid = false;
     s_boundFetch = s_boundVertex = s_boundPixel = nullptr;
     s_xfUniformValid = false;
@@ -2839,8 +2865,7 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
         for (uint32_t r = 0; r < kTevUniforms; ++r) GX2SetPixelUniformReg(4 * (128 + r), 4, s_tevPixelShadowPtr() + 4 * r);
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
-        GX2SetPixelTexture(&textures[map]->texture, map);
-        GX2SetPixelSampler(&textures[map]->sampler, map);
+        bindPixelTexture(&textures[map]->texture, &textures[map]->sampler, map);
     }
 }
 
@@ -3513,8 +3538,7 @@ static void setShader(FixedShader& shader, TextureEntry* texture, VertexProgram*
     GX2SetPixelUniformReg(shader.pixel.uniformVars[0].offset, 4, windowParams);
     s_tevPixelValid = false;  // overlaps the TEV path's registers
     if (shader.textured && texture) {
-        GX2SetPixelTexture(&texture->texture, 0);
-        GX2SetPixelSampler(&texture->sampler, 0);
+        bindPixelTexture(&texture->texture, &texture->sampler, 0);
     }
 }
 
