@@ -330,7 +330,7 @@ void texturePackShutdown() {
         s_workerStarted = false;
     }
     if (s_state.file) std::fclose(s_state.file);
-    s_state.file = nullptr; freeIndex(); s_state = State();
+    s_state.file = nullptr; freeIndex(); std::memset(&s_state, 0, sizeof s_state);
     s_requests.clear(); s_resultRead = s_resultWrite = 0;
     s_chunkReady = false;
 }
