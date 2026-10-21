@@ -148,6 +148,7 @@ u32 isqrt(u64 v)
 }
 
 extern "C" void sms_wiiu_hang_check(void);
+extern "C" void sms_wiiu_ax_load(u32* ppc, u32* dsp);
 extern "C" volatile int sms_wiiu_crash_stage;
 
 void log_stats(int64_t now)
@@ -162,6 +163,11 @@ void log_stats(int64_t now)
 	         g.blocks, ms, g.blocks * 1000u / ms, (g.blocks * 100000u / ms) % 100,
 	         (unsigned)(sub - g.statsSubframes), g.underruns, g.minQueued, g.maxQueued, target_blocks(),
 	         g.pendingWaits, (unsigned)(g.samples ? isqrt(g.sumSquares / g.samples) : 0), g.peak);
+	{
+		u32 ppc, dsp;
+		sms_wiiu_ax_load(&ppc, &dsp);
+		port_log("[audio] AX load ppc=%u dsp=%u\n", (unsigned)ppc, (unsigned)dsp);
+	}
 	g.sumSquares = g.samples = 0;
 	g.peak       = 0;
 	g.statsSince     = now;
