@@ -49,6 +49,7 @@ int main() {
     check(lru.evict(2, 30, evicted, 4) == 0, "lru protects previous frame");
     check(lru.evict(3, 30, evicted, 4) == 1 && evicted[0] == 1, "lru evicts oldest safe entry");
     check(lru.residentBytes() + 30 <= lru.budget(), "lru chunk budget");
+    check(!lru.add(3, 200, 3) && lru.residentBytes() <= lru.budget(), "lru rejects over-budget resident");
 
     TexturePackUploadBudget budget(256);
     check(budget.consume(128) && !budget.consume(129) && budget.bytes == 128, "bounded upload chunk");

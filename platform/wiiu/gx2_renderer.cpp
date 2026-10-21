@@ -3101,7 +3101,7 @@ static const float kArbitraryMipThreshold = 14.0f;
 // inside a frame (flushBatch), before applyState/setTevShader re-apply state.
 static void rebindTvTarget();
 static bool s_retileTextures = true;
-static bool retileTextureLevel(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
+static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
     if (level >= tiled.surface.mipLevels) return false;
     GX2CopySurface(&linear.surface, level, 0, &tiled.surface, level, 0); invalidateVertexUniforms();
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tiled.surface.image, tiled.surface.imageSize);
@@ -3133,7 +3133,7 @@ static void retileTexture(GX2Texture& texture) {
     if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
     GX2InitTextureRegs(&tiled);
     for (uint32_t level = 0; level < t.mipLevels; ++level)
-        retileTextureLevel(texture, tiled, level);
+        retileTexture(texture, tiled, level);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, t.image, t.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, t.image, t.imageSize);
     if (t.mipmaps) {
@@ -3383,7 +3383,7 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
     }
     e.packLevelBytes[chunk.level] += chunk.bytes;
     if (chunk.last) {
-        if (e.packLevelBytes[chunk.level] != level.rgbaSize || !retileTextureLevel(e.packLinear, e.packTiled, chunk.level)) return false;
+        if (e.packLevelBytes[chunk.level] != level.rgbaSize || !retileTexture(e.packLinear, e.packTiled, chunk.level)) return false;
         e.packLevelDone |= 1u << chunk.level;
     }
     return true;

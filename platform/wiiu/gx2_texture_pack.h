@@ -135,8 +135,12 @@ public:
     TexturePackLru() : budget_(0), bytes_(0) { reset(0); }
     void reset(uint64_t budget) { budget_ = budget; bytes_ = 0; memset(nodes_, 0, sizeof nodes_); }
     bool add(uint32_t id, uint64_t bytes, uint32_t frame) {
+        if (bytes > budget_) return false;
         for (TexturePackLruNode& n : nodes_)
-            if (n.resident && n.id == id) { bytes_ -= n.bytes; n.bytes = bytes; n.lastUsedFrame = frame; bytes_ += bytes; return bytes_ <= budget_; }
+            if (n.resident && n.id == id) {
+                if (bytes_ - n.bytes + bytes > budget_) return false;
+                bytes_ -= n.bytes; n.bytes = bytes; n.lastUsedFrame = frame; bytes_ += bytes; return true;
+            }
         for (TexturePackLruNode& n : nodes_) if (!n.resident) {
             n.id = id; n.bytes = bytes; n.lastUsedFrame = frame; n.resident = true; bytes_ += bytes; return bytes_ <= budget_;
         }
