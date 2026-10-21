@@ -26,12 +26,6 @@ bool rendererReady();
 static bool s_recording = false;
 static uint8_t* s_dlBegin = nullptr;
 static uint32_t s_dlSize = 0;
-static State& apiState() { return s_recording ? gProducer : g; }
-
-// Keep the API side of a display-list recording independent from the state
-// consumed by gx_fifo.cpp.  Outside recording apiState() is the consumer, so
-// the legacy direct path remains byte-for-byte and timing equivalent.
-#define GX_STATE apiState()
 
 static inline uint32_t setField(uint32_t reg, int size, int shift, uint32_t v) {
     uint32_t m = ((1u << size) - 1u) << shift;
@@ -42,18 +36,16 @@ static inline uint32_t getField(uint32_t reg, int size, int shift) { return (reg
 static void apiBP(uint32_t reg, uint32_t data) {
     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
     if (s_recording) {
-        shadowBP(v);
         GXPC_Write8(0x61);
         GXPC_Write32(v);
         return;
     }
     writeBP(v);
 }
-static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GX_STATE.bp[reg], size, shift, v)); }
+static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(g.bp[reg], size, shift, v)); }
 
 static void apiCP(uint8_t reg, uint32_t v) {
     if (s_recording) {
-        shadowCP(reg, v);
         GXPC_Write8(0x08);
         GXPC_Write8(reg);
         GXPC_Write32(v);
@@ -64,7 +56,6 @@ static void apiCP(uint8_t reg, uint32_t v) {
 
 static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
     if (s_recording) {
-        shadowXF(addr, n, w);
         GXPC_Write8(0x10);
         GXPC_Write32(((n - 1) << 16) | addr);
         for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
@@ -83,7 +74,7 @@ static inline uint32_t fbits(float f) {
     memcpy(&u, &f, 4);
     return u;
 }
-static uint32_t xfReg(int r) { return GX_STATE.xfReg[r]; }
+static uint32_t xfReg(int r) { return g.xfReg[r]; }
 
 // ------------------------------------------------------------------ internal object layouts
 namespace {
@@ -155,7 +146,6 @@ GXFifoObj* GXInit(void* base, u32 size) {
     // bring up a window (or a headless context) unless the host already did
     if (!rendererReady()) GXPC_InitAuto(1);
     resetState();
-    gProducer = g;
     FifoObjInt* f = reinterpret_cast<FifoObjInt*>(&s_fifo);
     f->base = static_cast<uint8_t*>(base);
     f->top = f->base + size - 4;
@@ -237,7 +227,7 @@ GXFifoObj* GXInit(void* base, u32 size) {
 }
 
 void GXSetMisc(GXMiscToken, u32) {}
-void GXFlush(void) { drainCommandStream(); flushBatch(); }
+void GXFlush(void) { flushBatch(); }
 void GXResetWriteGatherPipe(void) {}
 void GXAbortFrame(void) {}
 BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
@@ -246,15 +236,13 @@ void GXSetDrawSync(u16 token) {
     apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
     apiBP(BP_PE_TOKEN, token);
 }
-u16 GXReadDrawSync(void) { drainCommandStream(); return GX_STATE.drawSyncToken; }
+u16 GXReadDrawSync(void) { return g.drawSyncToken; }
 void GXSetDrawDone(void) {
     apiBP(BP_DRAWDONE, 2);
-    drainCommandStream();
     if (s_drawDoneCb) s_drawDoneCb();
 }
-void GXWaitDrawDone(void) { drainCommandStream(); flushBatch(); }
+void GXWaitDrawDone(void) { flushBatch(); }
 void GXDrawDone(void) {
-    drainCommandStream();
     flushBatch();
     if (s_drawDoneCb) s_drawDoneCb();
 }
@@ -342,10 +330,6 @@ void GXRestoreWriteGatherPipe(void) { setPipeRedirect(nullptr); }
 // ================================================================== display lists
 void GXBeginDisplayList(void* list, u32 size) {
     flushBatch();
-    // The producer starts from the last consumed state.  All API read-modify-
-    // writes during the recording then stay in gProducer until the list is
-    // called by the existing FIFO parser.
-    gProducer = g;
     s_recording = true;
     s_dlBegin = static_cast<uint8_t*>(list);
     s_dlSize = size;
@@ -368,12 +352,11 @@ void GXCallDisplayList(void* list, u32 nbytes) {
         return;
     }
     callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
-    gProducer = g;
 }
 
 // ================================================================== GXGeometry / GXAttr
 void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
-    uint32_t lo = GX_STATE.cpVcdLo, hi = GX_STATE.cpVcdHi;
+    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
     uint32_t t = uint32_t(type) & 3;
     if (attr == GX_VA_PNMTXIDX) lo = setField(lo, 1, 0, t != 0);
     else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) lo = setField(lo, 1, 1 + (attr - GX_VA_TEX0MTXIDX), t != 0);
@@ -382,8 +365,8 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
     else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
     else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
     else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
-    if (lo != GX_STATE.cpVcdLo) apiCP(CP_VCD_LO, lo);
-    if (hi != GX_STATE.cpVcdHi) apiCP(CP_VCD_HI, hi);
+    if (lo != g.cpVcdLo) apiCP(CP_VCD_LO, lo);
+    if (hi != g.cpVcdHi) apiCP(CP_VCD_HI, hi);
 }
 void GXSetVtxDescv(const GXVtxDescList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
@@ -393,7 +376,7 @@ void GXClearVtxDesc(void) {
     apiCP(CP_VCD_HI, 0);
 }
 void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
-    uint32_t lo = GX_STATE.cpVcdLo, hi = GX_STATE.cpVcdHi, t = 0;
+    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi, t = 0;
     if (attr == GX_VA_PNMTXIDX) t = lo & 1;
     else if (attr >= GX_VA_TEX0MTXIDX && attr <= GX_VA_TEX7MTXIDX) t = getField(lo, 1, 1 + attr - GX_VA_TEX0MTXIDX);
     else if (attr == GX_VA_POS) t = getField(lo, 2, 9);
@@ -414,7 +397,7 @@ void GXGetVtxDescv(GXVtxDescList* vcd) {
 }
 
 void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
-    uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
+    uint32_t A = g.cpVatA[fmt], B = g.cpVatB[fmt], C = g.cpVatC[fmt];
     uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
     switch (attr) {
     case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
@@ -437,15 +420,15 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
     default: break;
     }
     A |= 1u << 30;
-    if (A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
-    if (B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
-    if (C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
+    if (A != g.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
+    if (B != g.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
+    if (C != g.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
 }
 void GXSetVtxAttrFmtv(GXVtxFmt fmt, const GXVtxAttrFmtList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);
 }
 void GXGetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt* cnt, GXCompType* type, u8* frac) {
-    uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
+    uint32_t A = g.cpVatA[fmt], B = g.cpVatB[fmt], C = g.cpVatC[fmt];
     uint32_t c = 0, t = 0, f = 0;
     switch (attr) {
     case GX_VA_POS: c = getField(A, 1, 0); t = getField(A, 3, 1); f = getField(A, 5, 4); break;
@@ -480,14 +463,14 @@ void GXGetVtxAttrFmtv(GXVtxFmt fmt, GXVtxAttrFmtList* vat) {
 void GXSetArray(GXAttr attr, const void* base, u8 stride) {
     int slot = attr == GX_VA_NBT ? 1 : int(attr) - GX_VA_POS;
     if (slot < 0 || slot > 15) return;
-    GX_STATE.arrayBase[slot] = static_cast<const uint8_t*>(base);
-    GX_STATE.arrayStride[slot] = stride;
-    GX_STATE.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
     if (s_recording) {
         apiCP(uint8_t(CP_ARRAY_BASE + slot), ptrToPhys(base));
         apiCP(uint8_t(CP_ARRAY_STRIDE + slot), stride);
         return;
     }
+    g.arrayBase[slot] = static_cast<const uint8_t*>(base);
+    g.arrayStride[slot] = stride;
+    g.arrayBigEndian[slot] = g_defaultArrayBE || isBigEndianData(base);
     g_arrayGen++;
 }
 void GXInvalidateVtxCache(void) {}
@@ -553,33 +536,33 @@ void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
 }
 
 void GXSetLineWidth(u8 width, GXTexOffset off) {
-    GX_STATE.lineWidth = width;
-    uint32_t r = setField(GX_STATE.bp[BP_LPSIZE], 8, 0, width);
+    g.lineWidth = width;
+    uint32_t r = setField(g.bp[BP_LPSIZE], 8, 0, width);
     apiBP(BP_LPSIZE, setField(r, 3, 16, off));
 }
 void GXGetLineWidth(u8* width, GXTexOffset* off) {
-    *width = u8(getField(GX_STATE.bp[BP_LPSIZE], 8, 0));
-    *off = GXTexOffset(getField(GX_STATE.bp[BP_LPSIZE], 3, 16));
+    *width = u8(getField(g.bp[BP_LPSIZE], 8, 0));
+    *off = GXTexOffset(getField(g.bp[BP_LPSIZE], 3, 16));
 }
 void GXSetPointSize(u8 size, GXTexOffset off) {
-    GX_STATE.pointSize = size;
-    uint32_t r = setField(GX_STATE.bp[BP_LPSIZE], 8, 8, size);
+    g.pointSize = size;
+    uint32_t r = setField(g.bp[BP_LPSIZE], 8, 8, size);
     apiBP(BP_LPSIZE, setField(r, 3, 19, off));
 }
 void GXGetPointSize(u8* size, GXTexOffset* off) {
-    *size = u8(getField(GX_STATE.bp[BP_LPSIZE], 8, 8));
-    *off = GXTexOffset(getField(GX_STATE.bp[BP_LPSIZE], 3, 19));
+    *size = u8(getField(g.bp[BP_LPSIZE], 8, 8));
+    *off = GXTexOffset(getField(g.bp[BP_LPSIZE], 3, 19));
 }
 void GXEnableTexOffsets(GXTexCoordID coord, u8 line, u8 point) {
-    uint32_t r = setField(GX_STATE.bp[BP_SU_SSIZE + 2 * coord], 1, 18, line);
+    uint32_t r = setField(g.bp[BP_SU_SSIZE + 2 * coord], 1, 18, line);
     apiBP(BP_SU_SSIZE + 2 * coord, setField(r, 1, 19, point));
 }
 void GXSetCullMode(GXCullMode mode) {
-    GX_STATE.cullMode = mode;
+    g.cullMode = mode;
     uint32_t hw = mode == GX_CULL_FRONT ? 2 : mode == GX_CULL_BACK ? 1 : uint32_t(mode);
     bpField(BP_GENMODE, 2, 14, hw);
 }
-void GXGetCullMode(GXCullMode* mode) { *mode = GXCullMode(GX_STATE.cullMode); }
+void GXGetCullMode(GXCullMode* mode) { *mode = GXCullMode(g.cullMode); }
 void GXSetCoPlanar(GXBool enable) { bpField(BP_GENMODE, 1, 19, enable); }
 
 // ================================================================== GXTransform
@@ -601,13 +584,13 @@ void GXSetProjection(f32 mtx[4][4], GXProjectionType type) {
 }
 void GXSetProjectionv(f32* ptr) {
     traceNoteProjection(ptr);
-    memcpy(GX_STATE.projection, ptr, sizeof(GX_STATE.projection));
+    memcpy(g.projection, ptr, sizeof(g.projection));
     uint32_t w[7];
     for (int i = 0; i < 6; i++) w[i] = fbits(ptr[1 + i]);
     w[6] = ptr[0] != 0.0f ? 1 : 0;
     apiXF(XF_REG_BASE + XFR_PROJ, 7, w);
 }
-void GXGetProjectionv(f32* ptr) { memcpy(ptr, GX_STATE.projection, sizeof(GX_STATE.projection)); }
+void GXGetProjectionv(f32* ptr) { memcpy(ptr, g.projection, sizeof(g.projection)); }
 
 void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
 void GXLoadPosMtxIndx(u16 idx, u32 id) {
@@ -658,12 +641,12 @@ void GXLoadTexMtxIndx(u16 idx, u32 id, GXTexMtxType type) {
 
 void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
     if (field == 0) top -= 0.5f;
-    GX_STATE.viewport[0] = left;
-    GX_STATE.viewport[1] = top;
-    GX_STATE.viewport[2] = wd;
-    GX_STATE.viewport[3] = ht;
-    GX_STATE.viewport[4] = nearz;
-    GX_STATE.viewport[5] = farz;
+    g.viewport[0] = left;
+    g.viewport[1] = top;
+    g.viewport[2] = wd;
+    g.viewport[3] = ht;
+    g.viewport[4] = nearz;
+    g.viewport[5] = farz;
     float v[6];
     v[0] = wd * 0.5f;
     v[1] = -ht * 0.5f;
@@ -676,13 +659,13 @@ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz,
 void GXSetViewport(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz) {
     GXSetViewportJitter(left, top, wd, ht, nearz, farz, 1);
 }
-void GXGetViewportv(f32* vp) { memcpy(vp, GX_STATE.viewport, sizeof(GX_STATE.viewport)); }
+void GXGetViewportv(f32* vp) { memcpy(vp, g.viewport, sizeof(g.viewport)); }
 
 void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
-    GX_STATE.scissor[0] = uint32_t(left);
-    GX_STATE.scissor[1] = uint32_t(top);
-    GX_STATE.scissor[2] = uint32_t(wd);
-    GX_STATE.scissor[3] = uint32_t(ht);
+    g.scissor[0] = uint32_t(left);
+    g.scissor[1] = uint32_t(top);
+    g.scissor[2] = uint32_t(wd);
+    g.scissor[3] = uint32_t(ht);
     uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
     tl = setField(tl, 11, 12, uint32_t(left) + 342);
     uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
@@ -691,10 +674,10 @@ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
     apiBP(BP_SCISSOR_BR, br);
 }
 void GXGetScissor(u32* left, u32* top, u32* wd, u32* ht) {
-    *left = GX_STATE.scissor[0];
-    *top = GX_STATE.scissor[1];
-    *wd = GX_STATE.scissor[2];
-    *ht = GX_STATE.scissor[3];
+    *left = g.scissor[0];
+    *top = g.scissor[1];
+    *wd = g.scissor[2];
+    *ht = g.scissor[3];
 }
 void GXSetScissorBoxOffset(s32 x, s32 y) {
     uint32_t r = setField(0, 10, 0, uint32_t(x + 342) >> 1);
@@ -878,7 +861,7 @@ void GXSetTevOp(GXTevStageID id, GXTevMode mode) {
     GXSetTevAlphaOp(id, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
 }
 void GXSetTevColorIn(GXTevStageID s, GXTevColorArg a, GXTevColorArg b, GXTevColorArg c, GXTevColorArg d) {
-    uint32_t r = GX_STATE.bp[BP_TEV_COLOR_ENV + 2 * s];
+    uint32_t r = g.bp[BP_TEV_COLOR_ENV + 2 * s];
     r = setField(r, 4, 12, a);
     r = setField(r, 4, 8, b);
     r = setField(r, 4, 4, c);
@@ -886,7 +869,7 @@ void GXSetTevColorIn(GXTevStageID s, GXTevColorArg a, GXTevColorArg b, GXTevColo
     apiBP(BP_TEV_COLOR_ENV + 2 * s, r);
 }
 void GXSetTevAlphaIn(GXTevStageID s, GXTevAlphaArg a, GXTevAlphaArg b, GXTevAlphaArg c, GXTevAlphaArg d) {
-    uint32_t r = GX_STATE.bp[BP_TEV_COLOR_ENV + 2 * s + 1];
+    uint32_t r = g.bp[BP_TEV_COLOR_ENV + 2 * s + 1];
     r = setField(r, 3, 13, a);
     r = setField(r, 3, 10, b);
     r = setField(r, 3, 7, c);
@@ -906,10 +889,10 @@ static uint32_t tevOp(uint32_t r, GXTevOp op, GXTevBias bias, GXTevScale scale, 
     return setField(r, 2, 22, out);
 }
 void GXSetTevColorOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
-    apiBP(BP_TEV_COLOR_ENV + 2 * s, tevOp(GX_STATE.bp[BP_TEV_COLOR_ENV + 2 * s], op, bias, scale, clamp, out));
+    apiBP(BP_TEV_COLOR_ENV + 2 * s, tevOp(g.bp[BP_TEV_COLOR_ENV + 2 * s], op, bias, scale, clamp, out));
 }
 void GXSetTevAlphaOp(GXTevStageID s, GXTevOp op, GXTevBias bias, GXTevScale scale, GXBool clamp, GXTevRegID out) {
-    apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, tevOp(GX_STATE.bp[BP_TEV_COLOR_ENV + 2 * s + 1], op, bias, scale, clamp, out));
+    apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, tevOp(g.bp[BP_TEV_COLOR_ENV + 2 * s + 1], op, bias, scale, clamp, out));
 }
 static void tevRegWrite(uint32_t id, int r, int gg, int b, int a, bool konst) {
     uint32_t ra = setField(0, 11, 0, uint32_t(r)) | setField(0, 11, 12, uint32_t(a)) | (konst ? 0x800000u : 0);
@@ -927,13 +910,13 @@ void GXSetTevKAlphaSel(GXTevStageID s, GXTevKAlphaSel sel) {
     bpField(BP_TEV_KSEL + (s >> 1), 5, (s & 1) ? 19 : 9, sel);
 }
 void GXSetTevSwapMode(GXTevStageID s, GXTevSwapSel ras, GXTevSwapSel tex) {
-    uint32_t r = setField(GX_STATE.bp[BP_TEV_COLOR_ENV + 2 * s + 1], 2, 0, ras);
+    uint32_t r = setField(g.bp[BP_TEV_COLOR_ENV + 2 * s + 1], 2, 0, ras);
     apiBP(BP_TEV_COLOR_ENV + 2 * s + 1, setField(r, 2, 2, tex));
 }
 void GXSetTevSwapModeTable(GXTevSwapSel t, GXTevColorChan r, GXTevColorChan gch, GXTevColorChan b, GXTevColorChan a) {
-    uint32_t k0 = setField(GX_STATE.bp[BP_TEV_KSEL + 2 * t], 2, 0, r);
+    uint32_t k0 = setField(g.bp[BP_TEV_KSEL + 2 * t], 2, 0, r);
     apiBP(BP_TEV_KSEL + 2 * t, setField(k0, 2, 2, gch));
-    uint32_t k1 = setField(GX_STATE.bp[BP_TEV_KSEL + 2 * t + 1], 2, 0, b);
+    uint32_t k1 = setField(g.bp[BP_TEV_KSEL + 2 * t + 1], 2, 0, b);
     apiBP(BP_TEV_KSEL + 2 * t + 1, setField(k1, 2, 2, a));
 }
 void GXSetTevClampMode(void) {}
@@ -955,7 +938,7 @@ void GXSetTevOrder(GXTevStageID s, GXTexCoordID coord, GXTexMapID map, GXChannel
     int sh = (s & 1) ? 12 : 0;
     uint32_t tmap = uint32_t(map) & 0xFF;
     bool enable = tmap != 0xFF && !(uint32_t(map) & 0x100);
-    uint32_t r = GX_STATE.bp[reg];
+    uint32_t r = g.bp[reg];
     r = setField(r, 3, sh, tmap == 0xFF ? 0 : tmap & 7);
     r = setField(r, 3, sh + 3, coord == GX_TEXCOORD_NULL ? 0 : uint32_t(coord) & 7);
     r = setField(r, 1, sh + 6, enable);
@@ -996,11 +979,11 @@ void GXSetIndTexMtx(GXIndTexMtxID id, f32 offset[2][3], s8 scaleExp) {
 void GXSetIndTexCoordScale(GXIndTexStageID ind, GXIndTexScale ss, GXIndTexScale ts) {
     uint32_t reg = ind < 2 ? BP_RAS1_SS0 : BP_RAS1_SS1;
     int sh = (ind & 1) ? 8 : 0;
-    uint32_t r = setField(GX_STATE.bp[reg], 4, sh, ss);
+    uint32_t r = setField(g.bp[reg], 4, sh, ss);
     apiBP(reg, setField(r, 4, sh + 4, ts));
 }
 void GXSetIndTexOrder(GXIndTexStageID ind, GXTexCoordID coord, GXTexMapID map) {
-    uint32_t r = setField(GX_STATE.bp[BP_RAS1_IREF], 3, 6 * ind, uint32_t(map) & 7);
+    uint32_t r = setField(g.bp[BP_RAS1_IREF], 3, 6 * ind, uint32_t(map) & 7);
     apiBP(BP_RAS1_IREF, setField(r, 3, 6 * ind + 3, uint32_t(coord) & 7));
 }
 void GXSetNumIndStages(u8 n) { bpField(BP_GENMODE, 3, 16, n); }
@@ -1084,7 +1067,7 @@ void GXSetFogRangeAdj(GXBool enable, u16 center, GXFogAdjTable* table) {
     apiBP(BP_FOG_RANGE, (uint32_t(center) + 342) | (uint32_t(enable) << 10));
 }
 void GXSetBlendMode(GXBlendMode type, GXBlendFactor src, GXBlendFactor dst, GXLogicOp op) {
-    uint32_t r = GX_STATE.bp[BP_CMODE0];
+    uint32_t r = g.bp[BP_CMODE0];
     r = setField(r, 1, 0, type == GX_BM_BLEND || type == GX_BM_SUBTRACT);
     r = setField(r, 1, 1, type == GX_BM_LOGIC);
     r = setField(r, 1, 11, type == GX_BM_SUBTRACT);
@@ -1101,7 +1084,7 @@ void GXSetZMode(GXBool enable, GXCompare func, GXBool update) {
 }
 void GXSetZCompLoc(GXBool before) { bpField(BP_PE_CONTROL, 1, 6, before); }
 void GXSetPixelFmt(GXPixelFmt pix, GXZFmt16 z) {
-    uint32_t r = setField(GX_STATE.bp[BP_PE_CONTROL], 3, 0, pix);
+    uint32_t r = setField(g.bp[BP_PE_CONTROL], 3, 0, pix);
     apiBP(BP_PE_CONTROL, setField(r, 3, 3, z));
     bpField(BP_GENMODE, 1, 9, pix == GX_PF_RGB565_Z16);
 }
@@ -1122,8 +1105,8 @@ void GXPokeDstAlpha(GXBool, u8) {}
 void GXPokeDither(GXBool) {}
 void GXPokeZMode(GXBool, GXCompare, GXBool) {}
 void GXPokeARGB(u16, u16, u32) {}
-void GXPeekARGB(u16 x, u16 y, u32* color) { drainCommandStream(); *color = peekColor(x, y); }
-void GXPeekZ(u16 x, u16 y, u32* z) { drainCommandStream(); *z = peekZ(x, y); }
+void GXPeekARGB(u16 x, u16 y, u32* color) { *color = peekColor(x, y); }
+void GXPeekZ(u16 x, u16 y, u32* z) { *z = peekZ(x, y); }
 void GXPokeZ(u16, u16, u32) {}
 u32 GXCompressZ16(u32 z24, GXZFmt16) { return z24 >> 8; }
 u32 GXDecompressZ16(u32 z16, GXZFmt16) { return z16 << 8; }
@@ -1193,13 +1176,13 @@ static void doCopy(void* dest, GXBool clear, bool disp) {
     if (disp) apiBP(BP_COPY_YSCALE, s_dispYScale);
     // the renderer needs the host pointer; commands carry a physical address
     apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
-    if (!s_recording) GX_STATE.copyDest = dest;  // keep the full host pointer (64-bit hosts)
+    if (!s_recording) g.copyDest = dest;  // keep the full host pointer (64-bit hosts)
     uint32_t ctrl = disp ? s_dispCtrl : s_texCtrl;
     ctrl = setField(ctrl, 1, 11, clear);
     ctrl = setField(ctrl, 1, 14, disp);
     if (!disp && s_texCopyZ) {
         // the SDK switches PE_CONTROL to Z24 for depth copies
-        uint32_t pe = GX_STATE.bp[BP_PE_CONTROL];
+        uint32_t pe = g.bp[BP_PE_CONTROL];
         apiBP(BP_PE_CONTROL, setField(pe, 3, 0, 3));
         apiBP(BP_COPY_EXEC, ctrl);
         apiBP(BP_PE_CONTROL, pe);
@@ -1352,7 +1335,7 @@ void GXLoadTexObjPreLoaded(GXTexObj* obj, GXTexRegion*, GXTexMapID id) {
         uint32_t fmt = idx < 20 ? s_tlutLoaded[idx].fmt : 0;
         apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
     }
-    if (!s_recording) GX_STATE.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
+    if (!s_recording) g.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
 }
 void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
     if (s_texRegionCb) s_texRegionCb(obj, id);
@@ -1380,7 +1363,7 @@ void GXLoadTlut(GXTlutObj* obj, u32 name) {
     uint32_t bytes = uint32_t(t->entries) * 2;
     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
     onStateChange();
-    if (t->data) memcpy(GX_STATE.tlutMem + off, t->data, bytes);
+    if (t->data) memcpy(g.tlutMem + off, t->data, bytes);
 }
 void GXInitTexCacheRegion(GXTexRegion* region, u8 is32b, u32 even, GXTexCacheSize, u32 odd, GXTexCacheSize) {
     TexRegionInt* r = reinterpret_cast<TexRegionInt*>(region);
@@ -1418,7 +1401,7 @@ GXTlutRegionCallback GXSetTlutRegionCallback(GXTlutRegionCallback f) {
 void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
 void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
     if (coord >= 8) return;
-    GX_STATE.tcManual[coord] = enable != 0;
+    g.tcManual[coord] = enable != 0;
     if (enable) {
         bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
         bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
@@ -1524,8 +1507,8 @@ u32 GXReadClksPerVtx(void) { return 0; }
 
 // ================================================================== GXDraw (SDK helper shapes)
 static void drawWithPosNrm(void (*body)()) {
-    uint32_t lo = GX_STATE.cpVcdLo, hi = GX_STATE.cpVcdHi;
-    uint32_t A = GX_STATE.cpVatA[GX_VTXFMT3], B = GX_STATE.cpVatB[GX_VTXFMT3], C = GX_STATE.cpVatC[GX_VTXFMT3];
+    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
+    uint32_t A = g.cpVatA[GX_VTXFMT3], B = g.cpVatB[GX_VTXFMT3], C = g.cpVatC[GX_VTXFMT3];
     GXClearVtxDesc();
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_NRM, GX_DIRECT);
@@ -1599,8 +1582,6 @@ void GXDrawIcosahedron(void) {}
 u32 GXGenNormalTable(u8, f32*) { return 0; }
 
 }  // extern "C"
-
-#undef GX_STATE
 
 // GXVerify.h declares these without extern "C", so they keep C++ linkage.
 void GXSetVerifyLevel(GXWarningLevel) {}
