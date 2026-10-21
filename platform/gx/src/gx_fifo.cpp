@@ -627,11 +627,11 @@ const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) {
             l.clr[c] = o;
             o += 4;
         }
-    for (int t = 0; t < 8; t++)
-        if (fmt & (VF_TEX0 << t)) {
-            l.tex[t] = o;
-            o += 8;
-        }
+    for (uint32_t tm = (fmt >> 4) & 0xFF; tm; tm &= tm - 1) {
+        int t = __builtin_ctz(tm);
+        l.tex[t] = o;
+        o += 8;
+    }
     if (fmt & VF_MTX) {
         l.mtx = o;
         o += 12;
@@ -640,23 +640,44 @@ const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) {
     return cache.emplace(fmt, l).first->second;
 }
 
-void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& hv, bool zeroed) {
-    const VtxFmtLayout& l = vtxFmtLayout(fmt);
-    if (!zeroed) memset(static_cast<void*>(&hv), 0, sizeof(hv));
-    hv.nrm[2] = 1.0f;
-    memset(hv.clr, 255, sizeof(hv.clr));
-    memcpy(hv.mtx, defMtx, 9);
-    memcpy(hv.pos, src, 12);
-    if (fmt & VF_NRM) memcpy(hv.nrm, src + l.nrm, 12);
-    if (fmt & VF_NBT) {
-        memcpy(hv.bin, src + l.nrm + 12, 12);
-        memcpy(hv.tan, src + l.nrm + 24, 12);
+static inline void copyPackedWords(void* dst, const uint8_t* src, size_t bytes) {
+    if ((reinterpret_cast<uintptr_t>(src) & 3) == 0) {
+        typedef uint32_t gx_packed_word __attribute__((__may_alias__));
+        const gx_packed_word* s = reinterpret_cast<const gx_packed_word*>(src);
+        gx_packed_word* d = reinterpret_cast<gx_packed_word*>(dst);
+        for (size_t i = 0; i < bytes / 4; i++) d[i] = s[i];
+    } else {
+        memcpy(dst, src, bytes);
     }
-    for (int c = 0; c < 2; c++)
-        if (fmt & (VF_CLR0 << c)) memcpy(hv.clr[c], src + l.clr[c], 4);
-    for (int t = 0; t < 8; t++)
-        if (fmt & (VF_TEX0 << t)) memcpy(hv.tex[t], src + l.tex[t], 8);
-    if (fmt & VF_MTX) memcpy(hv.mtx, src + l.mtx, 12);
+}
+
+void unpackVertex(const VtxFmtLayout& l, uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9],
+                  HostVertex& hv, bool zeroed) {
+    if (!zeroed) memset(static_cast<void*>(&hv), 0, sizeof(hv));
+    copyPackedWords(hv.pos, src, 12);
+    if (fmt & VF_NRM) {
+        copyPackedWords(hv.nrm, src + l.nrm, 12);
+    } else {
+        hv.nrm[2] = 1.0f;
+    }
+    if (fmt & VF_NBT) {
+        copyPackedWords(hv.bin, src + l.nrm + 12, 12);
+        copyPackedWords(hv.tan, src + l.nrm + 24, 12);
+    }
+    for (int c = 0; c < 2; c++) {
+        if (fmt & (VF_CLR0 << c)) copyPackedWords(hv.clr[c], src + l.clr[c], 4);
+        else memset(hv.clr[c], 255, sizeof(hv.clr[c]));
+    }
+    for (uint32_t tm = (fmt >> 4) & 0xFF; tm; tm &= tm - 1) {
+        int t = __builtin_ctz(tm);
+        copyPackedWords(hv.tex[t], src + l.tex[t], 8);
+    }
+    if (fmt & VF_MTX) copyPackedWords(hv.mtx, src + l.mtx, 12);
+    else memcpy(hv.mtx, defMtx, 9);
+}
+
+void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], HostVertex& hv, bool zeroed) {
+    unpackVertex(vtxFmtLayout(fmt), fmt, src, defMtx, hv, zeroed);
 }
 
 // ------------------------------------------------------------------ attribute readers
