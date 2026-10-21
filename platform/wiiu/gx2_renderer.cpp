@@ -5288,6 +5288,10 @@ extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
     invalidateVertexUniforms();
 }
 
+extern "C" int sms_wiiu_gx2_nodiff_enabled(void) {
+    return s_noDiff ? 1 : 0;
+}
+
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
