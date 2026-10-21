@@ -53,16 +53,19 @@ extern "C" {
 BOOL wut_OSCreateThread(WutThread*, WutEntry, int32_t, char*, void*, uint32_t, int32_t, uint8_t) __asm__("OSCreateThread");
 int32_t wut_OSResumeThread(WutThread*) __asm__("OSResumeThread");
 BOOL wut_OSJoinThread(WutThread*, int*) __asm__("OSJoinThread");
-void wut_OSInitMessageQueue(WutMessageQueue*, void*, int32_t) __asm__("OSInitMessageQueue");
-BOOL wut_OSSendMessage(WutMessageQueue*, void*, int32_t) __asm__("OSSendMessage");
-BOOL wut_OSReceiveMessage(WutMessageQueue*, void**, int32_t) __asm__("OSReceiveMessage");
+/* wut's OSMessage is a pointer plus three words (16 bytes); the queue calls
+ * copy whole messages (a bare pointer here crashed the DSP mixer, e895c83). */
+struct WutMessage { void* message; uint32_t args[3]; };
+void wut_OSInitMessageQueue(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSInitMessageQueue");
+BOOL wut_OSSendMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSSendMessage");
+BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSReceiveMessage");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
 }
 static const uint8_t kWorkerAffinityCpu2 = 1u << 2;
 static const int32_t kMessageBlock = 1;
 static WutThread s_worker;
 static WutMessageQueue s_workerWake;
-static void* s_workerSlots[kTexturePackMaxQueue] __attribute__((aligned(32)));
+static WutMessage s_workerSlots[kTexturePackMaxQueue] __attribute__((aligned(32)));
 static uint8_t s_workerStack[0x10000] __attribute__((aligned(32)));
 static bool s_workerStarted;
 static volatile bool s_workerStop;
@@ -210,9 +213,9 @@ static void matchRequest(const TexturePackRequest& request) {
 
 static int texturePackWorker(int, const char**) {
     while (!s_workerStop) {
-        void* message = nullptr;
-        if (!wut_OSReceiveMessage(&s_workerWake, &message, kMessageBlock)) continue;
-        if (!message) break;
+        WutMessage m = {nullptr, {0, 0, 0}};
+        if (!wut_OSReceiveMessage(&s_workerWake, &m, kMessageBlock)) continue;
+        if (!m.message) break;
         TexturePackRequest request;
         while (s_requests.pop(&request)) matchRequest(request);
     }
@@ -281,27 +284,34 @@ bool texturePackInit() {
     s_state.indices = static_cast<uint32_t*>(MEMAllocFromDefaultHeapEx(uint32_t(s_state.slotCount * sizeof(uint32_t)), 64));
     s_state.entries = static_cast<TexturePackEntry*>(MEMAllocFromDefaultHeapEx(uint32_t(s_state.entryCount * sizeof(TexturePackEntry)), 64));
     if (!s_state.hashes || !s_state.indices || !s_state.entries) { reject("index allocation failed"); return false; }
-    uint8_t slot[16];
+    // Two bulk reads: one seek+read per slot and per entry (10k small SD reads)
+    // held the boot for minutes before the first frame (2026-10-21 06:56).
+    uint8_t* table = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(
+        uint32_t(indexBytes > entriesBytes ? indexBytes : entriesBytes), 64));
+    if (!table) { reject("table allocation failed"); return false; }
+    if (!readAt(s_state.indexOffset, table, uint32_t(indexBytes))) { MEMFreeToDefaultHeap(table); reject("truncated index"); return false; }
     for (uint32_t i = 0; i != s_state.slotCount; ++i) {
-        if (!readAt(s_state.indexOffset + uint64_t(i) * 16, slot, sizeof slot)) { reject("truncated index"); return false; }
+        const uint8_t* slot = table + size_t(i) * 16;
         s_state.hashes[i] = get64(slot); s_state.indices[i] = get32(slot + 8);
-        if (get32(slot + 12) > 1 || (s_state.indices[i] > s_state.entryCount && s_state.indices[i] != 0)) { reject("invalid index slot"); return false; }
+        if (get32(slot + 12) > 1 || (s_state.indices[i] > s_state.entryCount && s_state.indices[i] != 0)) { MEMFreeToDefaultHeap(table); reject("invalid index slot"); return false; }
     }
-    uint8_t raw[kEntryBytes];
+    if (!readAt(s_state.entriesOffset, table, uint32_t(entriesBytes))) { MEMFreeToDefaultHeap(table); reject("truncated entries"); return false; }
     for (uint32_t i = 0; i != s_state.entryCount; ++i) {
-        if (!readAt(s_state.entriesOffset + uint64_t(i) * kEntryBytes, raw, sizeof raw) || !parseEntry(raw, &s_state.entries[i])) { reject("truncated entry"); return false; }
+        const uint8_t* raw = table + size_t(i) * kEntryBytes;
+        if (!parseEntry(raw, &s_state.entries[i])) { MEMFreeToDefaultHeap(table); reject("truncated entry"); return false; }
         TexturePackEntry& e = s_state.entries[i];
         if (!e.width || !e.height || e.width > s_state.maxDimension || e.height > s_state.maxDimension ||
             !validFormat(e.key.format) || !validCodec(e.rgbaCodec) || e.rgbaCodec != kRgbaCodec ||
-            (e.key.wildcardTlut && e.key.tlutHash)) { reject("invalid entry metadata"); return false; }
+            (e.key.wildcardTlut && e.key.tlutHash)) { MEMFreeToDefaultHeap(table); reject("invalid entry metadata"); return false; }
         for (uint32_t l = 0; l != e.mipCount; ++l) {
             const TexturePackLevel& level = e.levels[l];
             if (!level.width || !level.height || level.width > s_state.maxDimension || level.height > s_state.maxDimension ||
                 !level.rgbaSize || !rangeOk(level.rgbaOffset, level.rgbaSize, s_state.archiveSize) ||
                 level.rgbaOffset < s_state.payloadOffset || !rangeOk(level.bcOffset, level.bcSize, s_state.archiveSize) ||
-                (level.bcSize && level.bcOffset < s_state.payloadOffset)) { reject("invalid payload range"); return false; }
+                (level.bcSize && level.bcOffset < s_state.payloadOffset)) { MEMFreeToDefaultHeap(table); reject("invalid payload range"); return false; }
         }
     }
+    MEMFreeToDefaultHeap(table);
     s_state.enabled = true;
     s_workerStop = false;
     s_chunkReady = false;
@@ -324,7 +334,8 @@ bool texturePackInit() {
 void texturePackShutdown() {
     if (s_workerStarted) {
         s_workerStop = true;
-        wut_OSSendMessage(&s_workerWake, nullptr, kMessageBlock);
+        WutMessage stop = {nullptr, {0, 0, 0}};
+        wut_OSSendMessage(&s_workerWake, &stop, kMessageBlock);
         int result = 0;
         wut_OSJoinThread(&s_worker, &result);
         s_workerStarted = false;
@@ -344,7 +355,9 @@ bool texturePackEnqueue(const TexturePackRequest& request) {
     if (s_requests.contains(request)) return true;
     if (!s_requests.push(request)) return false;
     ++s_stats.queuedJobs;
-    if (!wut_OSSendMessage(&s_workerWake, reinterpret_cast<void*>(uintptr_t(1)), kMessageBlock)) return false;
+    // A wake only; never block the draw path when wakes are already queued.
+    WutMessage wake = {reinterpret_cast<void*>(uintptr_t(1)), {0, 0, 0}};
+    wut_OSSendMessage(&s_workerWake, &wake, 0);
     return true;
 }
 
