@@ -95,6 +95,18 @@ struct State {
 };
 
 extern State g;
+struct ParserContext {
+    State* consumer;
+    uint32_t displayListDepth;
+};
+extern ParserContext g_parser;
+// API setters own this shadow while a GX display list is being produced.  It
+// is deliberately a complete State so read-modify-write setters and CPU
+// getters never consult the consumer half of the parser mid-recording.
+extern State gProducer;
+void shadowBP(uint32_t value);
+void shadowCP(uint8_t reg, uint32_t value);
+void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words);
 
 // ---------------------------------------------------------------- memory
 // Physical-address window used by 32-bit addresses inside command streams.
@@ -127,6 +139,7 @@ void resetState();
 // Command-stream parsing.  Big-endian bytes.
 void runCommands(const uint8_t* data, uint32_t size);
 void callDisplayList(const uint8_t* data, uint32_t size);  // GXCallDisplayList: runCommands, cached
+void drainCommandStream();  // ordered same-thread producer-to-consumer drain
 void pipeWrite(const uint8_t* bytes, uint32_t n);
 bool pipeIdle();
 void setPipeRedirect(uint8_t* dest);
