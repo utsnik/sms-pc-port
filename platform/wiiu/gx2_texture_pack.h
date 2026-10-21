@@ -146,6 +146,17 @@ public:
         }
         return false;
     }
+    // O(1) when the caller keeps the slot returned last time (hint); a linear
+    // scan per bind cost ~1 ms per frame in Delfino Plaza with the pack on.
+    uint32_t touchHint(uint32_t id, uint32_t frame, uint32_t hint) {
+        if (hint < kTexturePackMaxResidents && nodes_[hint].resident && nodes_[hint].id == id) {
+            nodes_[hint].lastUsedFrame = frame;
+            return hint;
+        }
+        for (uint32_t i = 0; i != kTexturePackMaxResidents; ++i)
+            if (nodes_[i].resident && nodes_[i].id == id) { nodes_[i].lastUsedFrame = frame; return i; }
+        return UINT32_MAX;
+    }
     void touch(uint32_t id, uint32_t frame) {
         for (TexturePackLruNode& n : nodes_) if (n.resident && n.id == id) { n.lastUsedFrame = frame; return; }
     }

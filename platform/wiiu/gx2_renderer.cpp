@@ -360,6 +360,8 @@ struct TextureEntry {
     bool valid = false;
     uint32_t packRequestId = 0;
     uint8_t packState = 0; // 0: disabled, 1: pending, 2: negative, 3: resident
+    uint32_t packTouchedFrame = UINT32_MAX;  // the LRU is touched once per frame
+    uint32_t packLruHint = UINT32_MAX;       // its node, for an O(1) touch
     const TexturePackEntry* packEntry = nullptr;
     GX2Texture packLinear;
     GX2Texture packTiled;
@@ -3180,7 +3182,10 @@ static TextureEntry* getTexture(int map) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.fmt == fmt && e.width == w && e.height == h &&
             e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
-            if (e.packState == 3) s_packLru.touch(e.packRequestId, g_displayFrames);
+            if (e.packState == 3 && e.packTouchedFrame != g_displayFrames) {
+                e.packTouchedFrame = g_displayFrames;
+                e.packLruHint = s_packLru.touchHint(e.packRequestId, g_displayFrames, e.packLruHint);
+            }
             // The sampler state belongs to the texmap, not the image: the same
             // texture may be bound with other wrap or filter modes.
             initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips);
