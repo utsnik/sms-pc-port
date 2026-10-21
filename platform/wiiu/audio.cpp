@@ -149,6 +149,7 @@ u32 isqrt(u64 v)
 
 extern "C" void sms_wiiu_hang_check(void);
 extern "C" void sms_wiiu_ax_load(u32* ppc, u32* dsp);
+extern "C" void port_audio_dsp_debug_log(void);
 extern "C" volatile int sms_wiiu_crash_stage;
 
 void log_stats(int64_t now)
@@ -167,6 +168,7 @@ void log_stats(int64_t now)
 		u32 ppc, dsp;
 		sms_wiiu_ax_load(&ppc, &dsp);
 		port_log("[audio] AX load ppc=%u dsp=%u\n", (unsigned)ppc, (unsigned)dsp);
+		port_audio_dsp_debug_log();
 	}
 	g.sumSquares = g.samples = 0;
 	g.peak       = 0;
