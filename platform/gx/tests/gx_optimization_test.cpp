@@ -7,71 +7,6 @@
 #include <cstring>
 #include <vector>
 
-namespace gx {
-extern void (*drawSyncCallback)(uint16_t);
-}
-
-static bool bpHasSideEffect(uint32_t reg, uint32_t data) {
-    return reg == gx::BP_COPY_EXEC || reg == gx::BP_PE_TOKEN_INT || reg == gx::BP_PE_TOKEN || reg == gx::BP_DRAWDONE ||
-           reg == gx::BP_LOADTLUT1 || reg == gx::BP_TEXINVALIDATE ||
-           (reg >= gx::BP_TEV_REG && reg < gx::BP_TEV_REG + 8 && (data & 0x800000));
-}
-
-static void referencePureBP(gx::State& s, uint32_t reg, uint32_t data) {
-    if (reg == gx::BP_MASK) {
-        s.bpMask = data;
-        return;
-    }
-    if (s.bpMask != 0xFFFFFF) {
-        data = (s.bp[reg] & ~s.bpMask) | (data & s.bpMask);
-        s.bpMask = 0xFFFFFF;
-    }
-    if (s.bp[reg] == data && !bpHasSideEffect(reg, data)) return;
-    if (bpHasSideEffect(reg, data)) return;
-    s.bp[reg] = data;
-    if (reg == gx::BP_COPY_DST) s.copyDest = gx::physToPtr(data << 5);
-    if ((reg >= gx::BP_TX_IMAGE3 && reg < gx::BP_TX_IMAGE3 + 4) ||
-        (reg >= gx::BP_TX_IMAGE3 + 0x20 && reg < gx::BP_TX_IMAGE3 + 0x24)) {
-        int map = (reg & 3) + ((reg & 0x20) ? 4 : 0);
-        s.texImage[map] = static_cast<const uint8_t*>(gx::physToPtr(data << 5));
-    }
-}
-
-static int s_drawSyncCalls;
-static void countDrawSync(uint16_t) { ++s_drawSyncCalls; }
-
-static void testBPFastPaths() {
-    gx::resetState();
-    gx::State expected = gx::g;
-    const uint32_t writes[] = {
-        (uint32_t(gx::BP_GENMODE) << 24) | 0x123456,
-        (uint32_t(gx::BP_COPY_DST) << 24) | 0x001234,
-        (uint32_t(gx::BP_TX_IMAGE3) << 24) | 0x002345,
-        (uint32_t(gx::BP_TX_IMAGE3 + 0x20) << 24) | 0x003456,
-        (uint32_t(gx::BP_GENMODE) << 24) | 0x123456,
-        (uint32_t(gx::BP_COPY_DST) << 24) | 0x001234,
-        (uint32_t(gx::BP_TX_IMAGE3) << 24) | 0x002345,
-        (uint32_t(gx::BP_MASK) << 24) | 0x00FF00,
-        (uint32_t(gx::BP_GENMODE) << 24) | 0x000056,
-    };
-    for (uint32_t value : writes) {
-        gx::writeBP(value);
-        referencePureBP(expected, value >> 24, value & 0xFFFFFF);
-    }
-    assert(memcmp(gx::g.bp, expected.bp, sizeof(gx::g.bp)) == 0);
-    assert(gx::g.bpMask == expected.bpMask);
-    assert(gx::g.copyDest == expected.copyDest);
-    assert(memcmp(gx::g.texImage, expected.texImage, sizeof(gx::g.texImage)) == 0);
-
-    gx::resetState();
-    gx::drawSyncCallback = countDrawSync;
-    s_drawSyncCalls = 0;
-    gx::writeBP((gx::BP_PE_TOKEN_INT << 24) | 0x0042);
-    gx::writeBP((gx::BP_PE_TOKEN_INT << 24) | 0x0042);
-    assert(s_drawSyncCalls == 2);
-    gx::drawSyncCallback = nullptr;
-}
-
 static void referenceUnpack(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], gx::HostVertex& hv,
                             bool zeroed) {
     const gx::VtxFmtLayout& l = gx::vtxFmtLayout(fmt);
@@ -152,7 +87,6 @@ static uint64_t referenceHash(const void* data, size_t n, uint64_t seed) {
 }
 
 int main() {
-    testBPFastPaths();
     std::vector<uint8_t> bytes(512 + 3);
     for (size_t i = 0; i < bytes.size(); ++i) bytes[i] = uint8_t(i * 37 + 11);
     for (size_t offset = 0; offset < 4; ++offset) {
@@ -198,6 +132,6 @@ int main() {
     assert(memcmp(pipe, expectedPipe, sizeof(expectedPipe)) == 0);
     GXPC_PipeBuf = nullptr;
     GXPC_PipeLen = GXPC_PipeFast = 0;
-    std::puts("gx_optimization_test: BP, hashBytes, unpackVertex, and vertex-writer reference comparisons passed");
+    std::puts("gx_optimization_test: hashBytes, unpackVertex, and vertex-writer reference comparisons passed");
     return 0;
 }

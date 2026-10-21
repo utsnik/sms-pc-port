@@ -33,12 +33,6 @@ static inline uint32_t setField(uint32_t reg, int size, int shift, uint32_t v) {
 }
 static inline uint32_t getField(uint32_t reg, int size, int shift) { return (reg >> shift) & ((1u << size) - 1u); }
 
-static inline bool bpWriteHasSideEffect(uint32_t reg, uint32_t data) {
-    return reg == BP_COPY_EXEC || reg == BP_PE_TOKEN_INT || reg == BP_PE_TOKEN || reg == BP_DRAWDONE ||
-           reg == BP_LOADTLUT1 || reg == BP_TEXINVALIDATE ||
-           (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000));
-}
-
 static void apiBP(uint32_t reg, uint32_t data) {
     uint32_t v = (reg << 24) | (data & 0xFFFFFF);
     if (s_recording) {
@@ -46,7 +40,6 @@ static void apiBP(uint32_t reg, uint32_t data) {
         GXPC_Write32(v);
         return;
     }
-    if (g.bpMask == 0xFFFFFF && g.bp[reg] == (data & 0xFFFFFF) && !bpWriteHasSideEffect(reg, data)) return;
     writeBP(v);
 }
 static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(g.bp[reg], size, shift, v)); }
