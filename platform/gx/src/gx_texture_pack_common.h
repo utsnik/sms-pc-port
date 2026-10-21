@@ -19,4 +19,8 @@ void paletteRange(const uint8_t* data, size_t bytes, uint32_t fmt, uint32_t* lo,
 std::string hiresName(const uint8_t* data, uint32_t fmt, uint32_t w, uint32_t h, bool mipmapped,
                       const uint8_t* tlut, uint32_t tlutBytes);
 
+/* Narrow converter-facing declaration; the implementation remains in
+ * gx_bcenc.cpp and keeps the PC renderer's block contract. */
+void encodeBlock(int format, const uint8_t* rgba, uint8_t* out);
+
 } // namespace gx
