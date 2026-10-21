@@ -97,6 +97,22 @@ if(SMS_WIIU)
       VERSION_GMSE01 BUILD_VERSION=2 NDEBUG=1)
   set(SMS_GAME_INCLUDE_DIRS ${SMS_DECOMP_INCLUDE_DIRS})
   set(SMS_GAME_PCH_DIR ${SMS_DECOMP}/include)
+  set(SMS_WIIU_FMA "off" CACHE STRING
+      "Wii U fused multiply-add contraction: off, port, or all")
+  set_property(CACHE SMS_WIIU_FMA PROPERTY STRINGS off port all)
+  if(NOT SMS_WIIU_FMA STREQUAL "off" AND
+     NOT SMS_WIIU_FMA STREQUAL "port" AND
+     NOT SMS_WIIU_FMA STREQUAL "all")
+    message(FATAL_ERROR "SMS_WIIU_FMA must be off, port, or all")
+  endif()
+  set(SMS_WIIU_GAME_FMA_FLAG -ffp-contract=off)
+  set(SMS_WIIU_PORT_FMA_FLAG)
+  if(SMS_WIIU_FMA STREQUAL "port" OR SMS_WIIU_FMA STREQUAL "all")
+    set(SMS_WIIU_PORT_FMA_FLAG -ffp-contract=fast)
+  endif()
+  if(SMS_WIIU_FMA STREQUAL "all")
+    set(SMS_WIIU_GAME_FMA_FLAG -ffp-contract=fast)
+  endif()
   # PowerPC keeps the stack back chain at 0(r1) either way (the profiler and
   # crash walks follow it), so a frame pointer only costs r31 and prologue work.
   option(SMS_WIIU_FRAME_POINTER "Keep -fno-omit-frame-pointer on the Wii U" ON)
@@ -108,7 +124,7 @@ if(SMS_WIIU)
   set(SMS_GAME_FLAGS
     -w -fno-strict-aliasing -fwrapv ${SMS_WIIU_FP_FLAG}
     -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 -fno-stack-protector
-    -ffunction-sections -fdata-sections -ffp-contract=off
+    -ffunction-sections -fdata-sections ${SMS_WIIU_GAME_FMA_FLAG}
     $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++03 -fno-gnu-keywords -fpermissive -fno-threadsafe-statics>
     $<$<COMPILE_LANGUAGE:C>:-std=gnu99 -fcommon>
     -include ${SMS_PORT_SRC}/port_compat.h
