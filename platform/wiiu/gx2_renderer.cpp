@@ -55,6 +55,7 @@
 #include <gx2/utils.h>
 #include <coreinit/title.h>
 #include <coreinit/cache.h>
+#include <coreinit/core.h>
 #include <coreinit/time.h>
 #include <whb/gfx.h>
 #include <proc_ui/procui.h>
@@ -89,6 +90,9 @@ static bool s_ready;
 static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
+// This is separate from the vertex/index arena above.  The GX2 command-list
+// proof is opt-in so an absent marker keeps the existing direct path intact.
+static bool s_gx2DlEnabled;
 static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
@@ -4208,6 +4212,10 @@ void rendererInit(float) {
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
+    // Read the Stage 1 switch exactly once.  No frame or present path probes
+    // the marker, and no GX2 display-list call is reachable while it is off.
+    s_gx2DlEnabled = sdMarkerPresent("gx2dl");
+    s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
@@ -4215,6 +4223,8 @@ void rendererInit(float) {
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s core-init=%u",
+                 s_gx2DlEnabled ? "on" : "off", (unsigned)s_perfDlCoreInit);
     s_ready = initShaders();
     if (!s_ready) WHBLogPrintf("SMS Wii U: GX2 shader setup failed");
 }
@@ -4396,6 +4406,12 @@ bool batchUsesArena() { return false; }  // stored runs are drawn at once, never
 
 static uint32_t s_drawsThisFrame;
 static uint32_t s_debugDrawNo;
+// Stage 1 command-list counters.  They are declared with the baseline path
+// as well so the control run reports zero recorder activity.
+static uint32_t s_perfDlRecorded, s_perfDlCalled, s_perfDlBytes, s_perfDlMaxBytes;
+static uint32_t s_perfDlFallbacks, s_perfDlForbidden, s_perfDlOverflows, s_perfDlBadAlignment;
+static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, s_perfDlSplitsFrame;
+static uint32_t s_perfDlCoreInit, s_perfDlCoreRecord, s_perfDlCoreCall;
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
 // perfdiag only: flushBatch's stages (key = TEV key, textures and pixel shader
@@ -5016,6 +5032,10 @@ extern "C" int sms_wiiu_gx2_renderer_init(void) {
     return s_ready ? 1 : 0;
 }
 
+extern "C" int sms_wiiu_gx2_display_list_enabled(void) {
+    return s_gx2DlEnabled ? 1 : 0;
+}
+
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
     texturePackShutdown();
 }
@@ -5089,7 +5109,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -5098,7 +5118,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
-                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)s_perfDlUploads, (unsigned)s_perfDlDecoded);
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)s_perfDlUploads, (unsigned)s_perfDlDecoded,
+                     s_gx2DlEnabled ? 1 : 0, (unsigned)s_perfDlRecorded, (unsigned)s_perfDlCalled, (unsigned)s_perfDlBytes,
+                     (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
+                     (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
+                     (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
+                     (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall);
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
             WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",
@@ -5114,6 +5139,10 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         g_dlReplayIdx = 0;
         s_perfDlDraws = s_perfDlUploads = s_perfDlDecoded = 0;
+        s_perfDlRecorded = s_perfDlCalled = s_perfDlBytes = s_perfDlMaxBytes = 0;
+        s_perfDlFallbacks = s_perfDlForbidden = s_perfDlOverflows = s_perfDlBadAlignment = 0;
+        s_perfDlSplitsCopy = s_perfDlSplitsClear = s_perfDlSplitsContext = s_perfDlSplitsFrame = 0;
+        s_perfDlCoreRecord = s_perfDlCoreCall = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }
