@@ -13,6 +13,7 @@ extern "C" {
  * MEM1 is queried for the GameCube compatibility boundary but is not used as
  * the game heap because foreground/system services own most of it. */
 void sms_wiiu_runtime_init(void);
+void sms_wiiu_sdl_audio_preopen(int rate);
 
 extern u8* port_mem1_base;
 extern u32 port_mem1_size;

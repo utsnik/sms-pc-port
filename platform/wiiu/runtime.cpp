@@ -286,6 +286,10 @@ void port_init(int, char**)
 	sms_wiiu_gfx_init();
 	port_vi_init();
 	port_pad_init();
+	/* axcore2 must finish AX setup before SMS_main can race JAudio's DSP map
+	 * creation with the pacer thread. SDL and noaudio remain lazy/unchanged. */
+	if (!port_no_audio)
+		sms_wiiu_sdl_audio_preopen(32000);
 	port_log("SMS Wii U: target OS, threads, FST/DV, audio, VI, "
 	         "and input initialized\n");
 	port_stub_report();

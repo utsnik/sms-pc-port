@@ -248,6 +248,8 @@ static int open_thread(int, const char** argv)
 /* SD marker axcore2: AXInit (and AXQuit) from a core-2 thread, so the
  * {SYS AX IST} it creates may run on core 2 instead of the game's core 1. */
 static bool s_axOnCore2;
+static bool s_axPreopened;
+static int s_axPreopenResult;
 static int open_ax_thread(int, const char** argv)
 {
 	OpenJob* job = reinterpret_cast<OpenJob*>(argv);
@@ -256,23 +258,40 @@ static int open_ax_thread(int, const char** argv)
 }
 static int close_ax_thread(int, const char**);
 
+static int open_ax_core2(int rate)
+{
+	static OSThread thread __attribute__((aligned(16)));
+	static uint8_t stack[0x8000] __attribute__((aligned(16)));
+	OpenJob job = {rate, 0};
+	if (cafe_OSCreateThread(&thread, open_ax_thread, 0, reinterpret_cast<char*>(&job), stack + sizeof stack,
+	                        sizeof stack, 16, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
+		cafe_OSResumeThread(&thread);
+		int ret = 0;
+		cafe_OSJoinThread(&thread, &ret);
+		s_axOnCore2 = job.result != 0;
+		port_log("[audio] SD marker axcore2: AX initialised on core 2 (%s)\n", job.result ? "ok" : "failed");
+		return job.result;
+	}
+	port_log("[audio] axcore2: core-2 thread failed; initialising AX here\n");
+	return open_ax(rate);
+}
+
+extern "C" void sms_wiiu_sdl_audio_preopen(int rate)
+{
+	if (s_axPreopened || !sms_wiiu_sd_marker("axcore2") || sms_wiiu_sd_marker("noaudio") ||
+	    sms_wiiu_sd_marker("sdlaudio"))
+		return;
+	s_axPreopened = true;
+	s_axPreopenResult = open_ax_core2(rate);
+}
+
 extern "C" int sms_wiiu_sdl_audio_open(int rate)
 {
 	if (!sms_wiiu_sd_marker("sdlaudio")) {
 		if (sms_wiiu_sd_marker("axcore2")) {
-			static OSThread thread __attribute__((aligned(16)));
-			static uint8_t stack[0x8000] __attribute__((aligned(16)));
-			OpenJob job = {rate, 0};
-			if (cafe_OSCreateThread(&thread, open_ax_thread, 0, reinterpret_cast<char*>(&job), stack + sizeof stack,
-			                        sizeof stack, 16, OS_THREAD_ATTRIB_AFFINITY_CPU2)) {
-				cafe_OSResumeThread(&thread);
-				int ret = 0;
-				cafe_OSJoinThread(&thread, &ret);
-				s_axOnCore2 = job.result != 0;
-				port_log("[audio] SD marker axcore2: AX initialised on core 2 (%s)\n", job.result ? "ok" : "failed");
-				return job.result;
-			}
-			port_log("[audio] axcore2: core-2 thread failed; initialising AX here\n");
+			if (s_axPreopened)
+				return s_axPreopenResult;
+			return open_ax_core2(rate);
 		}
 		return open_ax(rate);
 	}
