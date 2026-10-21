@@ -4174,8 +4174,20 @@ void rendererInit(float) {
         uint64_t cap = 128u << 20;
         const char* configured = std::getenv("SMS_GX2_TEXPACK_MB");
         if (configured && *configured) cap = uint64_t(std::strtoul(configured, nullptr, 10)) << 20;
-        const uint64_t headroom = sms_wiiu_heap_free();
-        if (headroom < cap) cap = headroom;
+        // The base-heap query reports 0 under Aroma (the app's default heap is
+        // not MEM2's base heap), which made the cap 0 and kept every
+        // replacement out. Probe the default heap with trial allocations
+        // instead and leave half of what fits for the arenas and the game's own
+        // textures, which are allocated after this.
+        uint64_t headroom = 0;
+        for (uint32_t probe = 512u << 20; probe >= (4u << 20); probe >>= 1) {
+            if (void* p = MEMAllocFromDefaultHeapEx(probe, 64)) {
+                MEMFreeToDefaultHeap(p);
+                headroom = probe;
+                break;
+            }
+        }
+        if (headroom / 2 < cap) cap = headroom / 2;
         s_packResidentBudget = cap;
         s_packLru.reset(cap);
         WHBLogPrintf("SMS Wii U: [texpack] MEM2 headroom=%llu resident-cap=%llu staging-cap=%u",
