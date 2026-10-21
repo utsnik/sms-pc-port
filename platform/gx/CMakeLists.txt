@@ -172,6 +172,19 @@ if(SMS_GX_BUILD_TESTS)
     target_compile_features(gx2_texture_pack_format_test PRIVATE cxx_std_17)
     add_test(NAME gx2_texture_pack_format_test COMMAND gx2_texture_pack_format_test)
 
+    add_library(gx2_texture_pack_core STATIC
+        src/gx_texture_pack_common.cpp
+        src/gx2_texture_pack_format.cpp
+        src/gx_bcenc.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/gx2_texture_pack.cpp)
+    target_compile_definitions(gx2_texture_pack_core PRIVATE GX2_TEXTURE_PACK_NO_MAIN)
+    target_include_directories(gx2_texture_pack_core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(gx2_texture_pack_core PRIVATE cxx_std_17)
+    add_executable(gx2_texture_pack ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/gx2_texture_pack.cpp)
+    target_link_libraries(gx2_texture_pack PRIVATE gx2_texture_pack_core)
+    target_include_directories(gx2_texture_pack PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_compile_features(gx2_texture_pack PRIVATE cxx_std_17)
+
     add_executable(gx_windowtest tests/gx_windowtest.cpp)
     target_include_directories(gx_windowtest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(gx_windowtest PRIVATE cxx_std_17)
