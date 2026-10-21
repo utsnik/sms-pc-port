@@ -441,12 +441,15 @@ static bool s_xfMemoryDirty = true;
  *  - s_tevPixelValid: the TEV pixel uniforms (setTevShader's shadow);
  *  - s_vtxLiveValid: the generated vertex program's live block;
  *  - s_stateValid: applyState's GX2 state;
- *  - s_bound*: the fetch, vertex and pixel shaders. */
+ *  - s_bound*: the fetch, vertex and pixel shaders;
+ *  - s_xfUniformValid/s_xfShadow: the changed-only XF uniform upload. */
 static bool s_tevPixelValid, s_vtxLiveValid, s_stateValid;
 static const void* s_boundFetch;
 static const void* s_boundVertex;
 static const void* s_boundPixel;
 static bool s_noDiff, s_noDiffMarker;
+static bool s_noApplyCache, s_noShaderCache, s_noTevUniformCache;
+static bool s_noVtxLiveCache, s_noBindCache, s_noXfUniformCache;
 static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets, 5 = 3 plus GX2DrawDone per draw
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
@@ -481,6 +484,19 @@ static void invalidateVertexUniforms() {
     s_boundFetch = s_boundVertex = s_boundPixel = nullptr;
     s_xfUniformValid = false;
     s_xfMemoryDirty = true;
+}
+
+static void disablePerDrawCaches() {
+    if (s_noApplyCache) s_stateValid = false;
+    if (s_noShaderCache) s_boundFetch = s_boundVertex = s_boundPixel = nullptr;
+    if (s_noTevUniformCache) s_tevPixelValid = false;
+    if (s_noVtxLiveCache) s_vtxLiveValid = false;
+    if (s_noBindCache)
+        for (BoundPixelTexture& b : s_boundPixelTex) b.valid = false;
+    if (s_noXfUniformCache) {
+        s_xfUniformValid = false;
+        s_xfMemoryDirty = true;
+    }
 }
 
 /*
@@ -4282,6 +4298,12 @@ void rendererInit(float) {
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
+    s_noApplyCache = s_noDiff || sdMarkerPresent("nc_apply");
+    s_noShaderCache = s_noDiff || sdMarkerPresent("nc_shader");
+    s_noTevUniformCache = s_noDiff || sdMarkerPresent("nc_tevu");
+    s_noVtxLiveCache = s_noDiff || sdMarkerPresent("nc_vlive");
+    s_noBindCache = s_noDiff || sdMarkerPresent("nc_bind");
+    s_noXfUniformCache = s_noDiff || sdMarkerPresent("nc_xfu");
     s_vertexOneClause = sdMarkerPresent("gpuxf1clause");
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
@@ -4614,6 +4636,7 @@ void flushBatch() {
     }
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
+    disablePerDrawCaches();
     OSTime perfTex0 = OSGetTime();
     const TevKey tevKey = currentTevKey();
     const bool textured = tevTextureMask(tevKey) != 0;
