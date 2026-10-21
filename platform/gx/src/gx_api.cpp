@@ -530,8 +530,8 @@ GXBool __GXinBegin;  // read by GXEnd when GXGeometry.h is built with DEBUG
 void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
     __GXinBegin = GX_TRUE;
     traceNoteBegin();
-    const uint8_t cmd[3] = {uint8_t(type | fmt), uint8_t(nverts >> 8), uint8_t(nverts)};
-    GXPC_WriteBytes(cmd, sizeof(cmd));
+    GXPC_Write8(uint8_t(type | fmt));
+    GXPC_Write16(nverts);
 }
 
 void GXSetLineWidth(u8 width, GXTexOffset off) {
@@ -593,9 +593,9 @@ void GXGetProjectionv(f32* ptr) { memcpy(ptr, g.projection, sizeof(g.projection)
 
 void GXLoadPosMtxImm(f32 mtx[3][4], u32 id) { apiXFf(uint16_t(id * 4), 12, &mtx[0][0]); }
 void GXLoadPosMtxIndx(u16 idx, u32 id) {
-    const uint16_t addr = uint16_t((11u << 12) | (id * 4));
-    const uint8_t cmd[5] = {0x20, uint8_t(idx >> 8), uint8_t(idx), uint8_t(addr >> 8), uint8_t(addr)};
-    GXPC_WriteBytes(cmd, sizeof(cmd));
+    GXPC_Write8(0x20);
+    GXPC_Write16(idx);
+    GXPC_Write16(uint16_t((11u << 12) | (id * 4)));
 }
 void GXLoadNrmMtxImm(f32 mtx[3][4], u32 id) {
     float m[9] = {mtx[0][0], mtx[0][1], mtx[0][2], mtx[1][0], mtx[1][1], mtx[1][2], mtx[2][0], mtx[2][1], mtx[2][2]};
@@ -603,9 +603,9 @@ void GXLoadNrmMtxImm(f32 mtx[3][4], u32 id) {
 }
 void GXLoadNrmMtxImm3x3(f32 mtx[3][3], u32 id) { apiXFf(uint16_t(0x400 + id * 3), 9, &mtx[0][0]); }
 void GXLoadNrmMtxIndx3x3(u16 idx, u32 id) {
-    const uint16_t addr = uint16_t((8u << 12) | (0x400 + id * 3));
-    const uint8_t cmd[5] = {0x28, uint8_t(idx >> 8), uint8_t(idx), uint8_t(addr >> 8), uint8_t(addr)};
-    GXPC_WriteBytes(cmd, sizeof(cmd));
+    GXPC_Write8(0x28);
+    GXPC_Write16(idx);
+    GXPC_Write16(uint16_t((8u << 12) | (0x400 + id * 3)));
 }
 void GXSetCurrentMtx(u32 id) {
     uint32_t a = setField(xfReg(XFR_MATIDX_A), 6, 0, id);
@@ -633,9 +633,9 @@ void GXLoadTexMtxIndx(u16 idx, u32 id, GXTexMtxType type) {
         addr = id * 4;
         n = type == GX_MTX2x4 ? 8 : 12;
     }
-    const uint16_t command = uint16_t(((n - 1) << 12) | addr);
-    const uint8_t cmd[5] = {0x30, uint8_t(idx >> 8), uint8_t(idx), uint8_t(command >> 8), uint8_t(command)};
-    GXPC_WriteBytes(cmd, sizeof(cmd));
+    GXPC_Write8(0x30);
+    GXPC_Write16(idx);
+    GXPC_Write16(uint16_t(((n - 1) << 12) | addr));
 }
 
 void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz, u32 field) {
@@ -773,10 +773,9 @@ void GXLoadLightObjImm(GXLightObj* o, GXLightID light) {
     apiXF(uint16_t(0x600 + lightIndex(light) * 16), 16, w);
 }
 void GXLoadLightObjIndx(u32 idx, GXLightID light) {
-    const uint16_t index = uint16_t(idx);
-    const uint16_t addr = uint16_t((15u << 12) | (0x600 + lightIndex(light) * 16));
-    const uint8_t cmd[5] = {0x38, uint8_t(index >> 8), uint8_t(index), uint8_t(addr >> 8), uint8_t(addr)};
-    GXPC_WriteBytes(cmd, sizeof(cmd));
+    GXPC_Write8(0x38);
+    GXPC_Write16(uint16_t(idx));
+    GXPC_Write16(uint16_t((15u << 12) | (0x600 + lightIndex(light) * 16)));
 }
 void GXGetLightAttnA(const GXLightObj* o, f32* a0, f32* a1, f32* a2) {
     const LightObjInt* l = reinterpret_cast<const LightObjInt*>(o);
