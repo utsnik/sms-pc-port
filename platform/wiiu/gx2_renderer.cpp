@@ -3381,9 +3381,16 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
     const TexturePackLevel& level = e.packEntry->levels[chunk.level];
     const uint32_t rowBytes = level.width * 4;
     uint32_t offset = chunk.offset, copied = 0;
-    uint8_t* base = chunk.level == 0 ? static_cast<uint8_t*>(e.packLinear.surface.image) :
-        static_cast<uint8_t*>(e.packLinear.surface.mipmaps) + e.packLinear.surface.mipLevelOffset[chunk.level - 1];
-    const uint32_t pitch = chunk.level == 0 ? e.packLinear.surface.pitch : ((level.width + 63) & ~63u);
+    // Level 1 starts the mipmap buffer; level l >= 2 is at mipLevelOffset[l - 1]
+    // (the layout the decoded-texture path above uses). Reading level 1 from
+    // mipLevelOffset[0] wrote past the mipmap allocation and corrupted the heap
+    // (Cemu: signal 11 in _memalign_r, 2026-10-21).
+    const GX2Surface& ls = e.packLinear.surface;
+    const uint32_t mipOff = chunk.level <= 1 ? 0 : ls.mipLevelOffset[chunk.level - 1];
+    uint8_t* base = chunk.level == 0 ? static_cast<uint8_t*>(ls.image) : static_cast<uint8_t*>(ls.mipmaps) + mipOff;
+    const uint32_t pitch = chunk.level == 0 ? ls.pitch : ((level.width + 63) & ~63u);
+    const uint64_t levelEnd = uint64_t(chunk.level == 0 ? 0 : mipOff) + uint64_t(pitch) * 4 * level.height;
+    if (!base || pitch < level.width || levelEnd > (chunk.level == 0 ? ls.imageSize : ls.mipmapSize)) return false;
     while (copied < chunk.bytes) {
         const uint32_t row = offset / rowBytes, col = offset % rowBytes;
         const uint32_t n = std::min(chunk.bytes - copied, rowBytes - col);
