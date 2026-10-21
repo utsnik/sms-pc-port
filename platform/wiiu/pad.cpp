@@ -11,6 +11,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+
+extern "C" uint32_t sms_wiiu_presents(void);  // gx_stub.cpp
 #include <strings.h>
 
 /* Set when the port itself asks for the Menu; vi.cpp drains the GPU before the
@@ -406,7 +408,21 @@ void sms_wiiu_input_poll(void)
 			if (!s_script_start)
 				s_script_start = OSGetTime();
 			const uint32_t wall = (uint32_t)(OSTicksToMilliseconds(OSGetTime() - s_script_start) * 5994 / 100000);
-			const uint32_t field = s_field > wall ? s_field : wall;
+			uint32_t field = s_field > wall ? s_field : wall;
+			/* SMS_AUTOPLAY_CLOCK=frames (autoplay file): two fields per presented
+			 * frame instead of wall time, so presses land on the same game frame
+			 * however fast a build runs. On the wall clock a slower boot (the
+			 * texture pack's SD reads) moved the file-select presses onto the
+			 * wrong menu items and SMS_WARP never applied (2026-10-21). */
+			static int s_frameClock = -1;
+			if (s_frameClock < 0) {
+				const char* c = std::getenv("SMS_AUTOPLAY_CLOCK");
+				s_frameClock = c && std::strcmp(c, "frames") == 0;
+				if (s_frameClock)
+					port_log("[pad] autoplay clock: presented frames\n");
+			}
+			if (s_frameClock)
+				field = 2 * sms_wiiu_presents();
 			/* A press starts at the first poll on or after its field (polls
 			 * stall during loads) and lasts its hold, but at least 3 polls. */
 			static uint32_t s_began[48], s_polls[48];
