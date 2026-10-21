@@ -4686,7 +4686,92 @@ static void debugPixelTrace(uint32_t draw) {
                  (unsigned)v[4]);
 }
 #endif
-uint32_t peekZ(int, int) { return 0xffffff; }
+// GXPeekZ: TSunModel::getZBufValue peeks 17 points around the sun each frame
+// and dims the glare by how many of them are still at the far plane; the old
+// stub (always far) drew the glare at full strength behind walls and palms.
+// The depth target converts into a tiled FLOAT_R32 texture, then copies into a
+// LINEAR_ALIGNED one the CPU reads.  Asynchronous like the colour peek: the
+// first peek of a frame answers from the previous frame's snapshot and queues
+// this frame's, and later peeks in the frame reuse that snapshot.  Under Cemu
+// (whose copies never reach guest memory) and with the SD marker "nopeekz" it
+// stays the old far-plane answer.
+extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
+                                                      uint32_t dstSlice);
+uint32_t peekZ(int x, int y) {
+    SMS_PORT_HEAP_SCOPE();
+    static int s_enabled = -1;
+    if (s_enabled < 0) {
+        s_enabled = !runningUnderCemu() && !sdMarkerPresent("nopeekz");
+        WHBLogPrintf("SMS Wii U: GXPeekZ %s", s_enabled ? "reads the depth target (one frame late)" : "stub (far plane)");
+    }
+    if (!s_enabled || x < 0 || y < 0) return 0xffffff;
+    flushBatch();
+    GX2DepthBuffer* db = renderDepth();
+    if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
+        db->surface.format != GX2_SURFACE_FORMAT_FLOAT_R32 || db->surface.aa != GX2_AA_MODE1X)
+        return 0xffffff;
+    static GX2Surface s_tiled, s_linear;
+    static bool s_ready2, s_queued;
+    static uint64_t s_stamp;
+    static uint32_t s_frame = ~0u;
+    if (s_ready2 && (s_linear.width != db->surface.width || s_linear.height != db->surface.height)) {
+        MEMFreeToDefaultHeap(s_tiled.image);
+        MEMFreeToDefaultHeap(s_linear.image);
+        s_ready2 = s_queued = false;
+    }
+    if (!s_ready2) {
+        memset(&s_tiled, 0, sizeof(s_tiled));
+        s_tiled.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        s_tiled.width = db->surface.width;
+        s_tiled.height = db->surface.height;
+        s_tiled.depth = 1;
+        s_tiled.mipLevels = 1;
+        s_tiled.format = GX2_SURFACE_FORMAT_FLOAT_R32;
+        s_tiled.aa = GX2_AA_MODE1X;
+        s_tiled.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+        s_tiled.tileMode = GX2_TILE_MODE_DEFAULT;
+        s_linear = s_tiled;
+        s_linear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        GX2CalcSurfaceSizeAndAlignment(&s_tiled);
+        GX2CalcSurfaceSizeAndAlignment(&s_linear);
+        s_tiled.image = alignedZero(s_tiled.alignment, s_tiled.imageSize);
+        s_linear.image = s_tiled.image ? alignedZero(s_linear.alignment, s_linear.imageSize) : nullptr;
+        if (!s_linear.image) {
+            if (s_tiled.image) MEMFreeToDefaultHeap(s_tiled.image);
+            s_enabled = 0;
+            WHBLogPrintf("SMS Wii U: GXPeekZ: out of memory, stub from now on");
+            return 0xffffff;
+        }
+        DCFlushRange(s_tiled.image, s_tiled.imageSize);
+        DCFlushRange(s_linear.image, s_linear.imageSize);
+        s_ready2 = true;
+    }
+    if (s_frame != g_displayFrames) {
+        // First peek of this frame: the previous snapshot is a frame old (done
+        // long ago); this frame's is queued without waiting for it.
+        if (s_queued) GX2WaitTimeStamp(s_stamp);
+        GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
+        GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
+        GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
+        rebindTvTarget();
+        GX2Flush();
+        const bool had = s_queued;
+        s_stamp = GX2GetLastSubmittedTimeStamp();
+        s_queued = true;
+        s_frame = g_displayFrames;
+        if (!had) return 0xffffff;
+    }
+    uint32_t px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
+    uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScale);
+    if (px >= s_linear.width) px = s_linear.width - 1;
+    if (py >= s_linear.height) py = s_linear.height - 1;
+    uint8_t* texel = static_cast<uint8_t*>(s_linear.image) + (size_t(py) * s_linear.pitch + px) * 4;
+    DCInvalidateRange(texel, 4);  // only the line read: the GPU rewrote it since
+    float d;
+    memcpy(&d, texel, 4);
+    if (!(d >= 0.0f)) d = 0.0f;  // NaN
+    return d >= 1.0f ? 0xffffff : uint32_t(d * 16777215.0f);
+}
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
 
