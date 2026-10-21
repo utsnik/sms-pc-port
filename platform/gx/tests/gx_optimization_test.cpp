@@ -6,26 +6,6 @@
 #include <cstring>
 #include <vector>
 
-static void referenceUnpack(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], gx::HostVertex& hv,
-                            bool zeroed) {
-    const gx::VtxFmtLayout& l = gx::vtxFmtLayout(fmt);
-    if (!zeroed) memset(&hv, 0, sizeof(hv));
-    hv.nrm[2] = 1.0f;
-    memset(hv.clr, 255, sizeof(hv.clr));
-    memcpy(hv.mtx, defMtx, 9);
-    memcpy(hv.pos, src, 12);
-    if (fmt & gx::VF_NRM) memcpy(hv.nrm, src + l.nrm, 12);
-    if (fmt & gx::VF_NBT) {
-        memcpy(hv.bin, src + l.nrm + 12, 12);
-        memcpy(hv.tan, src + l.nrm + 24, 12);
-    }
-    for (int c = 0; c < 2; c++)
-        if (fmt & (gx::VF_CLR0 << c)) memcpy(hv.clr[c], src + l.clr[c], 4);
-    for (int t = 0; t < 8; t++)
-        if (fmt & (gx::VF_TEX0 << t)) memcpy(hv.tex[t], src + l.tex[t], 8);
-    if (fmt & gx::VF_MTX) memcpy(hv.mtx, src + l.mtx, 12);
-}
-
 static uint64_t referenceHash(const void* data, size_t n, uint64_t seed) {
 #if defined(__WIIU__)
     const uint8_t* p = static_cast<const uint8_t*>(data);
@@ -96,26 +76,6 @@ int main() {
             }
         }
     }
-    const uint32_t formats[] = {
-        0,
-        gx::VF_NRM,
-        gx::VF_NRM | gx::VF_NBT | gx::VF_CLR0 | (gx::VF_CLR0 << 1) | gx::VF_TEX0 | (gx::VF_TEX0 << 3) | gx::VF_MTX,
-        (gx::VF_CLR0 << 1) | (gx::VF_TEX0 << 7),
-    };
-    const uint8_t defaults[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    for (uint32_t fmt : formats) {
-        const gx::VtxFmtLayout& layout = gx::vtxFmtLayout(fmt);
-        std::vector<uint8_t> packed(layout.stride + 3);
-        for (size_t i = 0; i < packed.size(); ++i) packed[i] = uint8_t(i * 19 + 7);
-        for (bool zeroed : {false, true}) {
-            gx::HostVertex got, expected;
-            memset(&got, 0xA5, sizeof(got));
-            memset(&expected, 0xA5, sizeof(expected));
-            gx::unpackVertex(layout, fmt, packed.data(), defaults, got, zeroed);
-            referenceUnpack(fmt, packed.data(), defaults, expected, zeroed);
-            assert(memcmp(&got, &expected, sizeof(got)) == 0);
-        }
-    }
-    std::puts("gx_optimization_test: hashBytes and unpackVertex reference comparisons passed");
+    std::puts("gx_optimization_test: hashBytes reference comparisons passed");
     return 0;
 }

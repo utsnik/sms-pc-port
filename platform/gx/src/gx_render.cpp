@@ -2181,9 +2181,7 @@ void flushBatch() {
     if (traceFile()) {
         static std::vector<HostVertex> hv;
         hv.resize(s_bcount);
-        const VtxFmtLayout& layout = vtxFmtLayout(s_bfmt);
-        for (uint32_t i = 0; i < s_bcount; i++)
-            unpackVertex(layout, s_bfmt, s_bdata.data + size_t(i) * s_bstride, defMtx, hv[i]);
+        for (uint32_t i = 0; i < s_bcount; i++) unpackVertex(s_bfmt, s_bdata.data + size_t(i) * s_bstride, defMtx, hv[i]);
         traceDraw(int(s_bclass), s_bcount, uint32_t(s_bidx.size), hv.data(), sp->id);
     }
     resetBatch();
