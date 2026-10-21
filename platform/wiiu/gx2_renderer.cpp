@@ -4590,10 +4590,9 @@ void flushBatch() {
     TevShader* tevShader = nullptr;
     if (tevSupported(tevKey)) {
         const uint32_t mask = tevTextureMask(tevKey);
-        // getTexture() may grow its cache, so resolve all entries once more
-        // after the insertions have settled and pointers cannot be invalidated.
-        for (int map = 0; map < 8; ++map)
-            if (mask & (1u << map)) getTexture(map);
+        // One lookup per map: the cache is a deque that only grows by
+        // push_back, so an entry's address survives later insertions (the
+        // old warm-up pass resolved every map twice).
         bool allTextures = true;
         for (int map = 0; map < 8; ++map) {
             if (!(mask & (1u << map))) continue;
