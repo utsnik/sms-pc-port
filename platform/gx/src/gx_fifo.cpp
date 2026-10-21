@@ -377,55 +377,32 @@ void writeCP(uint8_t reg, uint32_t value) {
 }
 
 void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
-    if (addr < XF_MEM_WORDS) {
-        const uint32_t n = std::min<uint32_t>(count, XF_MEM_WORDS - addr);
-        uint32_t first = n, last = 0;
-        for (uint32_t i = 0; i < n; i++) {
-            if (g.xfMem[addr + i] != words[i]) {
-                if (first == n) first = i;
-                last = i;
+    for (uint32_t i = 0; i < count; i++, addr++) {
+        uint32_t v = words[i];
+        if (addr < XF_MEM_WORDS) {
+            if (g.xfMem[addr] != v) {
+                onStateChange();
+                g.xfMem[addr] = v;
+                if (addr < g_xfDirtyLo) g_xfDirtyLo = addr;
+                if (addr > g_xfDirtyHi) g_xfDirtyHi = addr;
+                markXfMemDirty();
             }
-        }
-        if (first != n) {
-            onStateChange();
-            for (uint32_t i = first; i <= last; i++)
-                g.xfMem[addr + i] = words[i];
-            const uint32_t dirtyFirst = addr + first;
-            const uint32_t dirtyLast = addr + last;
-            if (dirtyFirst < g_xfDirtyLo) g_xfDirtyLo = dirtyFirst;
-            if (dirtyLast > g_xfDirtyHi) g_xfDirtyHi = dirtyLast;
-            markXfMemDirty();
-        }
-        addr += n;
-        words += n;
-        count -= n;
-    }
-    if (count && addr < XF_REG_BASE) {
-        const uint32_t n = std::min<uint32_t>(count, XF_REG_BASE - addr);
-        addr += n;
-        words += n;
-        count -= n;
-    }
-    if (count && addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
-        const uint32_t n = std::min<uint32_t>(count, XF_REG_BASE + XF_REG_COUNT - addr);
-        bool changed = false;
-        for (uint32_t i = 0; i < n; i++)
-            changed = changed || g.xfReg[addr - XF_REG_BASE + i] != words[i];
-        if (changed) {
-            onStateChange();
-            for (uint32_t i = 0; i < n; i++) {
-                if (g.xfReg[addr - XF_REG_BASE + i] != words[i])
-                    g.xfReg[addr - XF_REG_BASE + i] = words[i];
+        } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
+            uint32_t r = addr - XF_REG_BASE;
+            if (g.xfReg[r] != v) {
+                onStateChange();
+                g.xfReg[r] = v;
             }
         }
     }
 }
 
 void writeXFf(uint16_t addr, uint32_t count, const float* f) {
+    uint32_t w[16];
     while (count) {
         uint32_t n = count > 16 ? 16 : count;
-        typedef uint32_t gx_u32_alias __attribute__((__may_alias__));
-        writeXF(addr, n, reinterpret_cast<const gx_u32_alias*>(f));
+        memcpy(w, f, n * 4);
+        writeXF(addr, n, w);
         addr += n;
         f += n;
         count -= n;
