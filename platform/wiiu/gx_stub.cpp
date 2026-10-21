@@ -734,3 +734,6 @@ __attribute__((weak)) uint8_t* GXPC_SaveStateThumbnail(size_t* size)
 __attribute__((weak)) void GXPC_SetSaveStateApi(const void*) {}
 
 } // extern "C"
+
+/* Presents so far: pad.cpp's frame-clocked autoplay (SMS_AUTOPLAY_CLOCK=frames). */
+extern "C" uint32_t sms_wiiu_presents(void) { return s_presented; }
