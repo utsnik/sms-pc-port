@@ -1,7 +1,9 @@
 #include "port_compat.h"
 #include "port_os.h"
 #include "runtime.h"
+#if defined(PORT_GAME_SMG)
 #include "smg_arena.h"
+#endif
 
 #include <dolphin/os.h>
 #include <dolphin/os/OSAlloc.h>
