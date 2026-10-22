@@ -14,6 +14,7 @@ const size_t kTableCapacity = 1u << 14;
 const uint32_t kMaxRarcNodes = 4096;
 const uint32_t kMaxRarcEntries = 65536;
 const uint32_t kMaxBcsvRows = 4096;
+const uint32_t kMaxBcsvFields = 32;
 const uint32_t kMaxBcsvEntrySize = 1024;
 
 struct Object {
@@ -195,7 +196,8 @@ bool find_rarc_entry(const Rarc& rarc, uint32_t node_index, char* path,
             path[original_length + name_length] = '\0';
             if (path_is_error_window(reinterpret_cast<const uint8_t*>(path),
                                      strlen(path))) {
-                if (!range_ok(rarc.data_offset + child_or_offset, file_size,
+                if (child_or_offset > rarc.size - rarc.data_offset ||
+                    !range_ok(rarc.data_offset + child_or_offset, file_size,
                               rarc.size))
                     return false;
                 result->offset = rarc.data_offset + child_or_offset;
@@ -262,6 +264,8 @@ bool field_size_valid(uint8_t type, uint16_t offset, uint32_t entry_size)
 bool find_table(const uint8_t* dol, size_t dol_size, const char* const* wanted_names,
                 uint32_t wanted_count, uint32_t field_count, Object* result)
 {
+    if (field_count > kMaxBcsvFields)
+        return false;
     uint32_t wanted_hashes[3];
     for (uint32_t i = 0; i < wanted_count; ++i)
         wanted_hashes[i] = jmap_hash(wanted_names[i]);
@@ -316,7 +320,8 @@ bool find_table(const uint8_t* dol, size_t dol_size, const char* const* wanted_n
                 continue;
             size_t end = string_pool;
             for (int32_t row = 0; row < rows && valid; ++row) {
-                const uint8_t* entry = dol + string_pool + static_cast<size_t>(row) * entry_size;
+                const uint8_t* entry = dol + position + static_cast<size_t>(data_offset) +
+                                       static_cast<size_t>(row) * entry_size;
                 for (uint32_t field = 0; field < field_count; ++field) {
                     if (field_types[field] != 6)
                         continue;
