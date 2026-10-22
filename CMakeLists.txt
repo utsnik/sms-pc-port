@@ -19,12 +19,8 @@ if(PORT_GAME STREQUAL "smg")
       "External Wii U output directory")
   set(SMG_WIIU_BUILD_DIR "${PORT_WIIU_BUILD_DIR}" CACHE PATH
       "Galaxy Stage 1 Wii U output directory" FORCE)
-  if(DEFINED SMG_WIIU_RUN_GAME AND SMG_WIIU_RUN_GAME)
-    message(FATAL_ERROR "SMG_WIIU_RUN_GAME must be 0 for Stage 1; port_game_main is not runnable")
-  endif()
-  set(SMG_WIIU_RUN_GAME 0 CACHE BOOL "Stage 1 must not invoke port_game_main")
   set(SMG_DEFS GEKKO=1 TARGET_PC=1 TARGET_WIIU=1 __WIIU__=1 ESPRESSO=1
-      NDEBUG=1 VERSION=0 PORT_GAME_SMG=1 SMG_WIIU_RUN_GAME=0)
+      NDEBUG=1 VERSION=0 PORT_GAME_SMG=1 SMG_WIIU_RUN_GAME=1)
   set(SMG_GAME_FLAGS
     -w -fno-strict-aliasing -fwrapv -ffunction-sections -fdata-sections
     -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0

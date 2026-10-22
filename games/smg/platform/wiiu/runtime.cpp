@@ -14,8 +14,9 @@
 
 #include <math.h>
 #include <cassert>
+#include <cstdio>
+#include <cstring>
 #include <stdarg.h>
-#include <stdio.h>
 
 namespace JASystem { namespace AudioThread {
 alignas(32) unsigned char jac_audioThread[0x200];
@@ -47,6 +48,30 @@ int s_file_warned;
 int s_input_warned;
 int s_audio_warned;
 unsigned s_app_root_index;
+
+void write_stage2_log(const char* line)
+{
+    char marker_path[192];
+    std::snprintf(marker_path, sizeof(marker_path), "%sstage2log",
+                  kAppRootCandidates[s_app_root_index]);
+    FILE* marker = std::fopen(marker_path, "rb");
+    if (!marker)
+        return;
+    std::fclose(marker);
+
+    char log_path[192];
+    std::snprintf(log_path, sizeof(log_path), "%sstage2.log",
+                  kAppRootCandidates[s_app_root_index]);
+    FILE* log = std::fopen(log_path, "ab");
+    if (!log)
+        return;
+    const size_t length = std::strlen(line);
+    std::fwrite(line, 1, length, log);
+    if (length == 0 || line[length - 1] != '\n')
+        std::fputc('\n', log);
+    std::fflush(log);
+    std::fclose(log);
+}
 
 void resolve_app_root()
 {
@@ -128,9 +153,8 @@ void smg_wiiu_runtime_init(void)
     resolve_app_root();
     s_initialized = 1;
     port_log("SMG Wii U: arenas MEM1=25165824 MEM2=67108864 alignment=64");
+    port_log("SMG Wii U: app root=%s", sms_wiiu_app_root());
     port_log("SMG Wii U: stage2 runtime initialized; static arenas");
-    smg_wiiu_load_dol_data();
-    smg_wiiu_gx_link_stub_init();
 }
 
 void port_log(const char* fmt, ...)
@@ -142,6 +166,7 @@ void port_log(const char* fmt, ...)
     va_end(args);
     line[sizeof(line) - 1] = '\0';
     WHBLogPrintf("%s", line);
+    write_stage2_log(line);
 }
 
 void port_fatal(const char* fmt, ...)
@@ -392,6 +417,10 @@ void sms_wiiu_sdl_audio_queue(const void*, uint32_t) {}
 uint32_t sms_wiiu_sdl_audio_queued(void) { return 0; }
 void sms_wiiu_sdl_audio_close(void) {}
 void sms_wiiu_ax_load(u32*, u32*) {}
+void smg_wiiu_audio_init(void)
+{
+    port_log("[smg-audio] placeholder until Task 10");
+}
 void sms_wiiu_hang_check(void) {}
 volatile int sms_wiiu_crash_stage;
 volatile int sms_wiiu_crash_pending;

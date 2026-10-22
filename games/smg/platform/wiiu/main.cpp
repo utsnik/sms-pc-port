@@ -4,10 +4,7 @@
 
 #include <whb/log_udp.h>
 #include <whb/proc.h>
-
-#ifndef SMG_WIIU_RUN_GAME
-#error "SMG_WIIU_RUN_GAME must be defined by the Wii U target"
-#endif
+#include <revolution/nand.h>
 
 void port_game_main(void);
 
@@ -20,17 +17,18 @@ int main(int, char**)
     WHBLogUdpInit();
     WHBProcInit();
     smg_wiiu_runtime_init();
-    port_log("SMG Wii U: stage1 main entered");
+    port_log("SMG Wii U: stage2 main entered");
 
-#if SMG_WIIU_RUN_GAME == 1
+    port_os_init();
+    port_os_threads_init();
+    port_dvd_init();
+    smg_wiiu_load_dol_data();
+    port_vi_init();
+    port_pad_init();
+    const s32 nand_result = NANDInit();
+    port_log("SMG Wii U: NAND initialized result=%d", nand_result);
+    smg_wiiu_audio_init();
     s_game_entry();
-#else
-    (void)s_game_entry;
-#endif
-
-    while (WHBProcIsRunning()) {
-        /* WHBProcIsRunning owns the sole ProcUI pump for Stage 1. */
-    }
 
     WHBProcShutdown();
     WHBLogUdpDeinit();
