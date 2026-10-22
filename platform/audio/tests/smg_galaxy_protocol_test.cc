@@ -213,6 +213,26 @@ void start_stream_voice(int vi, uint32_t wavePtr, uint32_t bufSamples, unsigned 
 	put<uint16_t>(v, kActive, 1);
 }
 
+#if defined(PORT_GAME_SMG)
+void start_looping_adpcm4_voice(int vi, uint32_t wavePtr)
+{
+	uint8_t* v = voice(vi);
+	memset(v, 0, 0x180);
+	put<uint16_t>(v, kSource, 9);       // AFC ADPCM4: 9-byte, 16-sample frames
+	put<uint32_t>(v, kSampleCount, 32);
+	put<uint16_t>(v, kLoopFlag, 0xFFFF);
+	put<uint32_t>(v, kLoopStart, 0);
+	put<uint32_t>(v, kEnd, 32);
+	put<uint32_t>(v, kBase, wavePtr);
+	put<uint16_t>(v, kMix + 0, kConnectTable[1]);
+	put<uint16_t>(v, kMix + 2, 0x4000);
+	put<uint16_t>(v, kMix + 4, 0x4000);
+	put<uint16_t>(v, kPitch, 0x1000);
+	put<uint16_t>(v, kReset, 1);
+	put<uint16_t>(v, kActive, 1);
+}
+#endif
+
 uint16_t create_map(unsigned group)
 {
 	uint16_t map = 0;
@@ -590,6 +610,34 @@ int main(int argc, char** argv)
 	else
 		printf("audio-protocol-test: PCM start offset 0x068 = 1000 honoured\n");
 	put<uint16_t>(voice(3), kActive, 0);
+
+#if defined(PORT_GAME_SMG)
+	// ADPCM4 is the common Galaxy SFX/sequenced-music format. Exercise a
+	// genuine looping two-frame voice so D4's cursor/remaining writeback is not
+	// covered only by the PCM16 title stream.
+	const uint32_t adpcmBase = kAramHeapBase + 0x300000;
+	for (unsigned frame = 0; frame < 2; frame++) {
+		g_window[adpcmBase + frame * 9] = 0x80; // scale 8, predictor 0
+		for (unsigned i = 0; i < 8; i++)
+			g_window[adpcmBase + frame * 9 + 1 + i] = 0x88;
+	}
+	start_looping_adpcm4_voice(4, adpcmBase);
+	sync_frame(0x8000);
+	for (int sub = 0; sub < 7; sub++)
+		release_subframe();
+	unsigned adpcmNonzero = 0;
+	for (int k = 0; k < 560; k++)
+		adpcmNonzero += g_dac[k] != 0;
+	const uint32_t adpcmCursor = get<uint32_t>(voice(4), kAramAddr);
+	if (adpcmNonzero < 400)
+		fail("looping ADPCM4 produced only %u non-zero samples", adpcmNonzero);
+	if (adpcmCursor < adpcmBase || adpcmCursor > adpcmBase + 18)
+		fail("looping ADPCM4 cursor 0x%08x escaped its two-frame wave", adpcmCursor);
+	else
+		printf("audio-protocol-test: looping ADPCM4: %u/560 samples non-zero, cursor 0x%08x\n",
+		       adpcmNonzero, adpcmCursor);
+	put<uint16_t>(voice(4), kActive, 0);
+#endif
 
 	// The decoder test hook, through the same VARAM resolver.
 	int16_t decoded[64];

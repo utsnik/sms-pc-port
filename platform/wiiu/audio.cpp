@@ -44,6 +44,9 @@ extern "C" uint32_t sms_wiiu_sdl_audio_queued(void);
 extern "C" void sms_wiiu_sdl_audio_close(void);
 extern "C" u64 port_audio_dsp_subframes(void);
 extern "C" void port_audio_dsp_shutdown(void);
+#if defined(PORT_GAME_SMG)
+extern "C" int port_dspmix_active_voices(void);
+#endif
 
 extern "C" {
 /* wut symbols bound by name (the game's OS names are remapped by CMake). */
@@ -86,7 +89,13 @@ struct Ai {
 	int64_t lastDrain; // when the queue last went down
 	// Stats
 	u32 blocks, underruns, pendingWaits;
+#if defined(PORT_GAME_SMG)
+	u32 nonzero, voices;
+	#endif
 	int64_t statsSince;
+#if defined(PORT_GAME_SMG)
+	int64_t proofSince;
+	#endif
 	u64 statsSubframes;
 	u32 minQueued, maxQueued;
 	u64 sumSquares, samples; // level of what was played
@@ -122,9 +131,21 @@ void dma_block()
 				g.peak = a;
 		}
 		g.samples += frames * 2;
+#if defined(PORT_GAME_SMG)
+		if ((u32)port_dspmix_active_voices() > g.voices)
+			g.voices = (u32)port_dspmix_active_voices();
+#endif
 		sms_wiiu_sdl_audio_queue(s_mix, frames * 4);
 		g.fed = true;
 	}
+#if defined(PORT_GAME_SMG)
+	if (src && frames) {
+		for (u32 i = 0; i < frames * 2; i++)
+			g.nonzero += src[i] != 0;
+		if ((u32)port_dspmix_active_voices() > g.voices)
+			g.voices = (u32)port_dspmix_active_voices();
+	}
+#endif
 	g.blocks++;
 	if (g.cb) {
 		BOOL level = OSDisableInterrupts(); // the callback ran in interrupt context
@@ -132,6 +153,16 @@ void dma_block()
 		OSRestoreInterrupts(level);
 	}
 }
+
+#if defined(PORT_GAME_SMG)
+void log_smg_proof(int64_t now)
+{
+	if (now - g.proofSince < kTicksPerSec * 2)
+		return;
+	port_log("[smg-audio] blocks=%u nonzero=%u voices=%u\n", g.blocks, g.nonzero, g.voices);
+	g.proofSince = now;
+}
+#endif
 
 u32 isqrt(u64 v)
 {
@@ -239,12 +270,18 @@ void* pacer(void*)
 	if (!g.dev)
 		port_log("[audio] no audio device: pacing AI DMA from the system clock\n");
 	g.statsSince = sms_wiiu_audio_system_time();
+#if defined(PORT_GAME_SMG)
+	g.proofSince = g.statsSince;
+#endif
 	g.minQueued  = 0xFFFFFFFFu;
 	while (!g.quit) {
 		sms_wiiu_audio_sleep_ticks(kPollTicks);
 		if (g.quit)
 			break;
 		int64_t now = sms_wiiu_audio_system_time();
+#if defined(PORT_GAME_SMG)
+		log_smg_proof(now);
+#endif
 		log_stats(now);
 		if (!g.running) {
 			g.nextDue = 0;
@@ -345,7 +382,11 @@ extern "C" void AIInit(u8*)
 	if (g.inited)
 		return;
 	g.inited  = true;
+#if defined(PORT_GAME_SMG)
+	g.enabled = true;
+#else
 	g.enabled = !port_no_audio;
+#endif
 	if (!g.enabled) {
 		port_log("[audio] SMS_NO_AUDIO: AI DMA idle (no mixing, no output)\n");
 		return;

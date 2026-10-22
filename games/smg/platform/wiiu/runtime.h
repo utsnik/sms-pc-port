@@ -30,7 +30,11 @@ void port_os_threads_init(void);
 void port_vi_init(void);
 void port_pad_init(void);
 
-/* Task 10 replaces this logged placeholder with the audio protocol. */
+/* Opens the target audio output before JAudio's own initializer creates its
+ * DVD and audio threads. The pacer is started exactly once by JASAudioThread. */
+void sms_wiiu_sdl_audio_preopen(int rate);
+
+/* Opens AX/SDL and reserves the VARAM window before Galaxy JAudio2 starts. */
 void smg_wiiu_audio_init(void);
 
 /* Task 3's native-Espresso-BE data loader. */
@@ -39,6 +43,7 @@ void smg_wiiu_load_dol_data(void);
 /* Cemu's per-title save directory, used as the NAND provider's host root. */
 const char* smg_wiiu_save_root(void);
 const char* sms_wiiu_app_root(void);
+int sms_wiiu_sd_marker(const char* name);
 void port_log(const char* fmt, ...);
 
 /* The shared VI boundary counts presented fields; Galaxy autoplay is keyed

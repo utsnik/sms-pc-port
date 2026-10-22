@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(PORT_GAME_SMG)
+extern "C" void port_log(const char* fmt, ...);
+#endif
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -701,6 +705,10 @@ extern "C" void port_dspmix_render(int16_t* outA, int16_t* outB, int n, uint16_t
 		}
 	}
 	++g.traceTick;
+#if defined(PORT_GAME_SMG)
+	if ((g.traceTick & 127u) == 0)
+		port_log("[smg-audio] mixer subframes=%u voices=%d\n", g.traceTick, g.active);
+#endif
 	if (g.trace && g.traceTick % 2000 == 0) { // every 5 s of 80-sample subframes
 		int en = 0, stop = 0, silent = 0;
 		for (uint32_t i = 0; g.voices && i < g.nvoices; i++) {

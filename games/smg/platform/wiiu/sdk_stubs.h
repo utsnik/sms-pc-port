@@ -68,22 +68,11 @@
   X(LCEnable) \
   X(LCDisable) \
   X(DVDCheckDiskAsync) \
-  X(smg_gc_AIInit) \
-  X(smg_gc_AICheckInit) \
-  X(smg_gc_AIReset) \
-  X(smg_gc_AIRegisterDMACallback) \
-  X(smg_gc_AIInitDMA) \
-  X(smg_gc_AIGetDMAEnableFlag) \
-  X(smg_gc_AIStartDMA) \
-  X(smg_gc_AIStopDMA) \
-  X(smg_gc_AIGetDMABytesLeft) \
-  X(smg_gc_DSPInit) \
   X(smg_gc_DSPCheckInit) \
   X(smg_gc_DSPReset) \
   X(smg_gc_DSPHalt) \
   X(smg_gc_DSPUnhalt) \
   X(smg_gc_DSPAddTask) \
-  X(__DSP_boot_task) \
   X(__cxa_pure_virtual) \
   X(__syscall_tls_create) \
   X(__syscall_tls_delete) \

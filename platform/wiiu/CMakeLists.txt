@@ -33,16 +33,6 @@ if(PORT_GAME STREQUAL "smg")
     OSUnlockMutex=sms_wiiu_OSUnlockMutex
     OSTryLockMutex=sms_wiiu_OSTryLockMutex)
   set(SMG_WIIU_SND_ADAPTER_DEFS
-    AIInit=smg_gc_AIInit
-    AICheckInit=smg_gc_AICheckInit
-    AIReset=smg_gc_AIReset
-    AIRegisterDMACallback=smg_gc_AIRegisterDMACallback
-    AIInitDMA=smg_gc_AIInitDMA
-    AIGetDMAEnableFlag=smg_gc_AIGetDMAEnableFlag
-    AIStartDMA=smg_gc_AIStartDMA
-    AIStopDMA=smg_gc_AIStopDMA
-    AIGetDMABytesLeft=smg_gc_AIGetDMABytesLeft
-    DSPInit=smg_gc_DSPInit
     DSPCheckInit=smg_gc_DSPCheckInit
     DSPReset=smg_gc_DSPReset
     DSPHalt=smg_gc_DSPHalt
@@ -55,8 +45,6 @@ if(PORT_GAME STREQUAL "smg")
   set(SMG_WIIU_UNSELECTED_PROVIDER_PATHS
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/runtime.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/ai.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
     # Galaxy's ARAM is RVL_SDK aralt (games/smg/cmake/sources.cmake): the
     # DSP reads it at the DsetVARAM base, and its ARStartDMA takes
@@ -76,6 +64,8 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/vi.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/dvd.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/pad.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/port_heap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/msl_math.c
@@ -91,6 +81,8 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/input.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/nand.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/dol_data.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
@@ -153,7 +145,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
-  target_compile_definitions(smg PRIVATE ${SMG_DEFS}
+  target_compile_definitions(smg PRIVATE ${SMG_DEFS} SMS_AUDIO_DSP_HLE=1
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
   target_compile_options(smg PRIVATE ${SMG_GAME_FLAGS}
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
@@ -172,9 +164,10 @@ if(PORT_GAME STREQUAL "smg")
     # symbol is unique and attributed to input.cpp.
     -Wl,--allow-multiple-definition
     "-Wl,-Map,${SMG_WIIU_BUILD_DIR}/smg.map")
+  find_package(SDL2 REQUIRED CONFIG)
   target_link_libraries(smg PRIVATE
     -Wl,--whole-archive smg_game -Wl,--no-whole-archive
-    wut m)
+    SDL2::SDL2-static wut m)
   add_custom_target(smg_wiiu_elf ALL DEPENDS smg)
   return()
 endif()
