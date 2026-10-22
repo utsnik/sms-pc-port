@@ -17,12 +17,28 @@ inline JASAudioThread::JASAudioThread(int stackSize, int msgCount, u32 threadPri
     OSInitThreadQueue(&sThreadQueue);
 }
 
+#ifdef TARGET_WIIU
+/* On the Wii the priority-2 audio thread runs its whole init (DSP boot, which
+ * busy-waits on the DSP, then FX_BUF and the channel pools from JASDram) the
+ * moment create() resumes it, before the creating thread runs again. The Wii U
+ * DSP HLE answers from other threads, so the audio thread can lose the core
+ * mid-boot, and the creator went on to JAUNewSectionHeap(), which takes all of
+ * JASDram's free space: FX_BUF's 0x6000-byte JASDram allocation then failed
+ * (HeapMemoryWatcher OSPanic). Keep the retail order: wait for the init. */
+static volatile bool sInitDone;
+#endif
+
 void JASAudioThread::create(s32 threadPriority) {
     const int size = 0x2000;
     JASAudioThread* pAudioThread = new (JASDram, 0) JASAudioThread(threadPriority, 0x10, size);
     JKRHeap* pCurrentHeap = JKRGetSystemHeap();
     pAudioThread->setCurrentHeap(pCurrentHeap);
     pAudioThread->resume();
+#ifdef TARGET_WIIU
+    while (!sInitDone) {
+        OSSleepTicks(OSMillisecondsToTicks(1));
+    }
+#endif
 }
 
 void JASAudioThread::stop() {
@@ -40,6 +56,9 @@ void* JASAudioThread::run() {
 
     JASPoolAllocObject_MultiThreaded< JASChannel >::newMemPool(0x48);
     JASDriver::startDMA();
+#ifdef TARGET_WIIU
+    sInitDone = true;
+#endif
 
     OSMessage msg;
     while (true) {

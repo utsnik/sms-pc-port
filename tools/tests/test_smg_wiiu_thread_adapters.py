@@ -40,6 +40,8 @@ def run(elf: Path, tool: str, flag: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", type=Path, required=True)
+    parser.add_argument("--require-audio-init-wait", action="store_true",
+                        help="JASAudioThread::create must wait (OSSleepTicks) for the audio thread's init")
     args = parser.parse_args()
     elf = args.elf.resolve()
     imports = {}
@@ -53,6 +55,7 @@ def main() -> int:
     lines = run(elf, "powerpc-eabi-objdump", "-d").splitlines()
     func = "?"
     bad = set()
+    calls = set()
     for i, line in enumerate(lines):
         m = FUNC_RE.match(line)
         if m:
@@ -64,10 +67,18 @@ def main() -> int:
         if not m:
             continue
         name = imports.get((0xC0000000 + int(m.group(1))) & 0xFFFFFFFF, "")
+        calls.add((func, name))
         if "Thread" not in name:
             continue
         if func.startswith("_Z") and not func.startswith(PORT_PREFIXES):
             bad.add((func, name))
+    if args.require_audio_init_wait:
+        # Retail order: the priority-2 audio thread finishes DSP boot + FX_BUF
+        # before its creator reaches JAUNewSectionHeap (which takes all of
+        # JASDram). create() must sleep until run() reports the init done.
+        if ("_ZN14JASAudioThread6createEi", "OSSleepTicks") not in calls:
+            print("thread-adapters: FAIL: JASAudioThread::create does not wait for the audio thread init")
+            return 1
     for func, name in sorted(bad):
         print(f"thread-adapters: {func} calls coreinit {name} directly")
     if bad:
