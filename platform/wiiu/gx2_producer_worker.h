@@ -44,6 +44,7 @@ struct Counters {
     uint32_t segments;
     uint32_t listsCalled;
     uint32_t dlBegins;
+    uint32_t serviceFullWaits;
     uint32_t appendFailures;
     uint32_t serviceFailures;
 };

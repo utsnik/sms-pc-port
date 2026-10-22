@@ -34,7 +34,7 @@ void wut_OSYieldThread(void) __asm__("OSYieldThread");
 }
 
 static const uint32_t kByteRingSize = 2u << 20;
-static const uint32_t kServiceRingSize = 1024;
+static const uint32_t kServiceRingSize = 4096;
 static const uint32_t kWakeSlots = 4;
 static const uint32_t kWorkerStackSize = 1u << 20;
 static const uint8_t kAffinityCpu0 = 1u << 0;
@@ -126,9 +126,11 @@ static bool pushService(const ServiceRecord& record, bool mustSucceed) {
             }
             return false;
         }
-        /* A wait on core 1 drains this queue while its barrier is pending. */
+        /* A wait on core 1 drains this queue while its barrier is pending.
+         * Sleep rather than OSYieldThread: Cemu crashed in a yield spin here. */
         if (s_stopRequested) return false;
-        wut_OSYieldThread();
+        add(&s_totals.serviceFullWaits, 1);
+        wut_OSSleepTicks(62156250 / 20000); // about 50 us
     }
 }
 
@@ -191,6 +193,7 @@ static Counters delta(const Counters& now, const Counters& before) {
     d.segments -= before.segments;
     d.listsCalled -= before.listsCalled;
     d.dlBegins -= before.dlBegins;
+    d.serviceFullWaits -= before.serviceFullWaits;
     d.appendFailures -= before.appendFailures;
     d.serviceFailures -= before.serviceFailures;
     return d;
@@ -272,7 +275,7 @@ bool append(const uint8_t* bytes, uint32_t size) {
          * ring, so core 1 must pump that ring while applying byte backpressure. */
         wakeWorker();
         service();
-        wut_OSYieldThread();
+        wut_OSSleepTicks(62156250 / 20000); // about 50 us
     }
 
     const uint32_t offset = write % kByteRingSize;
@@ -323,7 +326,7 @@ bool enqueue_list(void* displayList, uint32_t bytes) {
     if (!s_started || !displayList || !bytes) return false;
     ServiceRecord record = {SERVICE_LIST, 0, displayList, bytes,
                             nullptr, nullptr};
-    if (!pushService(record, false)) return false;
+    if (!pushService(record, true)) return false;
     add(&s_totals.segments, 1);
     return true;
 }
@@ -331,7 +334,7 @@ bool enqueue_list(void* displayList, uint32_t bytes) {
 bool enqueueService(ServiceFn fn, void* arg) {
     if (!s_started || !fn) return false;
     ServiceRecord record = {SERVICE_CALLBACK, 0, nullptr, 0, fn, arg};
-    if (!pushService(record, false)) return false;
+    if (!pushService(record, true)) return false;
     add(&s_totals.segments, 1);
     return true;
 }
@@ -425,6 +428,7 @@ void snapshot(Counters* out) {
     value.segments = load(&s_totals.segments);
     value.listsCalled = load(&s_totals.listsCalled);
     value.dlBegins = load(&s_totals.dlBegins);
+    value.serviceFullWaits = load(&s_totals.serviceFullWaits);
     value.appendFailures = load(&s_totals.appendFailures);
     value.serviceFailures = load(&s_totals.serviceFailures);
     *out = value;
@@ -441,12 +445,12 @@ void note_frame(uint32_t frame) {
     if (!s_started) return;
     const Counters now = counters();
     const Counters d = delta(now, s_lastLog);
-    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u dlBegins=%u appendFail=%u serviceFail=%u\n",
+    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u dlBegins=%u fullWaits=%u appendFail=%u serviceFail=%u\n",
              frame, now.mode, now.workerCore, d.producerAppendMicros,
              d.waitMicros[WAIT_PEEK], d.waitMicros[WAIT_DRAWSYNC],
              d.waitMicros[WAIT_DRAWDONE], d.waitMicros[WAIT_PRESENT_DRAIN],
              d.workerBusyMicros, d.core1ReplayMicros,
-             now.queueHighWaterBytes, d.segments, d.listsCalled, d.dlBegins,
+             now.queueHighWaterBytes, d.segments, d.listsCalled, d.dlBegins, d.serviceFullWaits,
              d.appendFailures, d.serviceFailures);
     s_lastLog = now;
     s_lastLogFrame = frame;
