@@ -1150,9 +1150,10 @@ static bool tevIsConst(TevSource s) { return (s.sel & ~(1u << 12)) >= ALU_SRC_CO
 static uint32_t tevSelNoNeg(TevSource s) { return s.sel & ~(1u << 12); }
 
 // Whether ins can join the group: with bank swizzle VEC_012, src0 is read in
-// cycle 0 and src1 in cycle 1, one GPR per channel port per cycle; the
-// constant file likewise serves one address per channel and at most four
-// (address, channel) reads per group.
+// cycle 0 and src1 in cycle 1, one GPR per channel port per cycle.  On R700
+// (Latte) the constant file has two read ports per group, each serving one
+// address's xy or zw pair (Mesa r600 reserve_cfile); Cemu does not enforce
+// this, so an over-subscribed group reads wrong constants only on hardware.
 static bool tevFits(const std::vector<TevIns>& group, const TevIns& ins) {
     for (const TevIns& g : group) {
         if (g.dstCh == ins.dstCh) return false;
@@ -1173,12 +1174,12 @@ static bool tevFits(const std::vector<TevIns>& group, const TevIns& ins) {
     auto add = [&](TevSource s) {
         if (!tevIsConst(s)) return;
         for (uint32_t i = 0; i < n; ++i)
-            if (consts[i][0] == tevSelNoNeg(s) && consts[i][1] == s.chan) return;
-        if (n < 8) { consts[n][0] = tevSelNoNeg(s); consts[n][1] = s.chan; ++n; }
+            if (consts[i][0] == tevSelNoNeg(s) && consts[i][1] == s.chan / 2) return;
+        if (n < 8) { consts[n][0] = tevSelNoNeg(s); consts[n][1] = s.chan / 2; ++n; }
     };
     for (const TevIns& g : group) { add(g.s0); add(g.s1); }
     add(ins.s0); add(ins.s1);
-    return n <= 4;
+    return n <= 2;
 }
 
 // Emit the instructions as few groups as the read ports allow. They must be
