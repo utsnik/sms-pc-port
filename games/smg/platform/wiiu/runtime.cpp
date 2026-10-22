@@ -204,6 +204,10 @@ void port_fatal(const char* fmt, ...)
     va_end(args);
     line[sizeof(line) - 1] = '\0';
     WHBLogPrintf("SMG Wii U fatal: %s", line);
+    /* The spin below shows nothing in Cemu: put the reason in stage2.log too. */
+    char fatal_line[1040];
+    std::snprintf(fatal_line, sizeof(fatal_line), "SMG Wii U fatal: %s", line);
+    write_stage2_log(fatal_line);
     WHBProcStopRunning();
     for (;;) {
     }
