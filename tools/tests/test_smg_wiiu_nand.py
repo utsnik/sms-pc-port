@@ -263,8 +263,10 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="smg-nand-") as temporary:
         root = args.root or Path(temporary) / "save"
-        root.mkdir(parents=True, exist_ok=True)
+        if args.root is not None:
+            root.parent.mkdir(parents=True, exist_ok=True)
         if args.clean_create:
+            root.mkdir(parents=True, exist_ok=True)
             for child in root.iterdir():
                 if child.is_dir():
                     import shutil

@@ -69,6 +69,7 @@ bool path_stays_in_root(const char* path)
             break;
         *separator = '\0';
     }
+    // The remaining check is intentionally a small TOCTOU window; the save SD card is single-user.
     return realpath(prefix, resolved) != nullptr && within_root(root, resolved);
 }
 
@@ -99,6 +100,8 @@ bool make_path(char* out, size_t capacity, const char* path)
     const char* root = smg_wiiu_save_root();
     if (root == nullptr || root[0] == '\0')
         return false;
+    // Establish the canonical root before realpath() validates the mapped path.
+    mkdir(root, 0770);
 
     int written;
     if (path[0] == '/' && !is_home) {
@@ -382,6 +385,7 @@ s32 NANDSeekAsync(NANDFileInfo* info, s32 offset, s32 whence,
 { const s32 result = NANDSeek(info, offset, whence); finish(callback, result, block); return result; }
 
 s32 NANDPrivateDelete(const char* path) { return NANDDelete(path); }
+// Status is a smoke-test stub for now; it intentionally does not validate the path.
 s32 NANDPrivateGetStatus(const char*, NANDStatus* status)
 { if (status != nullptr) memset(status, 0, sizeof(*status)); return NAND_RESULT_OK; }
 s32 NANDGetStatus(const char* path, NANDStatus* status)
