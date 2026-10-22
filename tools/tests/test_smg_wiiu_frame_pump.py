@@ -31,6 +31,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--require-no-nested-boundary", action="store_true")
+    parser.add_argument("--require-paced-retrace", action="store_true",
+                        help="sms_wiiu_vsync_fields must pace (OSSleepTicks) and never freeze the retrace count")
     args = parser.parse_args()
     elf = args.elf.resolve()
 
@@ -41,6 +43,22 @@ def main() -> int:
             check=True, capture_output=True, text=True).stdout
 
     text = tool(OBJDUMP, "-d")
+    if args.require_paced_retrace:
+        # Without GX2 the retrace count must still advance at 60 Hz: a vsync
+        # source returning 0 froze VIGetRetraceCount and waitForTick spun.
+        imports = {}
+        for line in tool(OBJDUMP.replace("objdump", "nm"), "-n").splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0].startswith("c0000"):
+                imports[parts[2]] = int(parts[0], 16)
+        start = text.find("<sms_wiiu_vsync_fields>:\n")
+        body = text[start:text.find("\n\n", start)] if start >= 0 else ""
+        sleep = imports.get("OSSleepTicks")
+        off = None if sleep is None else sleep - 0xC0000000
+        if not body or re.fullmatch(r"(?s).*>:\n\s+[0-9a-f]+:\s+38 60 00 00\s+li\s+r3,0\n\s+[0-9a-f]+:\s+4e 80 00 20\s+blr\s*", body) \
+                or off is None or not re.search(rf"addi\s+r12,r12,{off}\b", body):
+            print("frame-pump: FAIL: sms_wiiu_vsync_fields does not pace the retrace count (OSSleepTicks)")
+            return 1
     if args.require_no_nested_boundary:
         flag_addr = None
         for line in tool(OBJDUMP.replace("objdump", "nm"), "-C").splitlines():
