@@ -51,6 +51,18 @@ u32 s_offthread_logged;
 /* GX2 and ProcUI belong to the thread that ran port_vi_init (the main thread on
  * core 1); a frame boundary reached from any other thread must not touch them. */
 void* s_owner_thread;
+#if defined(PORT_GAME_SMG)
+/* Galaxy's JUTVideo::preRetraceProc, run from the pre-retrace callback inside
+ * the frame boundary, calls VIFlush. On the Wii that runs in the retrace
+ * interrupt and only latches VI registers; here VIFlush pumps a boundary, so
+ * each boundary nested another one, one per vsync, and never returned to the
+ * game. VI calls made from inside the boundary are no-ops. */
+bool s_in_boundary;
+struct BoundaryScope {
+	BoundaryScope() { s_in_boundary = true; }
+	~BoundaryScope() { s_in_boundary = false; }
+};
+#endif
 /* One 60 Hz frame of the 62.15625 MHz timebase. */
 constexpr int64_t kFrameTicks = 62156250 / 60;
 
@@ -77,6 +89,11 @@ void sms_wiiu_frame_boundary(void)
 {
 	if (!s_initialized)
 		return;
+#if defined(PORT_GAME_SMG)
+	if (s_in_boundary)
+		return;
+	BoundaryScope boundary_scope;
+#endif
 	if (sms_wiiu_native_current_thread() != s_owner_thread) {
 		if (s_offthread_logged++ < 4)
 			port_log("[vi] frame boundary from a non-main thread; sleeping one frame\n");
@@ -171,6 +188,10 @@ void VIConfigure(GXRenderModeObj*) {}
 void VIConfigurePan(u16, u16, u16, u16) {}
 void VIFlush(void)
 {
+#if defined(PORT_GAME_SMG)
+	if (s_in_boundary)
+		return;
+#endif
 	if (!s_flush_pumped) {
 		sms_wiiu_frame_boundary();
 		s_flush_pumped = true;
@@ -199,6 +220,10 @@ VIRetraceCallback VISetPostRetraceCallback(VIRetraceCallback callback)
 }
 void VIWaitForRetrace(void)
 {
+#if defined(PORT_GAME_SMG)
+	if (s_in_boundary)
+		return;
+#endif
 	if (!s_flush_pumped)
 		sms_wiiu_frame_boundary();
 	s_flush_pumped = false;

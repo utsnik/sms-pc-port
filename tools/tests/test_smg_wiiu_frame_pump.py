@@ -7,6 +7,11 @@ platform frame boundary (platform/wiiu/vi.cpp sms_wiiu_frame_boundary, reached
 through VIFlush/VIWaitForRetrace on the main thread), so a blocking receive in
 MainLoopFramework's waitForTick slept forever on a queue only that thread can
 fill. Check the linked ELF: waitForTick must call VIWaitForRetrace.
+
+--require-no-nested-boundary: JUTVideo::preRetraceProc calls VIFlush from the
+pre-retrace callback, i.e. from inside the boundary; that nested one boundary
+per vsync forever. sms_wiiu_frame_boundary, VIFlush and VIWaitForRetrace must
+each read vi.cpp's s_in_boundary flag.
 """
 
 from __future__ import annotations
@@ -25,12 +30,36 @@ WAIT_FOR_TICK = re.compile(r"^[0-9a-f]+ <(_ZN12_GLOBAL__N_1L?11waitForTickEjt[^>
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", type=Path, required=True)
+    parser.add_argument("--require-no-nested-boundary", action="store_true")
     args = parser.parse_args()
     elf = args.elf.resolve()
-    text = subprocess.run(
-        ["docker", "run", "--rm", "--network", "none", "-v", f"{elf.parent}:/e:ro",
-         BUILDER_IMAGE, OBJDUMP, "-d", f"/e/{elf.name}"],
-        check=True, capture_output=True, text=True).stdout
+
+    def tool(binary: str, flag: str) -> str:
+        return subprocess.run(
+            ["docker", "run", "--rm", "--network", "none", "-v", f"{elf.parent}:/e:ro",
+             BUILDER_IMAGE, binary, flag, f"/e/{elf.name}"],
+            check=True, capture_output=True, text=True).stdout
+
+    text = tool(OBJDUMP, "-d")
+    if args.require_no_nested_boundary:
+        flag_addr = None
+        for line in tool(OBJDUMP.replace("objdump", "nm"), "-C").splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[-1].endswith("s_in_boundary"):
+                flag_addr = int(parts[0], 16)
+        if flag_addr is None:
+            print("frame-pump: FAIL: vi.cpp has no s_in_boundary re-entry flag")
+            return 1
+        hi = (flag_addr + 0x8000) >> 16
+        lo = flag_addr - (hi << 16)
+        hi_s = hi - 0x10000 if hi >= 0x8000 else hi
+        for name in ("sms_wiiu_frame_boundary", "VIFlush", "VIWaitForRetrace"):
+            start = text.find(f"<{name}>:\n")
+            body = text[start:text.find("\n\n", start)] if start >= 0 else ""
+            if not (re.search(rf"\blis\s+r\d+,{hi_s}\b", body) and
+                    re.search(rf"\b(lbz|stb)\s+r\d+,{lo}\(r\d+\)", body)):
+                print(f"frame-pump: FAIL: {name} does not check s_in_boundary (nested boundary)")
+                return 1
     func = None
     bodies: dict[str, list[str]] = {}
     for line in text.splitlines():
