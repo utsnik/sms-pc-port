@@ -38,7 +38,15 @@ set(SMG_GAME_INCLUDE_DIRS
   "${SMG_DECOMP_ROOT}/libs/JSystem/include"
   "${SMG_DECOMP_ROOT}/libs/RVL_SDK/include"
   "${SMG_DECOMP_ROOT}/libs/nw4r/include"
-  "${SMG_DECOMP_ROOT}/libs/RVLFaceLib/include")
+  "${SMG_DECOMP_ROOT}/libs/RVLFaceLib/include"
+  # Sunshine's shared Wii U providers are built against its pinned Dolphin
+  # headers; keep those roots explicit instead of relying on include order.
+  "${CMAKE_CURRENT_LIST_DIR}/../../../decomp/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../decomp/libs/dolphin/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../decomp/libs/JSystem/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../decomp/libs/PowerPC_EABI_Support/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../decomp/libs/TRK_MINNOW_DOLPHIN/include"
+  "${CMAKE_CURRENT_LIST_DIR}/../../../decomp/libs/OdemuExi2/include")
 
 # Review-only exclusions. Keep these names beside the source list so adding
 # a new RVL_SDK glob cannot silently bring a second ABI provider into SMG.

@@ -201,7 +201,7 @@ namespace MR {
         u32 i;
 
         for (i = 0; i < num - 1; pDst++, pSrc++, i++) {
-#if defined(TARGET_PC) && !PORT_HOST_BIG_ENDIAN
+#if !PORT_HOST_BIG_ENDIAN
             // Code units are native-endian here (the cooked messages are
             // little-endian): the high byte is not the first one.
             u16 c = static_cast< u16 >(*pSrc);

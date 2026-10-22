@@ -212,9 +212,11 @@ void GalaxyMap::calcAnimForCapture(const nw4r::lyt::DrawInfo& rDrawInfo) {
 
 void GalaxyMap::drawForCapture(const nw4r::lyt::DrawInfo& rDrawInfo) {
     MR::drawLayoutWithDrawInfoWithoutProjectionSetup(this, rDrawInfo);
-    std::for_each(mDomeIcon.begin(), mDomeIcon.end(), std::bind2nd(std::ptr_fun(MR::drawLayoutWithDrawInfoWithoutProjectionSetup), rDrawInfo));
-    std::for_each(mIcon.begin(), mIcon.end(), std::bind2nd(std::ptr_fun(MR::drawLayoutWithDrawInfoWithoutProjectionSetup), rDrawInfo));
-    std::for_each(mCometIcon.begin(), mCometIcon.end(), std::bind2nd(std::ptr_fun(MR::drawLayoutWithDrawInfoWithoutProjectionSetup), rDrawInfo));
+    typedef std::pointer_to_binary_function< const LayoutActor*, const nw4r::lyt::DrawInfo&, void > DrawLayoutFunction;
+    typedef std::port_binder2nd< DrawLayoutFunction, const nw4r::lyt::DrawInfo& > DrawLayoutBinder;
+    std::for_each(mDomeIcon.begin(), mDomeIcon.end(), DrawLayoutBinder(std::ptr_fun(MR::drawLayoutWithDrawInfoWithoutProjectionSetup), rDrawInfo));
+    std::for_each(mIcon.begin(), mIcon.end(), DrawLayoutBinder(std::ptr_fun(MR::drawLayoutWithDrawInfoWithoutProjectionSetup), rDrawInfo));
+    std::for_each(mCometIcon.begin(), mCometIcon.end(), DrawLayoutBinder(std::ptr_fun(MR::drawLayoutWithDrawInfoWithoutProjectionSetup), rDrawInfo));
 }
 
 void GalaxyMap::setModeNormal() {
