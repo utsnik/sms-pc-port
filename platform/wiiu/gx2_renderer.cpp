@@ -3465,12 +3465,41 @@ static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level)
     }
     return true;
 }
+// gx2prod: the worker cannot issue GX2CopySurface (no command buffer of its
+// own, and copies are not list-safe).  It closes its list, queues the
+// per-level copies as an ordered core-1 service, and reopens a list, so draws
+// recorded after this point sample the tiled copy once the GPU made it.
+static bool gx2DlOpenForDraw();
+struct ProducerRetile { GX2Surface linear, tiled; };
+static ProducerRetile s_producerRetiles[256];
+static uint32_t s_producerRetileWrite;
+static void producerRetileService(void* opaque) {
+    ProducerRetile& r = *static_cast<ProducerRetile*>(opaque);
+    for (uint32_t level = 0; level < r.tiled.mipLevels; ++level)
+        GX2CopySurface(&r.linear, level, 0, &r.tiled, level, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, r.tiled.image, r.tiled.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.tiled.image, r.tiled.imageSize);
+    if (r.tiled.mipmaps) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, r.tiled.mipmaps, r.tiled.mipmapSize);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.tiled.mipmaps, r.tiled.mipmapSize);
+    }
+    rebindTvTarget(false);  // GX2CopySurface leaves its destination bound
+}
+static bool enqueueProducerRetile(const GX2Surface& linear, const GX2Surface& tiled) {
+    if (s_producerRetileWrite >= sizeof(s_producerRetiles) / sizeof(s_producerRetiles[0])) return false;
+    gx2DlSplit(kDlSplitCopy);
+    ProducerRetile& r = s_producerRetiles[s_producerRetileWrite++];
+    r.linear = linear;
+    r.tiled = tiled;
+    const bool queued = gx2prod::enqueueService(producerRetileService, &r);
+    invalidateVertexUniforms();  // the copy clobbers what the next list inherits
+    gx2DlOpenForDraw();
+    return queued;
+}
+
 static void retileTexture(GX2Texture& texture) {
-    // The probe's worker is allowed to record draw state, but not to issue
-    // resource-copy GX2 calls.  Keep the linear source in place until the
-    // full service-queue retile path is enabled; sampling it is correct and
-    // preserves the worker's GX2 allow-list.
-    if (!s_retileTextures || runningUnderCemu() || (s_gx2ProdEnabled && OSGetCoreId() != 1)) return;
+    if (!s_retileTextures || runningUnderCemu()) return;
+    const bool worker = s_gx2ProdEnabled && OSGetCoreId() != 1;
     GX2Surface& linear = texture.surface;
     GX2Texture tiled = texture;
     GX2Surface& t = tiled.surface;
@@ -3489,6 +3518,18 @@ static void retileTexture(GX2Texture& texture) {
     DCFlushRange(t.image, t.imageSize);
     if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
     GX2InitTextureRegs(&tiled);
+    if (worker) {
+        if (!enqueueProducerRetile(linear, t)) {
+            // Out of retile slots this frame: keep sampling the linear copy.
+            MEMFreeToDefaultHeap(t.image);
+            if (t.mipmaps) MEMFreeToDefaultHeap(t.mipmaps);
+            return;
+        }
+        deferFree(linear.image);
+        deferFree(linear.mipmaps);
+        texture = tiled;
+        return;
+    }
     for (uint32_t level = 0; level < t.mipLevels; ++level)
         retileTexture(texture, tiled, level);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, t.image, t.imageSize);
@@ -5788,6 +5829,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             s_producerCopies[i].copy.retiredImage = nullptr;
         }
         s_producerCopyWrite = 0;
+        s_producerRetileWrite = 0;
         if (sms_wiiu_gx2prod_reset_draw_sync_jobs)
             sms_wiiu_gx2prod_reset_draw_sync_jobs();
     } else
