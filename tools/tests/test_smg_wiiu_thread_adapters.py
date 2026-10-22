@@ -40,6 +40,9 @@ def run(elf: Path, tool: str, flag: str) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", type=Path, required=True)
+    parser.add_argument("--require-queue-reclaim", action="store_true",
+                        help="the OSThreadQueue side table must be the 512-record SMG table "
+                             "(records are reclaimed when no thread sleeps on them)")
     parser.add_argument("--require-audio-init-wait", action="store_true",
                         help="JASAudioThread::create must wait (OSSleepTicks) for the audio thread's init")
     args = parser.parse_args()
@@ -72,6 +75,18 @@ def main() -> int:
             continue
         if func.startswith("_Z") and not func.startswith(PORT_PREFIXES):
             bad.add((func, name))
+    if args.require_queue_reclaim:
+        # 128 records were never released: Galaxy's per-request message queues
+        # exhausted the table and every later sleep/wake was dropped.
+        sizes = {}
+        for line in run(elf, "powerpc-eabi-nm", "-S").splitlines():
+            parts = line.split()
+            if len(parts) == 4 and parts[3].endswith("8s_queuesE"):
+                sizes["s_queues"] = int(parts[1], 16)
+        # QueueRecord: game*, WutQueue (16), active, sleepers = 28 bytes.
+        if sizes.get("s_queues", 0) < 512 * 28:
+            print("thread-adapters: FAIL: OSThreadQueue side table is not the reclaiming 512-record table")
+            return 1
     if args.require_audio_init_wait:
         # Retail order: the priority-2 audio thread finishes DSP boot + FX_BUF
         # before its creator reaches JAUNewSectionHeap (which takes all of

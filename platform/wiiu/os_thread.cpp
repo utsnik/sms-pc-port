@@ -56,7 +56,11 @@ extern "C" void sms_wiiu_set_game_core(unsigned core) { kGameThreadAffinityCpu1 
 const uint32_t kWutThreadBytes = 0x6a0;
 const unsigned kMaxThreads = 64;
 const uint32_t kMinThreadStack = 0x10000;
+#if defined(PORT_GAME_SMG)
+const unsigned kMaxQueues = 512;
+#else
 const unsigned kMaxQueues = 128;
+#endif
 
 struct ThreadRecord {
 	OSThread* game;
@@ -76,6 +80,10 @@ struct QueueRecord {
 	OSThreadQueue* game;
 	WutQueue wut;
 	bool active;
+#if defined(PORT_GAME_SMG)
+	/* Threads inside (or returning from) a sleep on this record. */
+	uint32_t sleepers;
+#endif
 };
 
 ThreadRecord s_threads[kMaxThreads];
@@ -120,9 +128,35 @@ QueueRecord* queue_for(OSThreadQueue* game, bool create)
 		wut_OSInitThreadQueue(&s_queues[i].wut);
 		return &s_queues[i];
 	}
+#if defined(PORT_GAME_SMG)
+	/* Galaxy keeps creating message queues (one per async-exec request and per
+	 * file request) at new heap addresses, and a record was never released, so
+	 * the table filled and every later sleep/wake was dropped. Reuse a record
+	 * no thread sleeps on: its game queue gets a new record if it is used again. */
+	for (unsigned i = 0; i < kMaxQueues; ++i) {
+		QueueRecord& r = s_queues[i];
+		if (__atomic_load_n(&r.sleepers, __ATOMIC_SEQ_CST) || r.wut.head)
+			continue;
+		r.game = game;
+		wut_OSInitThreadQueue(&r.wut);
+		return &r;
+	}
+#endif
 	port_log("[os] decomp queue side table exhausted\n");
 	return nullptr;
 }
+
+#if defined(PORT_GAME_SMG)
+void sleep_on(QueueRecord* q)
+{
+	__atomic_add_fetch(&q->sleepers, 1, __ATOMIC_SEQ_CST);
+	wut_OSSleepThread(&q->wut);
+	__atomic_sub_fetch(&q->sleepers, 1, __ATOMIC_SEQ_CST);
+}
+#define SLEEP_ON(q) sleep_on(q)
+#else
+#define SLEEP_ON(q) wut_OSSleepThread(&(q)->wut)
+#endif
 
 void set_thread_terminated(ThreadRecord* r, void* result)
 {
@@ -384,7 +418,7 @@ void sms_wiiu_OSSleepThread(OSThreadQueue* queue)
 {
 	QueueRecord* q = queue_for(queue, true);
 	if (q)
-		wut_OSSleepThread(&q->wut);
+		SLEEP_ON(q);
 }
 
 void sms_wiiu_OSWakeupThread(OSThreadQueue* queue)
@@ -460,7 +494,7 @@ void sms_wiiu_OSLockMutex(OSMutex* mutex)
 		// Sleep before re-enabling interrupts: a wakeup sent in between found no
 		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
-			wut_OSSleepThread(&q->wut);
+			SLEEP_ON(q);
 		wut_OSRestoreInterrupts(level);
 	}
 }
@@ -503,7 +537,7 @@ void sms_wiiu_OSWaitCond(struct OSCond* cond, OSMutex* mutex)
 	unlock_mutex_without_switch(mutex, current_game_thread());
 	QueueRecord* q = queue_for(&cond->queue, true);
 	if (q)
-		wut_OSSleepThread(&q->wut);  // before re-enabling interrupts (lost wakeup)
+		SLEEP_ON(q);  // before re-enabling interrupts (lost wakeup)
 	wut_OSRestoreInterrupts(level);
 	sms_wiiu_OSLockMutex(mutex);
 }
@@ -559,7 +593,7 @@ int send_message(OSMessageQueue* mq, void* msg, long flags, bool front)
 		// Sleep before re-enabling interrupts: a wakeup sent in between found no
 		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
-			wut_OSSleepThread(&q->wut);
+			SLEEP_ON(q);
 		wut_OSRestoreInterrupts(level);
 	}
 }
@@ -600,7 +634,7 @@ int sms_wiiu_OSReceiveMessage(OSMessageQueue* mq, void* msg, long flags)
 		// Sleep before re-enabling interrupts: a wakeup sent in between found no
 		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
-			wut_OSSleepThread(&q->wut);
+			SLEEP_ON(q);
 		wut_OSRestoreInterrupts(level);
 	}
 }
