@@ -1249,8 +1249,23 @@ void GXPokeDstAlpha(GXBool, u8) {}
 void GXPokeDither(GXBool) {}
 void GXPokeZMode(GXBool, GXCompare, GXBool) {}
 void GXPokeARGB(u16, u16, u32) {}
+#ifdef __WIIU__
+extern "C" int sms_wiiu_sd_marker(const char* name);
+// Timing probe: with the SD marker "nopeekwait" producer-mode peeks neither
+// wait for the worker nor read anything.  Colour answers "Mario visible"
+// (alpha 0x10, no silhouette) and depth answers the far plane (full sun glare).
+static bool noPeekWait() {
+    static int s_on = -1;
+    if (s_on < 0) {
+        s_on = sms_wiiu_sd_marker("nopeekwait") ? 1 : 0;
+        if (s_on) logmsg("gx2prod: nopeekwait marker - peeks skipped (timing probe)");
+    }
+    return s_on != 0;
+}
+#endif
 void GXPeekARGB(u16 x, u16 y, u32* color) {
 #ifdef __WIIU__
+    if (producerMode() && noPeekWait()) { *color = 0x10000000; return; }
     if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
     else
 #endif
@@ -1259,6 +1274,7 @@ void GXPeekARGB(u16 x, u16 y, u32* color) {
 }
 void GXPeekZ(u16 x, u16 y, u32* z) {
 #ifdef __WIIU__
+    if (producerMode() && noPeekWait()) { *z = 0xffffff; return; }
     if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
     else
 #endif
