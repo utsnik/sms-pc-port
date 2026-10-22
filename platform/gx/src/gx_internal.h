@@ -104,6 +104,9 @@ extern ParserContext g_parser;
 // is deliberately a complete State so read-modify-write setters and CPU
 // getters never consult the consumer half of the parser mid-recording.
 extern State gProducer;
+// Copy the consumer state into gProducer, all but tlutMem (512 KiB, which
+// only the direct path writes; a recording emits TLUT loads as BP commands).
+void syncProducerState();
 void shadowBP(uint32_t value);
 void shadowCP(uint8_t reg, uint32_t value);
 void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words);
