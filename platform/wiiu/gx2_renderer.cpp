@@ -4886,16 +4886,11 @@ static bool gx2DlEndCall(void* list) {
 static void* s_gx2DlOpen;
 static uint32_t s_gx2DlOpenDraws;
 
-static bool gx2DlRejectCore1ProducerClose(const char* operation) {
-    if (!s_gx2ProdEnabled || OSGetCoreId() != 1) return false;
-    if (s_gx2DlOpen) {
-        gx2prod::record_service_failure();
-        ++s_perfDlForbidden;
-        if (s_perfDlForbidden <= 8)
-            WHBLogPrintf("SMS Wii U: [gx2prod] service failure: core 1 attempted %s with worker list open (%u draws)",
-                         operation, (unsigned)s_gx2DlOpenDraws);
-    }
-    return true;
+// In producer mode core 1 replays copies and clears while the worker may hold
+// a list open; their GX2 macros must leave that list alone.  This is the
+// normal case, not a failure, so it is not counted.
+static bool gx2DlRejectCore1ProducerClose(const char*) {
+    return s_gx2ProdEnabled && OSGetCoreId() == 1;
 }
 
 static void gx2DlClose() {
