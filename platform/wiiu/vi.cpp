@@ -18,6 +18,7 @@ extern "C" volatile int sms_wiiu_menu_exit_pending;
 
 extern "C" {
 void sms_wiiu_gfx_frame(void);
+void sms_wiiu_gx2_renderer_prepare_exit(void);
 uint32_t sms_wiiu_vsync_fields(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
@@ -100,6 +101,9 @@ void sms_wiiu_frame_boundary(void)
 	 * step: a hang inside GX2DrawDone means a draw had already hung the GPU. */
 	if (sms_wiiu_menu_exit_pending == 1) {
 		sms_wiiu_menu_exit_pending = 2;
+		/* ProcUI cannot release while the producer worker can still issue GX2
+		 * recording calls. Drain and join it before entering the exit pump. */
+		sms_wiiu_gx2_renderer_prepare_exit();
 		WHBLogPrintf("SMS Wii U: exit drain: submitted=%llu retired=%llu",
 		             (unsigned long long)GX2GetLastSubmittedTimeStamp(),
 		             (unsigned long long)GX2GetRetiredTimeStamp());
