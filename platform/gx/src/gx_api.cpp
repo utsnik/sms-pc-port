@@ -155,7 +155,6 @@ GXFifoObj* GXInit(void* base, u32 size) {
     // bring up a window (or a headless context) unless the host already did
     if (!rendererReady()) GXPC_InitAuto(1);
     resetState();
-    gProducer = g;
     FifoObjInt* f = reinterpret_cast<FifoObjInt*>(&s_fifo);
     f->base = static_cast<uint8_t*>(base);
     f->top = f->base + size - 4;
@@ -345,7 +344,7 @@ void GXBeginDisplayList(void* list, u32 size) {
     // The producer starts from the last consumed state.  All API read-modify-
     // writes during the recording then stay in gProducer until the list is
     // called by the existing FIFO parser.
-    gProducer = g;
+    syncProducerState();
     s_recording = true;
     s_dlBegin = static_cast<uint8_t*>(list);
     s_dlSize = size;
@@ -368,7 +367,6 @@ void GXCallDisplayList(void* list, u32 nbytes) {
         return;
     }
     callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
-    gProducer = g;
 }
 
 // ================================================================== GXGeometry / GXAttr

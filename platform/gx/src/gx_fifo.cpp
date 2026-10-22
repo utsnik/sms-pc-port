@@ -28,6 +28,13 @@ namespace gx {
 State g;
 State gProducer;
 ParserContext g_parser = {&g, 0};
+
+void syncProducerState() {
+    const size_t head = offsetof(State, tlutMem), tail = offsetof(State, tlutMem) + sizeof(g.tlutMem);
+    memcpy(&gProducer, &g, head);
+    memcpy(reinterpret_cast<uint8_t*>(&gProducer) + tail, reinterpret_cast<const uint8_t*>(&g) + tail,
+           sizeof(State) - tail);
+}
 extern uint32_t g_traceLastVat;
 void (*drawSyncCallback)(uint16_t) = nullptr;
 
@@ -264,7 +271,7 @@ void resetState() {
         memcpy(&g.xfMem[60 * 4 + i], &ident[i], 4);
         memcpy(&g.xfMem[0x500 + 61 * 4 + i], &ident[i], 4);
     }
-    gProducer = g;
+    syncProducerState();
     g_parser.consumer = &g;
     g_parser.displayListDepth = 0;
     (void)be;
