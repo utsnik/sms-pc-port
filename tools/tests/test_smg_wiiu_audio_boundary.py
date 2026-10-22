@@ -90,6 +90,15 @@ def check_sources(args: argparse.Namespace) -> None:
             fail("SMG audio clock does not emit periodic proof-of-sound counters")
         if source_path.endswith("dsp_mixer.cpp") and "port_dspmix_active_voices" not in source:
             fail("SMG mixer does not expose active-voice diagnostics")
+        if source_path.endswith("audio_sdl.cpp"):
+            output_api = re.search(
+                r"#if defined\(PORT_GAME_SMG\).*?sms_wiiu_sdl_audio_output",
+                source, re.S,
+            )
+            if not output_api:
+                fail("sms_wiiu_sdl_audio_output must remain SMG-only")
+            if "s_axPreopenResult = sms_wiiu_sd_marker(\"axonc1\") ? open_ax(rate)" not in source:
+                fail("axonc1 must report the game-core AX output selected during preopen")
     overwrite = root / "games/smg/decomp/src/Game/System/Overwrite.cpp"
     overwrite_text = overwrite.read_text()
     if "#if defined(TARGET_WIIU)" not in overwrite_text or "port_mem1_base" not in overwrite_text:

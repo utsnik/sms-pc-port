@@ -18,6 +18,9 @@
 #include <dolphin/dsp.h>
 
 #include "dsp_mixer.h"
+#if defined(TARGET_WIIU) || defined(SMG_AUDIO_ASYNC_TEST)
+#define SMG_DSP_ASYNC 1
+#endif
 #ifdef TARGET_WIIU
 /* The mailbox deque and command vector grow from game threads. Outside a
  * PortHeapScope the Wii U operator new takes the game's current JKR heap, so a
@@ -29,6 +32,11 @@
 #include "../wiiu/runtime.h"
 #include <dolphin/os.h>
 #include <dolphin/os/OSThread.h>
+#elif defined(SMG_AUDIO_ASYNC_TEST)
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#define SMS_PORT_HEAP_SCOPE() ((void)0)
 #else
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
@@ -58,7 +66,7 @@ struct Hle {
 	bool release; // header word 0: DSPReleaseHalt's two map words
 	u32 want;
 	std::vector<u32> words;
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	std::vector<u32> workerWords;
 #endif
 	// frame state from the 0x82 command
@@ -113,19 +121,31 @@ void post(u32 m)
 	g.fromDsp.push_back(m);
 }
 
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 /* wut's coreinit ABI is deliberately kept separate from the decomp's
  * GameCube OS types. These declarations mirror the boundary in
  * platform/wiiu/os_thread.cpp and are bound to wut by symbol name. */
 struct WutThread {
+#ifdef TARGET_WIIU
 	unsigned char bytes[0x6a0];
 } __attribute__((aligned(32)));
 struct WutMessageQueue {
 	unsigned char bytes[0x100];
 } __attribute__((aligned(32)));
+#else
+	std::thread* thread;
+	bool started;
+};
+struct WutMessageQueue {
+	std::mutex mutex;
+	std::condition_variable condition;
+	std::deque<void*> messages;
+};
+#endif
 typedef int (*WutEntry)(int, const char**);
 
 extern "C" {
+#ifdef TARGET_WIIU
 BOOL wut_OSCreateThread(WutThread*, WutEntry, int32_t, char*, void*, uint32_t,
 	                        int32_t, uint8_t) __asm__("OSCreateThread");
 int32_t wut_OSResumeThread(WutThread*) __asm__("OSResumeThread");
@@ -145,6 +165,12 @@ BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSRec
 int sms_wiiu_OSCreateThread(OSThread*, void* (*)(void*), void*, void*, u32, s32, u16);
 long sms_wiiu_OSResumeThread(OSThread*);
 int sms_wiiu_OSJoinThread(OSThread*, void**);
+#else
+typedef WutThread TestThread;
+BOOL host_OSCreateThread(TestThread*, void* (*)(void*), void*, void*, u32, s32, u16);
+long host_OSResumeThread(TestThread*);
+int host_OSJoinThread(TestThread*, void**);
+#endif
 }
 
 #ifndef OS_THREAD_ATTRIB_AFFINITY_CPU0
@@ -170,12 +196,17 @@ struct Reply {
 struct AsyncState {
 	WutMessageQueue commandQueue;
 	WutMessageQueue replyQueue;
+#ifdef TARGET_WIIU
 	WutMessage commandSlots[kCommandQueueCount] __attribute__((aligned(32)));
 	WutMessage replySlots[kReplyQueueCount] __attribute__((aligned(32)));
 	WutThread mixerThread;
 	OSThread replyThread;
 	u8 mixerStack[0x10000] __attribute__((aligned(32)));
 	u8 replyStack[0x10000] __attribute__((aligned(32)));
+#else
+	WutThread mixerThread;
+	TestThread replyThread;
+#endif
 	volatile u32 framePending;
 	volatile u32 subframesRendered;
 	bool checked;
@@ -199,16 +230,33 @@ inline int dbg_kind(bool release, const std::vector<u32>& w)
 
 BOOL send_ptr(WutMessageQueue* q, void* p)
 {
+#ifdef TARGET_WIIU
 	WutMessage m = {p, {0, 0, 0}};
 	return wut_OSSendMessage(q, &m, kWutMessageBlock);
+#else
+	{
+		std::lock_guard<std::mutex> lock(q->mutex);
+		q->messages.push_back(p);
+	}
+	q->condition.notify_one();
+	return 1;
+#endif
 }
 
 BOOL receive_ptr(WutMessageQueue* q, void** p)
 {
+#ifdef TARGET_WIIU
 	WutMessage m = {nullptr, {0, 0, 0}};
 	const BOOL ok = wut_OSReceiveMessage(q, &m, kWutMessageBlock);
 	*p = m.message;
 	return ok;
+#else
+	std::unique_lock<std::mutex> lock(q->mutex);
+	q->condition.wait(lock, [q] { return !q->messages.empty(); });
+	*p = q->messages.front();
+	q->messages.pop_front();
+	return 1;
+#endif
 }
 bool s_workerRelease;
 
@@ -245,10 +293,15 @@ void* reply_thread(void*)
 		post(reply->first);
 		post(reply->second);
 #if defined(PORT_GAME_SMG)
-		if (reply->second == (kPrefix | 0xFF00u))
-			++s_subframeReplies;
+		const bool subframe_reply = reply->second == (kPrefix | 0xFF00u);
+#else
+		const bool subframe_reply = false;
 #endif
 		__DSPHandler(0, NULL);
+#if defined(PORT_GAME_SMG)
+		if (subframe_reply)
+			++s_subframeReplies;
+#endif
 		OSRestoreInterrupts(level);
 		{
 			SMS_PORT_HEAP_SCOPE();
@@ -281,15 +334,43 @@ int mixer_thread(int, const char** argv)
 	return 0;
 }
 
+#if defined(SMG_AUDIO_ASYNC_TEST)
+BOOL host_OSCreateThread(TestThread* thread, void* (*entry)(void*), void* arg,
+                         void*, u32, s32, u16)
+{
+	thread->thread = new std::thread([thread, entry, arg] {
+		entry(arg);
+		thread->started = false;
+	});
+	thread->started = true;
+	return 1;
+}
+
+long host_OSResumeThread(TestThread*) { return 0; }
+
+int host_OSJoinThread(TestThread* thread, void**)
+{
+	if (thread->thread && thread->thread->joinable())
+		thread->thread->join();
+	delete thread->thread;
+	thread->thread = nullptr;
+	thread->started = false;
+	return 1;
+}
+#endif
+
 bool start_async()
 {
 	if (s_async.checked)
 		return s_async.active;
 	s_async.checked = true;
+#if !defined(SMG_AUDIO_ASYNC_TEST)
 	if (sms_wiiu_sd_marker("syncmix")) {
 		port_log("[audio] DSP HLE mode: synchronous (SD marker syncmix)\n");
 		return false;
 	}
+#endif
+	#ifdef TARGET_WIIU
 	std::memset(&s_async, 0, sizeof(s_async));
 	s_async.checked = true;
 	wut_OSInitMessageQueue(&s_async.commandQueue, s_async.commandSlots, kCommandQueueCount);
@@ -317,6 +398,21 @@ bool start_async()
 	}
 	s_async.mixerStarted = true;
 	wut_OSResumeThread(&s_async.mixerThread);
+	#else
+	s_async.checked = true;
+	s_async.replyThread.thread = nullptr;
+	s_async.replyThread.started = false;
+	s_async.mixerThread.thread = new std::thread([] {
+		mixer_thread(0, reinterpret_cast<const char**>(&s_async));
+	});
+	s_async.mixerThread.started = true;
+	if (!host_OSCreateThread(&s_async.replyThread, reply_thread, nullptr, nullptr,
+	                         0, 0, 0))
+		return false;
+	s_async.replyStarted = true;
+	s_async.mixerStarted = true;
+	s_async.active = true;
+	#endif
 	port_log("[audio] DSP HLE mode: asynchronous (mixer core 0, replies core 1)\n");
 	return true;
 }
@@ -329,13 +425,25 @@ void stop_async()
 	 * mails produced by the mixer. */
 	send_ptr(&s_async.commandQueue, nullptr);
 	if (s_async.mixerStarted) {
+#ifdef TARGET_WIIU
 		wut_OSJoinThread(&s_async.mixerThread, nullptr);
+#else
+		if (s_async.mixerThread.thread && s_async.mixerThread.thread->joinable())
+			s_async.mixerThread.thread->join();
+		delete s_async.mixerThread.thread;
+		s_async.mixerThread.thread = nullptr;
+		s_async.mixerThread.started = false;
+#endif
 		s_async.mixerStarted = false;
 	}
 	s_async.active = false;
 	if (s_async.replyStarted) {
 		send_ptr(&s_async.replyQueue, nullptr);
+#ifdef TARGET_WIIU
 		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
+#else
+		host_OSJoinThread(&s_async.replyThread, nullptr);
+#endif
 		s_async.replyStarted = false;
 	}
 	port_log("[audio] DSP HLE asynchronous threads stopped\n");
@@ -350,7 +458,7 @@ void execute(bool fromWorker = false);
 // context at the next check point (the sender still has interrupts off).
 void raise_irq(u32 first, u32 second)
 {
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	if (s_async.active) {
 		++s_dbgReplies;
 		queue_reply(first, second);
@@ -361,10 +469,15 @@ void raise_irq(u32 first, u32 second)
 		post(first);
 		post(second);
 #if defined(PORT_GAME_SMG)
-		if (second == (kPrefix | 0xFF00u))
-			++s_subframeReplies;
+		const bool subframe_reply = second == (kPrefix | 0xFF00u);
+#else
+		const bool subframe_reply = false;
 #endif
 		__DSPHandler(0, NULL);
+#if defined(PORT_GAME_SMG)
+		if (subframe_reply)
+			++s_subframeReplies;
+#endif
 	});
 }
 
@@ -422,7 +535,7 @@ void render_subframe()
 #if defined(PORT_GAME_SMG)
 	++s_subframeRenders;
 #endif
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	if (s_async.active) {
 		s_async.subframesRendered++;
 		if (g.sub >= g.subframes) {
@@ -436,7 +549,7 @@ void render_subframe()
 
 void execute(bool fromWorker)
 {
-	#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	if (s_async.active && !fromWorker) {
 		SMS_PORT_HEAP_SCOPE();
 		Command* command = new Command;
@@ -464,7 +577,7 @@ void execute(bool fromWorker)
 	#endif
 	u32 op = w[0] >> 24;
 	if (
-#ifdef TARGET_WIIU
+	#if defined(SMG_DSP_ASYNC)
 		release
 #else
 		g.release
@@ -473,20 +586,18 @@ void execute(bool fromWorker)
 		// DSPReleaseHalt: the 64-bit active-voice map. The microcode renders
 		// the next subframe of the current frame and reports 0xFF00.
 #if defined(PORT_GAME_SMG)
-		/* smg-audio: D2. Galaxy releases the voices sixteen at a time
+	/* smg-audio: D2. Galaxy releases the voices sixteen at a time
 		 * (JASDSPChannel::updateAll), one DSPReleaseHalt2(group) word each:
 		 * group << 16 | the group's 16-voice map. The subframe is rendered and
 		 * reported once, after group 3; groups 0-2 get no reply. */
 		if (w.empty() || ((w[0] >> 16) & 0xFF) != 3)
 			return;
+		++s_subframeMails;
 #endif
 		if (g.outA && g.sub < g.subframes) {
-#if defined(PORT_GAME_SMG)
-			++s_subframeMails;
-#endif
 			render_subframe();
 		}
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 		else
 			++s_dbgReleaseIdle;
 #endif
@@ -518,7 +629,7 @@ void execute(bool fromWorker)
 			g.subSamples = g.subframes ? frame / g.subframes : 0;
 			g.sub        = 0;
 			++s_syncFrames;
-#ifdef TARGET_WIIU
+		#if defined(SMG_DSP_ASYNC)
 			if (s_async.active)
 				s_async.framePending = g.subframes != 0;
 #endif
@@ -563,7 +674,7 @@ extern "C" void port_audio_dsp_boot(DSPTaskInfo* task)
 	// Task start: the microcode mails 0xDCD10000 (the handler then runs the
 	// task's init_cb, DspHandShake, which waits for one more mail).
 	(void)task;
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	start_async();
 #endif
 	raise_irq(0xDCD10000u, kPrefix);
@@ -623,7 +734,7 @@ extern "C" void port_audio_dsp_assert_int(void)
 
 extern "C" u64 port_audio_dsp_subframes(void)
 {
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	if (s_async.active)
 		return s_async.subframesRendered;
 #endif
@@ -640,6 +751,25 @@ extern "C" void port_audio_dsp_subframe_stats(uint32_t* mails, uint32_t* renders
 		*renders = s_subframeRenders;
 	if (replies)
 		*replies = s_subframeReplies;
+}
+
+extern "C" void port_audio_dsp_subframe_stats_ex(uint32_t* releases,
+                                                   uint32_t* renders,
+                                                   uint32_t* replies,
+                                                   uint32_t* release_idle)
+{
+	if (releases)
+		*releases = s_subframeMails;
+	if (renders)
+		*renders = s_subframeRenders;
+	if (replies)
+		*replies = s_subframeReplies;
+	if (release_idle)
+#if defined(SMG_DSP_ASYNC)
+		*release_idle = s_dbgReleaseIdle;
+#else
+		*release_idle = 0;
+#endif
 }
 #endif
 
@@ -701,7 +831,7 @@ extern "C" u32 port_audio_dsp_frames_started(void)
 
 extern "C" int port_audio_dsp_frame_pending(void)
 {
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 	if (s_async.active) {
 		const int pending = s_async.framePending != 0;
 		__sync_synchronize();  // reads of the frame's samples come after the flag
@@ -711,7 +841,7 @@ extern "C" int port_audio_dsp_frame_pending(void)
 	return g.outA && g.sub < g.subframes;
 }
 
-#ifdef TARGET_WIIU
+#if defined(SMG_DSP_ASYNC)
 extern "C" void port_audio_dsp_shutdown(void) { stop_async(); }
 #endif
 

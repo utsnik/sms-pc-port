@@ -160,6 +160,7 @@ def main() -> int:
         "OSGetMEM1ArenaHi",
         "OSGetMEM2ArenaLo",
         "OSGetMEM2ArenaHi",
+        "OSSetMEM2ArenaLo",
         "OSSetMEM2ArenaHi",
         "OSGetArenaLo",
         "OSGetArenaHi",

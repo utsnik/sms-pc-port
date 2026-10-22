@@ -19,7 +19,8 @@ static u32 __AR_init_flag;
 
 static u32 __ARH_MemoryTop = 0x90000000;
 
-extern void smg_wiiu_bind_varam_base(u32) __attribute__((weak));
+extern void smg_wiiu_bind_varam_base(u32, u32) __attribute__((weak));
+extern void port_log(const char*, ...) __attribute__((weak));
 
 void ARStartDMA(u32 type, u32 ram_addr, u32 aram_addr, u32 len) {
     OSDisableScheduler();
@@ -72,11 +73,12 @@ u32 ARInit(u32*, u32) {
 
     __ARH_MemoryTop = (u32)memLo + ARGetBaseAddress();
     __ARH_BaseAdr = (u32)memLo;
-    if (smg_wiiu_bind_varam_base)
-        smg_wiiu_bind_varam_base(__ARH_BaseAdr);
-    OSReport("ARInit : Dummy ARAM enabled (RVL), area %p -> %p (size 0x%x)\n", memLo, memHi, diff);
     __AR_Size = diff;
     __AR_InternalSize = diff;
+    if (smg_wiiu_bind_varam_base)
+        smg_wiiu_bind_varam_base(__ARH_BaseAdr, __AR_Size);
+    if (port_log)
+        port_log("[smg-audio] ARAM base=0x%08x size=0x%08x", __ARH_BaseAdr, __AR_Size);
     return 0x4000;
 }
 

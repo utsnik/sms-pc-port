@@ -40,6 +40,8 @@ uint8_t* s_mem1_arena_lo;
 uint8_t* s_mem1_arena_hi;
 uint8_t* s_mem2_arena_start;
 uint8_t* s_mem2_arena_end;
+uint8_t* s_mem2_arena_lo;
+uint8_t* s_mem2_arena_hi;
 #endif
 int s_current_heap = -1;
 const uint32_t kHeapCount = 16;
@@ -89,7 +91,7 @@ void ensure_mem1_arena()
 
 void set_mem2_arena_hi(void* p)
 {
-	smg_wiiu::set_hi(s_arena_lo, s_arena_hi, s_mem2_arena_start,
+	smg_wiiu::set_hi(s_mem2_arena_lo, s_mem2_arena_hi, s_mem2_arena_start,
 	                 s_mem2_arena_end, p);
 }
 #endif
@@ -117,11 +119,11 @@ void port_os_init(void)
 	s_mem1_arena_hi = align_down(port_mem1_base + port_mem1_size, 32);
 	s_mem2_arena_start = align_up(sms_wiiu_mem2_base + smg_wiiu::kMem2ArenaOffset, 32);
 	s_mem2_arena_end = align_down(sms_wiiu_mem2_base + sms_wiiu_mem2_size, 32);
-	/* Keep the live OS cursor above the VARAM window.  Galaxy's ARInit and
-	 * low-memory allocations both read this cursor; a private reservation
-	 * cursor lets the root heap overlap ARAM. */
-	s_arena_lo = s_mem2_arena_start + smg_wiiu::kAramWindowBytes;
-	s_arena_hi = s_mem2_arena_end;
+	/* Wii OSGetArena* is the MEM1 cursor. MEM2 starts at its own arena mark;
+	 * HeapMemoryWatcher reserves the alt-ARAM window when it creates the GDDR3
+	 * root heap. Do not hide that window here as a second reservation. */
+	s_mem2_arena_lo = s_mem2_arena_start;
+	s_mem2_arena_hi = s_mem2_arena_end;
 #else
 	s_arena_lo = align_up(sms_wiiu_mem2_base + 0x4000, 32);
 	s_arena_hi = align_down(sms_wiiu_mem2_base + sms_wiiu_mem2_size, 32);
@@ -129,19 +131,37 @@ void port_os_init(void)
 	std::memset(s_heaps, 0, sizeof(s_heaps));
 	std::memset(sms_wiiu_mem2_base, 0, 0x4000);
 	*reinterpret_cast<uint32_t*>(sms_wiiu_mem2_base + 0x28) = port_mem1_size;
+#if defined(PORT_GAME_SMG)
+	port_log("[os] MEM1 arena=%p..%p; MEM2 arena=%p..%p\n",
+	         s_mem1_arena_lo, s_mem1_arena_hi, s_mem2_arena_lo, s_mem2_arena_hi);
+#else
 	port_log("[os] MEM2 arena=%p..%p; MEM1 reported=%u bytes\n", s_arena_lo,
 	         s_arena_hi, port_mem1_size);
+#endif
 }
 
 void OSInit(void) {}
-void* OSGetArenaLo(void) { return s_arena_lo; }
-void* OSGetArenaHi(void) { return s_arena_hi; }
+void* OSGetArenaLo(void)
+{
+#if defined(PORT_GAME_SMG)
+	return s_mem1_arena_lo;
+#else
+	return s_arena_lo;
+#endif
+}
+void* OSGetArenaHi(void)
+{
+#if defined(PORT_GAME_SMG)
+	return s_mem1_arena_hi;
+#else
+	return s_arena_hi;
+#endif
+}
 void OSSetArenaLo(void* p)
 {
 #if defined(PORT_GAME_SMG)
-	smg_wiiu::set_lo(s_arena_lo, s_arena_hi,
-	                 s_mem2_arena_start + smg_wiiu::kAramWindowBytes,
-	                 s_mem2_arena_end, p);
+	smg_wiiu::set_lo(s_mem1_arena_lo, s_mem1_arena_hi,
+	                 s_mem1_arena_lo, s_mem1_arena_hi, p);
 #else
 	s_arena_lo = reinterpret_cast<uint8_t*>(p);
 #endif
@@ -149,7 +169,8 @@ void OSSetArenaLo(void* p)
 void OSSetArenaHi(void* p)
 {
 #if defined(PORT_GAME_SMG)
-	set_mem2_arena_hi(p);
+	smg_wiiu::set_hi(s_mem1_arena_lo, s_mem1_arena_hi,
+	                 s_mem1_arena_lo, s_mem1_arena_hi, p);
 #else
 	s_arena_hi = reinterpret_cast<uint8_t*>(p);
 #endif
@@ -169,9 +190,14 @@ void* OSGetMEM1ArenaHi(void)
 void* OSGetMEM2ArenaLo(void)
 {
 	retain_arena_api();
-	return s_arena_lo;
+	return s_mem2_arena_lo;
 }
-void* OSGetMEM2ArenaHi(void) { return s_arena_hi; }
+void* OSGetMEM2ArenaHi(void) { return s_mem2_arena_hi; }
+void OSSetMEM2ArenaLo(void* p)
+{
+	smg_wiiu::set_lo(s_mem2_arena_lo, s_mem2_arena_hi,
+	                 s_mem2_arena_start, s_mem2_arena_end, p);
+}
 void OSSetMEM2ArenaHi(void* p) { set_mem2_arena_hi(p); }
 
 void* OSAllocFromMEM1ArenaLo(u32 size, u32 align)
@@ -191,9 +217,8 @@ void* OSAllocFromMEM1ArenaLo(u32 size, u32 align)
 void* OSAllocFromArenaLo(u32 size, u32 align)
 {
 #if defined(PORT_GAME_SMG)
-	void* result = smg_wiiu::alloc_lo(s_arena_lo, s_arena_hi,
-	                                  s_mem2_arena_start + smg_wiiu::kAramWindowBytes,
-	                                  s_mem2_arena_end, size,
+	void* result = smg_wiiu::alloc_lo(s_mem1_arena_lo, s_mem1_arena_hi,
+	                                  s_mem1_arena_lo, s_mem1_arena_hi, size,
 	                                  align);
 	if (!result) {
 		port_log("[os] arena-low overflow: %u bytes\n", size);
@@ -216,9 +241,8 @@ void* OSAllocFromArenaLo(u32 size, u32 align)
 void* OSAllocFromArenaHi(u32 size, u32 align)
 {
 #if defined(PORT_GAME_SMG)
-	void* result = smg_wiiu::alloc_hi(s_arena_lo, s_arena_hi,
-	                                  s_mem2_arena_start + smg_wiiu::kAramWindowBytes,
-	                                  size, align);
+	void* result = smg_wiiu::alloc_hi(s_mem1_arena_lo, s_mem1_arena_hi,
+	                                  s_mem1_arena_lo, size, align);
 	if (!result) {
 		port_log("[os] arena-high overflow: %u bytes\n", size);
 		return nullptr;
@@ -423,12 +447,12 @@ __attribute__((noinline)) void retain_arena_api()
 	volatile ArenaGetter getters[] = {
 		OSGetMEM1ArenaLo, OSGetMEM1ArenaHi, OSGetMEM2ArenaLo, OSGetMEM2ArenaHi,
 	};
-	volatile ArenaSetter setter = OSSetMEM2ArenaHi;
+	volatile ArenaSetter setters[] = {OSSetMEM2ArenaLo, OSSetMEM2ArenaHi};
 	volatile ArenaAllocator allocators[] = {
 		OSAllocFromMEM1ArenaLo, OSAllocFromArenaLo, OSAllocFromArenaHi,
 	};
 	(void)getters;
-	(void)setter;
+	(void)setters;
 	(void)allocators;
 }
 

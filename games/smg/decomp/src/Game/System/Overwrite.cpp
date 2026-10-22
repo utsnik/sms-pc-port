@@ -1068,10 +1068,10 @@ void JKRAramPiece::startDMA(JKRAMCommand* pCommand) {
     /* smg-audio: Wii U pointers are in the target's MEM1/MEM2 arenas, not
      * the GameCube 0x80000000 address space. aralt uses (type, src, dst):
      * direction 0 has main RAM in src; direction 1 has it in dst. */
-    const bool valid = smg_wiiu::aram_dma_command_valid(
+    const bool started = smg_wiiu::aram_dma_start(
         pCommand->mTransferDirection, pCommand->mSrc, pCommand->mDst,
-        pCommand->mDataLength);
-    if (!valid) {
+        pCommand->mDataLength, ARGetSize(), ARStartDMA);
+    if (!started) {
         static bool logged;
         if (!logged) {
             logged = true;
@@ -1082,6 +1082,8 @@ void JKRAramPiece::startDMA(JKRAMCommand* pCommand) {
         doneDMA(reinterpret_cast<u32>(pCommand));
         return;
     }
+    doneDMA(reinterpret_cast< u32 >(pCommand));
+    return;
 #else
     if (pCommand->mSrc < 0x80000000) {
         doneDMA(reinterpret_cast< u32 >(pCommand));

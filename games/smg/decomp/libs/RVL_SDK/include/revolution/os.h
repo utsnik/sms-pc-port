@@ -83,6 +83,7 @@ void OSSetArenaHi(void*);
 void OSSetArenaLo(void*);
 
 void OSSetMEM2ArenaHi(void*);
+void OSSetMEM2ArenaLo(void*);
 
 void* OSGetMEM1ArenaLo(void);
 void* OSGetMEM1ArenaHi(void);

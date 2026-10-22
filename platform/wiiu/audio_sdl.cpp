@@ -279,13 +279,22 @@ static int open_ax_core2(int rate)
 
 extern "C" void sms_wiiu_sdl_audio_preopen(int rate)
 {
+#if defined(PORT_GAME_SMG)
+	if (s_axPreopened || sms_wiiu_sd_marker("noaudio") ||
+	    sms_wiiu_sd_marker("sdlaudio"))
+		return;
+	s_axPreopened = true;
+	s_axPreopenResult = sms_wiiu_sd_marker("axonc1") ? open_ax(rate) : open_ax_core2(rate);
+#else
 	if (s_axPreopened || sms_wiiu_sd_marker("axonc1") || sms_wiiu_sd_marker("noaudio") ||
 	    sms_wiiu_sd_marker("sdlaudio"))
 		return;
 	s_axPreopened = true;
 	s_axPreopenResult = open_ax_core2(rate);
+#endif
 }
 
+#if defined(PORT_GAME_SMG)
 extern "C" const char* sms_wiiu_sdl_audio_output(void)
 {
 	if (s_output == OUTPUT_AX)
@@ -294,9 +303,14 @@ extern "C" const char* sms_wiiu_sdl_audio_output(void)
 		return "SDL";
 	return "none";
 }
+#endif
 
 extern "C" int sms_wiiu_sdl_audio_open(int rate)
 {
+#if defined(PORT_GAME_SMG)
+	if (s_axPreopened && !sms_wiiu_sd_marker("sdlaudio"))
+		return s_axPreopenResult;
+#endif
 	if (!sms_wiiu_sd_marker("sdlaudio")) {
 		if (sms_wiiu_sd_marker("axonc1")) {
 			int result = open_ax(rate);

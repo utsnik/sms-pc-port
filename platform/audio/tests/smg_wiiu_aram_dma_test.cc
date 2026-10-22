@@ -37,16 +37,6 @@ static void ARStartDMA_recording(uint32_t direction, uint32_t ram, uint32_t aram
 	g_record.length = length;
 }
 
-static void startDMA(JKRAMCommand* command)
-{
-	if (!smg_wiiu::aram_dma_command_valid(command->direction, command->src,
-	                                     command->dst, command->length))
-		return;
-	const uint32_t ram = command->direction == 0 ? command->src : command->dst;
-	const uint32_t aram = command->direction == 0 ? command->dst : command->src;
-	ARStartDMA_recording(command->direction, ram, aram, command->length);
-}
-
 static int check(bool condition, const char* message)
 {
 	if (condition)
@@ -63,29 +53,41 @@ int main()
 	sms_wiiu_mem2_size = 0x2000;
 
 	JKRAMCommand ram_to_aram = {0, 0x100, 0x10000100u, 0x00002000u};
-	startDMA(&ram_to_aram);
+	smg_wiiu::aram_dma_start(ram_to_aram.direction, ram_to_aram.src,
+	                         ram_to_aram.dst, ram_to_aram.length,
+	                         0x00E00000u, ARStartDMA_recording);
 	if (check(g_record.count == 1, "MEM1 RAM-to-ARAM command was dropped"))
 		return 1;
 	if (check(g_record.direction == 0 && g_record.ram == ram_to_aram.src &&
-	              g_record.aram == ram_to_aram.dst && g_record.length == ram_to_aram.length,
+		              g_record.aram == ram_to_aram.dst && g_record.length == ram_to_aram.length,
 	          "RAM-to-ARAM ARStartDMA arguments were changed"))
 		return 1;
 
 	JKRAMCommand aram_to_ram = {1, 0x80, 0x00003000u, 0x20001f80u};
-	startDMA(&aram_to_ram);
+	smg_wiiu::aram_dma_start(aram_to_ram.direction, aram_to_ram.src,
+	                         aram_to_ram.dst, aram_to_ram.length,
+	                         0x00E00000u, ARStartDMA_recording);
 	if (check(g_record.count == 2 && g_record.direction == 1 &&
-              g_record.ram == aram_to_ram.dst && g_record.aram == aram_to_ram.src,
-	          "ARAM-to-MEM2 ARStartDMA arguments were changed"))
+              g_record.ram == aram_to_ram.src && g_record.aram == aram_to_ram.dst,
+          "ARAM-to-MEM2 ARStartDMA must receive the shipped src,dst order"))
 		return 1;
 
 	JKRAMCommand crosses_mem1 = {0, 0x100, 0x10000f80u, 0x00004000u};
 	JKRAMCommand crosses_mem2 = {1, 0x100, 0x00004000u, 0x20001f80u};
 	JKRAMCommand old_gamecube_address = {0, 0x20, 0x80000000u, 0x00004000u};
 	JKRAMCommand crosses_aram = {0, 0x100, 0x20000ff0u, 0x03ffff80u};
-	startDMA(&crosses_mem1);
-	startDMA(&crosses_mem2);
-	startDMA(&old_gamecube_address);
-	startDMA(&crosses_aram);
+	smg_wiiu::aram_dma_start(crosses_mem1.direction, crosses_mem1.src,
+	                         crosses_mem1.dst, crosses_mem1.length,
+	                         0x00E00000u, ARStartDMA_recording);
+	smg_wiiu::aram_dma_start(crosses_mem2.direction, crosses_mem2.src,
+	                         crosses_mem2.dst, crosses_mem2.length,
+	                         0x00E00000u, ARStartDMA_recording);
+	smg_wiiu::aram_dma_start(old_gamecube_address.direction, old_gamecube_address.src,
+	                         old_gamecube_address.dst, old_gamecube_address.length,
+	                         0x00E00000u, ARStartDMA_recording);
+	smg_wiiu::aram_dma_start(crosses_aram.direction, crosses_aram.src,
+	                         crosses_aram.dst, crosses_aram.length,
+	                         0x00E00000u, ARStartDMA_recording);
 	if (check(g_record.count == 2, "an out-of-range DMA command reached ARStartDMA"))
 		return 1;
 
