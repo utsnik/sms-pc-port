@@ -1875,8 +1875,12 @@ static bool initVertexProgram(VertexProgram& shader) {
     }
     // Control flow first, ALU code after it: the CF stream must end in the
     // END_OF_PROGRAM export, or execution runs on into the ALU words.
+    // The first export keeps its barrier: it reads GPRs the ALU clauses just
+    // wrote, and without one Latte may start it before they retire (Cemu runs
+    // CF in order, so only hardware shows the stale positions).  Later exports
+    // follow it and need none, as in initTevVertex.
     std::vector<uint64_t> exports;
-    exports.push_back(EXP_DONE(POS0, _R(20), _x, _y, _z, _w) NO_BARRIER);
+    exports.push_back(EXP_DONE(POS0, _R(20), _x, _y, _z, _w));
     if (key.outputMode) {
         for (uint32_t i = 0; i < 4; ++i)
             exports.push_back(EXP(PARAM(i), _R(21 + i), _x, _y, _z, _w) NO_BARRIER);
