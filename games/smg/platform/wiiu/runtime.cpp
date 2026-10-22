@@ -183,6 +183,13 @@ void smg_wiiu_runtime_init(void)
     port_log("SMG Wii U: stage2 runtime initialized; static arenas");
 }
 
+/* Wii system language (SC_LANG_*). The Stage 1 stub returned 0, which is
+ * SC_LANG_JAPANESE: MR::getDecidedLanguageFromIPL() then picked JpJapanese on
+ * the PAL disc (row RMGP), whose data has only the Eu* language trees, so every
+ * language-dependent path (makeFileNameConsideringLanguage) was missing.
+ * English is the PAL default; mapping the Wii U system language is later work. */
+u8 SCGetLanguage(void) { return 1; /* SC_LANG_ENGLISH */ }
+
 void port_log(const char* fmt, ...)
 {
     char line[1024];

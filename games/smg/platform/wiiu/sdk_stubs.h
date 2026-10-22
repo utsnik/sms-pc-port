@@ -25,7 +25,6 @@
   X(SCGetSoundMode) \
   X(SCGetAspectRatio) \
   X(SCGetProgressiveMode) \
-  X(SCGetLanguage) \
   X(SCGetEuRgb60Mode) \
   X(RFLSearchOfficialData) \
   X(RFLGetAdditionalInfo) \

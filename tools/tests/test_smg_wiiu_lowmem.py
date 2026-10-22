@@ -126,6 +126,8 @@ def main() -> int:
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--no-docker", action="store_true")
     parser.add_argument("--allow", action="append", default=[])
+    parser.add_argument("--require-english-language", action="store_true",
+                        help="SCGetLanguage must report SC_LANG_ENGLISH (PAL disc has only Eu* trees)")
     parser.add_argument("--require-wiiu-ram-tests", action="store_true",
                         help="bound-pointer tests must use the Wii U RAM base (0x10000000)")
     args = parser.parse_args()
@@ -151,6 +153,13 @@ def main() -> int:
             if not re.search(r"\blis\s+r\d+,4095\b", body):
                 print(f"lowmem: FAIL: {func} still tests pointers against the Wii base 0x80000000")
                 return 1
+    if args.require_english_language:
+        # Galaxy's language = cSCLanguage2GameLanguageTable[disc row][SCGetLanguage()];
+        # 0 (the Stage 1 stub) is SC_LANG_JAPANESE -> JpJapanese, absent on RMGP01.
+        body = function_body(disassembly, "SCGetLanguage")
+        if body is None or not re.search(r"\bli\s+r3,1\n", body):
+            print("lowmem: FAIL: SCGetLanguage does not return SC_LANG_ENGLISH (1)")
+            return 1
     hits = [h for h in scan(disassembly)
             if not any(lo <= h[3] < hi for lo, hi in rpl)]
     bad = [h for h in hits if not any(a in h[0] for a in args.allow)]
