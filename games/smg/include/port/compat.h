@@ -24,6 +24,22 @@
 #include <stdarg.h>
 #include <float.h>
 #include <wchar.h>
+#if defined(__WIIU__) && !defined(PORT_PLATFORM_CODE)
+// libstdc++'s <cstdio> #undefs the rename macros below, so on Wii U they never
+// reached the game: bind the C names to the MSL shim at the symbol level
+// (games/smg/platform/wiiu/msl_printf.cpp).  These first declarations carry
+// the asm label into <stdio.h>'s and <cstdio>'s later ones.
+#ifdef __cplusplus
+extern "C" {
+#endif
+int sprintf(char*, const char*, ...) __asm__("port_sprintf");
+int snprintf(char*, size_t, const char*, ...) __asm__("port_snprintf");
+int vsprintf(char*, const char*, va_list) __asm__("port_vsprintf");
+int vsnprintf(char*, size_t, const char*, va_list) __asm__("port_vsnprintf");
+#ifdef __cplusplus
+}
+#endif
+#endif
 // Declare the C library's printf family (including bionic's FORTIFY inline
 // wrappers) before the renames below, so the macros only affect game code.
 #include <stdio.h>

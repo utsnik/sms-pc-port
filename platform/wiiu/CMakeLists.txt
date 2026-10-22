@@ -99,10 +99,16 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/dol_data.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gx_link_stub.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)
 
+  # The MSL printf shim calls newlib's snprintf: keep compat.h's printf
+  # bindings out of its own translation unit.
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
+    PROPERTIES COMPILE_DEFINITIONS PORT_PLATFORM_CODE=1)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S
     PROPERTIES COMPILE_OPTIONS "-Wa,-mgekko")

@@ -24,7 +24,11 @@ if(PORT_GAME STREQUAL "smg")
   set(SMG_GAME_FLAGS
     -w -fno-strict-aliasing -fwrapv -ffunction-sections -fdata-sections
     -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
-    -mcpu=750 -meabi -mhard-float -Wno-narrowing)
+    -mcpu=750 -meabi -mhard-float -Wno-narrowing
+    # MSL printf semantics (games/smg/platform/wiiu/msl_printf.cpp): keep GCC
+    # from folding e.g. sprintf(d, "%s", s) into strcpy behind the shim.
+    -fno-builtin-sprintf -fno-builtin-snprintf -fno-builtin-vsprintf
+    -fno-builtin-vsnprintf)
   include(${CMAKE_CURRENT_SOURCE_DIR}/games/smg/cmake/sources.cmake)
   message(STATUS "PORT_GAME=smg: selected Galaxy source manifest")
   message(STATUS "SMG targets: smg_game and smg")
