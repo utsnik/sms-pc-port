@@ -251,6 +251,9 @@ void markXfMemDirty();
 extern uint32_t g_xfDirtyLo, g_xfDirtyHi;
 uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
 uint32_t peekZ(int x, int y);      // 24-bit
+// Producer mode with the "peekeof" SD marker: peeks read the end-of-frame
+// snapshot and must not wait for the worker.
+bool peekEofNoWait();
 void pixMetricClear();
 uint32_t pixMetricRead();
 

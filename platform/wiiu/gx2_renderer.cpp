@@ -611,6 +611,7 @@ static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
 static bool s_gx2ProdEnabled;
 static bool s_gx2ProdMarker;
+static int s_peekEofMode;  // 0 off, 1 "peekeof", 2 "peekcmp" (see eofSnapshot)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
@@ -4648,6 +4649,14 @@ void rendererInit(float) {
             gx2prod::bind_service(gx2ProdCallList);
             setProducerMode(true);
             s_gx2ProdEnabled = true;
+            if (!runningUnderCemu()) {
+                // Cemu's copies never reach guest memory, so both stay console only.
+                if (sdMarkerPresent("peekcmp")) s_peekEofMode = 2;
+                else if (sdMarkerPresent("peekeof")) s_peekEofMode = 1;
+            }
+            if (s_peekEofMode)
+                WHBLogPrintf("SMS Wii U: [peekeof] %s", s_peekEofMode == 1 ? "peeks read end-of-frame snapshots (no worker wait)"
+                                                                           : "compare: prod6 peeks + end-of-frame snapshots");
             WHBLogPrintf("SMS Wii U: [gx2prod] worker started core=%u (default core 0; core 2 override=%s)",
                          s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "on" : "off");
         } else {
@@ -5634,13 +5643,199 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     return true;
 }
 
+// End-of-frame peek snapshots (producer mode, console only).  The only
+// per-frame peeks are Mario's occlusion probe (GXPeekARGB from
+// TMario::drawSyncCallback) and the sun glare (GXPeekZ from
+// TSunModel::getZBufValue); both already answer from a frame-old snapshot.
+// prod6 took that snapshot mid-frame after gx2prod::wait(kWaitPeek) drained the
+// worker, ~11 ms of core 1 per Plaza frame.  With "peekeof" a peek only reads
+// the last snapshot and asks for a new one, and renderer_end takes it after its
+// own present drain, where the worker is idle anyway.  With "peekcmp" the game
+// keeps prod6's answers (and wait) while the end-of-frame snapshot is read at
+// the same points, and [peekeof] lines count how often the two disagree.
+struct EofSnapshots {
+    GX2Surface colour, depthTiled, depthLinear;
+    bool allocated, failed, colourQueued, depthQueued, colourWanted, depthWanted;
+    uint64_t colourStamp, depthStamp;
+    uint32_t lastColour = 0x10000000;  // until the first snapshot: Mario visible
+};
+static EofSnapshots s_eof;
+extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
+                                                      uint32_t dstSlice);
+struct EofStats {
+    uint32_t cPeeks, cVisible, cOccluded, cMismatch, cNotReady;
+    uint32_t zPeeks, zFar, zMismatch, zFarMismatch, zNotReady, copies, logged;
+};
+static EofStats s_eofStats;
+
+bool peekEofNoWait() { return s_peekEofMode == 1; }
+
+static bool eofAllocate() {
+    if (s_eof.allocated) return true;
+    if (s_eof.failed) return false;
+    GX2ColorBuffer* cb = renderColour();
+    GX2DepthBuffer* db = renderDepth();
+    if (!cb || !db) return false;
+    GX2Surface& c = s_eof.colour;
+    memset(&c, 0, sizeof(c));
+    c.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    c.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    c.width = cb->surface.width;
+    c.height = cb->surface.height;
+    c.depth = 1;
+    c.mipLevels = 1;
+    c.format = cb->surface.format;
+    c.aa = GX2_AA_MODE1X;
+    c.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&c);
+    GX2Surface& t = s_eof.depthTiled;
+    memset(&t, 0, sizeof(t));
+    t.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    t.width = db->surface.width;
+    t.height = db->surface.height;
+    t.depth = 1;
+    t.mipLevels = 1;
+    t.format = GX2_SURFACE_FORMAT_FLOAT_R32;
+    t.aa = GX2_AA_MODE1X;
+    t.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    t.tileMode = GX2_TILE_MODE_DEFAULT;
+    s_eof.depthLinear = t;
+    s_eof.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&t);
+    GX2CalcSurfaceSizeAndAlignment(&s_eof.depthLinear);
+    c.image = alignedZero(c.alignment, c.imageSize);
+    t.image = c.image ? alignedZero(t.alignment, t.imageSize) : nullptr;
+    s_eof.depthLinear.image = t.image ? alignedZero(s_eof.depthLinear.alignment, s_eof.depthLinear.imageSize) : nullptr;
+    const unsigned bytes = unsigned(c.imageSize + t.imageSize + s_eof.depthLinear.imageSize);
+    if (!s_eof.depthLinear.image) {
+        if (t.image) MEMFreeToDefaultHeap(t.image);
+        if (c.image) MEMFreeToDefaultHeap(c.image);
+        s_eof.failed = true;
+        WHBLogPrintf("SMS Wii U: [peekeof] out of memory for %u bytes of snapshots; peeks answer visible/far", bytes);
+        return false;
+    }
+    DCFlushRange(c.image, c.imageSize);
+    DCFlushRange(t.image, t.imageSize);
+    DCFlushRange(s_eof.depthLinear.image, s_eof.depthLinear.imageSize);
+    s_eof.allocated = true;
+    WHBLogPrintf("SMS Wii U: [peekeof] snapshots allocated: %u bytes (colour %ux%u, depth %ux%u)", bytes,
+                 unsigned(c.width), unsigned(c.height), unsigned(t.width), unsigned(t.height));
+    return true;
+}
+
+static uint8_t* eofTexel(const GX2Surface& s, int x, int y) {
+    uint32_t px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
+    uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScale);
+    if (px >= s.width) px = s.width - 1;
+    if (py >= s.height) py = s.height - 1;
+    uint8_t* texel = static_cast<uint8_t*>(s.image) + (size_t(py) * s.pitch + px) * 4;
+    DCInvalidateRange(texel, 4);
+    return texel;
+}
+
+static bool eofReadColour(int x, int y, uint32_t* out) {
+    if (!s_eof.colourQueued || GX2GetRetiredTimeStamp() < s_eof.colourStamp) return false;
+    const uint8_t* t = eofTexel(s_eof.colour, x, y);
+    *out = uint32_t(t[3]) << 24 | uint32_t(t[0]) << 16 | uint32_t(t[1]) << 8 | t[2];
+    return true;
+}
+
+static bool eofReadDepth(int x, int y, uint32_t* out) {
+    if (!s_eof.depthQueued || GX2GetRetiredTimeStamp() < s_eof.depthStamp) return false;
+    float d;
+    memcpy(&d, eofTexel(s_eof.depthLinear, x, y), 4);
+    if (!(d >= 0.0f)) d = 0.0f;  // NaN
+    *out = d >= 1.0f ? 0xffffff : uint32_t(d * 16777215.0f);
+    return true;
+}
+
+static void eofLogMismatch(const char* what, int x, int y, uint32_t prod6, uint32_t eof) {
+    if (s_eofStats.logged >= 40) return;
+    ++s_eofStats.logged;
+    WHBLogPrintf("SMS Wii U: [peekeof] mismatch %s frame=%u (%d,%d) prod6=%08x eof=%08x", what, (unsigned)g_displayFrames,
+                 x, y, (unsigned)prod6, (unsigned)eof);
+}
+
+// renderer_end, producer mode, after the present drain and service(): the
+// worker is idle, so core 1 may copy and touch the renderer's caches exactly
+// like prod6's mid-frame peek did after its own drain.
+static void eofSnapshot() {
+    const bool wantColour = s_eof.colourWanted, wantDepth = s_eof.depthWanted;
+    s_eof.colourWanted = s_eof.depthWanted = false;
+    if ((!wantColour && !wantDepth) || !ProcUIInForeground() || !eofAllocate()) return;
+    GX2ColorBuffer* cb = renderColour();
+    GX2DepthBuffer* db = renderDepth();
+    bool colour = false, depth = false;
+    if (wantColour && cb && cb->surface.width == s_eof.colour.width && cb->surface.height == s_eof.colour.height &&
+        cb->surface.format == s_eof.colour.format && cb->surface.aa == GX2_AA_MODE1X) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+        GX2CopySurface(&cb->surface, 0, 0, &s_eof.colour, 0, 0); invalidateVertexUniforms();
+        colour = true;
+    }
+    if (wantDepth && db && db->surface.width == s_eof.depthTiled.width && db->surface.height == s_eof.depthTiled.height &&
+        db->surface.format == GX2_SURFACE_FORMAT_FLOAT_R32 && db->surface.aa == GX2_AA_MODE1X) {
+        GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
+        GX2ConvertDepthBufferToTextureSurface(db, &s_eof.depthTiled, 0, 0); invalidateVertexUniforms();
+        GX2CopySurface(&s_eof.depthTiled, 0, 0, &s_eof.depthLinear, 0, 0); invalidateVertexUniforms();
+        depth = true;
+    }
+    if (!colour && !depth) return;
+    rebindTvTarget();
+    GX2Flush();
+    const uint64_t stamp = GX2GetLastSubmittedTimeStamp();
+    if (colour) { s_eof.colourStamp = stamp; s_eof.colourQueued = true; }
+    if (depth) { s_eof.depthStamp = stamp; s_eof.depthQueued = true; }
+    ++s_eofStats.copies;
+}
+
+static void eofReport() {
+    if (!s_peekEofMode) return;
+    const EofStats& e = s_eofStats;
+    WHBLogPrintf("SMS Wii U: [peekeof] frame=%u mode=%d snaps=%u cPeeks=%u cVisible=%u cOccluded=%u cMismatch=%u cNotReady=%u "
+                 "zPeeks=%u zFar=%u zMismatch=%u zFarMismatch=%u zNotReady=%u",
+                 (unsigned)g_displayFrames, s_peekEofMode, (unsigned)e.copies, (unsigned)e.cPeeks, (unsigned)e.cVisible,
+                 (unsigned)e.cOccluded, (unsigned)e.cMismatch, (unsigned)e.cNotReady, (unsigned)e.zPeeks, (unsigned)e.zFar,
+                 (unsigned)e.zMismatch, (unsigned)e.zFarMismatch, (unsigned)e.zNotReady);
+    const uint32_t logged = e.logged;
+    s_eofStats = EofStats{};
+    s_eofStats.logged = logged;
+}
+
+static void eofCountColour(uint32_t c) {
+    if ((c & 0xff000000) == 0x10000000) ++s_eofStats.cVisible;
+    else ++s_eofStats.cOccluded;
+}
+
 uint32_t peekColor(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
+    if (s_peekEofMode == 1) {
+        ProdPeekScope prodPeek(true);
+        ++s_perfPeeks;
+        if (x < 0 || y < 0) return 0;
+        s_eof.colourWanted = true;
+        ++s_eofStats.cPeeks;
+        uint32_t c;
+        if (eofReadColour(x, y, &c)) s_eof.lastColour = c;
+        else { ++s_eofStats.cNotReady; c = s_eof.lastColour; }
+        eofCountColour(c);
+        return c;
+    }
     if (!s_gx2ProdEnabled) flushBatch();
     if (x < 0 || y < 0) return 0;
     const int point[1][2] = {{x, y}};
     uint32_t c = 0;
     if (!readTvPixels(point, 1, &c)) return 0;
+    if (s_peekEofMode == 2) {
+        s_eof.colourWanted = true;
+        ++s_eofStats.cPeeks;
+        eofCountColour(c);
+        uint32_t e;
+        if (!eofReadColour(x, y, &e)) ++s_eofStats.cNotReady;
+        else if (((c & 0xff000000) == 0x10000000) != ((e & 0xff000000) == 0x10000000)) {
+            ++s_eofStats.cMismatch;
+            eofLogMismatch("colour", x, y, c, e);
+        }
+    }
 #if SMS_GX2_DEBUG_PIXEL_TRACE
     static uint32_t n;
     if (n++ < 20 || (g_displayFrames % 50) == 0)
@@ -5677,8 +5872,7 @@ static void debugPixelTrace(uint32_t draw) {
 // stays the old far-plane answer.
 extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
                                                       uint32_t dstSlice);
-uint32_t peekZ(int x, int y) {
-    SMS_PORT_HEAP_SCOPE();
+static uint32_t peekZProd6(int x, int y) {
     ProdPeekScope prodPeek(s_gx2ProdEnabled);
     static int s_enabled = -1;
     if (s_enabled < 0) {
@@ -5756,6 +5950,37 @@ uint32_t peekZ(int x, int y) {
     memcpy(&d, texel, 4);
     if (!(d >= 0.0f)) d = 0.0f;  // NaN
     return d >= 1.0f ? 0xffffff : uint32_t(d * 16777215.0f);
+}
+uint32_t peekZ(int x, int y) {
+    SMS_PORT_HEAP_SCOPE();
+    if (s_peekEofMode == 1) {
+        ProdPeekScope prodPeek(true);
+        static int s_noPeekZ = -1;
+        if (s_noPeekZ < 0) s_noPeekZ = sdMarkerPresent("nopeekz") ? 1 : 0;
+        if (x < 0 || y < 0 || s_noPeekZ) return 0xffffff;
+        s_eof.depthWanted = true;
+        ++s_eofStats.zPeeks;
+        uint32_t z;
+        if (!eofReadDepth(x, y, &z)) { ++s_eofStats.zNotReady; return 0xffffff; }
+        if (z == 0xffffff) ++s_eofStats.zFar;
+        return z;
+    }
+    const uint32_t z = peekZProd6(x, y);
+    if (s_peekEofMode == 2 && x >= 0 && y >= 0) {
+        s_eof.depthWanted = true;
+        ++s_eofStats.zPeeks;
+        if (z == 0xffffff) ++s_eofStats.zFar;
+        uint32_t e;
+        if (!eofReadDepth(x, y, &e)) ++s_eofStats.zNotReady;
+        else if (e != z) {
+            ++s_eofStats.zMismatch;
+            if ((e == 0xffffff) != (z == 0xffffff)) {
+                ++s_eofStats.zFarMismatch;
+                eofLogMismatch("depth-far", x, y, z, e);
+            }
+        }
+    }
+    return z;
 }
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
@@ -5878,6 +6103,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         g_producerDraws = 0;
         if (sms_wiiu_gx2prod_reset_draw_sync_jobs)
             sms_wiiu_gx2prod_reset_draw_sync_jobs();
+        if (s_peekEofMode) eofSnapshot();
     } else
 #endif
     flushBatch();
@@ -5918,6 +6144,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
                      (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked);
+        eofReport();
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
             WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",
