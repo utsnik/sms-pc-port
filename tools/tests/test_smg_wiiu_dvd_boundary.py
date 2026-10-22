@@ -154,6 +154,13 @@ def main() -> int:
     missing = [fragment for fragment in required_fragments if fragment not in source]
     if missing:
         return fail("missing Wii U DVD boundary requirement: " + ", ".join(missing))
+    # sys/main.dol is outside the disc FST: the whole-file reader that the
+    # main.dol loader uses must serve "/sys/" from the app root's sys/ tree, or
+    # smg_wiiu_load_dol_data() port_fatal()s before the game starts.
+    read_file = source.split("void* sms_wiiu_dvd_read_file(", 1)
+    read_body = read_file[1].split("\n}\n", 1)[0] if len(read_file) == 2 else ""
+    if '"/sys/"' not in read_body or '"%ssys/%s"' not in read_body:
+        return fail("sms_wiiu_dvd_read_file cannot read /sys/ files outside the FST")
     if "gcdisc" in source or "pread" in source:
         return fail("source contains a second host DVD provider")
     if args.compile_db:

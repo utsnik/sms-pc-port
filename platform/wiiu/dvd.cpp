@@ -601,6 +601,37 @@ void* sms_wiiu_dvd_read_file(const char* path, size_t* size)
 {
 	if (size)
 		*size = 0;
+#if defined(PORT_GAME_SMG)
+	/* sys/ (main.dol, boot.bin, ...) is outside the disc FST, so the FST
+	 * lookup below can never find "/sys/main.dol"; read it from the app
+	 * root's sys/ directory, as port_dvd_init does for sys/fst.bin. */
+	if (path && std::strncmp(path, "/sys/", 5) == 0) {
+		if (!valid_fst_name(path + 5))
+			return nullptr;
+		char sys_path[kMaxPath + 128];
+		int n = std::snprintf(sys_path, sizeof(sys_path), "%ssys/%s",
+		                      sms_wiiu_app_root(), path + 5);
+		if (n < 0 || static_cast<uint32_t>(n) >= sizeof(sys_path))
+			return nullptr;
+		FILE* file = std::fopen(sys_path, "rb");
+		if (!file)
+			return nullptr;
+		long length = -1;
+		if (std::fseek(file, 0, SEEK_END) == 0)
+			length = std::ftell(file);
+		void* data = length > 0 ? port_low_alloc(static_cast<size_t>(length)) : nullptr;
+		const bool ok = data && std::fseek(file, 0, SEEK_SET) == 0 &&
+		                std::fread(data, 1, static_cast<size_t>(length), file) ==
+		                    static_cast<size_t>(length);
+		std::fclose(file);
+		if (!ok)
+			return nullptr;
+		port_log("[dvd] read %s bytes=%ld (sys/, outside the FST)\n", sys_path, length);
+		if (size)
+			*size = static_cast<size_t>(length);
+		return data;
+	}
+#endif
 	int entry = find_entry(path);
 	if (entry < 0 || s_entries[entry].directory)
 		return nullptr;
