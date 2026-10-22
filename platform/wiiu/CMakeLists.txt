@@ -96,6 +96,12 @@ if(PORT_GAME STREQUAL "smg")
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S
     PROPERTIES COMPILE_OPTIONS "-Wa,-mgekko")
+  # Keep the complete Galaxy provider in one retained text section so the
+  # ownership audit covers every exported KPAD/WPAD definition, including
+  # compatibility entry points not reached by this boot path yet.
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/input.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-function-sections")
 
   # Sunshine's providers use the Sunshine Dolphin/JSystem ABI. Compile them
   # as a separate object target so Galaxy's revolution headers and forced
@@ -154,9 +160,12 @@ if(PORT_GAME STREQUAL "smg")
   target_link_options(smg PRIVATE
     -Wl,--no-undefined
     -Wl,--gc-sections
-    # libwut's padscore archive groups its import shims in one object.  The
-    # Galaxy provider is listed first and intentionally replaces those shims;
-    # the linked ELF therefore has one selected definition per KPAD/WPAD API.
+    # libwut's padscore archive groups its Wii import-table entries in one
+    # object.  Those entries intentionally have the same names as Galaxy's
+    # real provider, so this target-local exception is required to retain the
+    # import table while selecting the provider's definitions.  The linked ELF
+    # audit tools/tests/test_smg_wiiu_link_symbols.py verifies every provider
+    # symbol is unique and attributed to input.cpp.
     -Wl,--allow-multiple-definition
     "-Wl,-Map,${SMG_WIIU_BUILD_DIR}/smg.map")
   target_link_libraries(smg PRIVATE

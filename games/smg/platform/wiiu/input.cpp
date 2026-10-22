@@ -23,7 +23,7 @@ struct ScriptEvent {
     f32 pointer_y;
     u32 at;
     u32 until;
-    const char* name;
+    char name[16];
     bool logged;
 };
 
@@ -149,6 +149,19 @@ bool parse_timing(char* text, u32* at, u32* hold)
     return true;
 }
 
+void clamp_pointer(const char* axis, f32* value)
+{
+    if (*value < -1.0f) {
+        port_log("[smg-input] autoplay: pointer %s %f clamped to -1.000000\n", axis,
+                 *value);
+        *value = -1.0f;
+    } else if (*value > 1.0f) {
+        port_log("[smg-input] autoplay: pointer %s %f clamped to 1.000000\n", axis,
+                 *value);
+        *value = 1.0f;
+    }
+}
+
 bool append_button_or_stick(char* name, char* timing)
 {
     if (s_script_count >= kMaxScriptEvents)
@@ -169,7 +182,14 @@ bool append_button_or_stick(char* name, char* timing)
     if (!parse_timing(timing, &at, &hold))
         return false;
     ScriptEvent& event = s_script[s_script_count++];
-    event = {kind, button, stick_x, stick_y, 0.0f, 0.0f, at, at + hold, name, false};
+    event = {};
+    event.kind = kind;
+    event.button = button;
+    event.stick_x = stick_x;
+    event.stick_y = stick_y;
+    event.at = at;
+    event.until = at + hold;
+    std::snprintf(event.name, sizeof(event.name), "%s", name);
     return true;
 }
 
@@ -196,8 +216,16 @@ bool append_pointer(char* timing)
         !parse_float(second_comma, &y) ||
         (plus && (!parse_uint(plus, &hold) || hold == 0)))
         return false;
+    clamp_pointer("x", &x);
+    clamp_pointer("y", &y);
     ScriptEvent& event = s_script[s_script_count++];
-    event = {SCRIPT_POINTER, 0, 0.0f, 0.0f, x, y, at, at + hold, "pointer", false};
+    event = {};
+    event.kind = SCRIPT_POINTER;
+    event.pointer_x = x;
+    event.pointer_y = y;
+    event.at = at;
+    event.until = at + hold;
+    std::snprintf(event.name, sizeof(event.name), "pointer");
     return true;
 }
 
@@ -229,38 +257,50 @@ void load_script()
         std::fclose(file);
         buffer[length] = '\0';
         char* save = nullptr;
-        for (char* token = ::strtok_r(buffer, ",\r\n", &save); token;
-             token = ::strtok_r(nullptr, ",\r\n", &save)) {
+        char* token = ::strtok_r(buffer, ",\r\n", &save);
+        while (token) {
             trim(token);
-            if (!*token || *token == '#')
-                continue;
-            char pointer_token[512];
-            char* directive = token;
-            if (std::strncmp(token, "pointer@", 8) == 0) {
-                char* x = ::strtok_r(nullptr, ",\r\n", &save);
-                char* y = ::strtok_r(nullptr, ",\r\n", &save);
-                if (!x || !y || std::snprintf(pointer_token, sizeof(pointer_token),
-                                               "%s,%s,%s", token, x, y) >=
-                                      static_cast<int>(sizeof(pointer_token))) {
-                    log_unknown(token);
-                    continue;
+            bool advance = true;
+            if (*token && *token != '#') {
+                if (std::strncmp(token, "pointer@", 8) == 0) {
+                    char* x = ::strtok_r(nullptr, ",\r\n", &save);
+                    char* y = ::strtok_r(nullptr, ",\r\n", &save);
+                    if (!x || std::strchr(x, '@')) {
+                        port_log("[smg-input] autoplay: malformed pointer directive '%s'\n",
+                                 token);
+                        token = x;
+                        advance = false;
+                    } else {
+                        trim(x);
+                        if (!y || std::strchr(y, '@')) {
+                            port_log("[smg-input] autoplay: malformed pointer directive '%s'\n",
+                                     token);
+                            token = y;
+                            advance = false;
+                        } else {
+                            trim(y);
+                            char pointer_timing[512];
+                            if (std::snprintf(pointer_timing, sizeof(pointer_timing),
+                                              "%s,%s,%s", token + 8, x, y) >=
+                                    static_cast<int>(sizeof(pointer_timing)) ||
+                                !append_pointer(pointer_timing))
+                                log_unknown(token);
+                        }
+                    }
+                } else {
+                    char* at = std::strchr(token, '@');
+                    if (!at) {
+                        log_unknown(token);
+                    } else {
+                        *at++ = '\0';
+                        trim(token);
+                        if (!append_button_or_stick(token, at))
+                            log_unknown(token);
+                    }
                 }
-                trim(pointer_token);
-                directive = pointer_token;
             }
-            char* at = std::strchr(directive, '@');
-            if (!at) {
-                log_unknown(directive);
-                continue;
-            }
-            *at++ = '\0';
-            trim(directive);
-            if (std::strcmp(directive, "pointer") == 0) {
-                if (!append_pointer(at))
-                    log_unknown(directive);
-            } else if (!append_button_or_stick(directive, at)) {
-                log_unknown(directive);
-            }
+            if (advance)
+                token = ::strtok_r(nullptr, ",\r\n", &save);
         }
     }
     port_log("[smg-input] autoplay: %u scripted events\n", (unsigned)s_script_count);

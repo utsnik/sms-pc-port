@@ -183,6 +183,7 @@ static float g_stick_x;
 static float g_stick_y;
 static std::string g_root;
 static std::string g_log;
+static volatile unsigned char g_stack_sink;
 
 extern "C" const char* sms_wiiu_app_root(void) { return g_root.c_str(); }
 extern "C" uint32_t sms_wiiu_frame_count(void) { return g_field; }
@@ -217,6 +218,13 @@ static void fail(const char* message) {
 
 static void check(bool condition, const char* message) {
     if (!condition) fail(message);
+}
+
+static void clobber_stack() {
+    volatile unsigned char padding[8192];
+    for (size_t i = 0; i < sizeof(padding); ++i)
+        padding[i] = static_cast<unsigned char>(i);
+    g_stack_sink = padding[0];
 }
 
 static KPADStatus read_status() {
@@ -276,8 +284,8 @@ int main(int argc, char** argv) {
 
     g_field = 10;
     status = read_status();
-    check(status.dpd_valid_fg == 2 && status.pos.x == 0.25f && status.pos.y == -0.5f,
-          "pointer validity and position");
+    check(status.dpd_valid_fg == 2 && status.pos.x == 1.0f && status.pos.y == -1.0f,
+          "pointer validity and clamped position");
 
     g_field = 14;
     status = read_status();
@@ -292,6 +300,25 @@ int main(int argc, char** argv) {
     check(status.ex_status.fs.stick.x < -0.7f, "VPAD stick mapping");
     check(status.trig & WPAD_BUTTON_A, "VPAD trigger mapping");
 
+    clobber_stack();
+    for (g_field = 21; g_field < 80; ++g_field)
+        status = read_status();
+    check(g_log.find("[smg-input] autoplay: press a field 2") != std::string::npos,
+          "exact button log after script buffer lifetime");
+    check(g_log.find("[smg-input] autoplay: pointer field 10") != std::string::npos,
+          "exact pointer log after script buffer lifetime");
+    check(g_log.find("[smg-input] autoplay: malformed pointer directive 'pointer@12'") !=
+              std::string::npos,
+          "malformed pointer log");
+    g_field = 15;
+    status = read_status();
+    check(status.hold & WPAD_BUTTON_UP, "malformed pointer does not swallow next directive");
+    check(g_log.find("[smg-input] autoplay: pointer x 2.000000 clamped to 1.000000") !=
+              std::string::npos,
+          "pointer x clamp log");
+    check(g_log.find("[smg-input] autoplay: pointer y -2.000000 clamped to -1.000000") !=
+              std::string::npos,
+          "pointer y clamp log");
     check(g_log.find("unknown") != std::string::npos, "unknown-token log");
     std::puts("input-host: PASS: real input.cpp; callbacks, edges, pointer, VPAD mapping");
     return 0;
@@ -310,7 +337,8 @@ def host_check(provider: Path) -> str:
         (include / "vpad" / "input.h").write_text(HOST_VPAD, encoding="utf-8")
         (root / "autopress").write_text("", encoding="utf-8")
         (root / "smg-autoplay").write_text(
-            "a@2+3,b@2+3,up@5+2,stick_right@7+2,pointer@10,0.25,-0.5+4,unknown@1+2\n",
+            "a@2+3,b@2+3,up@5+2,stick_right@7+2,pointer@10,2,-2+4,"
+            "pointer@12,0.75,up@15+1,unknown@1+2\n",
             encoding="utf-8",
         )
         harness = root / "input_host.cpp"
