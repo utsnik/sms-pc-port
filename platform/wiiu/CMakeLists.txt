@@ -177,6 +177,13 @@ if(PORT_GAME STREQUAL "smg")
     # audit tools/tests/test_smg_wiiu_link_symbols.py verifies every provider
     # symbol is unique and attributed to input.cpp.
     -Wl,--allow-multiple-definition
+    # Ruling R17: Sunshine's port-heap mechanism. port_heap.cpp's wraps send
+    # operator new inside SMS_PORT_HEAP_SCOPE to the system heap and every
+    # other new to __real_ = Galaxy's JKRHeap.cpp operator new; delete pairs
+    # by tag. Galaxy also defines the sized array delete (_ZdaPvj) itself, so
+    # it is wrapped too. tools/tests/test_smg_wiiu_link_symbols.py audits it.
+    -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv
+    -Wl,--wrap=_ZdlPvj -Wl,--wrap=_ZdaPvj
     "-Wl,-Map,${SMG_WIIU_BUILD_DIR}/smg.map")
   find_package(SDL2 REQUIRED CONFIG)
   target_link_libraries(smg PRIVATE

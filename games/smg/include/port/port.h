@@ -44,11 +44,6 @@ void port_mem_set_disc_id(const char* id);
 void* port_low_alloc(size_t size);
 int port_is_game_memory(const void* p);
 
-// Translation between game "physical" addresses (as programmed into GPU/DSP
-// registers) and host pointers.
-void* port_phys_to_host(uint32_t phys);
-uint32_t port_host_to_phys(const void* p);
-
 // ---------------------------------------------------------------------------
 // The disc the game's files come from (platform/src/dvd/dvd.cpp)
 // ---------------------------------------------------------------------------

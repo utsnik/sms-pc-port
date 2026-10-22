@@ -7,8 +7,34 @@ namespace smg_wiiu {
 
 constexpr uint32_t kMem2ArenaOffset = 0x00004000u;
 constexpr uint32_t kAramBaseOffset = 0x00004000u;
+/* Retail Wii aralt (ruling R18): createRootHeap carves this MEM2 window and
+ * ARInit reports it whole as __AR_Size; ARAlloc hands out offsets from
+ * ARGetBaseAddress() = 0x4000 without a bound. */
 constexpr uint32_t kAramWindowBytes = 0x00E00000u;
-constexpr uint32_t kAramAddressableBytes = kAramBaseOffset + kAramWindowBytes;
+
+/* The DSP's VARAM read (runtime.cpp port_varam_ptr): base + offset resolves
+ * inside [base + kAramBaseOffset, base + min(size, kAramWindowBytes)). Below
+ * 0x4000 is aralt's reserved area, never handed out by ARAlloc. A read past
+ * the window would alias the GDDR3 heap after it, so it resolves to nothing
+ * and *beyond is set for the caller's one-time log. */
+inline const uint8_t* varam_lookup(uint32_t base, uint32_t size, uint32_t addr,
+                                   bool* beyond)
+{
+    if (beyond)
+        *beyond = false;
+    if (!base || addr < base)
+        return nullptr;
+    const uint32_t window = size < kAramWindowBytes ? size : kAramWindowBytes;
+    const uint32_t offset = addr - base;
+    if (offset >= window) {
+        if (beyond)
+            *beyond = true;
+        return nullptr;
+    }
+    if (offset < kAramBaseOffset)
+        return nullptr;
+    return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
+}
 
 struct ArenaState {
     uint8_t* mem1_start;

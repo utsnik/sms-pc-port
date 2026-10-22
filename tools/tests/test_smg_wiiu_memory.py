@@ -78,6 +78,106 @@ def nm_info(elf: Path) -> tuple[dict[str, int], set[str]]:
     return sizes, symbols
 
 
+# os_core.cpp's linked Wii arena delegates (ruling R12): which ArenaState
+# field each getter returns / setter stores. Target pointers are 4 bytes, so
+# field k of smg_wiiu::ArenaState is at 4*k (mem1_start, mem1_end, mem1_lo,
+# mem1_hi, mem2_start, mem2_end, mem2_lo, mem2_hi).
+MEM1_FIELDS = range(0, 16)
+MEM2_FIELDS = range(16, 32)
+ARENA_GETTERS = {
+    "OSGetArenaLo": 8, "OSGetArenaHi": 12,
+    "OSGetMEM1ArenaLo": 8, "OSGetMEM1ArenaHi": 12,
+    "OSGetMEM2ArenaLo": 24, "OSGetMEM2ArenaHi": 28,
+}
+ARENA_SETTERS = {
+    "OSSetArenaLo": (8, MEM1_FIELDS), "OSSetArenaHi": (12, MEM1_FIELDS),
+    "OSSetMEM2ArenaLo": (24, MEM2_FIELDS), "OSSetMEM2ArenaHi": (28, MEM2_FIELDS),
+}
+ARENA_STATE_SYMBOL = "_ZN12_GLOBAL__N_1L12s_smg_arenasE"
+
+
+def disassemble_arena_api(elf: Path) -> tuple[int, dict[str, list[str]]]:
+    names = [ARENA_STATE_SYMBOL, *ARENA_GETTERS, *ARENA_SETTERS]
+    script = (
+        'set -euo pipefail; BIN=/opt/devkitpro/devkitPPC/bin; '
+        '$BIN/powerpc-eabi-nm -S --defined-only "$ELF" | '
+        'awk \'{print $1, $2, $NF}\' > /tmp/syms; '
+        'for name in ' + " ".join(names) + '; do '
+        'line=$(awk -v n="$name" \'$3==n{print; exit}\' /tmp/syms); '
+        'test -n "$line" || { echo "MISSING $name"; continue; }; '
+        'set -- $line; echo "SYM $3 $1 $2"; '
+        'if [ "$3" != ' + ARENA_STATE_SYMBOL + ' ]; then '
+        '$BIN/powerpc-eabi-objdump -d --no-show-raw-insn --start-address=0x$1 '
+        '--stop-address=$(printf 0x%x $((0x$1 + 0x$2))) "$ELF" | '
+        'sed -n "s/^ *[0-9a-f]*:\t/INS $3 /p"; fi; done'
+    )
+    result = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "--user",
+         f"{os.getuid()}:{os.getgid()}", "-v", f"{elf.parent}:/elf:ro",
+         "-e", f"ELF=/elf/{elf.name}", "soh-wiiu-builder:latest", "bash", "-lc", script],
+        capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError("builder objdump failed:\n" + (result.stdout + result.stderr).rstrip())
+    base = None
+    code: dict[str, list[str]] = {}
+    for line in result.stdout.splitlines():
+        if line.startswith("MISSING "):
+            raise RuntimeError("linked ELF has no " + line.split()[1])
+        parts = line.split(None, 2)
+        if parts[0] == "SYM" and parts[1] == ARENA_STATE_SYMBOL:
+            base = int(line.split()[2], 16)
+        elif parts[0] == "INS":
+            code.setdefault(parts[1], []).append(parts[2])
+    if base is None:
+        raise RuntimeError(f"linked ELF has no {ARENA_STATE_SYMBOL}")
+    return base, code
+
+
+def arena_accesses(instructions: list[str]) -> list[tuple[str, str, int]]:
+    """Resolve lis/addi-based lwz/stw addresses: (op, data register, address)."""
+    known: dict[str, int] = {}
+    accesses = []
+    for text in instructions:
+        fields = text.replace(",", " ").split()
+        op, operands = fields[0], fields[1:]
+        memory = re.match(r"^(-?\d+)\((r\d+)\)$", operands[-1]) if operands else None
+        if op == "lis":
+            known[operands[0]] = (int(operands[1]) << 16) & 0xFFFFFFFF
+            continue
+        if op == "addi" and operands[1] in known:
+            known[operands[0]] = (known[operands[1]] + int(operands[2])) & 0xFFFFFFFF
+            continue
+        if op in ("lwz", "stw") and memory and memory.group(2) in known:
+            address = (known[memory.group(2)] + int(memory.group(1))) & 0xFFFFFFFF
+            accesses.append((op, operands[0], address))
+        if op in ("bl", "bla", "blrl", "bctrl"):
+            for reg in ["r0"] + [f"r{i}" for i in range(3, 13)]:
+                known.pop(reg, None)
+        elif operands and not op.startswith(("st", "cmp", "b")):
+            known.pop(operands[0], None)
+    return accesses
+
+
+def arena_delegate_check(elf: Path) -> str:
+    base, code = disassemble_arena_api(elf)
+    for name, field in ARENA_GETTERS.items():
+        loads = [a for op, reg, a in arena_accesses(code.get(name, [])) if op == "lwz" and reg == "r3"]
+        if loads != [base + field]:
+            got = ", ".join(f"+{a - base}" for a in loads) or "none"
+            raise RuntimeError(f"linked {name} returns ArenaState {got}, expected +{field}")
+    for name, (field, allowed) in ARENA_SETTERS.items():
+        accesses = arena_accesses(code.get(name, []))
+        stores = [a for op, _reg, a in accesses if op == "stw"]
+        if stores != [base + field]:
+            got = ", ".join(f"+{a - base}" for a in stores) or "none"
+            raise RuntimeError(f"linked {name} stores ArenaState {got}, expected +{field}")
+        stray = [a - base for _op, _reg, a in accesses if (a - base) not in allowed]
+        if stray:
+            raise RuntimeError(f"linked {name} touches the other arena's cursor fields {stray}")
+    return (f"memory-elf: PASS: linked os_core delegates read/write ArenaState "
+            f"MEM1 (OSGet/SetArena*, OSGetMEM1Arena*) and MEM2 (OS*MEM2Arena*) fields")
+
+
 def host_allocator_check(os_core: Path) -> str:
     harness = Path(__file__).with_name("smg_wiiu_memory_host.cpp")
     with tempfile.TemporaryDirectory(prefix="smg-memory-") as build_dir:
@@ -191,6 +291,11 @@ def main() -> int:
     if missing_linked:
         return fail("linked ELF is missing real arena providers: " + ", ".join(missing_linked))
 
+    try:
+        delegate_output = arena_delegate_check(args.elf)
+    except RuntimeError as exc:
+        return fail(str(exc))
+
     if args.mem1 is not None and mem1 != args.mem1:
         return fail(f"source MEM1 size={mem1}, expected {args.mem1}")
     if args.mem2 is not None and mem2 != args.mem2:
@@ -200,6 +305,7 @@ def main() -> int:
 
     print("memory: PASS: MEM1=24 MiB MEM2=64 MiB static aligned arenas")
     print(host_output)
+    print(delegate_output)
     return 0
 
 

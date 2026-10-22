@@ -776,8 +776,18 @@ extern "C" void port_audio_dsp_mail_to(u32 mail)
 #endif
 	if (!g.inCmd)
 		return;
+#if defined(PORT_GAME_SMG)
+	/* Only the command vector is port memory. In synchronous mode execute()
+	 * runs the game's __DSPHandler (raise_irq), whose allocations belong to
+	 * the game heaps, so it must not run inside the port scope. */
+	{
+		SMS_PORT_HEAP_SCOPE();
+		g.words.push_back(mail);
+	}
+#else
 	SMS_PORT_HEAP_SCOPE();
 	g.words.push_back(mail);
+#endif
 	if (g.words.size() == g.want) {
 		g.inCmd = false;
 		execute();

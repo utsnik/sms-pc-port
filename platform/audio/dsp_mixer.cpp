@@ -240,6 +240,13 @@ int32_t decode_at(Decoder& d, const Voice& v)
 		const uint32_t fbytes = v.sourceType;
 		uint32_t f            = i >> 4;
 		const uint8_t* p      = aram(v.base + f * fbytes);
+#if defined(PORT_GAME_SMG)
+		/* smg-audio: R18. The resolver bounds the VARAM window per address;
+		 * a frame whose last byte is past it would read the GDDR3 heap
+		 * header that follows the window, so it is unresolved too. */
+		if (p && !aram(v.base + f * fbytes + fbytes - 1))
+			p = NULL;
+#endif
 		if (!p)
 			return 0;
 		int k = i & 15, r;
@@ -265,6 +272,10 @@ int32_t decode_at(Decoder& d, const Voice& v)
 	}
 	case 16: {
 		const uint8_t* p = aram(v.base + i * 2); // PCM16 waves are big-endian in ARAM
+#if defined(PORT_GAME_SMG)
+		if (p && !aram(v.base + i * 2 + 1)) // smg-audio: R18, as for ADPCM frames
+			p = NULL;
+#endif
 		return p ? (int16_t)((p[0] << 8) | p[1]) : 0;
 	}
 	case kDirectPcm:

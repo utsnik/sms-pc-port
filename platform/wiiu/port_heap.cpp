@@ -105,4 +105,11 @@ void* __wrap__Znaj(size_t n)
 void __wrap__ZdlPv(void* p) { if (!port_free(p)) __real__ZdlPv(p); }
 void __wrap__ZdaPv(void* p) { if (!port_free(p)) __real__ZdaPv(p); }
 void __wrap__ZdlPvj(void* p, size_t n) { if (!port_free(p)) __real__ZdlPvj(p, n); }
+#if defined(PORT_GAME_SMG)
+/* Galaxy's JKRHeap.cpp defines operator delete[](void*, size_t) itself
+ * instead of forwarding to _ZdaPv, so a scoped block freed through it must be
+ * caught here too, or gameFree would free() a pointer inside a tagged block. */
+void __real__ZdaPvj(void*, size_t);
+void __wrap__ZdaPvj(void* p, size_t n) { if (!port_free(p)) __real__ZdaPvj(p, n); }
+#endif
 }

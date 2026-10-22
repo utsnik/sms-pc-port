@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include "dol_data.h"
+#include "host_alloc.h"
 
 #include "port/heap_routing.h"
 #include "port/port.h"
@@ -45,8 +46,8 @@ alignas(64) unsigned char s_mem1_arena[kMem1ArenaBytes];
 alignas(64) unsigned char s_mem2_arena[kMem2ArenaBytes];
 uint32_t s_varam_base;
 uint32_t s_varam_size;
+int s_varam_overhang_logged;
 int s_initialized;
-int s_alloc_scope_depth;
 int s_game_heap_ready;
 int s_log_file_warned;
 int s_sleep_warned;
@@ -118,14 +119,19 @@ u32 sms_wiiu_mem2_size = (u32)kMem2ArenaBytes;
 
 /* smg-audio: D3. The DSP HLE's ARAM reads (platform/audio/dsp_hle.cpp): the
  * DsetVARAM base plus an ARAM offset is a MEM2 address, inside the window
- * aralt's ARInit maps (the MEM2 arena low mark createRootHeap reserved). */
+ * aralt's ARInit maps (the MEM2 arena low mark createRootHeap reserved).
+ * Ruling R18: a read past the 0xE00000 window would alias the GDDR3 heap
+ * header that follows it, so it resolves to nothing and is logged once. */
 const uint8_t* port_varam_ptr(uint32_t addr)
 {
-    const uint32_t lo = s_varam_base;
-    if (!lo || addr < lo || addr - lo >= s_varam_size ||
-        addr - lo < smg_wiiu::kAramBaseOffset)
-        return nullptr;
-    return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
+    bool beyond = false;
+    const uint8_t* p = smg_wiiu::varam_lookup(s_varam_base, s_varam_size, addr, &beyond);
+    if (beyond && !s_varam_overhang_logged) {
+        s_varam_overhang_logged = 1;
+        port_log("[smg-audio] VARAM read beyond the 0x%08x window dropped: offset=0x%08x",
+                 smg_wiiu::kAramWindowBytes, addr - s_varam_base);
+    }
+    return p;
 }
 
 void smg_wiiu_bind_varam_base(uint32_t base, uint32_t size)
@@ -134,7 +140,7 @@ void smg_wiiu_bind_varam_base(uint32_t base, uint32_t size)
     const uint32_t arena_hi = arena_lo + sms_wiiu_mem2_size;
     if (base < arena_lo || base > arena_hi || size > arena_hi - base ||
         size < smg_wiiu::kAramBaseOffset ||
-        size > smg_wiiu::kAramAddressableBytes) {
+        size > smg_wiiu::kAramWindowBytes) {
         port_log("[smg-audio] invalid ARAM base=0x%08x for MEM2 %p..%p",
                  base, sms_wiiu_mem2_base, sms_wiiu_mem2_base + sms_wiiu_mem2_size);
         s_varam_base = 0;
@@ -208,10 +214,12 @@ void port_log_file(const char*)
     log_unsupported_once(&s_log_file_warned, "port_log_file");
 }
 
+/* Port-internal allocations (Galaxy's operator new before the JKR root heap
+ * exists, the DSP HLE's async Command/Reply): wut's default heap, outside
+ * both Galaxy arenas, freed with free(). */
 void* port_host_alloc(size_t size, int alignment)
 {
-    (void)alignment;
-    return std::malloc(size);
+    return memalign(smg_wiiu::host_alloc_alignment(alignment), size);
 }
 
 void port_host_free(void* pointer)
@@ -221,7 +229,10 @@ void port_host_free(void* pointer)
 
 void smg_wiiu_game_heap_ready(void) { s_game_heap_ready = 1; }
 
-int port_use_game_heap(void) { return s_game_heap_ready && s_alloc_scope_depth == 0; }
+/* Port code reaches the system heap through SMS_PORT_HEAP_SCOPE and the
+ * platform/wiiu/port_heap.cpp operator new wraps (ruling R17), before
+ * Galaxy's operator new is consulted. */
+int port_use_game_heap(void) { return s_game_heap_ready; }
 
 int port_is_game_heap_ptr(const void* pointer)
 {
@@ -232,30 +243,10 @@ int port_is_game_heap_ptr(const void* pointer)
            (p >= mem2_lo && p < mem2_lo + kMem2ArenaBytes);
 }
 
-void port_host_alloc_scope_enter(void) { ++s_alloc_scope_depth; }
-
-void port_host_alloc_scope_leave(void)
-{
-    if (s_alloc_scope_depth > 0)
-        --s_alloc_scope_depth;
-}
-
 void* port_low_alloc(size_t size) { return memalign(64, size); }
 int port_mem_init(void) { return 1; }
 void port_mem_set_disc_id(const char*) {}
 int port_is_game_memory(const void* p) { return port_is_game_heap_ptr(p); }
-
-void* port_phys_to_host(uint32_t physical)
-{
-    return physical < kMem2ArenaBytes ? s_mem2_arena + physical : nullptr;
-}
-
-uint32_t port_host_to_phys(const void* pointer)
-{
-    if (!port_is_game_memory(pointer))
-        return 0;
-    return (uint32_t)(reinterpret_cast<const unsigned char*>(pointer) - s_mem2_arena);
-}
 
 void port_irq_set_handler(int, PortIrqHandler) {}
 void port_irq_raise(int) {}

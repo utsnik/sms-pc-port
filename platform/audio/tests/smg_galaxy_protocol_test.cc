@@ -54,7 +54,11 @@ const uint32_t kAramHeapBase = 0x4000u;  // JASKernel::setupAramHeap: ARGetBaseA
 const uint16_t kConnectTable[12] = { 0x0000, 0x0D00, 0x0D60, 0x0DC0, 0x0E20, 0x0E80,
 	                                 0x0EE0, 0x0CA0, 0x0F40, 0x0FA0, 0x0B00, 0x09A0 };
 
-std::vector<uint8_t> g_window(kWindowBytes);
+// Plus a few bytes past the window: on a Wii the GDDR3 heap header follows
+// it. port_varam_ptr never resolves them; the straddling-frame case below
+// fills them so a mixer read past the window becomes audible.
+const uint32_t kPastWindowBytes = 16;
+std::vector<uint8_t> g_window(kWindowBytes + kPastWindowBytes);
 unsigned g_rawAramLookups;
 unsigned g_windowMisses;
 std::deque<std::function<void()>> g_irqs;
@@ -648,6 +652,27 @@ int main(int argc, char** argv)
 	else
 		printf("audio-protocol-test: looping ADPCM4: %u/560 samples non-zero, cursor 0x%08x\n",
 		       adpcmNonzero, adpcmCursor);
+	put<uint16_t>(voice(4), kActive, 0);
+
+	// Ruling R18: an ADPCM4 frame that starts 5 bytes below the window end
+	// would read 4 bytes of what follows the window (the GDDR3 heap header).
+	// The mixer must treat it as unresolved: silence, and a window miss.
+	const uint32_t straddleBase = kWindowBytes - 5;
+	g_window[straddleBase] = 0x80;
+	for (uint32_t i = straddleBase + 1; i < kWindowBytes + kPastWindowBytes; i++)
+		g_window[i] = 0x88;
+	const unsigned missesBefore = g_windowMisses;
+	start_looping_adpcm4_voice(4, straddleBase);
+	sync_frame(0x8000);
+	release_subframe();
+	unsigned straddleNonzero = 0;
+	for (int k = 0; k < 80; k++)
+		straddleNonzero += g_dac[k] != 0;
+	if (straddleNonzero || g_windowMisses == missesBefore)
+		fail("ADPCM4 frame straddling the VARAM window end read past it (%u non-zero samples, %u window misses)",
+		     straddleNonzero, g_windowMisses - missesBefore);
+	else
+		printf("audio-protocol-test: ADPCM4 frame straddling the window end is unresolved (silent)\n");
 	put<uint16_t>(voice(4), kActive, 0);
 #endif
 

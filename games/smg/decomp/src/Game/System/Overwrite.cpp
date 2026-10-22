@@ -1067,11 +1067,21 @@ void JKRAramPiece::startDMA(JKRAMCommand* pCommand) {
 #if defined(TARGET_WIIU)
     /* smg-audio: Wii U pointers are in the target's MEM1/MEM2 arenas, not
      * the GameCube 0x80000000 address space. aralt uses (type, src, dst):
-     * direction 0 has main RAM in src; direction 1 has it in dst. */
-    const bool started = smg_wiiu::aram_dma_start(
+     * direction 0 has main RAM in src; direction 1 has it in dst.
+     * ARGetSize() is the retail 0xE00000 window; the part of a transfer past
+     * it (retail: the GDDR3 heap header) is dropped and logged once. */
+    const smg_wiiu::AramDmaResult dma = smg_wiiu::aram_dma_start(
         pCommand->mTransferDirection, pCommand->mSrc, pCommand->mDst,
         pCommand->mDataLength, ARGetSize(), ARStartDMA);
-    if (!started) {
+    if (dma.overhang_bytes) {
+        static bool overhang_logged;
+        if (!overhang_logged) {
+            overhang_logged = true;
+            port_log("[smg-audio] ARAM DMA beyond the 0x%08x window dropped: offset=0x%08x size=0x%08x dir=%d\n",
+                     ARGetSize(), dma.overhang_offset, dma.overhang_bytes,
+                     pCommand->mTransferDirection);
+        }
+    } else if (!dma.started) {
         static bool logged;
         if (!logged) {
             logged = true;
@@ -1079,8 +1089,6 @@ void JKRAramPiece::startDMA(JKRAMCommand* pCommand) {
                      pCommand->mTransferDirection, pCommand->mSrc,
                      pCommand->mDst, pCommand->mDataLength);
         }
-        doneDMA(reinterpret_cast<u32>(pCommand));
-        return;
     }
     doneDMA(reinterpret_cast< u32 >(pCommand));
     return;
