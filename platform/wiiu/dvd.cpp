@@ -10,9 +10,17 @@
 
 namespace {
 
+#if defined(PORT_GAME_SMG)
+const uint32_t kMaxEntries = 2465;
+#else
 const uint32_t kMaxEntries = 512;
+#endif
 const uint32_t kMaxPath = 512;
+#if defined(PORT_GAME_SMG)
+const uint32_t kMaxFstBytes = 81780u;
+#else
 const uint32_t kMaxFstBytes = 64u * 1024u;
+#endif
 const uint32_t kMaxFiles = 96;
 const uint32_t kMaxPending = 96;
 
@@ -82,6 +90,44 @@ bool append_text(char* out, uint32_t cap, const char* text)
 	return true;
 }
 
+#if defined(PORT_GAME_SMG)
+bool valid_fst_name(const char* name)
+{
+	if (!name || !*name || !std::strcmp(name, ".") || !std::strcmp(name, ".."))
+		return false;
+	for (const unsigned char* p = reinterpret_cast<const unsigned char*>(name); *p; ++p)
+		if (*p < 0x20 || *p == '/' || *p == '\\' || *p == ':')
+			return false;
+	return true;
+}
+#endif
+
+#if defined(PORT_GAME_SMG)
+bool valid_entry_path(const char* path)
+{
+	if (!path || path[0] != '/')
+		return false;
+	const char* part = path + 1;
+	while (*part) {
+		char name[256];
+		uint32_t length = 0;
+		while (part[length] && part[length] != '/') {
+			if (length + 1 >= sizeof(name))
+				return false;
+			name[length] = part[length];
+			++length;
+		}
+		name[length] = '\0';
+		if (!valid_fst_name(name))
+			return false;
+		part += length;
+		if (*part == '/')
+			++part;
+	}
+	return true;
+}
+#endif
+
 bool normalize_path(const char* input, char* out, uint32_t cap)
 {
 	if (!input || !*input)
@@ -92,8 +138,14 @@ bool normalize_path(const char* input, char* out, uint32_t cap)
 		std::strncpy(source, input, sizeof(source) - 1);
 	} else {
 		std::strncpy(source, s_current_dir, sizeof(source) - 1);
+		#if defined(PORT_GAME_SMG)
+		if (!append_text(source, sizeof(source), "/") ||
+		    !append_text(source, sizeof(source), input))
+			return false;
+		#else
 		append_text(source, sizeof(source), "/");
 		append_text(source, sizeof(source), input);
+		#endif
 	}
 	source[sizeof(source) - 1] = '\0';
 
@@ -113,9 +165,18 @@ bool normalize_path(const char* input, char* out, uint32_t cap)
 			part[n++] = *p++;
 		}
 		part[n] = '\0';
+		#if defined(PORT_GAME_SMG)
+		if (!valid_fst_name(part) && std::strcmp(part, ".") &&
+		    std::strcmp(part, ".."))
+			return false;
+		#endif
 		if (!std::strcmp(part, "."))
 			continue;
 		if (!std::strcmp(part, "..")) {
+			#if defined(PORT_GAME_SMG)
+			if (std::strlen(out) <= 1)
+				return false;
+			#endif
 			char* slash = std::strrchr(out + 1, '/');
 			if (slash)
 				*slash = '\0';
@@ -178,6 +239,21 @@ bool files_path(u32 entry, char* out, uint32_t cap)
 {
 	if (entry >= s_entry_count || s_entries[entry].directory)
 		return false;
+#if defined(PORT_GAME_SMG)
+	const char* root = sms_wiiu_app_root();
+	if (!root || !*root || !valid_entry_path(s_entries[entry].path))
+		return false;
+	const uint32_t root_len = static_cast<uint32_t>(std::strlen(root));
+	if (!root_len || root[root_len - 1] != '/')
+		return false;
+	/* FST paths are "/data/x.szs"; the extracted tree keeps them under files/. */
+	int n = std::snprintf(out, cap, "%sfiles%s", root,
+	                      s_entries[entry].path);
+	if (n < 0 || static_cast<uint32_t>(n) >= cap)
+		return false;
+	return std::strncmp(out, root, root_len) == 0 &&
+	       std::strncmp(out + root_len, "files/", 6) == 0;
+#else
 	/* FST paths are "/data/x.szs"; the extracted tree keeps them under files/. */
 	int n = std::snprintf(out, cap, "%sfiles%s", sms_wiiu_app_root(),
 	                      s_entries[entry].path);
@@ -187,6 +263,7 @@ bool files_path(u32 entry, char* out, uint32_t cap)
 	uint32_t root_len = static_cast<uint32_t>(std::strlen(root));
 	return std::strncmp(out, root, root_len) == 0 &&
 	       std::strncmp(out + root_len, "files/", 6) == 0;
+#endif
 }
 
 s32 read_file(FileState* state, void* address, s32 length, s32 offset)
@@ -267,9 +344,37 @@ void port_dvd_init(void)
 {
 	if (s_initialized)
 		return;
+#if defined(PORT_GAME_SMG)
+	s_entry_count = 0;
+	s_file_count = 0;
+	s_directory_count = 0;
+#endif
 	char fst_path[192];
 	std::snprintf(fst_path, sizeof(fst_path), "%ssys/fst.bin", sms_wiiu_app_root());
 	FILE* fst = std::fopen(fst_path, "rb");
+#if defined(PORT_GAME_SMG)
+	if (!fst || std::fseek(fst, 0, SEEK_END) != 0) {
+		if (fst)
+			std::fclose(fst);
+		port_log("[dvd] cannot open %s\n", fst_path);
+		return;
+	}
+	long fst_size = std::ftell(fst);
+	if (fst_size < 0 || fst_size > static_cast<long>(sizeof(s_fst_raw))) {
+		std::fclose(fst);
+		port_log("[dvd] invalid FST size=%ld\n", fst_size);
+		return;
+	}
+	std::rewind(fst);
+	if (fst_size == 0 ||
+	    std::fread(s_fst_raw, 1, static_cast<size_t>(fst_size), fst) !=
+	        static_cast<size_t>(fst_size)) {
+		std::fclose(fst);
+		port_log("[dvd] cannot read %s\n", fst_path);
+		return;
+	}
+	std::fclose(fst);
+#else
 	if (!fst || std::fread(s_fst_raw, 1, sizeof(s_fst_raw), fst) == 0) {
 		if (fst)
 			std::fclose(fst);
@@ -278,7 +383,12 @@ void port_dvd_init(void)
 	}
 	long fst_size = std::ftell(fst);
 	std::fclose(fst);
+#endif
+#if defined(PORT_GAME_SMG)
+	if (fst_size < 12) {
+#else
 	if (fst_size < 12 || fst_size > static_cast<long>(sizeof(s_fst_raw))) {
+#endif
 		port_log("[dvd] invalid FST size=%ld\n", fst_size);
 		return;
 	}
@@ -291,10 +401,14 @@ void port_dvd_init(void)
 	const uint8_t* strings = s_fst_raw + s_entry_count * 12;
 	uint32_t string_bytes = static_cast<uint32_t>(fst_size) - s_entry_count * 12;
 	std::memset(s_entries, 0, sizeof(s_entries));
-	std::strncpy(s_entries[0].path, "/", kMaxPath - 1);
 	for (uint32_t i = 0; i < s_entry_count; ++i) {
 		const uint8_t* raw = s_fst_raw + i * 12;
+#if defined(PORT_GAME_SMG)
+		u32 type_and_name = be32(raw);
+		u32 name_offset = type_and_name & 0x00ffffffu;
+#else
 		u32 name_offset = be32(raw) & 0x00ffffffu;
+#endif
 		if (i && name_offset >= string_bytes) {
 			port_log("[dvd] FST name offset out of range at %u\n", i);
 			return;
@@ -304,20 +418,53 @@ void port_dvd_init(void)
 			port_log("[dvd] unterminated FST name at %u\n", i);
 			return;
 		}
+#if defined(PORT_GAME_SMG)
+		s_entries[i].directory = (type_and_name & 0x01000000u) != 0;
+#else
 		s_entries[i].directory = (raw[0] & 1) != 0;
+#endif
 		if (s_entries[i].directory) {
 			s_entries[i].parent = be32(raw + 4);
 			s_entries[i].next = be32(raw + 8);
+#if defined(PORT_GAME_SMG)
+			if (s_entries[i].next <= i || s_entries[i].next > s_entry_count ||
+			    (i == 0 && (s_entries[i].parent != 0 ||
+			                s_entries[i].next != s_entry_count))) {
+				port_log("[dvd] invalid FST directory range at %u\n", i);
+				return;
+			}
+#endif
 			++s_directory_count;
 		} else {
+#if defined(PORT_GAME_SMG)
+			if (!i) {
+				port_log("[dvd] FST root is not a directory\n");
+				return;
+			}
+#endif
 			s_entries[i].offset = be32(raw + 4);
 			s_entries[i].size = be32(raw + 8);
 			++s_file_count;
 		}
-		if (!i)
+		if (!i) {
+#if defined(PORT_GAME_SMG)
+			std::strcpy(s_entries[i].path, "/");
+#endif
 			continue;
+		}
+#if defined(PORT_GAME_SMG)
+		if (!valid_fst_name(name)) {
+			port_log("[dvd] malformed FST name at %u\n", i);
+			return;
+		}
+#endif
 		u32 parent = s_entries[i].directory ? s_entries[i].parent : parent_for(i);
+#if defined(PORT_GAME_SMG)
+		if (parent >= i || !s_entries[parent].directory ||
+		    s_entries[parent].next <= i || !s_entries[parent].path[0] ||
+#else
 		if (parent >= i || !s_entries[parent].path[0] ||
+#endif
 		    std::strlen(s_entries[parent].path) + std::strlen(name) + 2 >= kMaxPath) {
 			port_log("[dvd] FST parent/path error at %u\n", i);
 			return;
@@ -330,10 +477,20 @@ void port_dvd_init(void)
 	std::snprintf(boot_path, sizeof(boot_path), "%ssys/boot.bin", sms_wiiu_app_root());
 	FILE* boot = std::fopen(boot_path, "rb");
 	std::memset(&s_disk_id, 0, sizeof(s_disk_id));
+#if defined(PORT_GAME_SMG)
+	if (!boot || std::fread(&s_disk_id, 1, sizeof(s_disk_id), boot) != sizeof(s_disk_id)) {
+		if (boot)
+			std::fclose(boot);
+		port_log("[dvd] cannot read %s\n", boot_path);
+		return;
+	}
+	std::fclose(boot);
+#else
 	if (boot) {
 		std::fread(&s_disk_id, 1, sizeof(s_disk_id), boot);
 		std::fclose(boot);
 	}
+#endif
 	s_current_dir[0] = '/';
 	s_current_dir[1] = '\0';
 	s_initialized = true;
