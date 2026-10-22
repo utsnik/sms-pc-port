@@ -36,6 +36,13 @@ static inline bool hostState() { return producerMode() && !s_recording; }
 static inline uint32_t hostPtr(const void* p) { return uint32_t(reinterpret_cast<uintptr_t>(p)); }
 static inline uint32_t hostFloat(float f) { uint32_t v; memcpy(&v, &f, sizeof v); return v; }
 #endif
+static inline bool forceVtxState() {
+#ifdef __WIIU__
+    return producerMode() && !s_recording;
+#else
+    return false;
+#endif
+}
 static State& apiState() {
 #ifdef __WIIU__
     return (s_recording || producerMode()) ? gProducer : g;
@@ -468,8 +475,12 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
     else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
     else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
     else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
-    if (lo != GX_STATE.cpVcdLo) apiCP(CP_VCD_LO, lo);
-    if (hi != GX_STATE.cpVcdHi) apiCP(CP_VCD_HI, hi);
+    // In producer mode called display lists change the worker's VCD but not
+    // the shadow (as on the GameCube, whose SDK writes dirty state again), so
+    // a "same as the shadow" write is not redundant there.
+    const bool always = forceVtxState();
+    if (always || lo != GX_STATE.cpVcdLo) apiCP(CP_VCD_LO, lo);
+    if (always || hi != GX_STATE.cpVcdHi) apiCP(CP_VCD_HI, hi);
 }
 void GXSetVtxDescv(const GXVtxDescList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
@@ -523,9 +534,10 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
     default: break;
     }
     A |= 1u << 30;
-    if (A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
-    if (B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
-    if (C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
+    const bool always = forceVtxState();
+    if (always || A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
+    if (always || B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
+    if (always || C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
 }
 void GXSetVtxAttrFmtv(GXVtxFmt fmt, const GXVtxAttrFmtList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);

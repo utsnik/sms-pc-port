@@ -1104,6 +1104,16 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
             if (avail < len) break;
             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
             uint32_t sz = be32(p + 5);
+#ifdef __WIIU__
+            if (s_hostOps) {
+                // gx2prod sends GXCallDisplayList as host-state records, so a raw
+                // call here means the stream lost sync with the producer.
+                static unsigned s_rawCallLogs;
+                if (s_rawCallLogs++ < 8)
+                    logmsg("gx2prod: raw 0x40 in the producer stream phys=%08x size=%u (desync?)", be32(p + 1), sz);
+                if (sz > (16u << 20)) dl = nullptr;
+            }
+#endif
             if (g_parser.displayListDepth < 4 && dl) {
                 g_parser.displayListDepth++;
                 runCommands(dl, sz);
