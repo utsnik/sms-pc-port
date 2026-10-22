@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -77,6 +78,44 @@ def nm_info(elf: Path) -> tuple[dict[str, int], set[str]]:
     return sizes, symbols
 
 
+def host_allocator_check(os_core: Path) -> str:
+    harness = Path(__file__).with_name("smg_wiiu_memory_host.cpp")
+    with tempfile.TemporaryDirectory(prefix="smg-memory-") as build_dir:
+        executable = Path(build_dir) / "smg_wiiu_memory_host"
+        compile_result = subprocess.run(
+            [
+                "g++",
+                "-std=c++17",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-I",
+                str(os_core.parent),
+                str(harness),
+                "-o",
+                str(executable),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if compile_result.returncode:
+            raise RuntimeError(
+                "host allocator harness compile failed:\n"
+                + compile_result.stdout
+                + compile_result.stderr
+            )
+        run_result = subprocess.run(
+            [str(executable)], capture_output=True, text=True
+        )
+        output = run_result.stdout + run_result.stderr
+        if run_result.returncode:
+            raise RuntimeError(
+                f"host allocator harness failed ({run_result.returncode}):\n"
+                + output.rstrip()
+            )
+        return output.rstrip()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--smg-runtime", type=Path, required=True)
@@ -111,6 +150,10 @@ def main() -> int:
         return fail("missing exact arena target log line")
     if not re.search(r"assert\s*\(", runtime):
         return fail("missing host-checkable arena alignment assertion")
+    try:
+        host_output = host_allocator_check(args.os_core)
+    except RuntimeError as exc:
+        return fail(str(exc))
 
     required_providers = (
         "OSGetMEM1ArenaLo",
@@ -155,6 +198,7 @@ def main() -> int:
         return fail(f"test contract requires 64-byte target alignment, got {args.alignment}")
 
     print("memory: PASS: MEM1=24 MiB MEM2=64 MiB static aligned arenas")
+    print(host_output)
     return 0
 
 

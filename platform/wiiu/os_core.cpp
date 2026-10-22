@@ -1,6 +1,7 @@
 #include "port_compat.h"
 #include "port_os.h"
 #include "runtime.h"
+#include "smg_arena.h"
 
 #include <dolphin/os.h>
 #include <dolphin/os/OSAlloc.h>
@@ -76,13 +77,6 @@ uint8_t* align_down(uint8_t* p, uint32_t align)
 }
 
 #if defined(PORT_GAME_SMG)
-uint32_t valid_alignment(uint32_t align)
-{
-	return align && !(align & (align - 1)) ? align : 32;
-}
-#endif
-
-#if defined(PORT_GAME_SMG)
 void ensure_mem1_arena()
 {
 	if (s_mem1_arena_lo || !port_mem1_base || !port_mem1_size)
@@ -93,12 +87,8 @@ void ensure_mem1_arena()
 
 void set_mem2_arena_hi(void* p)
 {
-	uint8_t* value = align_down(reinterpret_cast<uint8_t*>(p), 32);
-	if (value < s_mem2_arena_start)
-		value = s_mem2_arena_start;
-	if (value > s_mem2_arena_end)
-		value = s_mem2_arena_end;
-	s_arena_hi = value;
+	smg_wiiu::set_hi(s_arena_lo, s_arena_hi, s_mem2_arena_start,
+	                 s_mem2_arena_end, p);
 }
 #endif
 
@@ -144,12 +134,8 @@ void* OSGetArenaHi(void) { return s_arena_hi; }
 void OSSetArenaLo(void* p)
 {
 #if defined(PORT_GAME_SMG)
-	uint8_t* value = align_up(reinterpret_cast<uint8_t*>(p), 32);
-	if (value < s_mem2_arena_start)
-		value = s_mem2_arena_start;
-	if (value > s_mem2_arena_end)
-		value = s_mem2_arena_end;
-	s_arena_lo = value;
+	smg_wiiu::set_lo(s_arena_lo, s_arena_hi, s_mem2_arena_start,
+	                 s_mem2_arena_end, p);
 #else
 	s_arena_lo = reinterpret_cast<uint8_t*>(p);
 #endif
@@ -185,29 +171,28 @@ void OSSetMEM2ArenaHi(void* p) { set_mem2_arena_hi(p); }
 void* OSAllocFromMEM1ArenaLo(u32 size, u32 align)
 {
 	ensure_mem1_arena();
-	align = valid_alignment(align);
-	uint8_t* p = align_up(s_mem1_arena_lo, align);
-	if (p > s_mem1_arena_hi || size > static_cast<u32>(s_mem1_arena_hi - p)) {
+	void* result = smg_wiiu::alloc_lo(s_mem1_arena_lo, s_mem1_arena_hi,
+	                                  s_mem1_arena_lo, s_mem1_arena_hi, size,
+	                                  align);
+	if (!result) {
 		port_log("[os] MEM1 arena-low overflow: %u bytes\n", size);
 		return nullptr;
 	}
-	s_mem1_arena_lo = align_up(p + size, align);
-	return p;
+	return result;
 }
 #endif
 
 void* OSAllocFromArenaLo(u32 size, u32 align)
 {
 #if defined(PORT_GAME_SMG)
-	align = valid_alignment(align);
-	uint8_t* p = align_up(s_arena_lo, align);
-	if (p < s_mem2_arena_start || p > s_arena_hi ||
-	    size > static_cast<u32>(s_arena_hi - p)) {
+	void* result = smg_wiiu::alloc_lo(s_arena_lo, s_arena_hi,
+	                                  s_mem2_arena_start, s_mem2_arena_end, size,
+	                                  align);
+	if (!result) {
 		port_log("[os] arena-low overflow: %u bytes\n", size);
 		return nullptr;
 	}
-	s_arena_lo = align_up(p + size, align);
-	return p;
+	return result;
 #else
 	if (!align || (align & (align - 1)))
 		align = 32;
@@ -224,19 +209,13 @@ void* OSAllocFromArenaLo(u32 size, u32 align)
 void* OSAllocFromArenaHi(u32 size, u32 align)
 {
 #if defined(PORT_GAME_SMG)
-	align = valid_alignment(align);
-	if (size > static_cast<u32>(s_arena_hi - s_mem2_arena_start)) {
+	void* result = smg_wiiu::alloc_hi(s_arena_lo, s_arena_hi,
+	                                  s_mem2_arena_start, size, align);
+	if (!result) {
 		port_log("[os] arena-high overflow: %u bytes\n", size);
 		return nullptr;
 	}
-	uint8_t* p = align_down(s_arena_hi - size, align);
-	if (p < s_arena_lo || p < s_mem2_arena_start ||
-	    size > static_cast<u32>(s_arena_hi - p)) {
-		port_log("[os] arena-high overflow: %u bytes\n", size);
-		return nullptr;
-	}
-	s_arena_hi = p;
-	return p;
+	return result;
 #else
 	if (!align || (align & (align - 1)))
 		align = 32;
