@@ -401,6 +401,9 @@ void port_dvd_init(void)
 	const uint8_t* strings = s_fst_raw + s_entry_count * 12;
 	uint32_t string_bytes = static_cast<uint32_t>(fst_size) - s_entry_count * 12;
 	std::memset(s_entries, 0, sizeof(s_entries));
+#if !defined(PORT_GAME_SMG)
+	std::strncpy(s_entries[0].path, "/", kMaxPath - 1);
+#endif
 	for (uint32_t i = 0; i < s_entry_count; ++i) {
 		const uint8_t* raw = s_fst_raw + i * 12;
 #if defined(PORT_GAME_SMG)
@@ -446,12 +449,15 @@ void port_dvd_init(void)
 			s_entries[i].size = be32(raw + 8);
 			++s_file_count;
 		}
-		if (!i) {
 #if defined(PORT_GAME_SMG)
+		if (!i) {
 			std::strcpy(s_entries[i].path, "/");
-#endif
 			continue;
 		}
+#else
+		if (!i)
+			continue;
+#endif
 #if defined(PORT_GAME_SMG)
 		if (!valid_fst_name(name)) {
 			port_log("[dvd] malformed FST name at %u\n", i);
