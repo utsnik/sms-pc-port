@@ -47,6 +47,26 @@ HOST_TIME = r"""
 #include <stdint.h>
 typedef int64_t OSTime;
 extern "C" OSTime OSGetTime(void);
+extern "C" OSTime OSGetSystemTime(void);
+"""
+
+HOST_FASTMUTEX = r"""
+#pragma once
+typedef struct OSFastMutex { int locked; } OSFastMutex;
+extern "C" void OSFastMutex_Init(OSFastMutex*, const char*);
+extern "C" void OSFastMutex_Lock(OSFastMutex*);
+extern "C" void OSFastMutex_Unlock(OSFastMutex*);
+"""
+
+HOST_SYSTEMINFO = r"""
+#pragma once
+#define OSTimerClockSpeed 62156250u
+"""
+
+HOST_THREAD = r"""
+#pragma once
+#include <coreinit/time.h>
+extern "C" void OSSleepTicks(OSTime);
 """
 
 HOST_LOG = r"""
@@ -61,6 +81,7 @@ extern "C" void WHBProcStopRunning(void);
 
 HOST_HARNESS = r"""
 #include "runtime.h"
+#include <coreinit/fastmutex.h>
 #include <coreinit/time.h>
 #include <revolution/mtx.h>
 
@@ -76,6 +97,11 @@ HOST_HARNESS = r"""
 extern "C" void WHBLogPrintf(const char*, ...) {}
 extern "C" void WHBProcStopRunning(void) {}
 extern "C" OSTime OSGetTime(void) { return 0; }
+extern "C" OSTime OSGetSystemTime(void) { return 0; }
+extern "C" void OSSleepTicks(OSTime) {}
+extern "C" void OSFastMutex_Init(OSFastMutex* m, const char*) { m->locked = 0; }
+extern "C" void OSFastMutex_Lock(OSFastMutex* m) { m->locked = 1; }
+extern "C" void OSFastMutex_Unlock(OSFastMutex* m) { m->locked = 0; }
 extern "C" void PSMTXMultVecSR(const Mtx, const Vec* source, Vec* target) {
     *target = *source;
 }
@@ -145,6 +171,9 @@ def check_host_logging(runtime: Path) -> tuple[bool, str]:
         (include / "revolution" / "types.h").write_text(HOST_TYPES)
         (include / "revolution" / "mtx.h").write_text(HOST_MTX)
         (include / "coreinit" / "time.h").write_text(HOST_TIME)
+        (include / "coreinit" / "fastmutex.h").write_text(HOST_FASTMUTEX)
+        (include / "coreinit" / "systeminfo.h").write_text(HOST_SYSTEMINFO)
+        (include / "coreinit" / "thread.h").write_text(HOST_THREAD)
         (include / "whb" / "log.h").write_text(HOST_LOG)
         (include / "whb" / "proc.h").write_text(HOST_PROC)
         harness = temporary_path / "entry_host.cpp"

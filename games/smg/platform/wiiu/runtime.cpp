@@ -7,6 +7,7 @@
 #include "port/port.h"
 #include "wiiu/smg_arena.h"
 
+#include <coreinit/fastmutex.h>
 #include <coreinit/systeminfo.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
@@ -58,7 +59,25 @@ int s_input_warned;
 int s_audio_warned;
 unsigned s_app_root_index;
 
+/* Game, audio and loader threads all log: without a lock their open/append/
+ * close sequences interleaved and cut each other's lines. */
+OSFastMutex s_log_mutex;
+bool s_log_mutex_ready;
+
+void write_stage2_log_locked(const char* line);
+
 void write_stage2_log(const char* line)
+{
+    if (!s_log_mutex_ready) {
+        write_stage2_log_locked(line);
+        return;
+    }
+    OSFastMutex_Lock(&s_log_mutex);
+    write_stage2_log_locked(line);
+    OSFastMutex_Unlock(&s_log_mutex);
+}
+
+void write_stage2_log_locked(const char* line)
 {
     char marker_path[192];
     std::snprintf(marker_path, sizeof(marker_path), "%sstage2log",
@@ -178,6 +197,8 @@ void smg_wiiu_runtime_init(void)
         return;
     assert((reinterpret_cast<uintptr_t>(s_mem1_arena) & 63u) == 0);
     assert((reinterpret_cast<uintptr_t>(s_mem2_arena) & 63u) == 0);
+    OSFastMutex_Init(&s_log_mutex, "smg-stage2-log");
+    s_log_mutex_ready = true;
     resolve_app_root();
     s_initialized = 1;
     port_log("SMG Wii U: arenas MEM1=25165824 MEM2=67108864 alignment=64");
