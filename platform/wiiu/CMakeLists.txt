@@ -146,6 +146,7 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/audio.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx_stub.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/gx2_producer_worker.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_api.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_fifo.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src/gx_vert.cpp

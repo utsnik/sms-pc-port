@@ -1,5 +1,6 @@
 #include "port_heap.h"
 #include "runtime.h"
+#include "gx2_producer_worker.h"
 #include <cstdio>
 #ifndef SMS_GX2_ASYNC_PEEK
 #define SMS_GX2_ASYNC_PEEK 1
@@ -79,6 +80,9 @@ namespace gx {
 
 static GX2ColorBuffer* renderColour();
 static GX2DepthBuffer* renderDepth();
+static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
+static void gx2ProdBoundary(uint32_t kind);
+static void gx2ProdCallList(void* list, uint32_t bytes);
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
 
@@ -605,6 +609,9 @@ static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
+static bool s_gx2ProdEnabled;
+static bool s_gx2ProdMarker;
+static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
@@ -734,6 +741,10 @@ static uint32_t s_deferredFreeCount;
 static void deferFree(void* p) {
     if (!p) return;
     if (s_deferredFreeCount == 256) {
+        if (s_gx2ProdEnabled) {
+            WHBLogPrintf("SMS Wii U: [gx2prod] deferred-free queue full; retaining resources");
+            return;
+        }
         GX2DrawDone();
         for (uint32_t i = 0; i < s_deferredFreeCount; ++i) MEMFreeToDefaultHeap(s_deferredFree[i].p);
         s_deferredFreeCount = 0;
@@ -777,7 +788,7 @@ static float* allocVertices(uint32_t bytes) {
         s_vertexArenaInvalidated = true;
     }
     if (s_vertexArenaUsed + bytes > kVertexArenaBytes) {
-        GX2DrawDone();
+        if (!s_gx2ProdEnabled) GX2DrawDone();
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, arena, kVertexArenaBytes);
         s_vertexArenaUsed = 0;
         ++s_vertexArenaOverflows;
@@ -3334,7 +3345,11 @@ static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level)
     return true;
 }
 static void retileTexture(GX2Texture& texture) {
-    if (!s_retileTextures || runningUnderCemu()) return;
+    // The probe's worker is allowed to record draw state, but not to issue
+    // resource-copy GX2 calls.  Keep the linear source in place until the
+    // full service-queue retile path is enabled; sampling it is correct and
+    // preserves the worker's GX2 allow-list.
+    if (!s_retileTextures || runningUnderCemu() || (s_gx2ProdEnabled && OSGetCoreId() != 1)) return;
     GX2Surface& linear = texture.surface;
     GX2Texture tiled = texture;
     GX2Surface& t = tiled.surface;
@@ -4433,6 +4448,12 @@ void rendererInit(float) {
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
+    s_gx2ProdMarker = sdMarkerPresent("gx2prod");
+    s_gx2ProdCore2 = sdMarkerPresent("gx2core2");
+    if (s_gx2ProdMarker && !s_gx2DlEnabled) {
+        WHBLogPrintf("SMS Wii U: [gx2prod] refused: gx2dl marker is required");
+        s_gx2ProdMarker = false;
+    }
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
@@ -4452,8 +4473,24 @@ void rendererInit(float) {
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s fallback=%s core-init=%u",
                  s_gx2DlEnabled ? "on" : "off", s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit);
+    if (s_gx2ProdMarker)
+        WHBLogPrintf("SMS Wii U: [gx2prod] requested worker core=%u; core 2 already hosts texpack/AX workers, probe override=%s",
+                     s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "enabled" : "disabled");
     s_ready = initShaders();
     if (!s_ready) WHBLogPrintf("SMS Wii U: GX2 shader setup failed");
+    if (s_ready && s_gx2ProdMarker) {
+        syncProducerState();
+        gx2prod::Hooks hooks = {gx2ProdConsume, gx2ProdBoundary, nullptr};
+        if (gx2prod::start(hooks, s_gx2ProdCore2)) {
+            gx2prod::bind_service(gx2ProdCallList);
+            setProducerMode(true);
+            s_gx2ProdEnabled = true;
+            WHBLogPrintf("SMS Wii U: [gx2prod] worker started core=%u (default core 0; core 2 override=%s)",
+                         s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "on" : "off");
+        } else {
+            WHBLogPrintf("SMS Wii U: [gx2prod] worker start failed; marker path disabled");
+        }
+    }
 }
 
 float efbScale() { return 1.0f; }
@@ -4572,7 +4609,7 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     }
     if (s_dlArenaUsed + total > kDlArenaBytes) {
         // Every stored run goes: let the GPU finish reading them first.
-        GX2DrawDone();
+        if (!s_gx2ProdEnabled) GX2DrawDone();
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
         s_dlArenaUsed = 0;
         if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
@@ -4641,11 +4678,24 @@ static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, 
 static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
 static bool s_gx2DlRecording;
 
+static void gx2ProdCallList(void* list, uint32_t bytes) {
+    if (OSGetCoreId() != 1)
+        WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());
+    GX2DirectCallDisplayList(list, bytes);
+    ++s_perfDlCalled;
+    s_perfDlCoreCall = OSGetCoreId();
+}
+
+static void gx2ProdConsume(const uint8_t* bytes, uint32_t size) { producerConsume(bytes, size); }
+static void gx2ProdBoundary(uint32_t kind) { producerBoundary(kind); }
+
 static bool gx2DlBegin(void** outList) {
     if (!s_gx2DlEnabled) return false;
-    if (OSGetCoreId() != 1) {
+    const unsigned core = (unsigned)OSGetCoreId();
+    if ((!s_gx2ProdEnabled && core != 1) || (s_gx2ProdEnabled && core == 1)) {
         ++s_perfDlForbidden;
-        WHBLogPrintf("SMS Wii U: [gx2dl] recorder on unexpected core=%u", (unsigned)OSGetCoreId());
+        WHBLogPrintf("SMS Wii U: [gx2dl] recorder on unexpected core=%u prod=%u", core,
+                     s_gx2ProdEnabled ? 1u : 0u);
     }
     uint8_t*& arena = s_gx2DlArena[s_vertexArenaIndex];
     if (!arena) arena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kGx2DlArenaBytes, 256));
@@ -4689,11 +4739,17 @@ static bool gx2DlEndCall(void* list) {
     }
     DCFlushRange(list, bytes);
     ++s_perfDlRecorded;
-    ++s_perfDlCalled;
     s_perfDlBytes += bytes;
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
-    s_perfDlCoreCall = OSGetCoreId();
-    GX2DirectCallDisplayList(list, bytes);
+    if (s_gx2ProdEnabled) {
+        if (!gx2prod::enqueue_list(list, bytes)) {
+            ++s_perfDlOverflows;
+            WHBLogPrintf("SMS Wii U: [gx2prod] list queue overflow; sequence stopped");
+            return false;
+        }
+    } else {
+        gx2ProdCallList(list, bytes);
+    }
     return true;
 }
 
@@ -4866,7 +4922,7 @@ void flushBatch() {
                 GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
             }
-            if (s_padUniforms == 5) GX2DrawDone();
+            if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();
             ++s_drawsThisFrame;
             if (s_gpuDiag) {
                 GpuDrawInfo info = {};
@@ -5044,9 +5100,9 @@ void flushBatch() {
     } else {
         GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
     }
-    if (s_padUniforms == 5) GX2DrawDone();  // diagnostic fence stays outside a list
+    if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();  // diagnostic fence stays outside a list
     if (bracket) {
-        GX2DrawDone();
+        if (!s_gx2ProdEnabled) GX2DrawDone();
         WHBLogPrintf("SMS Wii U: [vxbracket] done");
     }
     ++s_drawsThisFrame;
@@ -5098,9 +5154,67 @@ static void rebindTvTarget() {
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
 }
+
+struct ProducerCopyRequest {
+    uint32_t ctrl, src, size, clearAr, clearGb, clearZ, cmode, pe, zmode;
+    void* dest;
+};
+static ProducerCopyRequest s_producerCopies[64];
+static uint32_t s_producerCopyWrite;
+
+static void producerCopyService(void* opaque) {
+    const ProducerCopyRequest& r = *static_cast<const ProducerCopyRequest*>(opaque);
+    const bool clear = (r.ctrl >> 11) & 1, disp = (r.ctrl >> 14) & 1;
+    const uint32_t x = r.src & 0x3ff, y = (r.src >> 10) & 0x3ff;
+    const uint32_t w = (r.size & 0x3ff) + 1, h = ((r.size >> 10) & 0x3ff) + 1;
+    debugCopy(disp, x, y, w, h, r.dest, r.ctrl);
+    if (disp) {
+        if (clear) {
+            s_frameClear[0] = float(r.clearAr & 255) / 255.0f;
+            s_frameClear[1] = float((r.clearGb >> 8) & 255) / 255.0f;
+            s_frameClear[2] = float(r.clearGb & 255) / 255.0f;
+            s_frameClear[3] = ((r.pe & 7) == 1) ? float((r.clearAr >> 8) & 255) / 255.0f : 1.0f;
+            s_frameClearPending = ((r.cmode >> 3) & 1) != 0;
+        }
+        return;
+    }
+    if (!s_frameActive || !ProcUIInForeground()) return;
+    copyToTexture(r.dest, x, y, w, h, (r.ctrl >> 9) & 1,
+                  ((r.ctrl >> 3) & 1) << 3 | ((r.ctrl >> 4) & 7));
+    rebindTvTarget();
+    if (!clear) return;
+    if ((r.cmode >> 3) & 1) {
+        ++s_perfClears;
+        GX2ClearColor(renderColour(), float(r.clearAr & 255) / 255.0f,
+                      float((r.clearGb >> 8) & 255) / 255.0f, float(r.clearGb & 255) / 255.0f,
+                      ((r.pe & 7) == 1) ? float((r.clearAr >> 8) & 255) / 255.0f : 1.0f);
+    }
+    if ((r.zmode >> 4) & 1)
+        GX2ClearDepthStencilEx(renderDepth(), float(r.clearZ & 0xffffff) / 16777215.0f, 0,
+                               GX2_CLEAR_FLAGS_DEPTH);
+    rebindTvTarget();
+}
+
 void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
     flushBatch();
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) {
+        if (s_producerCopyWrite >= sizeof(s_producerCopies) / sizeof(s_producerCopies[0])) {
+            WHBLogPrintf("SMS Wii U: [gx2prod] service queue overflow at copy");
+            return;
+        }
+        ProducerCopyRequest& r = s_producerCopies[s_producerCopyWrite++];
+        r.ctrl = ctrl;
+        r.src = g.bp[BP_COPY_SRC_TL]; r.size = g.bp[BP_COPY_SRC_WH];
+        r.clearAr = g.bp[BP_CLEAR_AR]; r.clearGb = g.bp[BP_CLEAR_GB]; r.clearZ = g.bp[BP_CLEAR_Z];
+        r.cmode = g.bp[BP_CMODE0]; r.pe = g.bp[BP_PE_CONTROL]; r.zmode = g.bp[BP_ZMODE];
+        r.dest = g.copyDest;
+        if (!gx2prod::enqueueService(producerCopyService, &r))
+            WHBLogPrintf("SMS Wii U: [gx2prod] service queue rejected copy");
+        return;
+    }
+#endif
     const bool clear = (ctrl >> 11) & 1, disp = (ctrl >> 14) & 1;
     const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
     const uint32_t x = src & 0x3ff, y = (src >> 10) & 0x3ff;
@@ -5263,7 +5377,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
 
 uint32_t peekColor(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
-    flushBatch();
+    if (!s_gx2ProdEnabled) flushBatch();
     if (x < 0 || y < 0) return 0;
     const int point[1][2] = {{x, y}};
     uint32_t c = 0;
@@ -5312,7 +5426,7 @@ uint32_t peekZ(int x, int y) {
         WHBLogPrintf("SMS Wii U: GXPeekZ %s", s_enabled ? "reads the depth target (one frame late)" : "stub (far plane)");
     }
     if (!s_enabled || x < 0 || y < 0) return 0xffffff;
-    flushBatch();
+    if (!s_gx2ProdEnabled) flushBatch();
     GX2DepthBuffer* db = renderDepth();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
         db->surface.format != GX2_SURFACE_FORMAT_FLOAT_R32 || db->surface.aa != GX2_AA_MODE1X)
@@ -5404,6 +5518,14 @@ extern "C" int sms_wiiu_gx2_display_list_enabled(void) {
 }
 
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
+    if (s_gx2ProdEnabled) {
+        gx2prod::wait(gx2prod::kWaitPresent);
+        gx2prod::service();
+        gx2prod::stop();
+        setProducerMode(false);
+        s_gx2ProdEnabled = false;
+        WHBLogPrintf("SMS Wii U: [gx2prod] worker stopped");
+    }
     texturePackShutdown();
 }
 /* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
@@ -5460,12 +5582,22 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
 // Sunshine runs at 30 fps and waits two retraces per game frame; presenting at
 // the second one showed a freshly cleared, empty frame half the time.
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void) {
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) return 1;
+#endif
     if (!s_batch.indices.empty()) return 1;
     return s_drawsThisFrame != 0;
 }
 extern "C" void sms_wiiu_gx2_renderer_end(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_frameActive) return;
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) {
+        gx2prod::wait(gx2prod::kWaitPresent);
+        gx2prod::service();
+        s_producerCopyWrite = 0;
+    } else
+#endif
     flushBatch();
     GX2Flush();
     endVertexArena();
@@ -5516,6 +5648,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;
+    gx2prod::note_frame(g_displayFrames);
 }
 
 } // namespace gx

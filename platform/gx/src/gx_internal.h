@@ -147,6 +147,15 @@ void pipeWrite(const uint8_t* bytes, uint32_t n);
 bool pipeIdle();
 void setPipeRedirect(uint8_t* dest);
 uint8_t* getPipeRedirect();
+#ifdef __WIIU__
+// The optional gx2prod path keeps the legacy pipe untouched until the
+// renderer has enabled the worker.  These hooks are called by the worker;
+// they are deliberately separate from the producer-facing pipe functions.
+void producerConsume(const uint8_t* bytes, uint32_t n);
+void producerBoundary(uint32_t kind);
+void setProducerMode(bool enabled);
+bool producerMode();
+#endif
 
 // ---------------------------------------------------------------- vertices
 struct HostVertex {

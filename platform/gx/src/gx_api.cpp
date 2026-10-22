@@ -4,6 +4,9 @@
 // agree bit for bit.
 #include "gx_internal.h"
 #include "sms_gx/gx_pc.h"
+#ifdef __WIIU__
+#include "../../wiiu/gx2_producer_worker.h"
+#endif
 
 #include <dolphin/gx.h>
 
@@ -26,7 +29,13 @@ bool rendererReady();
 static bool s_recording = false;
 static uint8_t* s_dlBegin = nullptr;
 static uint32_t s_dlSize = 0;
-static State& apiState() { return s_recording ? gProducer : g; }
+static State& apiState() {
+#ifdef __WIIU__
+    return (s_recording || producerMode()) ? gProducer : g;
+#else
+    return s_recording ? gProducer : g;
+#endif
+}
 
 // Keep the API side of a display-list recording independent from the state
 // consumed by gx_fifo.cpp.  Outside recording apiState() is the consumer, so
@@ -47,6 +56,14 @@ static void apiBP(uint32_t reg, uint32_t data) {
         GXPC_Write32(v);
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        shadowBP(v);
+        GXPC_Write8(0x61);
+        GXPC_Write32(v);
+        return;
+    }
+#endif
     writeBP(v);
 }
 static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GX_STATE.bp[reg], size, shift, v)); }
@@ -59,6 +76,15 @@ static void apiCP(uint8_t reg, uint32_t v) {
         GXPC_Write32(v);
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        shadowCP(reg, v);
+        GXPC_Write8(0x08);
+        GXPC_Write8(reg);
+        GXPC_Write32(v);
+        return;
+    }
+#endif
     writeCP(reg, v);
 }
 
@@ -70,6 +96,15 @@ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
         for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        shadowXF(addr, n, w);
+        GXPC_Write8(0x10);
+        GXPC_Write32(((n - 1) << 16) | addr);
+        for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
+        return;
+    }
+#endif
     writeXF(addr, n, w);
 }
 static void apiXF1(uint16_t addr, uint32_t v) { apiXF(addr, 1, &v); }
@@ -236,7 +271,12 @@ GXFifoObj* GXInit(void* base, u32 size) {
 }
 
 void GXSetMisc(GXMiscToken, u32) {}
-void GXFlush(void) { drainCommandStream(); flushBatch(); }
+void GXFlush(void) {
+#ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+#endif
+    drainCommandStream(); flushBatch();
+}
 void GXResetWriteGatherPipe(void) {}
 void GXAbortFrame(void) {}
 BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
@@ -245,14 +285,40 @@ void GXSetDrawSync(u16 token) {
     apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
     apiBP(BP_PE_TOKEN, token);
 }
-u16 GXReadDrawSync(void) { drainCommandStream(); return GX_STATE.drawSyncToken; }
+u16 GXReadDrawSync(void) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitDrawSync);
+    else
+#endif
+    drainCommandStream();
+    return GX_STATE.drawSyncToken;
+}
 void GXSetDrawDone(void) {
     apiBP(BP_DRAWDONE, 2);
+#ifdef __WIIU__
+    if (producerMode()) {
+        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+        if (s_drawDoneCb) s_drawDoneCb();
+        return;
+    }
+#endif
     drainCommandStream();
     if (s_drawDoneCb) s_drawDoneCb();
 }
-void GXWaitDrawDone(void) { drainCommandStream(); flushBatch(); }
+void GXWaitDrawDone(void) {
+#ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitDrawDone); return; }
+#endif
+    drainCommandStream(); flushBatch();
+}
 void GXDrawDone(void) {
+#ifdef __WIIU__
+    if (producerMode()) {
+        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+        if (s_drawDoneCb) s_drawDoneCb();
+        return;
+    }
+#endif
     drainCommandStream();
     flushBatch();
     if (s_drawDoneCb) s_drawDoneCb();
@@ -340,6 +406,10 @@ void GXRestoreWriteGatherPipe(void) { setPipeRedirect(nullptr); }
 
 // ================================================================== display lists
 void GXBeginDisplayList(void* list, u32 size) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+    else
+#endif
     flushBatch();
     // The producer starts from the last consumed state.  All API read-modify-
     // writes during the recording then stay in gProducer until the list is
@@ -366,6 +436,14 @@ void GXCallDisplayList(void* list, u32 nbytes) {
         GXPC_Write32(uint32_t(nbytes));
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        GXPC_Write8(0x40);
+        GXPC_Write32(ptrToPhys(list));
+        GXPC_Write32(uint32_t(nbytes));
+        return;
+    }
+#endif
     callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
 }
 
@@ -1120,8 +1198,22 @@ void GXPokeDstAlpha(GXBool, u8) {}
 void GXPokeDither(GXBool) {}
 void GXPokeZMode(GXBool, GXCompare, GXBool) {}
 void GXPokeARGB(u16, u16, u32) {}
-void GXPeekARGB(u16 x, u16 y, u32* color) { drainCommandStream(); *color = peekColor(x, y); }
-void GXPeekZ(u16 x, u16 y, u32* z) { drainCommandStream(); *z = peekZ(x, y); }
+void GXPeekARGB(u16 x, u16 y, u32* color) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    else
+#endif
+    drainCommandStream();
+    *color = peekColor(x, y);
+}
+void GXPeekZ(u16 x, u16 y, u32* z) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    else
+#endif
+    drainCommandStream();
+    *z = peekZ(x, y);
+}
 void GXPokeZ(u16, u16, u32) {}
 u32 GXCompressZ16(u32 z24, GXZFmt16) { return z24 >> 8; }
 u32 GXDecompressZ16(u32 z16, GXZFmt16) { return z16 << 8; }
@@ -1400,6 +1492,9 @@ void GXInitTlutRegion(GXTlutRegion* region, u32 addr, GXTlutSize size) {
 }
 void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
 void GXInvalidateTexAll(void) {
+#ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+#endif
     flushBatch();
     textureInvalidateAll();
 }

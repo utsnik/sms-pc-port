@@ -6,6 +6,9 @@
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
 #include "gx_internal.h"
+#ifdef __WIIU__
+#include "../../wiiu/gx2_producer_worker.h"
+#endif
 #include <time.h>
 #ifdef __APPLE__
 #include <mach/mach_time.h>
@@ -24,6 +27,13 @@
 #include <unordered_map>
 
 namespace gx {
+
+#ifdef __WIIU__
+struct ProducerDrawSyncJob { void (*callback)(uint16_t); uint16_t token; };
+static ProducerDrawSyncJob s_producerDrawSync[256];
+static uint32_t s_producerDrawSyncWrite;
+static void producerDrawSyncService(void* opaque);
+#endif
 
 State g;
 State gProducer;
@@ -367,6 +377,18 @@ void writeBP(uint32_t value) {
         g.drawSyncToken = uint16_t(data & 0xFFFF);
         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
             flushBatch();
+#ifdef __WIIU__
+            if (producerMode()) {
+                if (s_producerDrawSyncWrite < sizeof(s_producerDrawSync) / sizeof(s_producerDrawSync[0])) {
+                    ProducerDrawSyncJob& job = s_producerDrawSync[s_producerDrawSyncWrite++];
+                    job.callback = drawSyncCallback;
+                    job.token = g.drawSyncToken;
+                    ::gx2prod::enqueueService(producerDrawSyncService, &job);
+                } else {
+                    logmsg("gx2prod draw-sync callback queue overflow");
+                }
+            } else
+#endif
             drawSyncCallback(g.drawSyncToken);
         }
         return;
@@ -1506,6 +1528,12 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
 static uint32_t s_pipeCap = 0;
 static uint32_t s_pipeNeed = 1;
 static uint8_t* s_redirect = nullptr;
+#ifdef __WIIU__
+static bool s_producerMode;
+static std::vector<uint8_t> s_workerPipe;
+static uint32_t s_workerPipeLen;
+static uint32_t s_workerPipeNeed = 1;
+#endif
 }  // namespace gx
 // the buffer, its length and how far the inline writers may fill it (gx_pc.h)
 extern "C" {
@@ -1515,7 +1543,80 @@ uint32_t GXPC_PipeLen = 0, GXPC_PipeFast = 0;
 #define s_pipeBuf GXPC_PipeBuf
 #define s_pipeLen GXPC_PipeLen
 namespace gx {
-static void pipeFastUpdate() { GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1); }
+static void pipeFastUpdate() {
+#ifdef __WIIU__
+    // Inline writers must not append directly to the legacy buffer while the
+    // producer ring is active: that buffer belongs to the old same-thread
+    // parser.  Keeping the fast window closed also preserves byte order for
+    // commands split across GXPC_Put* calls.
+    GXPC_PipeFast = (s_redirect || s_producerMode) ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
+#else
+    GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
+#endif
+}
+
+#ifdef __WIIU__
+bool producerMode() { return s_producerMode; }
+
+void setProducerMode(bool enabled) {
+    s_producerMode = enabled;
+    if (enabled) {
+        // Any bytes already in the legacy pipe are consumed before the worker
+        // becomes visible.  The marker is read during renderer init, before
+        // the game starts issuing frame commands.
+        drainCommandStream();
+        GXPC_PipeLen = 0;
+        s_pipeNeed = 1;
+        s_workerPipeLen = 0;
+        s_workerPipeNeed = 1;
+        s_workerPipe.clear();
+        s_workerPipe.reserve(256u << 10);
+        s_producerDrawSyncWrite = 0;
+    }
+    pipeFastUpdate();
+}
+
+// Worker-side equivalent of pipeRun.  The producer ring owns the bytes until
+// this function copies them into the worker's private tail, so parse() never
+// sees a producer buffer that can be overwritten on core 1.
+void producerConsume(const uint8_t* bytes, uint32_t n) {
+    if (!bytes || !n) return;
+    if (s_workerPipe.size() < size_t(s_workerPipeLen) + n)
+        s_workerPipe.resize(size_t(s_workerPipeLen) + n);
+    memcpy(s_workerPipe.data() + s_workerPipeLen, bytes, n);
+    s_workerPipeLen += n;
+    while (s_workerPipeLen) {
+        uint32_t need = 1;
+        uint32_t used = parse(s_workerPipe.data(), s_workerPipeLen, &need);
+        if (!used) {
+            s_workerPipeNeed = need;
+            break;
+        }
+        if (used == s_workerPipeLen) {
+            s_workerPipeLen = 0;
+            s_workerPipeNeed = 1;
+        } else {
+            memmove(s_workerPipe.data(), s_workerPipe.data() + used, s_workerPipeLen - used);
+            s_workerPipeLen -= used;
+            s_workerPipeNeed = need;
+        }
+    }
+}
+
+void producerBoundary(uint32_t kind) {
+    // Boundaries are published only after all earlier byte chunks have been
+    // consumed by the worker.  A flush boundary closes the current GX2 list;
+    // the core-1 service pump then replays queued list calls in order.
+    if (s_workerPipeLen) producerConsume(nullptr, 0);
+    (void)kind;
+    flushBatch();
+}
+
+static void producerDrawSyncService(void* opaque) {
+    ProducerDrawSyncJob& job = *static_cast<ProducerDrawSyncJob*>(opaque);
+    if (job.callback) job.callback(job.token);
+}
+#endif
 
 // Writes through a redirected pipe go to memory directly (uncached on the
 // GameCube, so the game flushes nothing): stamp them when the redirect ends.
@@ -1571,6 +1672,12 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n) {
         s_redirect += n;
         return;
     }
+#ifdef __WIIU__
+    if (s_producerMode) {
+        ::gx2prod::append(bytes, n);
+        return;
+    }
+#endif
     if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
     memcpy(s_pipeBuf + s_pipeLen, bytes, n);
     s_pipeLen += n;
