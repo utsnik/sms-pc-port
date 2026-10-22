@@ -72,7 +72,6 @@ static volatile uint32_t s_workerHandled;
 static volatile uint32_t s_serviceDone;
 static volatile uint32_t s_stopRequested;
 static bool s_started;
-static uint32_t s_wokenAt;
 static Counters s_totals;
 static Counters s_lastLog;
 static uint32_t s_lastLogFrame;
@@ -253,7 +252,6 @@ bool start(const Hooks& hooks, bool core2) {
     s_requestId = s_workerHandled = s_serviceDone = 0;
     s_requestTarget = s_requestKind = 0;
     s_stopRequested = 0;
-    s_wokenAt = 0;
     s_workerDrainBlocked = 0;
     s_appendFailureLogged = s_serviceFailureLogged = false;
     s_wrongServiceCoreLogged = false;
@@ -323,10 +321,10 @@ bool append(const uint8_t* bytes, uint32_t size) {
     updateHighWater(used + size);
     add(&s_totals.producerAppendMicros, microsSince(startTime));
 
-    /* Wake immediately from empty, then every 32 KiB while the producer is
-     * ahead.  Synchronous boundaries always issue an unconditional wake. */
-    if (!used || s_byteWrite - s_wokenAt >= (32u << 10)) {
-        s_wokenAt = s_byteWrite;
+    /* Recheck after publishing: the pre-copy 'used' sample can be stale if
+     * the worker drained the ring while this append was in progress. */
+    const uint32_t published = s_byteWrite;
+    if (published != s_byteRead) {
         wakeWorker();
     }
     /* Keep display-list calls flowing while the game is producing.  The
