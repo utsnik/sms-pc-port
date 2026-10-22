@@ -3,27 +3,35 @@ if(PORT_GAME STREQUAL "smg")
       "Galaxy Stage 1 Wii U output directory")
 
   set(SMG_WIIU_OS_ADAPTER_DEFS
-    OSInitThreadQueue=smg_wiiu_OSInitThreadQueue
-    OSGetCurrentThread=smg_wiiu_OSGetCurrentThread
-    OSIsThreadTerminated=smg_wiiu_OSIsThreadTerminated
-    OSCreateThread=smg_wiiu_OSCreateThread
-    OSExitThread=smg_wiiu_OSExitThread
-    OSCancelThread=smg_wiiu_OSCancelThread
-    OSJoinThread=smg_wiiu_OSJoinThread
-    OSDetachThread=smg_wiiu_OSDetachThread
-    OSResumeThread=smg_wiiu_OSResumeThread
-    OSSuspendThread=smg_wiiu_OSSuspendThread
-    OSSleepThread=smg_wiiu_OSSleepThread
-    OSWakeupThread=smg_wiiu_OSWakeupThread
-    OSGetThreadPriority=smg_wiiu_OSGetThreadPriority
-    OSInitMessageQueue=smg_wiiu_OSInitMessageQueue
-    OSSendMessage=smg_wiiu_OSSendMessage
-    OSJamMessage=smg_wiiu_OSJamMessage
-    OSReceiveMessage=smg_wiiu_OSReceiveMessage
-    OSInitMutex=smg_wiiu_OSInitMutex
-    OSLockMutex=smg_wiiu_OSLockMutex
-    OSUnlockMutex=smg_wiiu_OSUnlockMutex
-    OSTryLockMutex=smg_wiiu_OSTryLockMutex)
+    OSInitThreadQueue=sms_wiiu_OSInitThreadQueue
+    OSGetCurrentThread=sms_wiiu_OSGetCurrentThread
+    OSIsThreadTerminated=sms_wiiu_OSIsThreadTerminated
+    OSCreateThread=sms_wiiu_OSCreateThread
+    OSExitThread=sms_wiiu_OSExitThread
+    OSCancelThread=sms_wiiu_OSCancelThread
+    OSJoinThread=sms_wiiu_OSJoinThread
+    OSDetachThread=sms_wiiu_OSDetachThread
+    OSResumeThread=sms_wiiu_OSResumeThread
+    OSSuspendThread=sms_wiiu_OSSuspendThread
+    OSSleepThread=sms_wiiu_OSSleepThread
+    OSWakeupThread=sms_wiiu_OSWakeupThread
+    OSGetThreadPriority=sms_wiiu_OSGetThreadPriority
+    OSDisableScheduler=sms_wiiu_OSDisableScheduler
+    OSEnableScheduler=sms_wiiu_OSEnableScheduler
+    OSYieldThread=sms_wiiu_OSYieldThread
+    OSDisableInterrupts=sms_wiiu_OSDisableInterrupts
+    OSEnableInterrupts=sms_wiiu_OSEnableInterrupts
+    OSRestoreInterrupts=sms_wiiu_OSRestoreInterrupts
+    OSGetTime=sms_wiiu_OSGetTime
+    OSGetTick=sms_wiiu_OSGetTick
+    OSInitMessageQueue=sms_wiiu_OSInitMessageQueue
+    OSSendMessage=sms_wiiu_OSSendMessage
+    OSJamMessage=sms_wiiu_OSJamMessage
+    OSReceiveMessage=sms_wiiu_OSReceiveMessage
+    OSInitMutex=sms_wiiu_OSInitMutex
+    OSLockMutex=sms_wiiu_OSLockMutex
+    OSUnlockMutex=sms_wiiu_OSUnlockMutex
+    OSTryLockMutex=sms_wiiu_OSTryLockMutex)
   set(SMG_WIIU_SND_ADAPTER_DEFS
     AIInit=smg_gc_AIInit
     AICheckInit=smg_gc_AICheckInit
@@ -49,20 +57,57 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_vert.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/os_core.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/os_thread.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/runtime.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/vi.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/dvd.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/pad.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/ai.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/port_heap.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/msl_math.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/msl_rand.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDBase.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDGeometry.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDLight.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDPixel.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDTev.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDTransform.c)
   set(SMG_WIIU_PLATFORM_SOURCES
-    ${SMG_WIIU_SHARED_PROVIDER_SOURCES}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/sdk_stubs.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/runtime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gx_link_stub.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)
+
+  set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S
+    PROPERTIES COMPILE_OPTIONS "-Wa,-mgekko")
+
+  # Sunshine's providers use the Sunshine Dolphin/JSystem ABI. Compile them
+  # as a separate object target so Galaxy's revolution headers and forced
+  # compatibility shim cannot be mixed into the same translation unit.
+  set(SMG_WIIU_SHARED_INCLUDE_DIRS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/JSystem/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/PowerPC_EABI_Support/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/TRK_MINNOW_DOLPHIN/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/OdemuExi2/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src/port_include)
+  add_library(smg_wiiu_shared OBJECT ${SMG_WIIU_SHARED_PROVIDER_SOURCES})
+  target_include_directories(smg_wiiu_shared BEFORE PRIVATE ${SMG_WIIU_SHARED_INCLUDE_DIRS})
+  target_compile_definitions(smg_wiiu_shared PRIVATE
+    GEKKO=1 TARGET_PC=1 TARGET_WIIU=1 __WIIU__=1 ESPRESSO=1 NDEBUG=1 DEBUG=1 VERSION=0
+    SMS_AUDIO_DSP_HLE=1
+    ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
+  target_compile_options(smg_wiiu_shared PRIVATE
+    ${SMG_GAME_FLAGS} -std=gnu++11
+    -include ${CMAKE_CURRENT_SOURCE_DIR}/../../src/port_compat.h
+    -include${CMAKE_CURRENT_SOURCE_DIR}/dolphin_externs.h)
 
   add_library(smg_game STATIC ${SMG_GAME_SOURCES})
   target_include_directories(smg_game BEFORE PRIVATE
@@ -76,7 +121,8 @@ if(PORT_GAME STREQUAL "smg")
   target_compile_options(smg_game PRIVATE ${SMG_GAME_FLAGS}
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
 
-  add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES})
+  add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES}
+    $<TARGET_OBJECTS:smg_wiiu_shared>)
   target_include_directories(smg BEFORE PRIVATE
     ${SMG_GAME_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include

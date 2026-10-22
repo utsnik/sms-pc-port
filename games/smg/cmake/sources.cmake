@@ -20,7 +20,6 @@ file(GLOB_RECURSE SMG_NW4R_SOURCES CONFIGURE_DEPENDS
 # Stage 1. In particular, the duplicate Sunshine GD set is not included.
 set(SMG_PETARI_SDK_SOURCES
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/arc/arc.c"
-  "${SMG_DECOMP_ROOT}/src/RVL_SDK/aralt/aralt.c"
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/tpl/TPL.c"
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/gd/GDIndirect.c"
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/gd/GDTexture.c")

@@ -32,7 +32,7 @@ configure:
 		-DCMAKE_BUILD_TYPE=Release
 
 build: configure
-	$(CMAKE) --build $(CMAKE_BUILD) --parallel 4
+	$(CMAKE) --build $(CMAKE_BUILD) --parallel 16
 
 clean:
 	rm -rf $(CMAKE_BUILD) $(BUILD)/sms.elf $(BUILD)/sms.map $(BUILD)/sms.rpx \
