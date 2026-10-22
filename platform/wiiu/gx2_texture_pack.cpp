@@ -53,6 +53,7 @@ extern "C" {
 BOOL wut_OSCreateThread(WutThread*, WutEntry, int32_t, char*, void*, uint32_t, int32_t, uint8_t) __asm__("OSCreateThread");
 int32_t wut_OSResumeThread(WutThread*) __asm__("OSResumeThread");
 BOOL wut_OSJoinThread(WutThread*, int*) __asm__("OSJoinThread");
+BOOL wut_OSIsThreadTerminated(WutThread*) __asm__("OSIsThreadTerminated");
 /* wut's OSMessage is a pointer plus three words (16 bytes); the queue calls
  * copy whole messages (a bare pointer here crashed the DSP mixer, e895c83). */
 struct WutMessage { void* message; uint32_t args[3]; };
@@ -198,6 +199,7 @@ static void matchRequest(const TexturePackRequest& request) {
     for (uint32_t level = 0; level != entry->mipCount; ++level) {
         const TexturePackLevel& source = entry->levels[level];
         for (uint32_t offset = 0; offset < source.rgbaSize; ) {
+            if (s_workerStop) return;
             const uint32_t bytesToRead = std::min<uint32_t>(kTexturePackMaxChunk, source.rgbaSize - offset);
             TexturePackUploadChunk chunk = {};
             chunk.requestId = request.requestId; chunk.level = level; chunk.offset = offset;
@@ -217,7 +219,7 @@ static int texturePackWorker(int, const char**) {
         if (!wut_OSReceiveMessage(&s_workerWake, &m, kMessageBlock)) continue;
         if (!m.message) break;
         TexturePackRequest request;
-        while (s_requests.pop(&request)) matchRequest(request);
+        while (!s_workerStop && s_requests.pop(&request)) matchRequest(request);
     }
     return 0;
 }
@@ -334,8 +336,20 @@ bool texturePackInit() {
 void texturePackShutdown() {
     if (s_workerStarted) {
         s_workerStop = true;
+        // Never block on the send: with the queue full of wakes and the worker
+        // inside a read, a blocking send hung the exit (sms-shadow, 2026-10-22).
+        // A worker that misses the stop message sees s_workerStop on its next loop.
         WutMessage stop = {nullptr, {0, 0, 0}};
-        wut_OSSendMessage(&s_workerWake, &stop, kMessageBlock);
+        wut_OSSendMessage(&s_workerWake, &stop, 0);
+        for (int i = 0; i < 500 && !wut_OSIsThreadTerminated(&s_worker); ++i)
+            wut_OSSleepTicks(62156250 / 1000); // about 1 ms, 0.5 s in all
+        if (!wut_OSIsThreadTerminated(&s_worker)) {
+            // Still in a read: leave the file and index alone rather than free
+            // them under it; the process is exiting anyway.
+            WHBLogPrint("SMS Wii U: [texpack] worker did not stop within 0.5 s; skipping its cleanup");
+            s_state.enabled = false;
+            return;
+        }
         int result = 0;
         wut_OSJoinThread(&s_worker, &result);
         s_workerStarted = false;
