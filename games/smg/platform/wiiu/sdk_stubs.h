@@ -98,7 +98,12 @@
   X(smg_gc_DSPHalt) \
   X(smg_gc_DSPUnhalt) \
   X(smg_gc_DSPAddTask) \
-  X(__DSP_boot_task)
+  X(__DSP_boot_task) \
+  X(__cxa_pure_virtual) \
+  X(__syscall_tls_create) \
+  X(__syscall_tls_delete) \
+  X(__syscall_tls_get) \
+  X(__syscall_tls_set)
 
 #ifdef __cplusplus
 extern "C" {

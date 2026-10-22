@@ -49,6 +49,17 @@ if(PORT_GAME STREQUAL "smg")
     DSPUnhalt=smg_gc_DSPUnhalt
     DSPAddTask=smg_gc_DSPAddTask)
 
+  # Keep the legacy shared-provider candidates explicit for the ownership
+  # audit. Stage 1 deliberately does not compile these audio/runtime sources:
+  # the Galaxy boundary supplies neutral no-data hooks instead.
+  set(SMG_WIIU_UNSELECTED_PROVIDER_PATHS
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/runtime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/ai.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp)
+  set(SMG_WIIU_RUNTIME_FILE runtime.cpp)
+
   # Shared Sunshine providers are compiled once here. Do not add their
   # Petari counterparts to SMG_GAME_SOURCES to resolve a missing symbol.
   set(SMG_WIIU_SHARED_PROVIDER_SOURCES
@@ -74,7 +85,7 @@ if(PORT_GAME STREQUAL "smg")
   set(SMG_WIIU_PLATFORM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/sdk_stubs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/main.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/runtime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gx_link_stub.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)

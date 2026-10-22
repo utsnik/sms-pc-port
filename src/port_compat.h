@@ -45,6 +45,17 @@
 #include <limits.h>
 #include <float.h>
 #include <wchar.h>
+
+/* Shared source patches may emit the port's diagnostic hook while compiling
+ * through the force-included compatibility boundary. */
+#ifdef __cplusplus
+extern "C" {
+#endif
+void port_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+#ifdef __cplusplus
+}
+#endif
+
 #ifdef __cplusplus
 #include <new>
 #include <cmath>
