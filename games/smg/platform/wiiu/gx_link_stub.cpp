@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 namespace {
 
@@ -52,7 +53,24 @@ void flushBatch() {}
 void onStateChange() {}
 void executeCopy(uint32_t) { note_stub(); }
 void markXfMemDirty() {}
-uint8_t* primitiveBegin(uint8_t, uint32_t, uint32_t, uint32_t) { return nullptr; }
+/* The vertex loader decodes each primitive into the buffer this returns, then
+ * the renderer would consume it. Without a renderer the bytes are discarded,
+ * but the buffer must be writable: nullptr made the first GXBegin
+ * (MainLoopFramework::clearEfb) fault in gx::readVec. */
+uint8_t* primitiveBegin(uint8_t, uint32_t count, uint32_t, uint32_t stride)
+{
+    static uint8_t* s_sink;
+    static size_t s_sink_bytes;
+    const size_t need = size_t(count) * stride;
+    if (need > s_sink_bytes) {
+        uint8_t* grown = static_cast<uint8_t*>(realloc(s_sink, need));
+        if (!grown)
+            return s_sink;
+        s_sink = grown;
+        s_sink_bytes = need;
+    }
+    return s_sink;
+}
 void primitiveEnd(uint8_t, uint32_t) {}
 PrimClass primClass(uint8_t opcode)
 {
