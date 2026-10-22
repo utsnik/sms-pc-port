@@ -1,3 +1,100 @@
+if(PORT_GAME STREQUAL "smg")
+  set(SMG_WIIU_BUILD_DIR "${PORT_WIIU_BUILD_DIR}" CACHE PATH
+      "Galaxy Stage 1 Wii U output directory")
+
+  set(SMG_WIIU_OS_ADAPTER_DEFS
+    OSInitThreadQueue=smg_wiiu_OSInitThreadQueue
+    OSGetCurrentThread=smg_wiiu_OSGetCurrentThread
+    OSIsThreadTerminated=smg_wiiu_OSIsThreadTerminated
+    OSCreateThread=smg_wiiu_OSCreateThread
+    OSExitThread=smg_wiiu_OSExitThread
+    OSCancelThread=smg_wiiu_OSCancelThread
+    OSJoinThread=smg_wiiu_OSJoinThread
+    OSDetachThread=smg_wiiu_OSDetachThread
+    OSResumeThread=smg_wiiu_OSResumeThread
+    OSSuspendThread=smg_wiiu_OSSuspendThread
+    OSSleepThread=smg_wiiu_OSSleepThread
+    OSWakeupThread=smg_wiiu_OSWakeupThread
+    OSGetThreadPriority=smg_wiiu_OSGetThreadPriority
+    OSInitMessageQueue=smg_wiiu_OSInitMessageQueue
+    OSSendMessage=smg_wiiu_OSSendMessage
+    OSJamMessage=smg_wiiu_OSJamMessage
+    OSReceiveMessage=smg_wiiu_OSReceiveMessage
+    OSInitMutex=smg_wiiu_OSInitMutex
+    OSLockMutex=smg_wiiu_OSLockMutex
+    OSUnlockMutex=smg_wiiu_OSUnlockMutex
+    OSTryLockMutex=smg_wiiu_OSTryLockMutex)
+  set(SMG_WIIU_SND_ADAPTER_DEFS
+    AIInit=smg_gc_AIInit
+    AICheckInit=smg_gc_AICheckInit
+    AIReset=smg_gc_AIReset
+    AIRegisterDMACallback=smg_gc_AIRegisterDMACallback
+    AIInitDMA=smg_gc_AIInitDMA
+    AIGetDMAEnableFlag=smg_gc_AIGetDMAEnableFlag
+    AIStartDMA=smg_gc_AIStartDMA
+    AIStopDMA=smg_gc_AIStopDMA
+    AIGetDMABytesLeft=smg_gc_AIGetDMABytesLeft
+    DSPInit=smg_gc_DSPInit
+    DSPCheckInit=smg_gc_DSPCheckInit
+    DSPReset=smg_gc_DSPReset
+    DSPHalt=smg_gc_DSPHalt
+    DSPUnhalt=smg_gc_DSPUnhalt
+    DSPAddTask=smg_gc_DSPAddTask)
+
+  set(SMG_WIIU_PLATFORM_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_api.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_fifo.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_vert.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/os_core.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/os_thread.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/runtime.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/vi.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/dvd.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/pad.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/ai.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
+
+  add_library(smg_game STATIC ${SMG_GAME_SOURCES})
+  target_include_directories(smg_game BEFORE PRIVATE
+    ${SMG_GAME_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+  target_compile_definitions(smg_game PRIVATE ${SMG_DEFS}
+    ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
+  target_compile_options(smg_game PRIVATE ${SMG_GAME_FLAGS})
+
+  add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES})
+  target_include_directories(smg BEFORE PRIVATE
+    ${SMG_GAME_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../gx/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
+  target_compile_definitions(smg PRIVATE ${SMG_DEFS}
+    ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
+  target_compile_options(smg PRIVATE ${SMG_GAME_FLAGS})
+  set_target_properties(smg PROPERTIES
+    OUTPUT_NAME smg
+    SUFFIX ".elf"
+    RUNTIME_OUTPUT_DIRECTORY ${SMG_WIIU_BUILD_DIR})
+  target_link_options(smg PRIVATE
+    -Wl,--no-undefined
+    -Wl,--gc-sections
+    "-Wl,-Map,${SMG_WIIU_BUILD_DIR}/smg.map")
+  target_link_libraries(smg PRIVATE
+    -Wl,--whole-archive smg_game -Wl,--no-whole-archive
+    wut m)
+  add_custom_target(smg_wiiu_elf ALL DEPENDS smg)
+  return()
+endif()
+
 set(SMS_WIIU_BUILD_DIR "/mnt/buildcache/wiiu-build/sms" CACHE PATH
     "Stage 1 Wii U output directory")
 option(SMS_WIIU_SKIP_INTRO "Skip opening movies in Wii U test builds" ON)

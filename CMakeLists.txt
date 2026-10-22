@@ -2,6 +2,38 @@ cmake_minimum_required(VERSION 3.20)
 project(sms_port C CXX)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+set(PORT_GAME "sms" CACHE STRING "Wii U game target: sms or smg")
+set_property(CACHE PORT_GAME PROPERTY STRINGS sms smg)
+if(NOT PORT_GAME STREQUAL "sms" AND NOT PORT_GAME STREQUAL "smg")
+  message(FATAL_ERROR "PORT_GAME must be sms or smg (got '${PORT_GAME}')")
+endif()
+
+# Galaxy is a separate source ownership boundary. Route it before the SMS
+# source generator so configuring PORT_GAME=smg never discovers Sunshine's
+# game objects or its desktop platform dependencies.
+if(PORT_GAME STREQUAL "smg")
+  if(NOT SMS_WIIU)
+    message(FATAL_ERROR "PORT_GAME=smg requires the Wii U target (SMS_WIIU=ON)")
+  endif()
+  set(PORT_WIIU_BUILD_DIR "/mnt/buildcache/wiiu-build/smg" CACHE PATH
+      "External Wii U output directory")
+  set(SMG_WIIU_BUILD_DIR "${PORT_WIIU_BUILD_DIR}" CACHE PATH
+      "Galaxy Stage 1 Wii U output directory" FORCE)
+  set(SMG_WIIU_RUN_GAME 0 CACHE BOOL "Stage 1 must not invoke port_game_main" FORCE)
+  set(SMG_DEFS GEKKO=1 TARGET_PC=1 TARGET_WIIU=1 __WIIU__=1 ESPRESSO=1
+      NDEBUG=1 VERSION=0 PORT_GAME_SMG=1 SMG_WIIU_RUN_GAME=0)
+  set(SMG_GAME_FLAGS
+    -w -fno-strict-aliasing -fwrapv -ffunction-sections -fdata-sections
+    -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
+    -mcpu=750 -meabi -mhard-float -Wno-narrowing)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/games/smg/cmake/sources.cmake)
+  message(STATUS "PORT_GAME=smg: selected Galaxy source manifest")
+  message(STATUS "SMG targets: smg_game and smg")
+  message(STATUS "SMG excludes desktop GL/XR/Android/AAudio and duplicate Petari SDK providers")
+  add_subdirectory(platform/wiiu)
+  return()
+endif()
+
 set(SMS_DECOMP ${CMAKE_CURRENT_SOURCE_DIR}/decomp)
 set(SMS_PORT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # The decomp's header roots, in configure.py's order: the game's include/,

@@ -1,13 +1,26 @@
-# Thin CMake/Ninja wrapper for the link-only Wii U Stage 1 target. All
-# generated state, objects, ELF and map stay below the external build cache.
+# Thin CMake/Ninja wrapper for the Wii U targets. All generated state, objects,
+# ELF and map stay below the external build cache.
 
+PORT_GAME ?= sms
+ifeq ($(PORT_GAME),smg)
+BUILD ?= /mnt/buildcache/wiiu-build/smg
+else
 BUILD ?= /mnt/buildcache/wiiu-build/sms
+endif
 CMAKE_BUILD ?= $(BUILD)/cmake
 TOOLCHAIN ?= /opt/devkitpro/cmake/WiiU.cmake
 NINJA ?= ninja
 CMAKE ?= cmake
 
-.PHONY: all configure build clean
+ifeq ($(PORT_GAME),smg)
+WIIU_CONFIGURE_ARGS = -DPORT_GAME=$(PORT_GAME) \
+	-DPORT_WIIU_BUILD_DIR=$(BUILD) -DSMS_WIIU=ON
+else
+WIIU_CONFIGURE_ARGS = -DPORT_GAME=$(PORT_GAME) \
+	-DSMS_WIIU=ON -DSMS_WIIU_BUILD_DIR=$(BUILD)
+endif
+
+.PHONY: all configure build clean rpx
 
 all: build
 
@@ -15,12 +28,18 @@ configure:
 	mkdir -p $(BUILD) $(CMAKE_BUILD)
 	$(CMAKE) -S . -B $(CMAKE_BUILD) -G Ninja \
 		-DCMAKE_TOOLCHAIN_FILE=$(TOOLCHAIN) \
-		-DSMS_WIIU=ON \
-		-DSMS_WIIU_BUILD_DIR=$(BUILD) \
+		$(WIIU_CONFIGURE_ARGS) \
 		-DCMAKE_BUILD_TYPE=Release
 
 build: configure
 	$(CMAKE) --build $(CMAKE_BUILD) --parallel 4
 
 clean:
-	rm -rf $(CMAKE_BUILD) $(BUILD)/sms.elf $(BUILD)/sms.map $(BUILD)/sms.rpx
+	rm -rf $(CMAKE_BUILD) $(BUILD)/sms.elf $(BUILD)/sms.map $(BUILD)/sms.rpx \
+		$(BUILD)/smg.elf $(BUILD)/smg.map $(BUILD)/smg.rpx
+
+rpx: build
+	@test "$(PORT_GAME)" = smg
+	docker run --rm --network none \
+		-v $(BUILD):$(BUILD) soh-wiiu-builder:latest \
+		/opt/devkitpro/tools/bin/elf2rpl $(BUILD)/smg.elf $(BUILD)/smg.rpx
