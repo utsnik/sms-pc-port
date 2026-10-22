@@ -19,6 +19,7 @@ extern uint8_t* sms_wiiu_mem2_base;
 extern uint32_t sms_wiiu_mem2_size;
 /* A MEM2 address (DsetVARAM base + ARAM offset) as memory; NULL outside MEM2. */
 const uint8_t* port_varam_ptr(uint32_t addr);
+void smg_wiiu_bind_varam_base(uint32_t base);
 
 /* Task 2's retail FST/DVD boundary, used by the native-BE main.dol loader. */
 void port_dvd_init(void);

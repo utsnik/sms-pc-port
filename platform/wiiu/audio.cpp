@@ -90,7 +90,7 @@ struct Ai {
 	// Stats
 	u32 blocks, underruns, pendingWaits;
 #if defined(PORT_GAME_SMG)
-	u32 nonzero, voices;
+	u32 nonzeroSamples, currentVoices, peakVoices;
 	#endif
 	int64_t statsSince;
 #if defined(PORT_GAME_SMG)
@@ -132,8 +132,9 @@ void dma_block()
 		}
 		g.samples += frames * 2;
 #if defined(PORT_GAME_SMG)
-		if ((u32)port_dspmix_active_voices() > g.voices)
-			g.voices = (u32)port_dspmix_active_voices();
+		g.currentVoices = (u32)port_dspmix_active_voices();
+		if (g.currentVoices > g.peakVoices)
+			g.peakVoices = g.currentVoices;
 #endif
 		sms_wiiu_sdl_audio_queue(s_mix, frames * 4);
 		g.fed = true;
@@ -141,9 +142,10 @@ void dma_block()
 #if defined(PORT_GAME_SMG)
 	if (src && frames) {
 		for (u32 i = 0; i < frames * 2; i++)
-			g.nonzero += src[i] != 0;
-		if ((u32)port_dspmix_active_voices() > g.voices)
-			g.voices = (u32)port_dspmix_active_voices();
+			g.nonzeroSamples += src[i] != 0;
+		g.currentVoices = (u32)port_dspmix_active_voices();
+		if (g.currentVoices > g.peakVoices)
+			g.peakVoices = g.currentVoices;
 	}
 #endif
 	g.blocks++;
@@ -159,7 +161,11 @@ void log_smg_proof(int64_t now)
 {
 	if (now - g.proofSince < kTicksPerSec * 2)
 		return;
-	port_log("[smg-audio] blocks=%u nonzero=%u voices=%u\n", g.blocks, g.nonzero, g.voices);
+	port_log("[smg-audio] blocks=%u nonzero=%u voices=%u peak_voices=%u\n",
+	         g.blocks, g.nonzeroSamples, g.currentVoices, g.peakVoices);
+	g.nonzeroSamples = 0;
+	g.currentVoices = 0;
+	g.peakVoices = 0;
 	g.proofSince = now;
 }
 #endif

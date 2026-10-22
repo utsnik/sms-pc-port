@@ -101,6 +101,12 @@ const uint8_t* aram_lookup(uint32_t a) { return s_varam ? port_varam_ptr(s_varam
 const uint8_t* aram_lookup(uint32_t a) { return port_aram_ptr(a); }
 #endif
 
+#if defined(PORT_GAME_SMG)
+/* Both the target's asynchronous queue and the host's synchronous fallback
+ * publish these counters.  The ordering contract is mail -> render -> reply. */
+volatile u32 s_subframeMails, s_subframeRenders, s_subframeReplies;
+#endif
+
 void post(u32 m)
 {
 	SMS_PORT_HEAP_SCOPE();
@@ -238,6 +244,10 @@ void* reply_thread(void*)
 		BOOL level = OSDisableInterrupts();
 		post(reply->first);
 		post(reply->second);
+#if defined(PORT_GAME_SMG)
+		if (reply->second == (kPrefix | 0xFF00u))
+			++s_subframeReplies;
+#endif
 		__DSPHandler(0, NULL);
 		OSRestoreInterrupts(level);
 		{
@@ -350,6 +360,10 @@ void raise_irq(u32 first, u32 second)
 	port_irq_defer([first, second]() {
 		post(first);
 		post(second);
+#if defined(PORT_GAME_SMG)
+		if (second == (kPrefix | 0xFF00u))
+			++s_subframeReplies;
+#endif
 		__DSPHandler(0, NULL);
 	});
 }
@@ -405,6 +419,9 @@ void render_subframe()
 	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
 	g.sub++;
 	g.subframesRendered++;
+#if defined(PORT_GAME_SMG)
+	++s_subframeRenders;
+#endif
 #ifdef TARGET_WIIU
 	if (s_async.active) {
 		s_async.subframesRendered++;
@@ -463,8 +480,12 @@ void execute(bool fromWorker)
 		if (w.empty() || ((w[0] >> 16) & 0xFF) != 3)
 			return;
 #endif
-		if (g.outA && g.sub < g.subframes)
+		if (g.outA && g.sub < g.subframes) {
+#if defined(PORT_GAME_SMG)
+			++s_subframeMails;
+#endif
 			render_subframe();
+		}
 #ifdef TARGET_WIIU
 		else
 			++s_dbgReleaseIdle;
@@ -609,6 +630,19 @@ extern "C" u64 port_audio_dsp_subframes(void)
 	return g.subframesRendered;
 }
 
+#if defined(PORT_GAME_SMG)
+extern "C" void port_audio_dsp_subframe_stats(uint32_t* mails, uint32_t* renders,
+                                               uint32_t* replies)
+{
+	if (mails)
+		*mails = s_subframeMails;
+	if (renders)
+		*renders = s_subframeRenders;
+	if (replies)
+		*replies = s_subframeReplies;
+}
+#endif
+
 // True while a frame started by 0x82 still has subframes to render. The AI
 // layer does not start another DMA block until it is done: on hardware the
 // DSP always finishes a frame within one block period, and consuming blocks
@@ -626,6 +660,20 @@ extern "C" void port_audio_dsp_debug_log(void)
 #ifdef TARGET_WIIU
 	if (!s_async.active)
 		return;
+#if defined(PORT_GAME_SMG)
+		port_log("[audio] async: queued rel/82/81/other %u/%u/%u/%u exec %u/%u/%u/%u releaseIdle %u replies %u posts %u subframe mail/render/reply %u/%u/%u "
+	         "pending %u sub %u/%u fromDsp %u mails %u skipped %u asserts %u lastAssertMail %u inCmd %d want %u have %u "
+	         "intcount %u audioThreadDead %d\n",
+	         (unsigned)s_dbgQueued[0], (unsigned)s_dbgQueued[1], (unsigned)s_dbgQueued[2], (unsigned)s_dbgQueued[3],
+	         (unsigned)s_dbgExec[0], (unsigned)s_dbgExec[1], (unsigned)s_dbgExec[2], (unsigned)s_dbgExec[3],
+		         (unsigned)s_dbgReleaseIdle, (unsigned)s_dbgReplies, (unsigned)s_dbgReplyPosts,
+		         (unsigned)s_subframeMails, (unsigned)s_subframeRenders, (unsigned)s_subframeReplies,
+	         (unsigned)s_async.framePending, (unsigned)g.sub, (unsigned)g.subframes, (unsigned)g.fromDsp.size(),
+	         (unsigned)s_dbgMails, (unsigned)s_dbgSkippedMails, (unsigned)s_dbgAsserts, (unsigned)s_dbgLastAssertMail,
+	         (int)g.inCmd, (unsigned)g.want, (unsigned)g.words.size(),
+	         (unsigned)JASystem::AudioThread::getDSPSyncCount(),
+	         sms_wiiu_OSIsThreadTerminated(&JASystem::AudioThread::jac_audioThread));
+#else
 	port_log("[audio] async: queued rel/82/81/other %u/%u/%u/%u exec %u/%u/%u/%u releaseIdle %u replies %u posts %u "
 	         "pending %u sub %u/%u fromDsp %u mails %u skipped %u asserts %u lastAssertMail %u inCmd %d want %u have %u "
 	         "intcount %u audioThreadDead %d\n",
@@ -637,6 +685,7 @@ extern "C" void port_audio_dsp_debug_log(void)
 	         (int)g.inCmd, (unsigned)g.want, (unsigned)g.words.size(),
 	         (unsigned)JASystem::AudioThread::getDSPSyncCount(),
 	         sms_wiiu_OSIsThreadTerminated(&JASystem::AudioThread::jac_audioThread));
+#endif
 #endif
 }
 

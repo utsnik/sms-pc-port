@@ -34,6 +34,7 @@ uint32_t port_audio_dsp_read_mail_from(void);
 uint32_t port_audio_dsp_check_mail_from(void);
 void port_audio_dsp_mail_to(uint32_t mail);
 void port_audio_dsp_assert_int(void);
+void port_audio_dsp_subframe_stats(uint32_t* mails, uint32_t* renders, uint32_t* replies);
 }
 
 namespace {
@@ -250,10 +251,21 @@ void release_subframe()
 {
 	for (unsigned group = 0; group < 4; group++) {
 		const unsigned before = g_subframeMails;
+		uint32_t mailsBefore, rendersBefore, repliesBefore;
+		port_audio_dsp_subframe_stats(&mailsBefore, &rendersBefore, &repliesBefore);
 		uint32_t word = group << 16 | create_map(group);
 		send(&word, 0);
 		if (g_subframeMails - before != (group == 3 ? 1u : 0u))
 			++g_misframedReleases;
+		uint32_t mailsAfter, rendersAfter, repliesAfter;
+		port_audio_dsp_subframe_stats(&mailsAfter, &rendersAfter, &repliesAfter);
+		if (group != 3 && (mailsAfter != mailsBefore || rendersAfter != rendersBefore ||
+		                   repliesAfter != repliesBefore))
+			fail("group %u posted a subframe reply before the render release", group);
+		if (group == 3 && (mailsAfter != mailsBefore + 1 ||
+		                   rendersAfter != rendersBefore + 1 ||
+		                   repliesAfter != repliesBefore + 1))
+			fail("subframe mail/render/reply counts diverged at async reply boundary");
 	}
 }
 

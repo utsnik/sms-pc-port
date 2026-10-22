@@ -286,6 +286,15 @@ extern "C" void sms_wiiu_sdl_audio_preopen(int rate)
 	s_axPreopenResult = open_ax_core2(rate);
 }
 
+extern "C" const char* sms_wiiu_sdl_audio_output(void)
+{
+	if (s_output == OUTPUT_AX)
+		return "AX";
+	if (s_output == OUTPUT_SDL || sms_wiiu_sd_marker("sdlaudio"))
+		return "SDL";
+	return "none";
+}
+
 extern "C" int sms_wiiu_sdl_audio_open(int rate)
 {
 	if (!sms_wiiu_sd_marker("sdlaudio")) {

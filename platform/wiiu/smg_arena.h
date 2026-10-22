@@ -5,6 +5,9 @@
 
 namespace smg_wiiu {
 
+constexpr uint32_t kMem2ArenaOffset = 0x00004000u;
+constexpr uint32_t kAramWindowBytes = 0x00E00000u;
+
 inline uint8_t* align_up(uint8_t* pointer, uint32_t alignment)
 {
     uintptr_t value = reinterpret_cast<uintptr_t>(pointer);

@@ -19,6 +19,8 @@ static u32 __AR_init_flag;
 
 static u32 __ARH_MemoryTop = 0x90000000;
 
+extern void smg_wiiu_bind_varam_base(u32) __attribute__((weak));
+
 void ARStartDMA(u32 type, u32 ram_addr, u32 aram_addr, u32 len) {
     OSDisableScheduler();
 
@@ -70,6 +72,8 @@ u32 ARInit(u32*, u32) {
 
     __ARH_MemoryTop = (u32)memLo + ARGetBaseAddress();
     __ARH_BaseAdr = (u32)memLo;
+    if (smg_wiiu_bind_varam_base)
+        smg_wiiu_bind_varam_base(__ARH_BaseAdr);
     OSReport("ARInit : Dummy ARAM enabled (RVL), area %p -> %p (size 0x%x)\n", memLo, memHi, diff);
     __AR_Size = diff;
     __AR_InternalSize = diff;

@@ -40,7 +40,6 @@ uint8_t* s_mem1_arena_lo;
 uint8_t* s_mem1_arena_hi;
 uint8_t* s_mem2_arena_start;
 uint8_t* s_mem2_arena_end;
-uint8_t* s_mem2_low_alloc_lo;
 #endif
 int s_current_heap = -1;
 const uint32_t kHeapCount = 16;
@@ -116,11 +115,13 @@ void port_os_init(void)
 #if defined(PORT_GAME_SMG)
 	s_mem1_arena_lo = align_up(port_mem1_base, 32);
 	s_mem1_arena_hi = align_down(port_mem1_base + port_mem1_size, 32);
-	s_mem2_arena_start = align_up(sms_wiiu_mem2_base + 0x4000, 32);
+	s_mem2_arena_start = align_up(sms_wiiu_mem2_base + smg_wiiu::kMem2ArenaOffset, 32);
 	s_mem2_arena_end = align_down(sms_wiiu_mem2_base + sms_wiiu_mem2_size, 32);
-	s_arena_lo = s_mem2_arena_start;
+	/* Keep the live OS cursor above the VARAM window.  Galaxy's ARInit and
+	 * low-memory allocations both read this cursor; a private reservation
+	 * cursor lets the root heap overlap ARAM. */
+	s_arena_lo = s_mem2_arena_start + smg_wiiu::kAramWindowBytes;
 	s_arena_hi = s_mem2_arena_end;
-	s_mem2_low_alloc_lo = align_up(s_mem2_arena_start + 0x00E00000u, 32);
 #else
 	s_arena_lo = align_up(sms_wiiu_mem2_base + 0x4000, 32);
 	s_arena_hi = align_down(sms_wiiu_mem2_base + sms_wiiu_mem2_size, 32);
@@ -138,7 +139,8 @@ void* OSGetArenaHi(void) { return s_arena_hi; }
 void OSSetArenaLo(void* p)
 {
 #if defined(PORT_GAME_SMG)
-	smg_wiiu::set_lo(s_arena_lo, s_arena_hi, s_mem2_arena_start,
+	smg_wiiu::set_lo(s_arena_lo, s_arena_hi,
+	                 s_mem2_arena_start + smg_wiiu::kAramWindowBytes,
 	                 s_mem2_arena_end, p);
 #else
 	s_arena_lo = reinterpret_cast<uint8_t*>(p);
@@ -189,8 +191,9 @@ void* OSAllocFromMEM1ArenaLo(u32 size, u32 align)
 void* OSAllocFromArenaLo(u32 size, u32 align)
 {
 #if defined(PORT_GAME_SMG)
-	void* result = smg_wiiu::alloc_lo(s_mem2_low_alloc_lo, s_arena_hi,
-	                                  s_mem2_arena_start + 0x00E00000u, s_mem2_arena_end, size,
+	void* result = smg_wiiu::alloc_lo(s_arena_lo, s_arena_hi,
+	                                  s_mem2_arena_start + smg_wiiu::kAramWindowBytes,
+	                                  s_mem2_arena_end, size,
 	                                  align);
 	if (!result) {
 		port_log("[os] arena-low overflow: %u bytes\n", size);
@@ -214,7 +217,8 @@ void* OSAllocFromArenaHi(u32 size, u32 align)
 {
 #if defined(PORT_GAME_SMG)
 	void* result = smg_wiiu::alloc_hi(s_arena_lo, s_arena_hi,
-	                                  s_mem2_arena_start + 0x00E00000u, size, align);
+	                                  s_mem2_arena_start + smg_wiiu::kAramWindowBytes,
+	                                  size, align);
 	if (!result) {
 		port_log("[os] arena-high overflow: %u bytes\n", size);
 		return nullptr;

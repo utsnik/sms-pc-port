@@ -38,6 +38,7 @@
 
 #include <cstdarg>
 #include <revolution/sc.h>
+#include "wiiu/aram_dma.h"
 
 #if defined(TARGET_WIIU)
 extern "C" {
@@ -1067,20 +1068,17 @@ void JKRAramPiece::startDMA(JKRAMCommand* pCommand) {
     /* smg-audio: Wii U pointers are in the target's MEM1/MEM2 arenas, not
      * the GameCube 0x80000000 address space. aralt uses (type, src, dst):
      * direction 0 has main RAM in src; direction 1 has it in dst. */
-    const auto in_range = [](u32 address, u8* base, u32 size) {
-        const u32 lo = reinterpret_cast<u32>(base);
-        return base != nullptr && address >= lo && address - lo < size;
-    };
-    const auto is_main_ram = [&](u32 address) {
-        return address >= 0x80000000u ||
-               in_range(address, port_mem1_base, port_mem1_size) ||
-               in_range(address, sms_wiiu_mem2_base, sms_wiiu_mem2_size);
-    };
-    const bool main_ok = pCommand->mTransferDirection == 0
-        ? is_main_ram(pCommand->mSrc)
-        : is_main_ram(pCommand->mDst);
-    const u32 aram = pCommand->mTransferDirection == 0 ? pCommand->mDst : pCommand->mSrc;
-    if (!main_ok || aram >= 0x04000000u) {
+    const bool valid = smg_wiiu::aram_dma_command_valid(
+        pCommand->mTransferDirection, pCommand->mSrc, pCommand->mDst,
+        pCommand->mDataLength);
+    if (!valid) {
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            port_log("[smg-audio] dropped invalid ARAM DMA dir=%d src=0x%08x dst=0x%08x len=0x%08x\n",
+                     pCommand->mTransferDirection, pCommand->mSrc,
+                     pCommand->mDst, pCommand->mDataLength);
+        }
         doneDMA(reinterpret_cast<u32>(pCommand));
         return;
     }

@@ -50,8 +50,19 @@ def cmake_sources(cmake: str) -> tuple[str, str]:
 def check_sources(args: argparse.Namespace) -> None:
     shared, platform = cmake_sources(args.cmake)
     selected = shared + platform
+    cmake_path = pathlib.Path(args.cmake).resolve()
+    root = cmake_path.parents[2]
+    cmake_dir = cmake_path.parent
     def selected_in(body: str, path: str) -> bool:
-        return path in body or path.rsplit("/", 1)[-1] in body and body.count(path.rsplit("/", 1)[-1]) > 0
+        # Expand CMake's source-dir variable and compare complete normalized
+        # paths.  A basename match lets an unrelated audio.cpp from another
+        # provider satisfy this boundary.
+        expected = (root / path).resolve()
+        for token in re.findall(r"[^\s()]+", body):
+            expanded = token.replace("${CMAKE_CURRENT_SOURCE_DIR}", str(cmake_dir))
+            if pathlib.Path(expanded).resolve() == expected:
+                return True
+        return False
 
     for source in ("platform/audio/dsp_hle.cpp", "platform/audio/dsp_mixer.cpp"):
         if not selected_in(shared, source):
@@ -65,8 +76,6 @@ def check_sources(args: argparse.Namespace) -> None:
         if selected_in(selected, source):
             fail(f"SMG selects forbidden silent/host provider {source}")
 
-    cmake_path = pathlib.Path(args.cmake).resolve()
-    root = cmake_path.parents[2]
     stubs = root / "games/smg/platform/wiiu/sdk_stubs.h"
     if not stubs.exists():
         fail(f"missing SMG stub manifest: {stubs}")
@@ -79,8 +88,8 @@ def check_sources(args: argparse.Namespace) -> None:
         source = pathlib.Path(source_path).read_text()
         if source_path.endswith("audio.cpp") and "[smg-audio] blocks=" not in source:
             fail("SMG audio clock does not emit periodic proof-of-sound counters")
-        if source_path.endswith("dsp_mixer.cpp") and "[smg-audio]" not in source:
-            fail("SMG mixer does not emit active-voice diagnostics")
+        if source_path.endswith("dsp_mixer.cpp") and "port_dspmix_active_voices" not in source:
+            fail("SMG mixer does not expose active-voice diagnostics")
     overwrite = root / "games/smg/decomp/src/Game/System/Overwrite.cpp"
     overwrite_text = overwrite.read_text()
     if "#if defined(TARGET_WIIU)" not in overwrite_text or "port_mem1_base" not in overwrite_text:
@@ -127,11 +136,12 @@ def check_elf(elf: str) -> None:
     if not path.is_file():
         fail(f"linked ELF not found: {elf}")
     checker = pathlib.Path("/home/utking/homelab/wiiu/tools/wiiu_port_check.py")
-    if checker.is_file():
-        result = subprocess.run([sys.executable, str(checker), "elf", str(path)],
-                                text=True, capture_output=True)
-        if result.returncode:
-            fail("linked ELF audit failed: " + (result.stdout + result.stderr).strip())
+    if not checker.is_file():
+        fail(f"linked ELF checker is missing: {checker}")
+    result = subprocess.run([sys.executable, str(checker), "elf", str(path)],
+                            text=True, capture_output=True)
+    if result.returncode:
+        fail("linked ELF audit failed: " + (result.stdout + result.stderr).strip())
     print("audio-boundary: linked ELF: Wii U ELF audit passed")
 
 

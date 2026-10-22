@@ -33,6 +33,20 @@ if(PORT_GAME STREQUAL "smg")
     OSUnlockMutex=sms_wiiu_OSUnlockMutex
     OSTryLockMutex=sms_wiiu_OSTryLockMutex)
   set(SMG_WIIU_SND_ADAPTER_DEFS
+    AIInit=smg_gc_AIInit
+    AICheckInit=smg_gc_AICheckInit
+    AIReset=smg_gc_AIReset
+    AIRegisterDMACallback=smg_gc_AIRegisterDMACallback
+    AIInitDMA=smg_gc_AIInitDMA
+    AIGetDMAEnableFlag=smg_gc_AIGetDMAEnableFlag
+    AIStartDMA=smg_gc_AIStartDMA
+    AIStopDMA=smg_gc_AIStopDMA
+    AIGetDMABytesLeft=smg_gc_AIGetDMABytesLeft
+    AIGetDMAStartAddr=smg_gc_AIGetDMAStartAddr
+    AIGetDMALength=smg_gc_AIGetDMALength
+    AISetDSPSampleRate=smg_gc_AISetDSPSampleRate
+    AIGetDSPSampleRate=smg_gc_AIGetDSPSampleRate
+    DSPInit=smg_gc_DSPInit
     DSPCheckInit=smg_gc_DSPCheckInit
     DSPReset=smg_gc_DSPReset
     DSPHalt=smg_gc_DSPHalt

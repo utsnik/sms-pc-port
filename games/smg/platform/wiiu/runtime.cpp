@@ -4,6 +4,7 @@
 
 #include "port/heap_routing.h"
 #include "port/port.h"
+#include "wiiu/smg_arena.h"
 
 #include <coreinit/time.h>
 #include <whb/log.h>
@@ -29,8 +30,6 @@ namespace {
 
 constexpr size_t kMem1ArenaBytes = 24u * 1024u * 1024u;
 constexpr size_t kMem2ArenaBytes = 64u * 1024u * 1024u;
-constexpr size_t kMem2ArenaOffset = 0x4000u;
-constexpr size_t kAramWindowBytes = 0x00E00000u;
 static_assert(kMem1ArenaBytes == 25165824u, "SMG MEM1 arena size changed");
 static_assert(kMem2ArenaBytes == 67108864u, "SMG MEM2 arena size changed");
 const char kAppRootCandidates[][128] = {
@@ -41,7 +40,8 @@ const char kAppRootCandidates[][128] = {
 
 alignas(64) unsigned char s_mem1_arena[kMem1ArenaBytes];
 alignas(64) unsigned char s_mem2_arena[kMem2ArenaBytes];
-size_t s_mem2_arena_used = kMem2ArenaOffset + kAramWindowBytes;
+size_t s_mem2_arena_used = smg_wiiu::kMem2ArenaOffset + smg_wiiu::kAramWindowBytes;
+uint32_t s_varam_base;
 int s_initialized;
 int s_alloc_scope_depth;
 int s_log_file_warned;
@@ -131,10 +131,26 @@ u32 sms_wiiu_mem2_size = (u32)kMem2ArenaBytes;
  * aralt's ARInit maps (the MEM2 arena low mark createRootHeap reserved). */
 const uint8_t* port_varam_ptr(uint32_t addr)
 {
-    const uint32_t lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(s_mem2_arena + kMem2ArenaOffset));
-    if (addr < lo || addr - lo >= kAramWindowBytes)
+    const uint32_t lo = s_varam_base;
+    if (!lo || addr < lo || addr - lo >= smg_wiiu::kAramWindowBytes)
         return nullptr;
     return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
+}
+
+void smg_wiiu_bind_varam_base(uint32_t base)
+{
+    const uint32_t arena_lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sms_wiiu_mem2_base));
+    const uint32_t arena_hi = arena_lo + sms_wiiu_mem2_size;
+    if (base < arena_lo || base > arena_hi ||
+        smg_wiiu::kAramWindowBytes > arena_hi - base) {
+        port_log("[smg-audio] invalid ARAM base=0x%08x for MEM2 %p..%p",
+                 base, sms_wiiu_mem2_base, sms_wiiu_mem2_base + sms_wiiu_mem2_size);
+        s_varam_base = 0;
+        return;
+    }
+    s_varam_base = base;
+    port_log("[smg-audio] ARAM base bound=0x%08x window=0x%08x",
+             s_varam_base, (unsigned)smg_wiiu::kAramWindowBytes);
 }
 
 void* smg_wiiu_arena_alloc(size_t size, size_t alignment)
@@ -176,10 +192,10 @@ void smg_wiiu_runtime_init(void)
     resolve_app_root();
     s_initialized = 1;
     port_log("SMG Wii U: arenas MEM1=25165824 MEM2=67108864 alignment=64");
-    port_log("[smg-audio] VARAM window=%p..%p size=0x%08x (reserved from MEM2 low allocations)",
-             s_mem2_arena + kMem2ArenaOffset,
-             s_mem2_arena + kMem2ArenaOffset + kAramWindowBytes,
-             (unsigned)kAramWindowBytes);
+    port_log("[smg-audio] VARAM reservation=%p..%p size=0x%08x (live MEM2 low cursor)",
+             s_mem2_arena + smg_wiiu::kMem2ArenaOffset,
+             s_mem2_arena + smg_wiiu::kMem2ArenaOffset + smg_wiiu::kAramWindowBytes,
+             (unsigned)smg_wiiu::kAramWindowBytes);
     port_log("SMG Wii U: app root=%s", sms_wiiu_app_root());
     port_log("SMG Wii U: stage2 runtime initialized; static arenas");
 }
@@ -242,7 +258,8 @@ void port_host_alloc_scope_leave(void)
         --s_alloc_scope_depth;
 }
 
-void* port_low_alloc(size_t size) { return arena_alloc(size, 64); }
+extern void* OSAllocFromArenaLo(uint32_t size, uint32_t align);
+void* port_low_alloc(size_t size) { return OSAllocFromArenaLo((uint32_t)size, 64); }
 int port_mem_init(void) { return 1; }
 void port_mem_set_disc_id(const char*) {}
 int port_is_game_memory(const void* p) { return port_is_game_heap_ptr(p); }
@@ -441,9 +458,11 @@ void C_QUATSlerp(const Quaternion* p, const Quaternion* q, Quaternion* out, f32 
 void smg_wiiu_audio_init(void)
 {
     sms_wiiu_sdl_audio_preopen(32000);
-    const uint32_t varam = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(s_mem2_arena)) + 0x4000;
+    extern void* OSGetMEM2ArenaLo(void);
+    const uint32_t varam = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(OSGetMEM2ArenaLo()));
+    extern const char* sms_wiiu_sdl_audio_output(void);
     port_log("[smg-audio] init output=%s rate=32000 VARAM=0x%08x size=0x%08x; JAudio owns one audio thread",
-             sms_wiiu_sd_marker("sdlaudio") ? "SDL" : "AX", varam, 0x00E00000u);
+             sms_wiiu_sdl_audio_output(), varam, (unsigned)smg_wiiu::kAramWindowBytes);
 }
 void sms_wiiu_hang_check(void) {}
 volatile int sms_wiiu_crash_stage;
