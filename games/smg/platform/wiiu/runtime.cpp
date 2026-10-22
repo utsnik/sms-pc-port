@@ -1,5 +1,7 @@
 #include "runtime.h"
 
+#include "dol_data.h"
+
 #include "port/heap_routing.h"
 #include "port/port.h"
 
@@ -24,6 +26,11 @@ u32 __OSFpscrEnableBits;
 namespace {
 
 constexpr size_t kArenaBytes = 16u * 1024u * 1024u;
+const char kAppRootCandidates[][128] = {
+    "fs:/vol/external01/wiiu/apps/smg/",
+    "wiiu/apps/smg/",
+    "/vol/external01/wiiu/apps/smg/",
+};
 
 alignas(64) unsigned char s_arena[kArenaBytes];
 size_t s_arena_used;
@@ -34,6 +41,25 @@ int s_sleep_warned;
 int s_file_warned;
 int s_input_warned;
 int s_audio_warned;
+unsigned s_app_root_index;
+
+void resolve_app_root()
+{
+    for (unsigned i = 0; i < sizeof(kAppRootCandidates) / sizeof(kAppRootCandidates[0]); ++i) {
+        char probe[160];
+        std::snprintf(probe, sizeof(probe), "%ssys/fst.bin", kAppRootCandidates[i]);
+        FILE* file = std::fopen(probe, "rb");
+        port_log("SMG Wii U: app root probe %s -> %s", kAppRootCandidates[i],
+                 file ? "ok" : "missing");
+        if (file) {
+            std::fclose(file);
+            s_app_root_index = i;
+            return;
+        }
+    }
+    port_log("SMG Wii U: no app root holds sys/fst.bin; keeping %s",
+             kAppRootCandidates[s_app_root_index]);
+}
 
 void log_unsupported_once(int* flag, const char* what)
 {
@@ -78,17 +104,18 @@ uint32_t smg_wiiu_arena_used(void)
     return (uint32_t)s_arena_used;
 }
 
-const char* sms_wiiu_app_root(void) { return ""; }
+const char* sms_wiiu_app_root(void) { return kAppRootCandidates[s_app_root_index]; }
 uint32_t sms_wiiu_heap_free(void) { return 0; }
 
 void smg_wiiu_runtime_init(void)
 {
     if (s_initialized)
         return;
+    resolve_app_root();
     s_initialized = 1;
-    port_log("SMG Wii U: stage1 runtime initialized; fixed arena=%u bytes",
+    port_log("SMG Wii U: stage2 runtime initialized; fixed arena=%u bytes",
              (unsigned)kArenaBytes);
-    port_log("SMG Wii U: OS/input/audio/file boundary is neutral; no game data access");
+    smg_wiiu_load_dol_data();
     smg_wiiu_gx_link_stub_init();
 }
 

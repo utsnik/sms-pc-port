@@ -15,11 +15,6 @@ void JASInstEffect::effect(int, int, JASInstParam*) const {}
 
 extern "C" {
 
-/* Stage 1 intentionally carries no converted game tables or archives. */
-u8 cErrorArchive[1] = {0};
-extern const u8 StoryEventBCSV[1] = {0};
-extern const JMapData GalaxyIDBCSV = {0, 0, 0, 0};
-
 void GDSetGenMode(u8, u8, u8) {}
 void GDSetTevColor(GXTevRegID, GXColor) {}
 void GDSetTexCoordGen(GXTexCoordID, GXTexGenType, GXTexGenSrc, GXBool, u32) {}

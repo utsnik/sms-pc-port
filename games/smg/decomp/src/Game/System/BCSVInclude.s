@@ -1,13 +1,4 @@
-# The port does not assemble this file: it loads both tables from the
-# converted sys/ folder, taken from the player's main.dol (see
-# platform/src/dvd/dol_data.cpp); the .bcsv files are not in this repository.
+# The Wii U port supplies both native-BE tables from sys/main.dol at runtime.
+# Keep this source empty so the decompilation cannot provide a second symbol.
 
 .section .rodata
-
-.global StoryEventBCSV   # 0x8053DC20 - 0x8053DDFF
-StoryEventBCSV:
-	.incbin "src/Game/System/StoryEvent.bcsv"
-
-.global GalaxyIDBCSV     # 0x8053DE00 - 0x8053EB1F
-GalaxyIDBCSV:
-	.incbin "src/Game/System/GalaxyID.bcsv"

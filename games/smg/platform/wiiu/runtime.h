@@ -17,6 +17,10 @@ uint32_t smg_wiiu_arena_used(void);
 /* Activates only the neutral lower GX boundary; no renderer is started. */
 void smg_wiiu_gx_link_stub_init(void);
 
+/* Task 2's retail FST/DVD boundary, used by the native-BE main.dol loader. */
+void port_dvd_init(void);
+void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
+
 #ifdef __cplusplus
 }
 #endif
