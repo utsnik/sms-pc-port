@@ -155,6 +155,17 @@ void producerConsume(const uint8_t* bytes, uint32_t n);
 void producerBoundary(uint32_t kind);
 void setProducerMode(bool enabled);
 bool producerMode();
+// State the API sets outside the GX command stream (full host pointers that
+// do not survive ptrToPhys/physToPtr on Wii U, viewport/scissor floats, TLUT
+// loads, ...).  In producer mode it travels in order through the stream as a
+// private 8-byte command (0xF0 kind slot 0 value32) the worker applies to g.
+enum ProducerHostKind : uint8_t {
+    kHostArrayBase = 1, kHostArrayStride, kHostArrayBE, kHostDefaultBE,
+    kHostViewport, kHostScissor, kHostCull, kHostLineWidth, kHostPointSize,
+    kHostTcManual, kHostCopyDest, kHostTexImage, kHostCallDlPtr, kHostCallDlSize,
+    kHostTlutPtr, kHostTlutOffset, kHostTlutLoad,
+};
+void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
 #endif
 
 // ---------------------------------------------------------------- vertices

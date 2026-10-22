@@ -1058,6 +1058,13 @@ static bool s_dlRecFail = false;  // the list being recorded does more than draw
 
 // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
 // tail holds an incomplete command, *need receives its total length.
+#ifdef __WIIU__
+static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value);
+// Set only while the worker parses the producer stream itself: a game display
+// list never carries the private 0xF0 command.
+static bool s_hostOps = false;
+#endif
+
 static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
     const uint8_t* start = p;
     const uint8_t* end = p + n;
@@ -1106,6 +1113,12 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
             len = 5;
             if (avail < len) break;
             writeBP(be32(p + 1));
+#ifdef __WIIU__
+        } else if (op == 0xF0 && s_hostOps) {
+            len = 8;
+            if (avail < len) break;
+            applyHostState(p[1], p[2], be32(p + 4));
+#endif
         } else if (op >= 0x80 && op < 0xC0) {
             if (avail < 3) { len = 3; break; }
             const VtxLayout& L = layoutFor(op & 7);
@@ -1139,6 +1152,9 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
         else if (op >= 0x20 && op <= 0x38) len = 5;
         else if (op == 0x40) len = 9;
         else if (op == 0x61) len = 5;
+#ifdef __WIIU__
+        else if (op == 0xF0 && s_hostOps) len = 8;
+#endif
         else if (op >= 0x80 && op < 0xC0) {
             if (avail < 3) len = 3;
             else {
@@ -1591,6 +1607,7 @@ void producerConsume(const uint8_t* bytes, uint32_t n) {
         s_workerPipe.resize(size_t(s_workerPipeLen) + n);
     memcpy(s_workerPipe.data() + s_workerPipeLen, bytes, n);
     s_workerPipeLen += n;
+    s_hostOps = true;
     while (s_workerPipeLen) {
         uint32_t need = 1;
         uint32_t used = parse(s_workerPipe.data(), s_workerPipeLen, &need);
@@ -1607,6 +1624,7 @@ void producerConsume(const uint8_t* bytes, uint32_t n) {
             s_workerPipeNeed = need;
         }
     }
+    s_hostOps = false;
 }
 
 void producerBoundary(uint32_t kind) {
@@ -1692,6 +1710,75 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n) {
 
 void pipeWrite(const uint8_t* bytes, uint32_t n) { SMS_PORT_HEAP_SCOPE(); pipePut(bytes, n); }
 
+#ifdef __WIIU__
+void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
+    const uint8_t cmd[8] = {0xF0, kind, slot, 0, uint8_t(value >> 24), uint8_t(value >> 16),
+                            uint8_t(value >> 8), uint8_t(value)};
+    pipePut(cmd, sizeof cmd);
+}
+
+// The worker side of producerHostState: what the same-thread API would have
+// written into g directly, applied at the same point in the command order.
+static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
+    static const uint8_t* s_dlPtr;
+    static const uint8_t* s_tlutPtr;
+    static uint32_t s_tlutOffset;
+    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(uintptr_t(value));
+    switch (kind) {
+    case kHostArrayBase:
+        if (slot < 16) { g.arrayBase[slot] = ptr; g_arrayGen++; }
+        break;
+    case kHostArrayStride:
+        if (slot < 16) { g.arrayStride[slot] = uint8_t(value); g_arrayGen++; }
+        break;
+    case kHostArrayBE:
+        if (slot < 16) { g.arrayBigEndian[slot] = value != 0; g_arrayGen++; }
+        break;
+    case kHostDefaultBE:
+        for (int i = 0; i < 16; i++) g.arrayBigEndian[i] = value != 0;
+        g_arrayGen++;
+        break;
+    case kHostViewport:
+        if (slot < 6) memcpy(&g.viewport[slot], &value, sizeof value);
+        break;
+    case kHostScissor:
+        if (slot < 4) g.scissor[slot] = value;
+        break;
+    case kHostCull: g.cullMode = value; break;
+    case kHostLineWidth: g.lineWidth = uint8_t(value); break;
+    case kHostPointSize: g.pointSize = uint8_t(value); break;
+    case kHostTcManual:
+        if (slot < 8) g.tcManual[slot] = value != 0;
+        break;
+    case kHostCopyDest: g.copyDest = const_cast<uint8_t*>(ptr); break;
+    case kHostTexImage:
+        if (slot < 8) g.texImage[slot] = ptr;
+        break;
+    case kHostCallDlPtr: s_dlPtr = ptr; break;
+    case kHostCallDlSize:
+        if (s_dlPtr) {
+            // A game list holds GX commands only; its 0x40 calls use the
+            // same physical addresses as the same-thread path.
+            s_hostOps = false;
+            callDisplayList(s_dlPtr, value);
+            s_hostOps = true;
+        }
+        s_dlPtr = nullptr;
+        break;
+    case kHostTlutPtr: s_tlutPtr = ptr; break;
+    case kHostTlutOffset: s_tlutOffset = value; break;
+    case kHostTlutLoad:
+        onStateChange();
+        if (s_tlutPtr && s_tlutOffset + value <= sizeof g.tlutMem) memcpy(g.tlutMem + s_tlutOffset, s_tlutPtr, value);
+        s_tlutPtr = nullptr;
+        break;
+    default:
+        logmsg("gx2prod: unknown host-state kind %u", unsigned(kind));
+        break;
+    }
+}
+#endif
+
 }  // namespace gx
 
 // ------------------------------------------------------------------ C entry points
@@ -1733,11 +1820,17 @@ void GXPC_SetArrayBigEndian(int attr, int bigEndian) {
     if (attr == 25) slot = 1;           // GX_VA_NBT shares the normal array
     else if (attr >= 9 && attr <= 24) slot = attr - 9;
     else return;
+#ifdef __WIIU__
+    if (s_producerMode) { producerHostState(kHostArrayBE, uint8_t(slot), bigEndian != 0); return; }
+#endif
     g.arrayBigEndian[slot] = bigEndian != 0;
     g_arrayGen++;
 }
 void GXPC_SetDefaultArrayBigEndian(int bigEndian) {
     s_defaultArrayBE = bigEndian != 0;
+#ifdef __WIIU__
+    if (s_producerMode) { producerHostState(kHostDefaultBE, 0, bigEndian != 0); return; }
+#endif
     for (int i = 0; i < 16; i++) g.arrayBigEndian[i] = s_defaultArrayBE;
     g_arrayGen++;
 }

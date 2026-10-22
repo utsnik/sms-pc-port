@@ -29,6 +29,13 @@ bool rendererReady();
 static bool s_recording = false;
 static uint8_t* s_dlBegin = nullptr;
 static uint32_t s_dlSize = 0;
+#ifdef __WIIU__
+// Producer mode: state the same-thread path writes straight into g goes
+// through the stream instead (see ProducerHostKind).
+static inline bool hostState() { return producerMode() && !s_recording; }
+static inline uint32_t hostPtr(const void* p) { return uint32_t(reinterpret_cast<uintptr_t>(p)); }
+static inline uint32_t hostFloat(float f) { uint32_t v; memcpy(&v, &f, sizeof v); return v; }
+#endif
 static State& apiState() {
 #ifdef __WIIU__
     return (s_recording || producerMode()) ? gProducer : g;
@@ -441,9 +448,9 @@ void GXCallDisplayList(void* list, u32 nbytes) {
     }
 #ifdef __WIIU__
     if (producerMode()) {
-        GXPC_Write8(0x40);
-        GXPC_Write32(ptrToPhys(list));
-        GXPC_Write32(uint32_t(nbytes));
+        // A full host pointer: ptrToPhys/physToPtr do not round-trip on Wii U.
+        producerHostState(kHostCallDlPtr, 0, hostPtr(list));
+        producerHostState(kHostCallDlSize, 0, uint32_t(nbytes));
         return;
     }
 #endif
@@ -567,6 +574,14 @@ void GXSetArray(GXAttr attr, const void* base, u8 stride) {
         apiCP(uint8_t(CP_ARRAY_STRIDE + slot), stride);
         return;
     }
+#ifdef __WIIU__
+    if (hostState()) {
+        producerHostState(kHostArrayBase, uint8_t(slot), hostPtr(base));
+        producerHostState(kHostArrayStride, uint8_t(slot), stride);
+        producerHostState(kHostArrayBE, uint8_t(slot), GX_STATE.arrayBigEndian[slot]);
+        return;
+    }
+#endif
     g_arrayGen++;
 }
 void GXInvalidateVtxCache(void) {}
@@ -633,6 +648,9 @@ void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
 
 void GXSetLineWidth(u8 width, GXTexOffset off) {
     GX_STATE.lineWidth = width;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostLineWidth, 0, width);
+#endif
     uint32_t r = setField(GX_STATE.bp[BP_LPSIZE], 8, 0, width);
     apiBP(BP_LPSIZE, setField(r, 3, 16, off));
 }
@@ -642,6 +660,9 @@ void GXGetLineWidth(u8* width, GXTexOffset* off) {
 }
 void GXSetPointSize(u8 size, GXTexOffset off) {
     GX_STATE.pointSize = size;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostPointSize, 0, size);
+#endif
     uint32_t r = setField(GX_STATE.bp[BP_LPSIZE], 8, 8, size);
     apiBP(BP_LPSIZE, setField(r, 3, 19, off));
 }
@@ -655,6 +676,9 @@ void GXEnableTexOffsets(GXTexCoordID coord, u8 line, u8 point) {
 }
 void GXSetCullMode(GXCullMode mode) {
     GX_STATE.cullMode = mode;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostCull, 0, uint32_t(mode));
+#endif
     uint32_t hw = mode == GX_CULL_FRONT ? 2 : mode == GX_CULL_BACK ? 1 : uint32_t(mode);
     bpField(BP_GENMODE, 2, 14, hw);
 }
@@ -743,6 +767,10 @@ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz,
     GX_STATE.viewport[3] = ht;
     GX_STATE.viewport[4] = nearz;
     GX_STATE.viewport[5] = farz;
+#ifdef __WIIU__
+    if (hostState())
+        for (int i = 0; i < 6; i++) producerHostState(kHostViewport, uint8_t(i), hostFloat(GX_STATE.viewport[i]));
+#endif
     float v[6];
     v[0] = wd * 0.5f;
     v[1] = -ht * 0.5f;
@@ -762,6 +790,10 @@ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
     GX_STATE.scissor[1] = uint32_t(top);
     GX_STATE.scissor[2] = uint32_t(wd);
     GX_STATE.scissor[3] = uint32_t(ht);
+#ifdef __WIIU__
+    if (hostState())
+        for (int i = 0; i < 4; i++) producerHostState(kHostScissor, uint8_t(i), GX_STATE.scissor[i]);
+#endif
     uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
     tl = setField(tl, 11, 12, uint32_t(left) + 342);
     uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
@@ -1287,6 +1319,9 @@ static void doCopy(void* dest, GXBool clear, bool disp) {
     // the renderer needs the host pointer; commands carry a physical address
     apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
     if (!s_recording) GX_STATE.copyDest = dest;  // keep the full host pointer (64-bit hosts)
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostCopyDest, 0, hostPtr(dest));
+#endif
     uint32_t ctrl = disp ? s_dispCtrl : s_texCtrl;
     ctrl = setField(ctrl, 1, 11, clear);
     ctrl = setField(ctrl, 1, 14, disp);
@@ -1446,6 +1481,9 @@ void GXLoadTexObjPreLoaded(GXTexObj* obj, GXTexRegion*, GXTexMapID id) {
         apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
     }
     if (!s_recording) GX_STATE.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostTexImage, uint8_t(map), hostPtr(t->image));
+#endif
 }
 void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
     if (s_texRegionCb) s_texRegionCb(obj, id);
@@ -1472,6 +1510,16 @@ void GXLoadTlut(GXTlutObj* obj, u32 name) {
     uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
     uint32_t bytes = uint32_t(t->entries) * 2;
     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
+#ifdef __WIIU__
+    if (hostState()) {
+        // The worker flushes its batch and copies the palette in stream order.
+        if (t->data) memcpy(GX_STATE.tlutMem + off, t->data, bytes);
+        producerHostState(kHostTlutPtr, 0, hostPtr(t->data));
+        producerHostState(kHostTlutOffset, 0, off);
+        producerHostState(kHostTlutLoad, 0, bytes);
+        return;
+    }
+#endif
     onStateChange();
     if (t->data) memcpy(GX_STATE.tlutMem + off, t->data, bytes);
 }
@@ -1515,6 +1563,9 @@ void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
 void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
     if (coord >= 8) return;
     GX_STATE.tcManual[coord] = enable != 0;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostTcManual, uint8_t(coord), enable != 0);
+#endif
     if (enable) {
         bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
         bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
