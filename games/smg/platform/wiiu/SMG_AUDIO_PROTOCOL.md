@@ -80,7 +80,8 @@ Status values:
 
 ### Why aralt and not ar.cpp (the `0x8E` decision)
 
-The DSP has to read ARAM at the same address the CPU's DMA wrote it to.
+The decisive reason is that the CPU copy and the DSP lookup share the same
+VARAM base: the DSP must read ARAM at the address where the CPU's DMA wrote it.
 
 - **On the Wii, both use the same base.**
   - aralt's `ARInit` sets `__ARH_BaseAdr = MEM2ArenaLo`.
@@ -88,7 +89,9 @@ The DSP has to read ARAM at the same address the CPU's DMA wrote it to.
   - So ARAM offset *a* is main memory `VARAM + a` for both the copy and the DSP.
 - **With ar.cpp the base would be meaningless.**
   - Offsets index a private buffer, so `port_aram_ptr(a)` is right and `VARAM + a` is wrong.
-  - ar.cpp's `ARStartDMA(type, mainmem, aram)` also reverses Galaxy's direction-1 call (`ARStartDMA(1, aramSrc, mainDst)`, `Overwrite.cpp:1072`), so ARAM → main-memory copies would read from the wrong side.
+  - Galaxy does not currently reach direction-1 copies through
+    `JKRAramPiece::startDMA`; the shared VARAM base remains the decisive
+    compatibility requirement.
 - **The donor port made the same choice.** GalaxyQuest `wiiu-stage2` links `aralt` (`CMakeLists.txt` `SDK_MODULES`) and resolves `varam + offset`.
 - **Other effects:**
   - `test_smg_wiiu_source_boundary.py` (which expects `aralt.c`) passes again.

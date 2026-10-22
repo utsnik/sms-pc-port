@@ -56,6 +56,8 @@ typedef struct NANDFileInfo {
     s32 fileDescriptor; s32 origFd; char origPath[NAND_MAX_PATH];
     char tmpPath[NAND_MAX_PATH]; u8 accType; u8 stage; u8 mark;
 } NANDFileInfo;
+// Keep NANDCommandBlock opaque: the host revolution/nand.h shim intentionally
+// provides only enough shape for callback pointers.
 typedef struct NANDCommandBlock { void* unused; } NANDCommandBlock;
 typedef struct NANDStatus { u32 ownerId; u16 groupId; u8 attribute; u8 permission; } NANDStatus;
 typedef void (*NANDCallback)(s32, NANDCommandBlock*);
@@ -83,6 +85,8 @@ s32 NANDWrite(NANDFileInfo*, const void*, u32);
 s32 NANDGetLength(NANDFileInfo*, u32*);
 s32 NANDDelete(const char*);
 s32 NANDMove(const char*, const char*);
+s32 NANDGetStatus(const char*, NANDStatus*);
+s32 NANDPrivateGetStatus(const char*, NANDStatus*);
 s32 NANDCheck(u32, u32, u32*);
 s32 NANDPrivateDeleteAsync(const char*, NANDCallback, NANDCommandBlock*);
 s32 NANDPrivateCreateAsync(const char*, u8, u8, NANDCallback, NANDCommandBlock*);
@@ -100,6 +104,7 @@ HARNESS = r'''
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -156,6 +161,20 @@ int main(int argc, char** argv) {
     check(read == written, "read-back");
     check(NANDClose(&info) == NAND_RESULT_OK, "read close");
 
+    check(NANDCreate("/move-source.bin", NAND_PERM_RWALL, 0) == NAND_RESULT_OK,
+          "NANDMove source create");
+    std::filesystem::create_directories(
+        std::filesystem::path(g_root) / "move-target");
+    check(NANDMove("/move-source.bin", "/move-target") == NAND_RESULT_OK,
+          "NANDMove inside save tree");
+    check(NANDDelete("/move-target/move-source.bin") == NAND_RESULT_OK,
+          "NANDDelete inside save tree");
+    NANDStatus status = {};
+    check(NANDGetStatus("/move-target", &status) == NAND_RESULT_OK,
+          "NANDGetStatus inside save tree");
+    check(NANDPrivateGetStatus("/move-target", &status) == NAND_RESULT_OK,
+          "NANDPrivateGetStatus inside save tree");
+
     NANDCommandBlock block = {};
     check(NANDOpenAsync(save_name, &info, NAND_ACCESS_READ, callback, &block) == NAND_RESULT_OK,
           "async open");
@@ -173,6 +192,16 @@ int main(int argc, char** argv) {
           "create escape");
     check(NANDDelete("/../escape.bin") == NAND_RESULT_INVALID, "delete escape");
     check(NANDMove("/../escape.bin", "/") == NAND_RESULT_INVALID, "move escape");
+
+    const std::filesystem::path home_root =
+        std::filesystem::path(g_root) / "title/00010000/524d4750/data";
+    const std::filesystem::path outside = std::filesystem::path(g_root).parent_path() / "outside";
+    std::filesystem::create_directories(outside);
+    std::filesystem::create_directories(home_root);
+    std::filesystem::create_directory_symlink(outside, home_root / "link");
+    check(NANDCreate("/title/00010000/524d4750/data/link/escape.bin",
+                     NAND_PERM_RWALL, 0) == NAND_RESULT_INVALID,
+          "symlink escape must be rejected");
 
     std::puts("nand-host: PASS: real nand.cpp clean create/write/read; escapes rejected");
     return 0;

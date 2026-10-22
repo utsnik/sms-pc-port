@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -15,6 +16,7 @@ constexpr int kMaxFiles = 32;
 constexpr size_t kMaxHostPath = 256;
 FILE* s_files[kMaxFiles];
 char s_paths[kMaxFiles][NAND_MAX_PATH];
+bool s_path_escape_logged;
 
 bool valid_path(const char* path)
 {
@@ -35,6 +37,48 @@ bool valid_path(const char* path)
             (length == 2 && begin[0] == '.' && begin[1] == '.') ||
             memchr(begin, '\\', length) != nullptr)
             return false;
+    }
+    return true;
+}
+
+bool within_root(const char* root, const char* path)
+{
+    const size_t root_length = strlen(root);
+    return strncmp(path, root, root_length) == 0 &&
+        (path[root_length] == '\0' || path[root_length] == '/');
+}
+
+bool path_stays_in_root(const char* path)
+{
+    char root[kMaxHostPath];
+    if (realpath(smg_wiiu_save_root(), root) == nullptr)
+        return false;
+
+    char resolved[kMaxHostPath];
+    if (realpath(path, resolved) != nullptr)
+        return within_root(root, resolved);
+
+    char prefix[kMaxHostPath];
+    const size_t length = strlen(path);
+    if (length >= sizeof(prefix))
+        return false;
+    memcpy(prefix, path, length + 1);
+    while (realpath(prefix, resolved) == nullptr) {
+        char* separator = strrchr(prefix, '/');
+        if (separator == nullptr || separator == prefix)
+            break;
+        *separator = '\0';
+    }
+    return realpath(prefix, resolved) != nullptr && within_root(root, resolved);
+}
+
+bool reject_path_escape(const char* path)
+{
+    if (path_stays_in_root(path))
+        return false;
+    if (!s_path_escape_logged) {
+        fprintf(stderr, "SMG Wii U NAND: refusing path outside save root\n");
+        s_path_escape_logged = true;
     }
     return true;
 }
@@ -63,17 +107,14 @@ bool make_path(char* out, size_t capacity, const char* path)
         const char* home_relative = path + strlen(SMG_WIIU_NAND_HOME);
         while (*home_relative == '/')
             ++home_relative;
-        written = snprintf(out, capacity, "%s%s%s", root, SMG_WIIU_NAND_HOME,
-                           *home_relative ? "/" : "");
-        if (written > 0 && static_cast<size_t>(written) < capacity && *home_relative) {
-            written = snprintf(out, capacity, "%s%s/%s", root, SMG_WIIU_NAND_HOME,
-                               home_relative);
-        }
+        written = snprintf(out, capacity, "%s%s%s%s", root, SMG_WIIU_NAND_HOME,
+                           *home_relative ? "/" : "", home_relative);
     } else {
         written = snprintf(out, capacity, "%s%s/%s", root, SMG_WIIU_NAND_HOME,
                            relative);
     }
-    return written > 0 && static_cast<size_t>(written) < capacity;
+    return written > 0 && static_cast<size_t>(written) < capacity &&
+        !reject_path_escape(out);
 }
 
 void make_parent_dirs(const char* path)

@@ -20,7 +20,7 @@ SHARED = (
     "platform/wiiu/vi.cpp", "platform/wiiu/dvd.cpp", "platform/wiiu/pad.cpp",
     "platform/audio/ai.cpp", "platform/audio/dsp_hle.cpp",
     "platform/audio/dsp_mixer.cpp", "platform/audio/noaudio.cpp",
-    "platform/ar/ar.cpp", "platform/mtx/mtx.cpp",
+    "platform/mtx/mtx.cpp",
 )
 
 
@@ -53,6 +53,7 @@ def main() -> int:
         return fail("provider set is incomplete")
     text = manifest.read_text(encoding="utf-8")
     cmake = CMK.read_text(encoding="utf-8")
+    smg_sources = (ROOT / "games/smg/cmake/sources.cmake").read_text(encoding="utf-8")
     smg_cmake = cmake.split("endif()", 1)[0]
     header = STUB_H.read_text(encoding="utf-8")
     source = STUB_CPP.read_text(encoding="utf-8")
@@ -60,6 +61,13 @@ def main() -> int:
         return fail("provider set is incomplete")
     if "SMG_WIIU_SHARED_PROVIDER_SOURCES" not in smg_cmake:
         return fail("shared provider source set is not declared")
+    if "${SMG_DECOMP_ROOT}/src/RVL_SDK/aralt/aralt.c" not in smg_sources:
+        return fail("SMG does not select RVL_SDK aralt.c")
+    shared_sources = smg_cmake.split(
+        "set(SMG_WIIU_SHARED_PROVIDER_SOURCES", 1
+    )[1].split(")", 1)[0]
+    if "platform/ar/ar.cpp" in shared_sources:
+        return fail("SMG selects platform/ar/ar.cpp")
     missing = [path for path in SHARED if smg_cmake.count(path) != 1]
     if missing:
         return fail("shared provider selection is not exactly once: " + ", ".join(missing))

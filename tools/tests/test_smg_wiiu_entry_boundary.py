@@ -207,7 +207,7 @@ def main() -> int:
     if args.require_single_procui_owner:
         if procui_owners != 1:
             return fail(f"expected one ProcUI pump owner, found {procui_owners}")
-        if "WHBProcIsRunning" in main_source or "while" in main_source and "WHBProcIsRunning" in main_source:
+        if "WHBProcIsRunning" in main_source:
             return fail("SMG main retains a second ProcUI owner")
         if main_source.count("WHBProcInit(") != 1 or main_source.count("WHBProcShutdown(") != 1:
             return fail("SMG main does not have one ProcUI lifetime")
