@@ -59,6 +59,9 @@ struct Counters {
     uint32_t core1CopyClearMicros;
     uint32_t core1RetileMicros;
     uint32_t core1CallbackMicros;
+    uint32_t peekReady;
+    uint32_t peekNotReady;
+    uint32_t dlOpenAtPeek;
     uint32_t queueHighWaterBytes;
     uint32_t segments;
     uint32_t listsCalled;
@@ -106,6 +109,7 @@ void record_core1_blocked(uint32_t micros);
 void record_core1_frontend(uint32_t micros);
 void record_core1_peek(uint32_t micros);
 void record_core1_present(uint32_t micros);
+void record_core1_readback(bool stampPresent, bool stampReady, bool displayListOpen);
 
 /* Bind before lists can be emitted.  The callback is invoked only by
  * service(), hence on the integrating core-1 service path. */

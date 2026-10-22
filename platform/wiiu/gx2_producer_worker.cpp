@@ -219,6 +219,9 @@ static Counters delta(const Counters& now, const Counters& before) {
     d.core1CopyClearMicros -= before.core1CopyClearMicros;
     d.core1RetileMicros -= before.core1RetileMicros;
     d.core1CallbackMicros -= before.core1CallbackMicros;
+    d.peekReady -= before.peekReady;
+    d.peekNotReady -= before.peekNotReady;
+    d.dlOpenAtPeek -= before.dlOpenAtPeek;
     d.segments -= before.segments;
     d.listsCalled -= before.listsCalled;
     d.dlBegins -= before.dlBegins;
@@ -415,6 +418,15 @@ void record_core1_present(uint32_t micros) {
     if (s_started) add(&s_totals.core1PresentMicros, micros);
 }
 
+void record_core1_readback(bool stampPresent, bool stampReady, bool displayListOpen) {
+    if (!s_started) return;
+    if (stampPresent) {
+        if (stampReady) add(&s_totals.peekReady, 1);
+        else add(&s_totals.peekNotReady, 1);
+    }
+    if (displayListOpen) add(&s_totals.dlOpenAtPeek, 1);
+}
+
 void bind_service(ServiceCallback callback) { s_serviceCallback = callback; }
 
 static bool s_inService;
@@ -524,6 +536,9 @@ void snapshot(Counters* out) {
     value.core1CopyClearMicros = load(&s_totals.core1CopyClearMicros);
     value.core1RetileMicros = load(&s_totals.core1RetileMicros);
     value.core1CallbackMicros = load(&s_totals.core1CallbackMicros);
+    value.peekReady = load(&s_totals.peekReady);
+    value.peekNotReady = load(&s_totals.peekNotReady);
+    value.dlOpenAtPeek = load(&s_totals.dlOpenAtPeek);
     value.queueHighWaterBytes = load(&s_totals.queueHighWaterBytes);
     value.segments = load(&s_totals.segments);
     value.listsCalled = load(&s_totals.listsCalled);
@@ -545,7 +560,7 @@ void note_frame(uint32_t frame) {
     if (!s_started) return;
     const Counters now = counters();
     const Counters d = delta(now, s_lastLog);
-    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u appendCalls=%u appendBytes=%u wakeCalls=%u flushHooks=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u workerBlocked=%u replay=%u core1Blocked=%u frontend=%u peek=%u present=%u list=%u copyClear=%u retile=%u callback=%u queueHigh=%u segments=%u lists=%u dlBegins=%u fullWaits=%u appendFail=%u serviceFail=%u\n",
+    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u appendCalls=%u appendBytes=%u wakeCalls=%u flushHooks=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u workerBlocked=%u replay=%u core1Blocked=%u frontend=%u peek=%u present=%u list=%u copyClear=%u retile=%u callback=%u peekReady=%u peekNotReady=%u dlOpenAtPeek=%u queueHigh=%u segments=%u lists=%u dlBegins=%u fullWaits=%u appendFail=%u serviceFail=%u\n",
              frame, now.mode, now.workerCore, d.producerAppendMicros,
              d.producerAppendCalls, d.producerAppendBytes, d.producerWakeCalls,
              d.producerFlushHookCalls,
@@ -554,7 +569,8 @@ void note_frame(uint32_t frame) {
              d.workerBusyMicros, d.workerBlockedMicros, d.core1ReplayMicros,
              d.core1BlockedMicros, d.core1FrontendMicros, d.core1PeekMicros,
              d.core1PresentMicros, d.core1ListMicros, d.core1CopyClearMicros,
-             d.core1RetileMicros, d.core1CallbackMicros,
+             d.core1RetileMicros, d.core1CallbackMicros, d.peekReady, d.peekNotReady,
+             d.dlOpenAtPeek,
              now.queueHighWaterBytes, d.segments, d.listsCalled, d.dlBegins, d.serviceFullWaits,
              d.appendFailures, d.serviceFailures);
     s_lastLog = now;

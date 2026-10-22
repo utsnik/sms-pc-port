@@ -623,7 +623,7 @@ static constexpr uint32_t kGx2DlReserveBytes = 512u << 10;
 // such call in this file goes through the macros below.
 static constexpr uint32_t kGx2DlMaxDraws = 48;
 enum { kDlSplitCopy, kDlSplitClear, kDlSplitContext, kDlSplitFrame };
-static void gx2DlClose(bool directCall = false);
+static void gx2DlClose();
 static void gx2DlSplit(int reason);
 #define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurface(__VA_ARGS__))
 #define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurfaceEx(__VA_ARGS__))
@@ -4890,7 +4890,7 @@ static bool gx2DlBegin(void** outList) {
     return true;
 }
 
-static bool gx2DlEndCall(void* list, bool directCall = false) {
+static bool gx2DlEndCall(void* list) {
     if (!s_gx2DlRecording) return false;
     const uint32_t bytes = GX2EndDisplayList(list);
     s_gx2DlRecording = false;
@@ -4913,7 +4913,7 @@ static bool gx2DlEndCall(void* list, bool directCall = false) {
     ++s_perfDlRecorded;
     s_perfDlBytes += bytes;
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
-    if (s_gx2ProdEnabled && !directCall) {
+    if (s_gx2ProdEnabled) {
         if (!gx2prod::enqueue_list(list, bytes)) {
             ++s_perfDlOverflows;
             WHBLogPrintf("SMS Wii U: [gx2prod] list queue overflow; sequence stopped");
@@ -4931,24 +4931,24 @@ static uint32_t s_gx2DlOpenDraws;
 // In producer mode core 1 replays copies and clears while the worker may hold
 // a list open; their GX2 macros must leave that list alone.  This is the
 // normal case, not a failure, so it is not counted.
-static bool gx2DlRejectCore1ProducerClose(const char*, bool directCall) {
-    return s_gx2ProdEnabled && OSGetCoreId() == 1 && !directCall;
+static bool gx2DlRejectCore1ProducerClose(const char*) {
+    return s_gx2ProdEnabled && OSGetCoreId() == 1;
 }
 
-static void gx2DlClose(bool directCall) {
+static void gx2DlClose() {
     // In producer mode only the worker may finish the list it opened.  A
     // core-1 split is a service-ordering defect, not permission to close it.
-    if (gx2DlRejectCore1ProducerClose("gx2DlClose", directCall)) return;
+    if (gx2DlRejectCore1ProducerClose("gx2DlClose")) return;
     if (!s_gx2DlOpen) return;
     void* list = s_gx2DlOpen;
     s_gx2DlOpen = nullptr;
-    if (!gx2DlEndCall(list, directCall))
+    if (!gx2DlEndCall(list))
         WHBLogPrintf("SMS Wii U: [gx2dl] merged list (%u draws) failed validation; its draws are lost",
                      (unsigned)s_gx2DlOpenDraws);
 }
 
 static void gx2DlSplit(int reason) {
-    if (gx2DlRejectCore1ProducerClose("gx2DlSplit", false)) return;
+    if (gx2DlRejectCore1ProducerClose("gx2DlSplit")) return;
     if (!s_gx2DlOpen) return;
     switch (reason) {
     case kDlSplitCopy: ++s_perfDlSplitsCopy; break;
@@ -4986,14 +4986,6 @@ struct ProdPeekScope {
         if (enabled) gx2prod::record_core1_peek(prodMicros(start));
     }
 };
-
-static void gx2ProdPrepareReadback() {
-    // gx2prod::wait() has retired all producer records before GXPeek reaches
-    // here.  If an older path left a merged list open, call it directly on
-    // core 1 so the timestamped readback cannot pass an uncalled list.
-    if (s_gx2ProdEnabled && OSGetCoreId() == 1)
-        gx2DlClose(true);
-}
 
 static bool prodTimestampReady(uint64_t stamp) {
     if (!s_gx2ProdEnabled) {
@@ -5598,6 +5590,10 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         static uint64_t s_peekStamp;
         static bool s_peekQueued;
         const bool have = s_peekQueued;
+        if (s_gx2ProdEnabled && OSGetCoreId() == 1) {
+            gx2prod::record_core1_readback(have, have && GX2GetRetiredTimeStamp() >= s_peekStamp,
+                                           s_gx2DlOpen != nullptr);
+        }
         if (have) {
             if (!prodTimestampReady(s_peekStamp)) return false;
             for (uint32_t i = 0; i < count; ++i) {
@@ -5610,7 +5606,6 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
                 out[i] = uint32_t(texel[3]) << 24 | uint32_t(texel[0]) << 16 | uint32_t(texel[1]) << 8 | texel[2];
             }
         }
-        gx2ProdPrepareReadback();
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
         GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
         rebindTvTarget();
@@ -5735,8 +5730,11 @@ uint32_t peekZ(int x, int y) {
     if (s_frame != g_displayFrames) {
         // First peek of this frame: the previous snapshot is a frame old (done
         // long ago); this frame's is queued without waiting for it.
+        if (s_gx2ProdEnabled && OSGetCoreId() == 1) {
+            gx2prod::record_core1_readback(s_queued, s_queued && GX2GetRetiredTimeStamp() >= s_stamp,
+                                           s_gx2DlOpen != nullptr);
+        }
         if (s_queued && !prodTimestampReady(s_stamp)) return 0xffffff;
-        gx2ProdPrepareReadback();
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
         GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
         GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
