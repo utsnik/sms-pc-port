@@ -52,10 +52,10 @@ int main()
 	sms_wiiu_mem2_base = reinterpret_cast<uint8_t*>(0x20000000u);
 	sms_wiiu_mem2_size = 0x2000;
 
-	JKRAMCommand ram_to_aram = {0, 0x100, 0x10000100u, 0x00002000u};
+	JKRAMCommand ram_to_aram = {0, 0x100, 0x10000100u, smg_wiiu::kAramBaseOffset};
 	smg_wiiu::aram_dma_start(ram_to_aram.direction, ram_to_aram.src,
 	                         ram_to_aram.dst, ram_to_aram.length,
-	                         0x00E00000u, ARStartDMA_recording);
+	                         smg_wiiu::kAramAddressableBytes, ARStartDMA_recording);
 	if (check(g_record.count == 1, "MEM1 RAM-to-ARAM command was dropped"))
 		return 1;
 	if (check(g_record.direction == 0 && g_record.ram == ram_to_aram.src &&
@@ -63,10 +63,10 @@ int main()
 	          "RAM-to-ARAM ARStartDMA arguments were changed"))
 		return 1;
 
-	JKRAMCommand aram_to_ram = {1, 0x80, 0x00003000u, 0x20001f80u};
+	JKRAMCommand aram_to_ram = {1, 0x80, smg_wiiu::kAramBaseOffset, 0x20001f80u};
 	smg_wiiu::aram_dma_start(aram_to_ram.direction, aram_to_ram.src,
 	                         aram_to_ram.dst, aram_to_ram.length,
-	                         0x00E00000u, ARStartDMA_recording);
+	                         smg_wiiu::kAramAddressableBytes, ARStartDMA_recording);
 	if (check(g_record.count == 2 && g_record.direction == 1 &&
               g_record.ram == aram_to_ram.src && g_record.aram == aram_to_ram.dst,
           "ARAM-to-MEM2 ARStartDMA must receive the shipped src,dst order"))
@@ -75,19 +75,20 @@ int main()
 	JKRAMCommand crosses_mem1 = {0, 0x100, 0x10000f80u, 0x00004000u};
 	JKRAMCommand crosses_mem2 = {1, 0x100, 0x00004000u, 0x20001f80u};
 	JKRAMCommand old_gamecube_address = {0, 0x20, 0x80000000u, 0x00004000u};
-	JKRAMCommand crosses_aram = {0, 0x100, 0x20000ff0u, 0x03ffff80u};
+	JKRAMCommand crosses_aram = {0, 0x100, 0x20000ff0u,
+	                             smg_wiiu::kAramAddressableBytes - 0x80u};
 	smg_wiiu::aram_dma_start(crosses_mem1.direction, crosses_mem1.src,
 	                         crosses_mem1.dst, crosses_mem1.length,
-	                         0x00E00000u, ARStartDMA_recording);
+	                         smg_wiiu::kAramAddressableBytes, ARStartDMA_recording);
 	smg_wiiu::aram_dma_start(crosses_mem2.direction, crosses_mem2.src,
 	                         crosses_mem2.dst, crosses_mem2.length,
-	                         0x00E00000u, ARStartDMA_recording);
+	                         smg_wiiu::kAramAddressableBytes, ARStartDMA_recording);
 	smg_wiiu::aram_dma_start(old_gamecube_address.direction, old_gamecube_address.src,
 	                         old_gamecube_address.dst, old_gamecube_address.length,
-	                         0x00E00000u, ARStartDMA_recording);
+	                         smg_wiiu::kAramAddressableBytes, ARStartDMA_recording);
 	smg_wiiu::aram_dma_start(crosses_aram.direction, crosses_aram.src,
 	                         crosses_aram.dst, crosses_aram.length,
-	                         0x00E00000u, ARStartDMA_recording);
+	                         smg_wiiu::kAramAddressableBytes, ARStartDMA_recording);
 	if (check(g_record.count == 2, "an out-of-range DMA command reached ARStartDMA"))
 		return 1;
 

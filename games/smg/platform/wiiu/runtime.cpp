@@ -17,6 +17,9 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include <functional>
+#include <malloc.h>
 #include <stdarg.h>
 
 namespace JASystem { namespace AudioThread {
@@ -40,13 +43,11 @@ const char kAppRootCandidates[][128] = {
 
 alignas(64) unsigned char s_mem1_arena[kMem1ArenaBytes];
 alignas(64) unsigned char s_mem2_arena[kMem2ArenaBytes];
-constexpr size_t kPortPoolBytes = 16u * 1024u * 1024u;
-alignas(64) unsigned char s_port_pool[kPortPoolBytes];
-size_t s_port_pool_used;
 uint32_t s_varam_base;
 uint32_t s_varam_size;
 int s_initialized;
 int s_alloc_scope_depth;
+int s_game_heap_ready;
 int s_log_file_warned;
 int s_sleep_warned;
 int s_file_warned;
@@ -104,20 +105,6 @@ void log_unsupported_once(int* flag, const char* what)
     port_log("SMG Wii U: unsupported Stage 1 call: %s", what);
 }
 
-void* port_pool_alloc(size_t size, size_t alignment)
-{
-    if (alignment < 4 || (alignment & (alignment - 1)) != 0)
-        alignment = 4;
-
-    const size_t aligned = (s_port_pool_used + alignment - 1) & ~(alignment - 1);
-    if (aligned > kPortPoolBytes || size > kPortPoolBytes - aligned)
-        return nullptr;
-
-    void* result = s_port_pool + aligned;
-    s_port_pool_used = aligned + size;
-    return result;
-}
-
 } // namespace
 
 extern "C" {
@@ -135,7 +122,8 @@ u32 sms_wiiu_mem2_size = (u32)kMem2ArenaBytes;
 const uint8_t* port_varam_ptr(uint32_t addr)
 {
     const uint32_t lo = s_varam_base;
-    if (!lo || addr < lo || addr - lo >= s_varam_size)
+    if (!lo || addr < lo || addr - lo >= s_varam_size ||
+        addr - lo < smg_wiiu::kAramBaseOffset)
         return nullptr;
     return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
 }
@@ -145,7 +133,8 @@ void smg_wiiu_bind_varam_base(uint32_t base, uint32_t size)
     const uint32_t arena_lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sms_wiiu_mem2_base));
     const uint32_t arena_hi = arena_lo + sms_wiiu_mem2_size;
     if (base < arena_lo || base > arena_hi || size > arena_hi - base ||
-        size > smg_wiiu::kAramWindowBytes) {
+        size < smg_wiiu::kAramBaseOffset ||
+        size > smg_wiiu::kAramAddressableBytes) {
         port_log("[smg-audio] invalid ARAM base=0x%08x for MEM2 %p..%p",
                  base, sms_wiiu_mem2_base, sms_wiiu_mem2_base + sms_wiiu_mem2_size);
         s_varam_base = 0;
@@ -153,16 +142,6 @@ void smg_wiiu_bind_varam_base(uint32_t base, uint32_t size)
     }
     s_varam_base = base;
     s_varam_size = size;
-}
-
-void* smg_wiiu_arena_alloc(size_t size, size_t alignment)
-{
-    return port_pool_alloc(size, alignment);
-}
-
-uint32_t smg_wiiu_arena_used(void)
-{
-    return (uint32_t)s_port_pool_used;
 }
 
 const char* sms_wiiu_app_root(void) { return kAppRootCandidates[s_app_root_index]; }
@@ -231,21 +210,26 @@ void port_log_file(const char*)
 
 void* port_host_alloc(size_t size, int alignment)
 {
-    return port_pool_alloc(size, alignment > 0 ? (size_t)alignment : 4u);
+    (void)alignment;
+    return std::malloc(size);
 }
 
-void port_host_free(void*)
+void port_host_free(void* pointer)
 {
-    /* The fixed arena is reclaimed with the process. */
+    std::free(pointer);
 }
 
-int port_use_game_heap(void) { return 0; }
+void smg_wiiu_game_heap_ready(void) { s_game_heap_ready = 1; }
+
+int port_use_game_heap(void) { return s_game_heap_ready && s_alloc_scope_depth == 0; }
 
 int port_is_game_heap_ptr(const void* pointer)
 {
     const uintptr_t p = reinterpret_cast<uintptr_t>(pointer);
-    const uintptr_t lo = reinterpret_cast<uintptr_t>(s_mem2_arena);
-    return p >= lo && p < lo + kMem2ArenaBytes;
+    const uintptr_t mem1_lo = reinterpret_cast<uintptr_t>(s_mem1_arena);
+    const uintptr_t mem2_lo = reinterpret_cast<uintptr_t>(s_mem2_arena);
+    return (p >= mem1_lo && p < mem1_lo + kMem1ArenaBytes) ||
+           (p >= mem2_lo && p < mem2_lo + kMem2ArenaBytes);
 }
 
 void port_host_alloc_scope_enter(void) { ++s_alloc_scope_depth; }
@@ -256,7 +240,7 @@ void port_host_alloc_scope_leave(void)
         --s_alloc_scope_depth;
 }
 
-void* port_low_alloc(size_t size) { return port_pool_alloc(size, 64); }
+void* port_low_alloc(size_t size) { return memalign(64, size); }
 int port_mem_init(void) { return 1; }
 void port_mem_set_disc_id(const char*) {}
 int port_is_game_memory(const void* p) { return port_is_game_heap_ptr(p); }
@@ -455,11 +439,6 @@ void C_QUATSlerp(const Quaternion* p, const Quaternion* q, Quaternion* out, f32 
 void smg_wiiu_audio_init(void)
 {
     sms_wiiu_sdl_audio_preopen(32000);
-    extern void* OSGetMEM2ArenaLo(void);
-    const uint32_t varam = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(OSGetMEM2ArenaLo()));
-    extern const char* sms_wiiu_sdl_audio_output(void);
-    port_log("[smg-audio] init output=%s rate=32000 VARAM=0x%08x size=0x%08x; JAudio owns one audio thread",
-             sms_wiiu_sdl_audio_output(), varam, (unsigned)smg_wiiu::kAramWindowBytes);
 }
 void sms_wiiu_hang_check(void) {}
 volatile int sms_wiiu_crash_stage;

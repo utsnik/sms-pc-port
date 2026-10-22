@@ -3,6 +3,10 @@
 #include <JSystem/JKernel/JKRExpHeap.hpp>
 #include <JSystem/JKernel/JKRSolidHeap.hpp>
 #include <revolution/os.h>
+
+#if defined(PORT_GAME_SMG)
+extern "C" void smg_wiiu_game_heap_ready(void);
+#endif
 #include <revolution/wpad.h>
 
 JKRExpHeap* HeapMemoryWatcher::sRootHeapGDDR3;
@@ -122,6 +126,9 @@ void HeapMemoryWatcher::createRootHeap() {
     u32 arenaHi, arenaLo;
 
     JKRExpHeap::createRoot(1, true);
+#if defined(PORT_GAME_SMG)
+    smg_wiiu_game_heap_ready();
+#endif
     arenaLo = reinterpret_cast< u32 >(OSGetMEM2ArenaLo());
     arenaHi = reinterpret_cast< u32 >(OSGetMEM2ArenaHi());
     newHi = reinterpret_cast< void* >(arenaLo + 0xE00000);

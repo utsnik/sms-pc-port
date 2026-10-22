@@ -1,6 +1,7 @@
 #ifndef SMS_PLATFORM_WIIU_ARAM_DMA_H
 #define SMS_PLATFORM_WIIU_ARAM_DMA_H
 
+#include "smg_arena.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -18,8 +19,6 @@ namespace smg_wiiu {
 typedef void (*ArStartDma)(uint32_t direction, uint32_t src, uint32_t dst,
                            uint32_t length);
 
-constexpr uint32_t kAramWindowBytes = 0x00E00000u;
-
 inline bool aram_range_contains(uint32_t address, uint32_t length,
                                 const uint8_t* base, uint32_t size)
 {
@@ -34,15 +33,21 @@ inline bool aram_range_contains(uint32_t address, uint32_t length,
 inline bool aram_dma_command_valid(int direction, uint32_t src, uint32_t dst,
                                    uint32_t length, uint32_t aram_size)
 {
-	if ((direction != 0 && direction != 1) || length > kAramWindowBytes)
+	if ((direction != 0 && direction != 1) ||
+	    length > kAramWindowBytes)
 		return false;
 	const uint32_t ram = direction == 0 ? src : dst;
 	const uint32_t aram = direction == 0 ? dst : src;
 	const bool main_ok = aram_range_contains(ram, length, port_mem1_base, port_mem1_size) ||
 	                     aram_range_contains(ram, length, sms_wiiu_mem2_base,
 	                                         sms_wiiu_mem2_size);
-	const uint32_t limit = aram_size < kAramWindowBytes ? aram_size : kAramWindowBytes;
-	return main_ok && aram <= limit && length <= limit - aram;
+	/* ARInit reports the full ARAM address space.  The first 0x4000 bytes
+	 * remain reserved, so an ARAlloc(kAramWindowBytes) block occupies
+	 * [0x4000, 0xE04000). */
+	const uint32_t limit = aram_size < kAramAddressableBytes ? aram_size :
+	                                                       kAramAddressableBytes;
+	return main_ok && aram >= kAramBaseOffset && aram <= limit &&
+	       length <= limit - aram;
 }
 
 inline bool aram_dma_start(int direction, uint32_t src, uint32_t dst,

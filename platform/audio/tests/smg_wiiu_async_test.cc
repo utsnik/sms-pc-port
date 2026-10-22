@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <cstdlib>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -17,6 +18,7 @@ void port_audio_dsp_mail_to(uint32_t);
 void port_audio_dsp_assert_int(void);
 void port_audio_dsp_subframe_stats_ex(uint32_t*, uint32_t*, uint32_t*, uint32_t*);
 void port_audio_dsp_shutdown(void);
+void port_audio_dsp_async_alloc_stats(uint32_t*, uint32_t*, uint32_t*, uint32_t*);
 uint32_t port_audio_dsp_check_mail_from(void);
 uint32_t port_audio_dsp_read_mail_from(void);
 }
@@ -50,6 +52,8 @@ extern "C" BOOL OSDisableInterrupts(void) { return 0; }
 extern "C" BOOL OSRestoreInterrupts(BOOL) { return 0; }
 extern "C" void port_log(const char*, ...) {}
 extern "C" const uint8_t* port_varam_ptr(uint32_t) { return nullptr; }
+extern "C" void* port_host_alloc(size_t size, int) { return std::malloc(size); }
+extern "C" void port_host_free(void* pointer) { std::free(pointer); }
 
 extern "C" void __DSPHandler(int, void*)
 {
@@ -88,12 +92,15 @@ int port_audio_dsp_async_test_run(void)
     uint32_t frame[5] = {0x82010000u | 0x8000u,
                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(out)),
                          static_cast<uint32_t>(reinterpret_cast<uintptr_t>(out + 560)), 0, 0};
-    send(frame, 5);
-    for (unsigned group = 0; group < 4; ++group) {
-        const uint32_t release = group << 16;
-        send(&release, 0);
-        if (group == 3)
-            wait_for(1, 1);
+    const unsigned frame_count = 2000;
+    for (unsigned frame_index = 0; frame_index < frame_count; ++frame_index) {
+        send(frame, 5);
+        for (unsigned group = 0; group < 4; ++group) {
+            const uint32_t release = group << 16;
+            send(&release, 0);
+            if (group == 3)
+                wait_for(1, frame_index + 1);
+        }
     }
 
     uint32_t releases, renders, replies, idle;
@@ -108,14 +115,23 @@ int port_audio_dsp_async_test_run(void)
         usleep(10000);
     }
     port_audio_dsp_subframe_stats_ex(&releases, &renders, &replies, &idle);
-    const bool ok = releases == 2 && renders == 1 && replies == 1 && idle == 1 &&
+    const bool ok = releases == frame_count + 1 && renders == frame_count &&
+                    replies == frame_count && idle == 1 &&
                     releases - idle == renders && renders == replies &&
                     g_order_failures == 0 && g_replies == replies_before_idle;
     if (!ok)
         fprintf(stderr, "async-reply-test: counts releases=%u renders=%u replies=%u idle=%u boot=%u order=%u\n",
                 releases, renders, replies, idle, g_boot, g_order_failures);
     port_audio_dsp_shutdown();
+    uint32_t command_allocs, command_frees, reply_allocs, reply_frees;
+    port_audio_dsp_async_alloc_stats(&command_allocs, &command_frees,
+                                     &reply_allocs, &reply_frees);
     munmap(memory, 0x4000);
+    if (command_allocs != command_frees || reply_allocs != reply_frees) {
+        fprintf(stderr, "async-reply-test: counts command alloc/free=%u/%u reply alloc/free=%u/%u\n",
+                command_allocs, command_frees, reply_allocs, reply_frees);
+        return 0;
+    }
     return ok ? 1 : 0;
 }
 

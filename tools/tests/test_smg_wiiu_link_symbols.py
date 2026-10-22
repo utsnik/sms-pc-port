@@ -70,7 +70,16 @@ def check_audio_ownership(nm: Path, elf: Path, map_path: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Check Galaxy input ownership and SMG AI/DSP audio ownership.",
+        epilog=(
+            "Task 10/11 linked invocation: python3 tools/tests/test_smg_wiiu_link_symbols.py "
+            "--elf $BUILD/smg.elf --map $BUILD/smg.map "
+            "--provider-object $BUILD/cmake/platform/wiiu/CMakeFiles/smg.dir/__/__/games/smg/platform/wiiu/input.o "
+            "--audio-elf $BUILD/smg.elf --audio-map $BUILD/smg.map "
+            "--nm /opt/devkitpro/devkitPPC/bin/powerpc-eabi-nm"
+        ),
+    )
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--map", type=Path, required=True)
     parser.add_argument("--provider-object", type=Path, required=True)

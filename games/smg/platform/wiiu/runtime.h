@@ -10,9 +10,6 @@ extern "C" {
 /* Initializes the Galaxy-owned Wii U runtime boundary and app root. */
 void smg_wiiu_runtime_init(void);
 
-/* Fixed target-owned storage for link-only port allocations. */
-void* smg_wiiu_arena_alloc(size_t size, size_t alignment);
-uint32_t smg_wiiu_arena_used(void);
 extern uint8_t* port_mem1_base;
 extern uint32_t port_mem1_size;
 extern uint8_t* sms_wiiu_mem2_base;
@@ -20,6 +17,8 @@ extern uint32_t sms_wiiu_mem2_size;
 /* A MEM2 address (DsetVARAM base + ARAM offset) as memory; NULL outside MEM2. */
 const uint8_t* port_varam_ptr(uint32_t addr);
 void smg_wiiu_bind_varam_base(uint32_t base, uint32_t size);
+/* Called immediately after Galaxy creates JKRHeap::sRootHeap. */
+void smg_wiiu_game_heap_ready(void);
 
 /* Task 2's retail FST/DVD boundary, used by the native-BE main.dol loader. */
 void port_dvd_init(void);

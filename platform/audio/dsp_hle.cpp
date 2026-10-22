@@ -36,9 +36,15 @@
 #include <condition_variable>
 #include <mutex>
 #include <thread>
+#include <cstdlib>
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #else
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
+#endif
+
+#if defined(PORT_GAME_SMG) && defined(SMG_DSP_ASYNC)
+extern "C" void* port_host_alloc(size_t, int);
+extern "C" void port_host_free(void*);
 #endif
 
 #include <cstring>
@@ -220,6 +226,29 @@ volatile u32 s_syncFrames;
 // Async-path debug counters (logged with the 10 s audio stats).
 volatile u32 s_dbgMails, s_dbgAsserts, s_dbgLastAssertMail, s_dbgSkippedMails;
 volatile u32 s_dbgQueued[4], s_dbgExec[4], s_dbgReleaseIdle, s_dbgReplies, s_dbgReplyPosts;
+#if defined(SMG_AUDIO_ASYNC_TEST)
+volatile u32 s_asyncCommandAllocs, s_asyncCommandFrees;
+volatile u32 s_asyncReplyAllocs, s_asyncReplyFrees;
+#endif
+
+#if defined(PORT_GAME_SMG) && defined(SMG_DSP_ASYNC)
+template <typename T>
+T* async_alloc()
+{
+	void* storage = port_host_alloc(sizeof(T), alignof(T));
+	return storage ? new (storage) T : nullptr;
+}
+
+template <typename T>
+void async_free(T* object)
+{
+	if (!object)
+		return;
+	object->~T();
+	port_host_free(object);
+}
+#endif
+
 inline int dbg_kind(bool release, const std::vector<u32>& w)
 {
 	if (release) return 0;
@@ -269,13 +298,27 @@ void execute(bool fromWorker = false);
 void queue_reply(u32 first, u32 second)
 {
 	SMS_PORT_HEAP_SCOPE();
+#if defined(PORT_GAME_SMG)
+	Reply* reply = async_alloc<Reply>();
+#else
 	Reply* reply = new Reply;
+#endif
 	if (!reply)
 		return;
+#if defined(SMG_AUDIO_ASYNC_TEST)
+	++s_asyncReplyAllocs;
+#endif
 	reply->first = first;
 	reply->second = second;
 	if (!send_ptr(&s_async.replyQueue, reply)) {
+#if defined(PORT_GAME_SMG)
+		async_free(reply);
+#if defined(SMG_AUDIO_ASYNC_TEST)
+		++s_asyncReplyFrees;
+#endif
+#else
 		delete reply;
+#endif
 		port_log("[audio] DSP reply queue failed\n");
 	}
 }
@@ -305,7 +348,14 @@ void* reply_thread(void*)
 		OSRestoreInterrupts(level);
 		{
 			SMS_PORT_HEAP_SCOPE();
+#if defined(PORT_GAME_SMG)
+			async_free(reply);
+#if defined(SMG_AUDIO_ASYNC_TEST)
+			++s_asyncReplyFrees;
+#endif
+#else
 			delete reply;
+#endif
 		}
 	}
 	return nullptr;
@@ -328,7 +378,14 @@ int mixer_thread(int, const char** argv)
 			++s_dbgExec[dbg_kind(s_workerRelease, g.workerWords)];
 			execute(true);
 			g.workerWords.clear();
+#if defined(PORT_GAME_SMG)
+			async_free(command);
+#if defined(SMG_AUDIO_ASYNC_TEST)
+			++s_asyncCommandFrees;
+#endif
+#else
 			delete command;
+#endif
 		}
 	}
 	return 0;
@@ -552,9 +609,16 @@ void execute(bool fromWorker)
 #if defined(SMG_DSP_ASYNC)
 	if (s_async.active && !fromWorker) {
 		SMS_PORT_HEAP_SCOPE();
+#if defined(PORT_GAME_SMG)
+		Command* command = async_alloc<Command>();
+#else
 		Command* command = new Command;
+#endif
 		if (!command)
 			return;
+#if defined(SMG_AUDIO_ASYNC_TEST)
+		++s_asyncCommandAllocs;
+#endif
 		command->words = g.words;
 		command->release = g.release;
 		++s_dbgQueued[dbg_kind(g.release, g.words)];
@@ -565,7 +629,14 @@ void execute(bool fromWorker)
 		    ((g.words[0] >> 16) & 0xFF) != 0)
 			s_async.framePending = 1;
 		if (!send_ptr(&s_async.commandQueue, command)) {
+#if defined(PORT_GAME_SMG)
+			async_free(command);
+#if defined(SMG_AUDIO_ASYNC_TEST)
+			++s_asyncCommandFrees;
+#endif
+#else
 			delete command;
+#endif
 			port_log("[audio] DSP command queue failed\n");
 		}
 		return;
@@ -770,6 +841,23 @@ extern "C" void port_audio_dsp_subframe_stats_ex(uint32_t* releases,
 #else
 		*release_idle = 0;
 #endif
+}
+#endif
+
+#if defined(SMG_AUDIO_ASYNC_TEST)
+extern "C" void port_audio_dsp_async_alloc_stats(uint32_t* command_allocs,
+                                                    uint32_t* command_frees,
+                                                    uint32_t* reply_allocs,
+                                                    uint32_t* reply_frees)
+{
+	if (command_allocs)
+		*command_allocs = s_asyncCommandAllocs;
+	if (command_frees)
+		*command_frees = s_asyncCommandFrees;
+	if (reply_allocs)
+		*reply_allocs = s_asyncReplyAllocs;
+	if (reply_frees)
+		*reply_frees = s_asyncReplyFrees;
 }
 #endif
 

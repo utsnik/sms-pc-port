@@ -19,6 +19,8 @@ static u32 __AR_init_flag;
 
 static u32 __ARH_MemoryTop = 0x90000000;
 
+enum { ARALT_RESERVED_BYTES = 0x4000 };
+
 extern void smg_wiiu_bind_varam_base(u32, u32) __attribute__((weak));
 extern void port_log(const char*, ...) __attribute__((weak));
 
@@ -47,6 +49,11 @@ void ARStartDMA(u32 type, u32 ram_addr, u32 aram_addr, u32 len) {
 u32 ARAlloc(u32 amount) {
     BOOL en = OSDisableInterrupts();
     u32 top = __ARH_MemoryTop;
+    u32 used = top - __ARH_BaseAdr;
+    if (used > __AR_Size || amount > __AR_Size - used) {
+        OSRestoreInterrupts(en);
+        return 0;
+    }
     OSRestoreInterrupts(en);
     __ARH_MemoryTop += amount;
     return top - __ARH_BaseAdr;
@@ -73,8 +80,12 @@ u32 ARInit(u32*, u32) {
 
     __ARH_MemoryTop = (u32)memLo + ARGetBaseAddress();
     __ARH_BaseAdr = (u32)memLo;
-    __AR_Size = diff;
-    __AR_InternalSize = diff;
+    /* Real Dolphin ARInit reports the physical ARAM size, including the
+     * 0x4000 stack/header reservation. ARAlloc starts at ARGetBaseAddress()
+     * and checks amount <= __AR_Size - current_offset, so a full
+     * 0xE00000-byte audio heap occupies [0x4000, 0xE04000). */
+    __AR_Size = diff + ARALT_RESERVED_BYTES;
+    __AR_InternalSize = __AR_Size;
     if (smg_wiiu_bind_varam_base)
         smg_wiiu_bind_varam_base(__ARH_BaseAdr, __AR_Size);
     if (port_log)

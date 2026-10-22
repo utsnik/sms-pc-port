@@ -230,8 +230,10 @@ def main() -> int:
         return fail("SMG entry calls a forbidden shared runtime/audio owner")
     if "SMG_WIIU_RUN_GAME" in main_source:
         return fail("SMG main retains the Stage 1 run-game branch")
-    if "[smg-audio] placeholder until Task 10" not in runtime_source:
-        return fail("Task 10 audio boundary placeholder is missing")
+    if "void smg_wiiu_audio_init(void)" not in runtime_source:
+        return fail("Task 10 audio initialization boundary is missing")
+    if "VARAM=OSGetMEM2ArenaLo" in runtime_source:
+        return fail("audio init retains the stale pre-ARInit VARAM log")
     if runtime_source.count("platform/wiiu/runtime.cpp"):
         return fail("SMG runtime accidentally references shared runtime source")
     smg_platform_block = platform_cmake.split(

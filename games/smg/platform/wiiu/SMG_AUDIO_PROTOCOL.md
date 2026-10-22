@@ -42,7 +42,7 @@ Status values:
 | `dsp-cursor` | DSP-written read cursor | The mixer writes 0x068 (position) for waves and touches 0x074 only for `0x21` streams. A wave loops when the position reaches 0x114 | `JASAramStream::updateChannel` reads the DSP's **0x070 ARAM address** to see which ring block is playing and refill it (`:468-473`). It reads 0x074 + 0x064 as the samples left (`:412`, `:529`). It **moves the loop point by rewriting 0x074** (`:461`, `:498`, `:515`), so the DSP must loop when 0x074 runs out and then reload it from 0x114 − 0x110. These are the Zelda-microcode semantics (Dolphin's Zelda HLE; GalaxyQuest's `dsp_mixer.cpp` `downloadPcm`) | difference | `platform/audio/dsp_mixer.cpp#D4` |
 | `start-offset` | PCM start | always sample 0 | `TChannel::setWaveInfo` sets 0x068 = skip for PCM8/PCM16 (`JASDSPInterface.cpp:229-233`; ADPCM moves 0x118 instead, `:221-227`), and the DSP starts there | difference | `platform/audio/dsp_mixer.cpp#D5` |
 | `mixer-level` | Master level | Q15 word from `0x82`; SMS sends 0x5000 | `DSP_MIXERLEVEL` defaults to 0x4000; `setDSPMixerLevel` sends 4096 × 4 × level (`dspproc.cpp:36-40`, `JASDSPInterface.cpp:44-49`). The word is opaque to the HLE. Galaxy's actual level is not yet measured against retail | compatible | — |
-| `aram-provider` | ARAM storage | `platform/ar/ar.cpp`: a separate 16 MiB buffer; `ARStartDMA(type, mainmem, aram)` | Wii virtual ARAM. `createRootHeap` reserves 0xE00000 at the MEM2 arena low mark and names it with `setAltAramStartAdr` (`HeapMemoryWatcher.cpp:127-129`). aralt's `ARInit` maps ARAM offset 0 there (`aralt.c:72`). `JKRAramPiece::startDMA` calls `ARStartDMA(dir, src, dst)` (`Overwrite.cpp:1072`), which is aralt's order (`aralt.c:26,31`) | difference | `games/smg/cmake/sources.cmake#aralt/aralt.c` |
+| `aram-provider` | ARAM storage | `platform/ar/ar.cpp`: a separate 16 MiB buffer; `ARStartDMA(type, mainmem, aram)` | Wii virtual ARAM. `createRootHeap` reserves a 0xE00000 MEM2 window and names its low mark with `setAltAramStartAdr` (`HeapMemoryWatcher.cpp:127-129`). Real Dolphin `ARInit` starts allocation at offset 0x4000 and keeps `__AR_Size` as the total addressable size; `ARAlloc` checks the request against the remaining total (`decomp/libs/dolphin/src/ar/ar.c:62-78`). The SMG aralt therefore reports 0xE04000 (`0x4000` reserve + `0xE00000` usable), so `ARAlloc(0xE00000)` spans [0x4000, 0xE04000). `JKRAramPiece::startDMA` calls `ARStartDMA(dir, src, dst)` (`Overwrite.cpp:1072`), which is aralt's order (`aralt.c:26,31`) | difference | `games/smg/cmake/sources.cmake#aralt/aralt.c` |
 
 ## The fixes
 
@@ -56,7 +56,7 @@ Status values:
 
 **D3, `0x8E DsetVARAM`** (`dsp_hle.cpp`, `case 0x8E` and `aram_lookup`).
 - The handler stores the base and acks `0xF3558E00` (DsetVARAM busy-waits on that ack).
-- From then on the mixer's ARAM resolver returns `port_varam_ptr(base + offset)`. Before `0x8E`, nothing resolves.
+- From then on the mixer's ARAM resolver returns `port_varam_ptr(base + offset)`. Before `0x8E`, nothing resolves. The resolver accepts the reserved-offset range through `0xE04000`, while rejecting offsets below `ARGetBaseAddress()` and offsets beyond the `0xE00000` usable window.
 - `port_varam_ptr` is provided by:
   - the Galaxy Wii U runtime (`games/smg/platform/wiiu/runtime.cpp`): a bounds-checked cast inside the MEM2 arena that holds the window;
   - the host test: its own MEM2 window at 0x90000000.
@@ -86,7 +86,7 @@ VARAM base: the DSP must read ARAM at the address where the CPU's DMA wrote it.
 - **On the Wii, both use the same base.**
   - aralt's `ARInit` sets `__ARH_BaseAdr = MEM2ArenaLo`.
   - That is the value `createRootHeap` already gave `setAltAramStartAdr`, which `JASDsp::boot` sends with `0x8E`.
-  - So ARAM offset *a* is main memory `VARAM + a` for both the copy and the DSP.
+  - So ARAM offset *a* is main memory `VARAM + a` for both the copy and the DSP; offsets below 0x4000 are the ARAM allocator's reserved stack/header area, not audio heap data.
 - **With ar.cpp the base would be meaningless.**
   - Offsets index a private buffer, so `port_aram_ptr(a)` is right and `VARAM + a` is wrong.
   - Galaxy does not currently reach direction-1 copies through
