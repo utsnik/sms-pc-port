@@ -25,6 +25,9 @@ void smg_wiiu_gx_link_stub_init(void);
 void port_dvd_init(void);
 void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
 
+/* Cemu's per-title save directory, used as the NAND provider's host root. */
+const char* smg_wiiu_save_root(void);
+
 #ifdef __cplusplus
 }
 #endif

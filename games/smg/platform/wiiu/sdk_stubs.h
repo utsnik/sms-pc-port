@@ -1,25 +1,12 @@
 #pragma once
 
 /*
- * Stage 1 has no Wii data, NAND, or game input service.  These are the
- * residual link-only symbols allowed to fail safely until their later owner
- * is implemented.  Keep this list finite and reviewable; never replace it
- * with a wildcard or a weak-definition blanket.
+ * Stage 1 has no Wii data or game input service. These are the residual
+ * link-only symbols allowed to fail safely until their later owner is
+ * implemented. Keep this list finite and reviewable; never replace it with
+ * a wildcard or a weak-definition blanket.
  */
 #define SMG_STAGE1_STUB_SYMBOLS(X) \
-  X(NANDInit) \
-  X(NANDCheck) \
-  X(NANDOpen) \
-  X(NANDClose) \
-  X(NANDRead) \
-  X(NANDWrite) \
-  X(NANDCreate) \
-  X(NANDDelete) \
-  X(NANDMove) \
-  X(NANDGetStatus) \
-  X(NANDGetHomeDir) \
-  X(NANDGetLength) \
-  X(NANDInitBanner) \
   X(OSSetErrorHandler) \
   X(OSProtectRange) \
   X(OSFillFPUContext) \

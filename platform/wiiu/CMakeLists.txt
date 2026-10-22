@@ -84,6 +84,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDTransform.c)
   set(SMG_WIIU_PLATFORM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/sdk_stubs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/nand.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/dol_data.cpp

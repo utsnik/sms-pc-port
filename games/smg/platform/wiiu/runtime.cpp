@@ -110,6 +110,13 @@ uint32_t smg_wiiu_arena_used(void)
 }
 
 const char* sms_wiiu_app_root(void) { return kAppRootCandidates[s_app_root_index]; }
+const char* smg_wiiu_save_root(void)
+{
+    static char save_root[160];
+    std::snprintf(save_root, sizeof(save_root), "%ssave",
+                  kAppRootCandidates[s_app_root_index]);
+    return save_root;
+}
 uint32_t sms_wiiu_heap_free(void) { return 0; }
 
 void smg_wiiu_runtime_init(void)
