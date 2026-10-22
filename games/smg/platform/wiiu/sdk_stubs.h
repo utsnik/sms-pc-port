@@ -1,10 +1,11 @@
 #pragma once
 
 /*
- * Stage 1 has no Wii data or game input service. These are the residual
- * link-only symbols allowed to fail safely until their later owner is
- * implemented. Keep this list finite and reviewable; never replace it with
- * a wildcard or a weak-definition blanket.
+ * Stage 1 has no Wii data service. KPAD/WPAD are intentionally absent here:
+ * input.cpp is their Galaxy owner. These are the remaining residual link-only
+ * symbols allowed to fail safely until a later owner is implemented. Keep
+ * this list finite and reviewable; never replace it with a wildcard or a
+ * weak-definition blanket.
  */
 #define SMG_STAGE1_STUB_SYMBOLS(X) \
   X(OSSetErrorHandler) \

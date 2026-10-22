@@ -27,7 +27,8 @@ extern "C" void smg_stage1_stub_log_once(const char* symbol)
   WHBLogPrintf("SMG Wii U: Stage 1 stub %s (safe no-op)", symbol);
 }
 
-/*
+/* KPAD/WPAD do not belong to this stub boundary; input.cpp provides them.
+ *
  * These entry points deliberately use a C varargs ABI.  The Revolution SDK
  * declarations live in the Petari headers and the functions are only link
  * boundaries in Stage 1; no stub may be called before a later service owner

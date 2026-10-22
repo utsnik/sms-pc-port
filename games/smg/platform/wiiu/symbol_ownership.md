@@ -13,7 +13,8 @@ documented Galaxy stub.
 | GD* command builders | Sunshine Dolphin GD set: `GDBase.c`, `GDGeometry.c`, `GDLight.c`, `GDPixel.c`, `GDTev.c`, `GDTransform.c` | Exclude those duplicate Petari files; retain only `GDIndirect.c` and `GDTexture.c` when the symbol manifest proves Sunshine has no provider |
 | OS*, OSThread, queues, mutexes, arenas, time, cache, reset | Sunshine `platform/wiiu/os_core.cpp`, `os_thread.cpp`, `runtime.cpp`, and explicit wut adapters | Exclude all Petari `os/*.c` and `mem/*.c`; do not link same-named wut/Revolution implementations |
 | AI*, DSP*, `__DSP_*` | Sunshine `platform/audio/ai.cpp`, `dsp_hle.cpp`, `dsp_mixer.cpp`, `noaudio.cpp`, and the shared Wii U audio adapter | Exclude Petari `ai/*.c`, `dsp/*.c`, `ax/*.c`, and `axfx/*.c` |
-| VI*, DVD*, PAD*, KPAD*, WPAD* | Sunshine Wii U `vi.cpp`, `dvd.cpp`, and `pad.cpp`; Galaxy-only KPAD/WPAD shape is a logged stub boundary | Exclude Petari `vi/*.c`, `dvd/*.c`, `pad/*.c`, `kpad/*.c`, and `wpad/*.c` |
+| VI*, DVD*, PAD* | Sunshine Wii U `vi.cpp`, `dvd.cpp`, and `pad.cpp` | Exclude Petari `vi/*.c`, `dvd/*.c`, and `pad/*.c` |
+| KPAD*, WPAD* | Galaxy-only `games/smg/platform/wiiu/input.cpp`; it supplies channel 0's deterministic Wii Remote+Nunchuk and Cemu autoplay surface | Exclude Petari `kpad/*.c` and `wpad/*.c`; do not use the shared GameCube PAD parser for Galaxy |
 | AR*, PSMTX*, and common platform math | Sunshine `platform/ar/ar.cpp`, `platform/mtx/mtx.cpp`, and shared math/misc | Exclude Petari `ar/` and `mtx/` duplicates; retain `aralt/aralt.c` only for absent ARQ/ARAM-alt symbols |
 | ARC* and TPL* software readers | Petari `arc/arc.c`, `aralt/aralt.c`, and `tpl/TPL.c` where the manifest requires them | No Sunshine duplicate; `TPL.c` receives the native-BE policy guard in Task 4 |
 | Galaxy game, JSystem/JAudio2, NW4R, Galaxy service calls | `games/smg/decomp/src/Game/**`, `JSystem/**`, `nw4r/**`, and the explicit stub boundary | Petari contribution; no Sunshine game objects |
@@ -43,7 +44,7 @@ shared provider or to a finite, named stub; a wildcard stub is forbidden.
 | Candidate family | Current status |
 | --- | --- |
 | NAND/FST/FS (`nand`, `fs`) | unresolved; no data access in Stage 1 |
-| KPAD/WPAD (`kpad`, `wpad`) | unresolved; logged safe-failure boundary |
+| KPAD/WPAD (`kpad`, `wpad`) | Galaxy provider selected in `games/smg/platform/wiiu/input.cpp` |
 | optional VI/DVD service (`vi`, `dvd`) | unresolved residuals only; shared providers own core APIs |
 | GX peek/performance (`gx`) | unresolved residuals only; shared GX owns core APIs |
 | MEM (`mem`) | unresolved residuals only; shared wut/runtime ownership |
@@ -72,8 +73,8 @@ core/thread/runtime, VI/DVD/PAD, AI/DSP/no-audio, AR, and MTX.  The Petari
 source manifest supplies only the five software readers/builders listed above.
 
 `games/smg/platform/wiiu/sdk_stubs.cpp` owns the finite
-`SMG_STAGE1_STUB_SYMBOLS` list in its header.  It covers only residual
-link-only NAND, KPAD/WPAD, GX peek/performance calls.  Each entry logs once
-and returns the documented zero safe failure.  It is not a weak wildcard and
-does not define a second GXInit, GXSet*, GD*, OS*, AI*, DSP*, VI*, DVD*, PAD*,
-or AR* provider.
+`SMG_STAGE1_STUB_SYMBOLS` list in its header.  KPAD/WPAD are deliberately not
+in that list: the Galaxy input provider owns those APIs.  The remaining
+entries log once and return the documented zero safe failure.  It is not a
+weak wildcard and does not define a second GXInit, GXSet*, GD*, OS*, AI*, DSP*,
+VI*, DVD*, PAD*, KPAD*, WPAD*, or AR* provider.

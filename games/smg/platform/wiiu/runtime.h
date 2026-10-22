@@ -27,6 +27,12 @@ void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
 
 /* Cemu's per-title save directory, used as the NAND provider's host root. */
 const char* smg_wiiu_save_root(void);
+const char* sms_wiiu_app_root(void);
+void port_log(const char* fmt, ...);
+
+/* The shared VI boundary counts presented fields; Galaxy autoplay is keyed
+ * to that same deterministic counter. */
+uint32_t sms_wiiu_frame_count(void);
 
 #ifdef __cplusplus
 }

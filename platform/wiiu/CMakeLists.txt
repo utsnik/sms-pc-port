@@ -84,6 +84,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../decomp/libs/dolphin/src/gd/GDTransform.c)
   set(SMG_WIIU_PLATFORM_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/sdk_stubs.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/input.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/nand.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
@@ -153,6 +154,10 @@ if(PORT_GAME STREQUAL "smg")
   target_link_options(smg PRIVATE
     -Wl,--no-undefined
     -Wl,--gc-sections
+    # libwut's padscore archive groups its import shims in one object.  The
+    # Galaxy provider is listed first and intentionally replaces those shims;
+    # the linked ELF therefore has one selected definition per KPAD/WPAD API.
+    -Wl,--allow-multiple-definition
     "-Wl,-Map,${SMG_WIIU_BUILD_DIR}/smg.map")
   target_link_libraries(smg PRIVATE
     -Wl,--whole-archive smg_game -Wl,--no-whole-archive
