@@ -272,6 +272,14 @@ int main(int argc, char** argv) {
               (WPAD_BUTTON_A | WPAD_BUTTON_B), "A+B simultaneous hold");
     check((status.trig & (WPAD_BUTTON_A | WPAD_BUTTON_B)) == 0, "hold has no repeat trigger");
 
+    clobber_stack();
+    for (g_field = 21; g_field < 100; ++g_field)
+        status = read_status();
+    check(g_log.find("[smg-input] autoplay: press b field 90") != std::string::npos,
+          "post-clobber button log uses owned name");
+    check(g_log.find("[smg-input] autoplay: press stick_left field 95") != std::string::npos,
+          "post-clobber stick log uses owned name");
+
     g_field = 5;
     status = read_status();
     check((status.hold & WPAD_BUTTON_UP) && (status.trig & WPAD_BUTTON_UP),
@@ -300,9 +308,6 @@ int main(int argc, char** argv) {
     check(status.ex_status.fs.stick.x < -0.7f, "VPAD stick mapping");
     check(status.trig & WPAD_BUTTON_A, "VPAD trigger mapping");
 
-    clobber_stack();
-    for (g_field = 21; g_field < 80; ++g_field)
-        status = read_status();
     check(g_log.find("[smg-input] autoplay: press a field 2") != std::string::npos,
           "exact button log after script buffer lifetime");
     check(g_log.find("[smg-input] autoplay: pointer field 10") != std::string::npos,
@@ -338,6 +343,7 @@ def host_check(provider: Path) -> str:
         (root / "autopress").write_text("", encoding="utf-8")
         (root / "smg-autoplay").write_text(
             "a@2+3,b@2+3,up@5+2,stick_right@7+2,pointer@10,2,-2+4,"
+            "b@90+2,stick_left@95+2,"
             "pointer@12,0.75,up@15+1,unknown@1+2\n",
             encoding="utf-8",
         )
