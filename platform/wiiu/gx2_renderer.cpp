@@ -4972,6 +4972,16 @@ void flushBatch() {
         s_dlPending = {};
         return;
     }
+    // The producer worker has no GX2 command buffer of its own: every packet
+    // it emits (texture/arena invalidates during materialisation included)
+    // must land in a list, so open one before any resource work.
+    if (s_gx2ProdEnabled && !gx2DlOpenForDraw()) {
+        static unsigned s_noListLogs;
+        if (s_noListLogs++ < 8) WHBLogPrintf("SMS Wii U: [gx2prod] no list for a batch; dropped");
+        s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+        s_dlPending = {};
+        return;
+    }
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
     disablePerDrawCaches();
