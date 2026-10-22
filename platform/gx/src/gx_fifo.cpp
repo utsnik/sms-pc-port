@@ -388,7 +388,8 @@ void writeBP(uint32_t value) {
                     ProducerDrawSyncJob& job = s_producerDrawSync[s_producerDrawSyncWrite++ % capacity];
                     job.callback = drawSyncCallback;
                     job.token = g.drawSyncToken;
-                    if (!::gx2prod::enqueueService(producerDrawSyncService, &job))
+                    if (!::gx2prod::enqueueService(producerDrawSyncService, &job,
+                                                   ::gx2prod::SERVICE_COUNTER_CALLBACK))
                         logmsg("gx2prod draw-sync service queue rejected callback");
                 } else {
                     logmsg("gx2prod draw-sync callback queue overflow");
@@ -1597,6 +1598,7 @@ bool producerMode() { return s_producerMode; }
 
 static void pipeGrow(uint32_t need);
 static void producerFlushPending() {
+    ::gx2prod::record_flush_hook();
     if (!s_pipeLen) return;
     ::gx2prod::append(s_pipeBuf, s_pipeLen);
     s_pipeLen = 0;

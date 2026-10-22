@@ -3491,7 +3491,8 @@ static bool enqueueProducerRetile(const GX2Surface& linear, const GX2Surface& ti
     ProducerRetile& r = s_producerRetiles[s_producerRetileWrite++];
     r.linear = linear;
     r.tiled = tiled;
-    const bool queued = gx2prod::enqueueService(producerRetileService, &r);
+    const bool queued = gx2prod::enqueueService(producerRetileService, &r,
+                                                gx2prod::SERVICE_COUNTER_RETILE);
     invalidateVertexUniforms();  // the copy clobbers what the next list inherits
     gx2DlOpenForDraw();
     return queued;
@@ -4971,6 +4972,30 @@ static bool gx2DlOpenForDraw() {
 }
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
+static OSTime s_prodFrontendStart;
+
+static uint32_t prodMicros(OSTime start) {
+    return static_cast<uint32_t>(OSTicksToMicroseconds(OSGetTime() - start));
+}
+
+struct ProdPeekScope {
+    bool enabled;
+    OSTime start;
+    explicit ProdPeekScope(bool on) : enabled(on), start(on ? OSGetTime() : 0) {}
+    ~ProdPeekScope() {
+        if (enabled) gx2prod::record_core1_peek(prodMicros(start));
+    }
+};
+
+static void prodWaitTimestamp(uint64_t stamp) {
+    if (!s_gx2ProdEnabled) {
+        GX2WaitTimeStamp(stamp);
+        return;
+    }
+    const OSTime start = OSGetTime();
+    GX2WaitTimeStamp(stamp);
+    gx2prod::record_core1_blocked(prodMicros(start));
+}
 // perfdiag only: flushBatch's stages (key = TEV key, textures and pixel shader
 // lookup; vkey = vertex key and program; state = applyState; shader =
 // setTevShader/setShader; xfu = XF and live vertex uniforms; submit = the rest).
@@ -4982,6 +5007,7 @@ static inline OSTime stageLap(OSTime& acc, OSTime t) {
     return now;
 }
 static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfFrames;
+static gx2prod::Counters s_prodPerfLast;
 static uint32_t s_perfGpuDraws, s_perfCpuDraws, s_perfGpuVerts, s_perfCpuVerts;
 struct PerfScope {
     OSTime& acc; OSTime t0;
@@ -5436,7 +5462,8 @@ void executeCopy(uint32_t ctrl) {
                 invalidateVertexUniforms();
             }
         }
-        if (!gx2prod::enqueueService(producerCopyService, &r))
+        if (!gx2prod::enqueueService(producerCopyService, &r,
+                                     gx2prod::SERVICE_COUNTER_COPY_CLEAR))
             WHBLogPrintf("SMS Wii U: [gx2prod] service queue rejected copy");
         return;
     }
@@ -5515,6 +5542,7 @@ void markXfMemDirty() {
 static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
+    ProdPeekScope prodPeek(s_gx2ProdEnabled);
     ++s_perfPeeks;
     GX2ColorBuffer* cb = renderColour();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
@@ -5562,7 +5590,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         static bool s_peekQueued;
         const bool have = s_peekQueued;
         if (have) {
-            GX2WaitTimeStamp(s_peekStamp);
+            prodWaitTimestamp(s_peekStamp);
             for (uint32_t i = 0; i < count; ++i) {
                 uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
                 uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
@@ -5646,6 +5674,7 @@ extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Su
                                                       uint32_t dstSlice);
 uint32_t peekZ(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
+    ProdPeekScope prodPeek(s_gx2ProdEnabled);
     static int s_enabled = -1;
     if (s_enabled < 0) {
         s_enabled = !runningUnderCemu() && !sdMarkerPresent("nopeekz");
@@ -5696,7 +5725,7 @@ uint32_t peekZ(int x, int y) {
     if (s_frame != g_displayFrames) {
         // First peek of this frame: the previous snapshot is a frame old (done
         // long ago); this frame's is queued without waiting for it.
-        if (s_queued) GX2WaitTimeStamp(s_stamp);
+        if (s_queued) prodWaitTimestamp(s_stamp);
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
         GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
         GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
@@ -5768,6 +5797,7 @@ extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
+    if (s_gx2ProdEnabled) s_prodFrontendStart = OSGetTime();
     beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     // The generated vertex programs use up to R60; the default split gives
@@ -5841,11 +5871,23 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
     const OSTime perfNow = OSGetTime();
+    if (s_gx2ProdEnabled && s_prodFrontendStart)
+        gx2prod::record_core1_frontend(prodMicros(s_prodFrontendStart));
     if (s_perfLastEnd) s_perfWall += perfNow - s_perfLastEnd;
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        uint32_t prodFrontend = 0, prodPeek = 0, prodPresent = 0, prodBlocked = 0;
+        if (s_gx2ProdEnabled) {
+            gx2prod::Counters prodNow = {};
+            gx2prod::snapshot(&prodNow);
+            prodFrontend = prodNow.core1FrontendMicros - s_prodPerfLast.core1FrontendMicros;
+            prodPeek = prodNow.core1PeekMicros - s_prodPerfLast.core1PeekMicros;
+            prodPresent = prodNow.core1PresentMicros - s_prodPerfLast.core1PresentMicros;
+            prodBlocked = prodNow.core1BlockedMicros - s_prodPerfLast.core1BlockedMicros;
+            s_prodPerfLast = prodNow;
+        }
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u prodFrontend=%u prodPeek=%u prodPresent=%u prodBlocked=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -5859,7 +5901,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
-                     (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall);
+                     (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
+                     (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked);
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
             WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",

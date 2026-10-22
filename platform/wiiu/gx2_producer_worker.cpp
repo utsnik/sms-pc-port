@@ -44,6 +44,7 @@ static const int32_t kMessageBlock = 1;
 enum ServiceType { SERVICE_LIST, SERVICE_CALLBACK, SERVICE_BARRIER };
 struct ServiceRecord {
     uint32_t type;
+    uint32_t counterKind;
     uint32_t request;
     void* list;
     uint32_t bytes;
@@ -78,6 +79,7 @@ static uint32_t s_lastLogFrame;
 static bool s_appendFailureLogged;
 static bool s_serviceFailureLogged;
 static bool s_wrongServiceCoreLogged;
+static uint32_t s_workerDrainBlocked;
 
 static inline void releaseBarrier() { __sync_synchronize(); }
 static inline void acquireBarrier() { __sync_synchronize(); }
@@ -104,10 +106,12 @@ static void updateHighWater(uint32_t used) {
 static void wakeWorker() {
     WutMessage wake = {reinterpret_cast<void*>(uintptr_t(1)), {0, 0, 0}};
     /* Nonblocking sends coalesce naturally when a wake is already queued. */
+    add(&s_totals.producerWakeCalls, 1);
     wut_OSSendMessage(&s_wakeQueue, &wake, 0);
 }
 
-static bool pushService(const ServiceRecord& record, bool mustSucceed) {
+static bool pushService(const ServiceRecord& record, bool mustSucceed, bool workerWait,
+                        uint32_t* workerBlockedMicros = nullptr) {
     for (;;) {
         const uint32_t write = s_serviceWrite;
         acquireBarrier();
@@ -130,7 +134,13 @@ static bool pushService(const ServiceRecord& record, bool mustSucceed) {
          * Sleep rather than OSYieldThread: Cemu crashed in a yield spin here. */
         if (s_stopRequested) return false;
         add(&s_totals.serviceFullWaits, 1);
+        const OSTime blockedStart = OSGetTime();
         wut_OSSleepTicks(62156250 / 20000); // about 50 us
+        const uint32_t blocked = microsSince(blockedStart);
+        if (workerWait && workerBlockedMicros)
+            *workerBlockedMicros += blocked;
+        else if (!workerWait)
+            add(&s_totals.core1BlockedMicros, blocked);
     }
 }
 
@@ -154,18 +164,22 @@ static void drainWorker() {
         const uint32_t target = s_byteWrite;
         const uint32_t request = s_requestId;
         const OSTime busyStart = OSGetTime();
+        s_workerDrainBlocked = 0;
         consumeThrough(target);
 
         if (request != s_workerHandled && reached(target, s_requestTarget)) {
             const uint32_t kind = s_requestKind;
             s_hooks.boundary(kind);
-            ServiceRecord barrier = {SERVICE_BARRIER, request, nullptr, 0,
+            ServiceRecord barrier = {SERVICE_BARRIER, 0, request, nullptr, 0,
                                      nullptr, nullptr};
-            if (!pushService(barrier, true)) return;
+            if (!pushService(barrier, true, true, &s_workerDrainBlocked)) return;
             releaseBarrier();
             s_workerHandled = request;
         }
-        add(&s_totals.workerBusyMicros, microsSince(busyStart));
+        const uint32_t busyMicros = microsSince(busyStart);
+        add(&s_totals.workerBlockedMicros, s_workerDrainBlocked);
+        add(&s_totals.workerBusyMicros,
+            busyMicros > s_workerDrainBlocked ? busyMicros - s_workerDrainBlocked : 0);
 
         acquireBarrier();
         if (s_byteRead == s_byteWrite && request == s_requestId) return;
@@ -175,7 +189,10 @@ static void drainWorker() {
 static int workerMain(int, const char**) {
     for (;;) {
         WutMessage message = {nullptr, {0, 0, 0}};
-        if (!wut_OSReceiveMessage(&s_wakeQueue, &message, kMessageBlock))
+        const OSTime blockedStart = OSGetTime();
+        const BOOL received = wut_OSReceiveMessage(&s_wakeQueue, &message, kMessageBlock);
+        add(&s_totals.workerBlockedMicros, microsSince(blockedStart));
+        if (!received)
             continue;
         if (!message.message || s_stopRequested) break;
         drainWorker();
@@ -186,10 +203,23 @@ static int workerMain(int, const char**) {
 static Counters delta(const Counters& now, const Counters& before) {
     Counters d = now;
     d.producerAppendMicros -= before.producerAppendMicros;
+    d.producerAppendCalls -= before.producerAppendCalls;
+    d.producerAppendBytes -= before.producerAppendBytes;
+    d.producerWakeCalls -= before.producerWakeCalls;
+    d.producerFlushHookCalls -= before.producerFlushHookCalls;
     for (uint32_t i = 0; i != WAIT_KIND_COUNT; ++i)
         d.waitMicros[i] -= before.waitMicros[i];
     d.workerBusyMicros -= before.workerBusyMicros;
+    d.workerBlockedMicros -= before.workerBlockedMicros;
     d.core1ReplayMicros -= before.core1ReplayMicros;
+    d.core1BlockedMicros -= before.core1BlockedMicros;
+    d.core1FrontendMicros -= before.core1FrontendMicros;
+    d.core1PeekMicros -= before.core1PeekMicros;
+    d.core1PresentMicros -= before.core1PresentMicros;
+    d.core1ListMicros -= before.core1ListMicros;
+    d.core1CopyClearMicros -= before.core1CopyClearMicros;
+    d.core1RetileMicros -= before.core1RetileMicros;
+    d.core1CallbackMicros -= before.core1CallbackMicros;
     d.segments -= before.segments;
     d.listsCalled -= before.listsCalled;
     d.dlBegins -= before.dlBegins;
@@ -224,6 +254,7 @@ bool start(const Hooks& hooks, bool core2) {
     s_requestTarget = s_requestKind = 0;
     s_stopRequested = 0;
     s_wokenAt = 0;
+    s_workerDrainBlocked = 0;
     s_appendFailureLogged = s_serviceFailureLogged = false;
     s_wrongServiceCoreLogged = false;
     std::memset(&s_worker, 0, sizeof s_worker);
@@ -255,6 +286,8 @@ static void (*s_flushHook)();
 
 bool append(const uint8_t* bytes, uint32_t size) {
     if (!s_started || !bytes || !size) return false;
+    add(&s_totals.producerAppendCalls, 1);
+    add(&s_totals.producerAppendBytes, size);
     const OSTime startTime = OSGetTime();
     if (size > kByteRingSize) {
         add(&s_totals.appendFailures, 1);
@@ -323,8 +356,11 @@ void wait(uint32_t kind) {
     wakeWorker();
     while (!reached(s_serviceDone, request)) {
         serviceImpl(true);
-        if (!reached(s_serviceDone, request))
+        if (!reached(s_serviceDone, request)) {
+            const OSTime blockedStart = OSGetTime();
             wut_OSSleepTicks(62156250 / 20000); // about 50 us
+            add(&s_totals.core1BlockedMicros, microsSince(blockedStart));
+        }
     }
     if (kind < WAIT_KIND_COUNT)
         add(&s_totals.waitMicros[kind], microsSince(startTime));
@@ -332,17 +368,19 @@ void wait(uint32_t kind) {
 
 bool enqueue_list(void* displayList, uint32_t bytes) {
     if (!s_started || !displayList || !bytes) return false;
-    ServiceRecord record = {SERVICE_LIST, 0, displayList, bytes,
+    ServiceRecord record = {SERVICE_LIST, 0, 0, displayList, bytes,
                             nullptr, nullptr};
-    if (!pushService(record, true)) return false;
+    const bool worker = OSGetCoreId() != 1;
+    if (!pushService(record, true, worker, worker ? &s_workerDrainBlocked : nullptr)) return false;
     add(&s_totals.segments, 1);
     return true;
 }
 
-bool enqueueService(ServiceFn fn, void* arg) {
+bool enqueueService(ServiceFn fn, void* arg, ServiceCounterKind kind) {
     if (!s_started || !fn) return false;
-    ServiceRecord record = {SERVICE_CALLBACK, 0, nullptr, 0, fn, arg};
-    if (!pushService(record, true)) return false;
+    ServiceRecord record = {SERVICE_CALLBACK, uint32_t(kind), 0, nullptr, 0, fn, arg};
+    const bool worker = OSGetCoreId() != 1;
+    if (!pushService(record, true, worker, worker ? &s_workerDrainBlocked : nullptr)) return false;
     add(&s_totals.segments, 1);
     return true;
 }
@@ -357,6 +395,26 @@ void record_dl_begin() {
 
 void record_service_failure() {
     if (s_started) add(&s_totals.serviceFailures, 1);
+}
+
+void record_flush_hook() {
+    if (s_started) add(&s_totals.producerFlushHookCalls, 1);
+}
+
+void record_core1_blocked(uint32_t micros) {
+    if (s_started) add(&s_totals.core1BlockedMicros, micros);
+}
+
+void record_core1_frontend(uint32_t micros) {
+    if (s_started) add(&s_totals.core1FrontendMicros, micros);
+}
+
+void record_core1_peek(uint32_t micros) {
+    if (s_started) add(&s_totals.core1PeekMicros, micros);
+}
+
+void record_core1_present(uint32_t micros) {
+    if (s_started) add(&s_totals.core1PresentMicros, micros);
 }
 
 void bind_service(ServiceCallback callback) { s_serviceCallback = callback; }
@@ -394,6 +452,7 @@ static void serviceImpl(bool allowNested) {
             s_serviceRead = read + 1;
         }
         if (record.type == SERVICE_LIST) {
+            const OSTime serviceStart = OSGetTime();
             if (s_serviceCallback) {
                 s_serviceCallback(record.list, record.bytes);
                 add(&s_totals.listsCalled, 1);
@@ -404,8 +463,16 @@ static void serviceImpl(bool allowNested) {
                     port_log("SMS Wii U: [prod] display list reached core 1 without a service callback\n");
                 }
             }
+            add(&s_totals.core1ListMicros, microsSince(serviceStart));
         } else if (record.type == SERVICE_CALLBACK) {
+            const OSTime serviceStart = OSGetTime();
             record.fn(record.arg);
+            const uint32_t micros = microsSince(serviceStart);
+            switch (record.counterKind) {
+            case SERVICE_COUNTER_COPY_CLEAR: add(&s_totals.core1CopyClearMicros, micros); break;
+            case SERVICE_COUNTER_RETILE: add(&s_totals.core1RetileMicros, micros); break;
+            default: add(&s_totals.core1CallbackMicros, micros); break;
+            }
         }
         if (record.type == SERVICE_BARRIER) {
             /* Retire the queue slot before publishing completion.  A waiter
@@ -442,10 +509,23 @@ void snapshot(Counters* out) {
     value.mode = s_totals.mode;
     value.workerCore = s_totals.workerCore;
     value.producerAppendMicros = load(&s_totals.producerAppendMicros);
+    value.producerAppendCalls = load(&s_totals.producerAppendCalls);
+    value.producerAppendBytes = load(&s_totals.producerAppendBytes);
+    value.producerWakeCalls = load(&s_totals.producerWakeCalls);
+    value.producerFlushHookCalls = load(&s_totals.producerFlushHookCalls);
     for (uint32_t i = 0; i != WAIT_KIND_COUNT; ++i)
         value.waitMicros[i] = load(&s_totals.waitMicros[i]);
     value.workerBusyMicros = load(&s_totals.workerBusyMicros);
+    value.workerBlockedMicros = load(&s_totals.workerBlockedMicros);
     value.core1ReplayMicros = load(&s_totals.core1ReplayMicros);
+    value.core1BlockedMicros = load(&s_totals.core1BlockedMicros);
+    value.core1FrontendMicros = load(&s_totals.core1FrontendMicros);
+    value.core1PeekMicros = load(&s_totals.core1PeekMicros);
+    value.core1PresentMicros = load(&s_totals.core1PresentMicros);
+    value.core1ListMicros = load(&s_totals.core1ListMicros);
+    value.core1CopyClearMicros = load(&s_totals.core1CopyClearMicros);
+    value.core1RetileMicros = load(&s_totals.core1RetileMicros);
+    value.core1CallbackMicros = load(&s_totals.core1CallbackMicros);
     value.queueHighWaterBytes = load(&s_totals.queueHighWaterBytes);
     value.segments = load(&s_totals.segments);
     value.listsCalled = load(&s_totals.listsCalled);
@@ -467,11 +547,16 @@ void note_frame(uint32_t frame) {
     if (!s_started) return;
     const Counters now = counters();
     const Counters d = delta(now, s_lastLog);
-    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u dlBegins=%u fullWaits=%u appendFail=%u serviceFail=%u\n",
+    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u appendCalls=%u appendBytes=%u wakeCalls=%u flushHooks=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u workerBlocked=%u replay=%u core1Blocked=%u frontend=%u peek=%u present=%u list=%u copyClear=%u retile=%u callback=%u queueHigh=%u segments=%u lists=%u dlBegins=%u fullWaits=%u appendFail=%u serviceFail=%u\n",
              frame, now.mode, now.workerCore, d.producerAppendMicros,
+             d.producerAppendCalls, d.producerAppendBytes, d.producerWakeCalls,
+             d.producerFlushHookCalls,
              d.waitMicros[WAIT_PEEK], d.waitMicros[WAIT_DRAWSYNC],
              d.waitMicros[WAIT_DRAWDONE], d.waitMicros[WAIT_PRESENT_DRAIN],
-             d.workerBusyMicros, d.core1ReplayMicros,
+             d.workerBusyMicros, d.workerBlockedMicros, d.core1ReplayMicros,
+             d.core1BlockedMicros, d.core1FrontendMicros, d.core1PeekMicros,
+             d.core1PresentMicros, d.core1ListMicros, d.core1CopyClearMicros,
+             d.core1RetileMicros, d.core1CallbackMicros,
              now.queueHighWaterBytes, d.segments, d.listsCalled, d.dlBegins, d.serviceFullWaits,
              d.appendFailures, d.serviceFailures);
     s_lastLog = now;

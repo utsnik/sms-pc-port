@@ -5,6 +5,7 @@
 #include "../gx/include/sms_gx/gx_pc.h"
 #include "runtime.h"
 #include "gx2_texture_pack.h"
+#include "gx2_producer_worker.h"
 
 #include <dolphin/gx/GXCpu2Efb.h>
 #include <dolphin/gx/GXFrameBuffer.h>
@@ -19,6 +20,7 @@
 #include <sys/stat.h>
 #include <whb/gfx.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/time.h>
 #include <gx2/clear.h>
 #include <gx2/display.h>
 #include <gx2/event.h>
@@ -647,6 +649,12 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	const int64_t t2 = wut_OSGetTime_stub();
 	s_presentFinish += t1 - t0;
 	s_presentBegin += t2 - t1;
+	if (gx2prod::enabled()) {
+		const uint32_t finishUs = uint32_t(OSTicksToMicroseconds(t1 - t0));
+		const uint32_t beginUs = uint32_t(OSTicksToMicroseconds(t2 - t1));
+		gx2prod::record_core1_present(finishUs + beginUs);
+		gx2prod::record_core1_blocked(finishUs + beginUs);
+	}
 	if (++s_presentFrames == 30) {
 		const int64_t tick100us = (248625000 / 4) / 10000;
 		port_log("SMS Wii U: [present] per-frame x0.1ms finish(GPU drain)=%u beginRender(vsync)=%u\n",

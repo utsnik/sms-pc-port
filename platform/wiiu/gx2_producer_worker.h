@@ -33,13 +33,32 @@ struct Hooks {
 typedef void (*ServiceCallback)(void* displayList, uint32_t bytes);
 typedef void (*ServiceFn)(void* arg);
 
+enum ServiceCounterKind {
+    SERVICE_COUNTER_CALLBACK = 0,
+    SERVICE_COUNTER_COPY_CLEAR = 1,
+    SERVICE_COUNTER_RETILE = 2
+};
+
 struct Counters {
     uint32_t mode;
     uint32_t workerCore;
     uint32_t producerAppendMicros;
+    uint32_t producerAppendCalls;
+    uint32_t producerAppendBytes;
+    uint32_t producerWakeCalls;
+    uint32_t producerFlushHookCalls;
     uint32_t waitMicros[WAIT_KIND_COUNT];
     uint32_t workerBusyMicros;
+    uint32_t workerBlockedMicros;
     uint32_t core1ReplayMicros;
+    uint32_t core1BlockedMicros;
+    uint32_t core1FrontendMicros;
+    uint32_t core1PeekMicros;
+    uint32_t core1PresentMicros;
+    uint32_t core1ListMicros;
+    uint32_t core1CopyClearMicros;
+    uint32_t core1RetileMicros;
+    uint32_t core1CallbackMicros;
     uint32_t queueHighWaterBytes;
     uint32_t segments;
     uint32_t listsCalled;
@@ -75,12 +94,18 @@ void stop();
 bool enqueue_list(void* displayList, uint32_t bytes);
 /* Queue an ordered worker-produced operation for core 1.  arg remains owned
  * by the renderer and must stay valid through the next wait/present drain. */
-bool enqueueService(ServiceFn fn, void* arg);
+bool enqueueService(ServiceFn fn, void* arg,
+                    ServiceCounterKind kind = SERVICE_COUNTER_CALLBACK);
 void publish_token(uint16_t token);
 /* Count a GXBeginDisplayList wait for the producer report. */
 void record_dl_begin();
 /* Include renderer-side service-ordering failures in the prod report. */
 void record_service_failure();
+void record_flush_hook();
+void record_core1_blocked(uint32_t micros);
+void record_core1_frontend(uint32_t micros);
+void record_core1_peek(uint32_t micros);
+void record_core1_present(uint32_t micros);
 
 /* Bind before lists can be emitted.  The callback is invoked only by
  * service(), hence on the integrating core-1 service path. */
