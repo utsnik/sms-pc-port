@@ -57,7 +57,12 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/ai.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
+    # Galaxy's ARAM is RVL_SDK aralt (games/smg/cmake/sources.cmake): the
+    # DSP reads it at the DsetVARAM base, and its ARStartDMA takes
+    # (type, src, dst). ar.cpp's separate 16 MiB buffer takes the GameCube
+    # (type, mainmem, aram) order and would duplicate every AR* symbol.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp)
   set(SMG_WIIU_RUNTIME_FILE runtime.cpp)
 
   # Shared Sunshine providers are compiled once here. Do not add their
@@ -71,7 +76,6 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/vi.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/dvd.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/pad.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/port_heap.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/misc/msl_math.c

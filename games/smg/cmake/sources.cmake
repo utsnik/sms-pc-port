@@ -20,6 +20,11 @@ file(GLOB_RECURSE SMG_NW4R_SOURCES CONFIGURE_DEPENDS
 # Stage 1. In particular, the duplicate Sunshine GD set is not included.
 set(SMG_PETARI_SDK_SOURCES
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/arc/arc.c"
+  # Galaxy's ARAM provider (Stage 2 Task 9): the Wii's virtual ARAM in the
+  # MEM2 window that JKRHeap::setAltAramStartAdr and DsetVARAM name. Its
+  # ARStartDMA(type, src, dst) is the convention JKRAramPiece::startDMA
+  # calls; Sunshine's platform/ar/ar.cpp is not linked into smg.
+  "${SMG_DECOMP_ROOT}/src/RVL_SDK/aralt/aralt.c"
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/tpl/TPL.c"
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/gd/GDIndirect.c"
   "${SMG_DECOMP_ROOT}/src/RVL_SDK/gd/GDTexture.c")

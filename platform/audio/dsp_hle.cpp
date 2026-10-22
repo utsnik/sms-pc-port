@@ -88,7 +88,18 @@ Hle& hle_state()
 Hle g;
 #endif
 
+#if defined(PORT_GAME_SMG)
+/* smg-audio: D3. Galaxy's DSP addresses ARAM relative to the base JASDsp::boot
+ * sends with DsetVARAM (0x8E, dspproc.cpp): JKRHeap::getAltAramStartAdr(), the
+ * MEM2 arena low mark that HeapMemoryWatcher::createRootHeap reserves and
+ * RVL_SDK aralt's ARInit maps ARAM offset 0 to. port_varam_ptr resolves that
+ * main-memory address (NULL outside the window); before 0x8E nothing resolves. */
+extern "C" const u8* port_varam_ptr(u32 addr);
+u32 s_varam;
+const uint8_t* aram_lookup(uint32_t a) { return s_varam ? port_varam_ptr(s_varam + a) : NULL; }
+#else
 const uint8_t* aram_lookup(uint32_t a) { return port_aram_ptr(a); }
+#endif
 
 void post(u32 m)
 {
@@ -319,6 +330,10 @@ void stop_async()
 	}
 	port_log("[audio] DSP HLE asynchronous threads stopped\n");
 }
+#else
+// Host builds (platform/audio/tests) run the synchronous path only.
+volatile u32 s_syncFrames;
+void execute(bool fromWorker = false);
 #endif
 
 // Raise the DSP interrupt: runs the decomp's __DSPHandler in interrupt
@@ -341,6 +356,7 @@ void raise_irq(u32 first, u32 second)
 
 void reply(u32 low16) { raise_irq(0xDCD10004u, kPrefix | low16); }
 
+#if !defined(PORT_GAME_SMG)
 // Debug: SMS_AUDIO_ARAM_DUMP=path[,subframe] writes the 16 MiB ARAM image once
 // (default after 40 s of audio) for offline mixer runs (tests/, PROTOCOL.md).
 void maybe_dump_aram()
@@ -364,10 +380,13 @@ void maybe_dump_aram()
 		port_log("[audio] ARAM image written to %s\n", fn.c_str());
 	}
 }
+#endif
 
 void render_subframe()
 {
+#if !defined(PORT_GAME_SMG)
 	maybe_dump_aram();
+#endif
 	u32 n = g.subSamples;
 #ifdef TARGET_WIIU
 	// A/B switch (SD marker "nomix"): silence instead of the mixer, to
@@ -436,6 +455,14 @@ void execute(bool fromWorker)
 	) {
 		// DSPReleaseHalt: the 64-bit active-voice map. The microcode renders
 		// the next subframe of the current frame and reports 0xFF00.
+#if defined(PORT_GAME_SMG)
+		/* smg-audio: D2. Galaxy releases the voices sixteen at a time
+		 * (JASDSPChannel::updateAll), one DSPReleaseHalt2(group) word each:
+		 * group << 16 | the group's 16-voice map. The subframe is rendered and
+		 * reported once, after group 3; groups 0-2 get no reply. */
+		if (w.empty() || ((w[0] >> 16) & 0xFF) != 3)
+			return;
+#endif
 		if (g.outA && g.sub < g.subframes)
 			render_subframe();
 #ifdef TARGET_WIIU
@@ -481,6 +508,15 @@ void execute(bool fromWorker)
 			}
 		}
 		break;
+#if defined(PORT_GAME_SMG)
+	case 0x8E: // smg-audio: D3. DsetVARAM(base): sent once by JASDsp::boot, before 0x81
+		if (w.size() >= 2) {
+			s_varam = w[1];
+			port_log("[audio] DSP VARAM base 0x%08x (ARAM addresses are relative to it)\n", (unsigned)s_varam);
+		}
+		reply(w[0] >> 16); // DsetVARAM spins until DspFinishWork(0x8E00)
+		break;
+#endif
 	default:
 		port_log("[audio] DSP: unknown command 0x%08x (%zu words)\n", (unsigned)w[0], w.size());
 		reply(w[0] >> 16);
@@ -553,7 +589,13 @@ extern "C" void port_audio_dsp_assert_int(void)
 	s_dbgLastAssertMail = g.lastMail;
 #endif
 	g.release = g.lastMail == 0;
+#if defined(PORT_GAME_SMG)
+	// smg-audio: D1. Galaxy's DSPSendCommands2 (JAudio2 dsptask.cpp) sends
+	// ONE word for a count of 0: DSPReleaseHalt2's group/map word.
+	g.want    = g.lastMail ? g.lastMail : 1;
+#else
 	g.want    = g.lastMail ? g.lastMail : 2;
+#endif
 	g.inCmd   = true;
 	g.words.clear();
 }

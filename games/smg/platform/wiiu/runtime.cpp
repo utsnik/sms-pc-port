@@ -124,6 +124,17 @@ u32 port_mem1_size = (u32)kMem1ArenaBytes;
 u8* sms_wiiu_mem2_base = s_mem2_arena;
 u32 sms_wiiu_mem2_size = (u32)kMem2ArenaBytes;
 
+/* smg-audio: D3. The DSP HLE's ARAM reads (platform/audio/dsp_hle.cpp): the
+ * DsetVARAM base plus an ARAM offset is a MEM2 address, inside the window
+ * aralt's ARInit maps (the MEM2 arena low mark createRootHeap reserved). */
+const uint8_t* port_varam_ptr(uint32_t addr)
+{
+    const uint32_t lo = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(s_mem2_arena));
+    if (addr < lo || addr - lo >= kMem2ArenaBytes)
+        return nullptr;
+    return reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(addr));
+}
+
 void* smg_wiiu_arena_alloc(size_t size, size_t alignment)
 {
     return arena_alloc(size, alignment);

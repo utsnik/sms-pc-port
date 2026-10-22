@@ -135,6 +135,19 @@ int bus_index(uint16_t addr)
 	return 0;
 }
 
+#if defined(PORT_GAME_SMG)
+// smg-audio: D6. Galaxy's SEND_TABLE (JAudio2 JASDSPInterface.cpp), which
+// setFXLine uses for the FX returns, names buses 3-6 eight words in: 0x0DC8,
+// 0x0E28, 0x0E88, 0x0EE8 (Sunshine's: 0x0DC0, 0x0E20, 0x0E80, 0x0EE0; the
+// voice sends' connect_table is unchanged). The return is mixed into that bus
+// (assumed: the 8-word offset, likely an 8-sample delay, is not modelled).
+int fx_return_bus(uint16_t addr)
+{
+	const int b = bus_index(addr);
+	return b || (addr & 0xF) != 8 ? b : bus_index((uint16_t)(addr - 8));
+}
+#endif
+
 struct Decoder {
 	bool active;
 	bool ended;       // one-shot source ran out
@@ -285,7 +298,13 @@ int32_t pull(Decoder& d, const Voice& v)
 		d.idx++;
 		return s;
 	}
+#if defined(PORT_GAME_SMG)
+	// smg-audio: D4. The remaining length (0x074) runs out at the loop end;
+	// JASAramStream::updateChannel moves that end by rewriting 0x074.
+	if (d.remaining == 0) {
+#else
 	if (d.idx >= v.endPosition) {
+#endif
 		if (v.looping && v.loopStart < v.endPosition) {
 			if (v.sourceType == 9 || v.sourceType == 5) {
 				// The stored loop history is y[-1], y[-2] of the ADPCM frame
@@ -302,12 +321,18 @@ int32_t pull(Decoder& d, const Voice& v)
 			} else {
 				d.idx = v.loopStart;
 			}
+#if defined(PORT_GAME_SMG)
+			d.remaining = v.endPosition - v.loopStart; // reloaded from 0x110/0x114 now
+#endif
 		} else {
 			d.ended = true;
 			d.tail  = 1;
 			return 0;
 		}
 	}
+#if defined(PORT_GAME_SMG)
+	d.remaining--;
+#endif
 	int32_t s = decode_at(d, v);
 	d.idx++;
 	return s;
@@ -338,6 +363,16 @@ void start(Decoder& d, const Voice& v)
 	d.written   = v.remaining;
 	if (is_oscillator(v.sourceType))
 		return; // no source data: the phase starts at 0
+#if defined(PORT_GAME_SMG)
+	if (v.sourceType != kDirectPcm) {
+		// smg-audio: D5. PCM starts at 0x068 (TChannel::setWaveInfo's skip;
+		// ADPCM skips by moving baseAddress instead). D4: the remaining
+		// length counts from there to endPosition.
+		if (v.sourceType == 8 || v.sourceType == 16)
+			d.idx = (uint32_t)v.position;
+		d.remaining = v.endPosition > d.idx ? v.endPosition - d.idx : 0;
+	}
+#endif
 	d.win[0] = 0;
 	for (int k = 1; k < 4; k++)
 		d.win[k] = (int16_t)pull(d, v);
@@ -436,6 +471,10 @@ void render_voice(int vi, int n)
 		d.startTick = g.traceTick;
 	} else if (v.sourceType == kDirectPcm && v.remaining != d.written)
 		d.remaining = v.remaining;
+#if defined(PORT_GAME_SMG)
+	else if (!is_oscillator(v.sourceType) && v.remaining != d.written)
+		d.remaining = v.remaining; // smg-audio: D4. JASAramStream moved the loop end
+#endif
 	d.written   = v.remaining; // the CPU rewrote the count (endless streams)
 	if (v.pause) {
 		if (stopping)
@@ -501,6 +540,17 @@ void render_voice(int vi, int n)
 		d.written = v.remaining;
 	} else {
 		v.position = (int32_t)d.idx;
+#if defined(PORT_GAME_SMG)
+		if (!is_oscillator(v.sourceType)) {
+			// smg-audio: D4. The DSP's cursor, which JASAramStream reads to
+			// refill its ARAM ring: the next ARAM byte to fetch (0x070) and
+			// the samples left before the loop end (0x074).
+			const uint32_t t = v.sourceType;
+			v.aramAddr  = v.base + (t == 9 || t == 5 ? ((d.idx + 15) >> 4) * t : t == 8 ? d.idx : d.idx * 2);
+			v.remaining = d.remaining;
+			d.written   = d.remaining;
+		}
+#endif
 	}
 	v.posFrac = (int16_t)(is_oscillator(v.sourceType) ? d.phase >> 6 : d.frac & 0xFFFF);
 	if (got < n || (d.ended && d.tail > 2)) {
@@ -557,7 +607,11 @@ void prepare_fx(int n)
 				}
 			}
 			if (pass == 0) {
+#if defined(PORT_GAME_SMG)
+				int a = fx_return_bus(f.busA), b = fx_return_bus(f.busB);
+#else
 				int a = bus_index(f.busA), b = bus_index(f.busB);
+#endif
 				for (int k = 0; k < n; k++) {
 					if (a)
 						g.bus[a][k] += (window[k] * f.gainA) >> 15;
@@ -682,6 +736,9 @@ extern "C" void port_dspmix_decode_wave(int format, uint32_t base, int count, in
 	v.endPosition = (uint32_t)count;
 	Decoder d;
 	memset(&d, 0, sizeof d);
+#if defined(PORT_GAME_SMG)
+	d.remaining = (uint32_t)count; // smg-audio: D4. The wave ends after count samples
+#endif
 	if (!g.coef[1][0])
 		load_adpcm_table(kAdpcmDefault);
 	for (int i = 0; i < count; i++)
