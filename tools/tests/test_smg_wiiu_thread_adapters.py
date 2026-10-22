@@ -68,7 +68,7 @@ def main() -> int:
             continue
         name = imports.get((0xC0000000 + int(m.group(1))) & 0xFFFFFFFF, "")
         calls.add((func, name))
-        if "Thread" not in name:
+        if "Thread" not in name and "Alarm" not in name:
             continue
         if func.startswith("_Z") and not func.startswith(PORT_PREFIXES):
             bad.add((func, name))

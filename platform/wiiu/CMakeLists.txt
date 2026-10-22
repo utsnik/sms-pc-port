@@ -33,7 +33,11 @@ if(PORT_GAME STREQUAL "smg")
     OSInitMutex=sms_wiiu_OSInitMutex
     OSLockMutex=sms_wiiu_OSLockMutex
     OSUnlockMutex=sms_wiiu_OSUnlockMutex
-    OSTryLockMutex=sms_wiiu_OSTryLockMutex)
+    OSTryLockMutex=sms_wiiu_OSTryLockMutex
+    OSCreateAlarm=smg_wiiu_OSCreateAlarm
+    OSSetAlarm=smg_wiiu_OSSetAlarm
+    OSSetPeriodicAlarm=smg_wiiu_OSSetPeriodicAlarm
+    OSCancelAlarm=smg_wiiu_OSCancelAlarm)
   set(SMG_WIIU_SND_ADAPTER_DEFS
     AIInit=smg_gc_AIInit
     AICheckInit=smg_gc_AICheckInit
@@ -101,6 +105,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/dol_data.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/alarm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gx_link_stub.cpp
