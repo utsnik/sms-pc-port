@@ -917,6 +917,10 @@ namespace MR {
             StationedFileInfo::LOAD_TYPE_MOUNT_RESOURCE_LAYOUT,
             "/LayoutData/TimeUp.arc",
         },
+#if !defined(TARGET_WIIU)
+        // Stage 2 Cemu has no HOME RSO to link (see
+        // Game/System/HomeButtonMenuWrapper.cpp); skip the blocking load of
+        // the module and its symbol table for the Wii U target.
         {
             StationedFileInfo::HEAP_TYPE_GDDR,
             StationedFileInfo::LOAD_TYPE_FILE,
@@ -927,6 +931,7 @@ namespace MR {
             StationedFileInfo::LOAD_TYPE_FILE,
             "/ModuleData/product.sel",
         },
+#endif
         {
             StationedFileInfo::HEAP_TYPE_GDDR,
             StationedFileInfo::LOAD_TYPE_MOUNT_RESOURCE,

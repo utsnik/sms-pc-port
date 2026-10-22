@@ -4,6 +4,14 @@
 #include <JSystem/JKernel/JKRExpHeap.hpp>
 #include <revolution/rso.h>
 
+#if defined(TARGET_WIIU)
+// OSReport is a weak SDK stub on this target (platform/sdk_stubs.cpp) that
+// only counts the call and discards the message, so it cannot carry this
+// log line. Use the same WHBLogPrintf path the Stage 1/2 stubs already use
+// (games/smg/platform/wiiu/sdk_stubs.cpp) to make it observable in Cemu.
+#include <whb/log.h>
+#endif
+
 #ifndef TARGET_PC
 void (*HBMCreateRSO)(const HBMDataInfo*);
 void (*HBMInitRSO)(void);
@@ -92,8 +100,13 @@ void RSO::HBMStartBlackOut() {
 #else
 // The HOME Menu ships as a PowerPC module (HomeButtonMenuWrapperRSO.rso).
 // On Quest the system menu takes its place, so the menu closes as soon as
-// it opens.
+// it opens. On Wii U, Cemu has no HOME RSO to link either; Stage 2 leaves
+// this a deterministic no-op and HBMGetSelectBtnNum() below already returns
+// the neutral HBM_SELECT_HOMEBTN value.
 void RSO::setupRsoHomeButtonMenu() {
+#if defined(TARGET_WIIU)
+    WHBLogPrintf("SMG Wii U: HOME RSO disabled for Stage 2 Cemu");
+#endif
 }
 
 void RSO::HBMCreate(const HBMDataInfo* pHBInfo) {
