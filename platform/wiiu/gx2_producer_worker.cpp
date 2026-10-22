@@ -251,6 +251,8 @@ bool start(const Hooks& hooks, bool core2) {
 
 bool enabled() { return s_started; }
 
+static void (*s_flushHook)();
+
 bool append(const uint8_t* bytes, uint32_t size) {
     if (!s_started || !bytes || !size) return false;
     const OSTime startTime = OSGetTime();
@@ -301,13 +303,17 @@ bool append(const uint8_t* bytes, uint32_t size) {
 }
 
 void wake() {
+    if (s_started && s_flushHook) s_flushHook();
     if (s_started) wakeWorker();
 }
 
 static void serviceImpl(bool allowNested);
 
+void set_flush_hook(void (*fn)()) { s_flushHook = fn; }
+
 void wait(uint32_t kind) {
     if (!s_started) return;
+    if (s_flushHook) s_flushHook();  // the producer's buffered bytes first
     const OSTime startTime = OSGetTime();
     const uint32_t request = s_requestId + 1;
     s_requestTarget = s_byteWrite;

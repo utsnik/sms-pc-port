@@ -60,6 +60,8 @@ bool enabled();
 bool append(const uint8_t* bytes, uint32_t size);
 /* Wake the worker without waiting for a boundary; used by GXFlush. */
 void wake();
+/* The producer buffers GX writes locally; wait() and wake() hand them over first. */
+void set_flush_hook(void (*fn)());
 /* Every wait kind services through its worker-published barrier before it
  * returns; present drains cannot leave a completed display-list call queued
  * on the worker side. */

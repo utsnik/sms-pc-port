@@ -1562,6 +1562,7 @@ static uint32_t s_pipeNeed = 1;
 static uint8_t* s_redirect = nullptr;
 #ifdef __WIIU__
 static bool s_producerMode;
+static const uint32_t kProdChunk = 16u << 10;
 static std::vector<uint8_t> s_workerPipe;
 static uint32_t s_workerPipeLen;
 static uint32_t s_workerPipeNeed = 1;
@@ -1581,7 +1582,11 @@ static void pipeFastUpdate() {
     // producer ring is active: that buffer belongs to the old same-thread
     // parser.  Keeping the fast window closed also preserves byte order for
     // commands split across GXPC_Put* calls.
-    GXPC_PipeFast = (s_redirect || s_producerMode) ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
+    // In producer mode the inline writers fill the local buffer, which goes
+    // to the worker in kProdChunk pieces (and at every wait): one ring append
+    // per chunk instead of per GX write.
+    GXPC_PipeFast = s_redirect ? 0 : s_producerMode ? std::min(s_pipeCap, kProdChunk)
+                                                   : std::min(s_pipeCap, s_pipeNeed - 1);
 #else
     GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
 #endif
@@ -1589,6 +1594,13 @@ static void pipeFastUpdate() {
 
 #ifdef __WIIU__
 bool producerMode() { return s_producerMode; }
+
+static void pipeGrow(uint32_t need);
+static void producerFlushPending() {
+    if (!s_pipeLen) return;
+    ::gx2prod::append(s_pipeBuf, s_pipeLen);
+    s_pipeLen = 0;
+}
 
 void setProducerMode(bool enabled) {
     s_producerMode = enabled;
@@ -1604,6 +1616,8 @@ void setProducerMode(bool enabled) {
         s_workerPipe.clear();
         s_workerPipe.reserve(256u << 10);
         s_producerDrawSyncWrite = 0;
+        if (s_pipeCap < 2 * kProdChunk) pipeGrow(2 * kProdChunk);
+        ::gx2prod::set_flush_hook(producerFlushPending);
     }
     pipeFastUpdate();
 }
@@ -1708,7 +1722,10 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n) {
     }
 #ifdef __WIIU__
     if (s_producerMode) {
-        ::gx2prod::append(bytes, n);
+        if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
+        memcpy(s_pipeBuf + s_pipeLen, bytes, n);
+        s_pipeLen += n;
+        if (s_pipeLen >= kProdChunk) producerFlushPending();
         return;
     }
 #endif
