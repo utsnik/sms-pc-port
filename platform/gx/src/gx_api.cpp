@@ -456,6 +456,7 @@ void GXCallDisplayList(void* list, u32 nbytes) {
 #ifdef __WIIU__
     if (producerMode()) {
         // A full host pointer: ptrToPhys/physToPtr do not round-trip on Wii U.
+        ++g_producerDraws;
         producerHostState(kHostCallDlPtr, 0, hostPtr(list));
         producerHostState(kHostCallDlSize, 0, uint32_t(nbytes));
         return;
@@ -654,6 +655,9 @@ GXBool __GXinBegin;  // read by GXEnd when GXGeometry.h is built with DEBUG
 void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
     __GXinBegin = GX_TRUE;
     traceNoteBegin();
+#ifdef __WIIU__
+    if (hostState()) ++g_producerDraws;
+#endif
     GXPC_Write8(uint8_t(type | fmt));
     GXPC_Write16(nverts);
 }

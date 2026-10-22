@@ -166,6 +166,10 @@ enum ProducerHostKind : uint8_t {
     kHostTlutPtr, kHostTlutOffset, kHostTlutLoad,
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
+// Draws the game issued this frame (GXBegin / GXCallDisplayList) in producer
+// mode: the renderer's own count lags on the worker, and the present logic
+// must not show the empty second retrace of a 30 fps frame.
+extern uint32_t g_producerDraws;
 #endif
 
 // ---------------------------------------------------------------- vertices

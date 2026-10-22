@@ -5809,7 +5809,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
 // the second one showed a freshly cleared, empty frame half the time.
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void) {
 #ifdef __WIIU__
-    if (s_gx2ProdEnabled) return 1;
+    if (s_gx2ProdEnabled) return g_producerDraws != 0;
 #endif
     if (!s_batch.indices.empty()) return 1;
     return s_drawsThisFrame != 0;
@@ -5830,6 +5830,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         }
         s_producerCopyWrite = 0;
         s_producerRetileWrite = 0;
+        g_producerDraws = 0;
         if (sms_wiiu_gx2prod_reset_draw_sync_jobs)
             sms_wiiu_gx2prod_reset_draw_sync_jobs();
     } else

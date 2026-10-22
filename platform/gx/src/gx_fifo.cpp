@@ -1721,6 +1721,8 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n) {
 void pipeWrite(const uint8_t* bytes, uint32_t n) { SMS_PORT_HEAP_SCOPE(); pipePut(bytes, n); }
 
 #ifdef __WIIU__
+uint32_t g_producerDraws = 0;
+
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     const uint8_t cmd[8] = {0xF0, kind, slot, 0, uint8_t(value >> 24), uint8_t(value >> 16),
                             uint8_t(value >> 8), uint8_t(value)};
