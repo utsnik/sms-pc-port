@@ -1565,6 +1565,7 @@ static uint8_t* s_redirect = nullptr;
 static bool s_producerMode;
 static const uint32_t kProdChunk = 16u << 10;
 static std::vector<uint8_t> s_workerPipe;
+static std::vector<uint8_t> s_producerFlush;
 static uint32_t s_workerPipeLen;
 static uint32_t s_workerPipeNeed = 1;
 #endif
@@ -1598,10 +1599,19 @@ bool producerMode() { return s_producerMode; }
 
 static void pipeGrow(uint32_t need);
 static void producerFlushPending() {
-    ::gx2prod::record_flush_hook();
     if (!s_pipeLen) return;
-    ::gx2prod::append(s_pipeBuf, s_pipeLen);
+    ::gx2prod::record_flush_hook();
+    const uint32_t bytes = s_pipeLen;
+    // append() may pump a draw-sync callback which re-enters GX and this hook.
+    // Detach the source before handing it over so nested writes cannot repeat
+    // or overwrite the chunk currently being copied into the worker ring.
+    std::vector<uint8_t> chunk;
+    chunk.swap(s_producerFlush);
+    chunk.assign(s_pipeBuf, s_pipeBuf + bytes);
     s_pipeLen = 0;
+    pipeFastUpdate();
+    ::gx2prod::append(chunk.data(), bytes);
+    s_producerFlush.swap(chunk);
 }
 
 void setProducerMode(bool enabled) {
@@ -1617,6 +1627,7 @@ void setProducerMode(bool enabled) {
         s_workerPipeNeed = 1;
         s_workerPipe.clear();
         s_workerPipe.reserve(256u << 10);
+        s_producerFlush.clear();
         s_producerDrawSyncWrite = 0;
         if (s_pipeCap < 2 * kProdChunk) pipeGrow(2 * kProdChunk);
         ::gx2prod::set_flush_hook(producerFlushPending);
