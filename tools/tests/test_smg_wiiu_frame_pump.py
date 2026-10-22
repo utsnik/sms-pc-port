@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Ruling R15: Galaxy's retrace wait must drive the platform frame boundary.
+
+On the Wii, JUTVideo's message queue is filled from the retrace interrupt
+(JUTVideo::postRetraceProc). On Wii U the VI callbacks fire only inside the
+platform frame boundary (platform/wiiu/vi.cpp sms_wiiu_frame_boundary, reached
+through VIFlush/VIWaitForRetrace on the main thread), so a blocking receive in
+MainLoopFramework's waitForTick slept forever on a queue only that thread can
+fill. Check the linked ELF: waitForTick must call VIWaitForRetrace.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+BUILDER_IMAGE = "soh-wiiu-builder:latest"
+OBJDUMP = "/opt/devkitpro/devkitPPC/bin/powerpc-eabi-objdump"
+WAIT_FOR_TICK = re.compile(r"^[0-9a-f]+ <(_ZN12_GLOBAL__N_1L?11waitForTickEjt[^>]*)>:$")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--elf", type=Path, required=True)
+    args = parser.parse_args()
+    elf = args.elf.resolve()
+    text = subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "-v", f"{elf.parent}:/e:ro",
+         BUILDER_IMAGE, OBJDUMP, "-d", f"/e/{elf.name}"],
+        check=True, capture_output=True, text=True).stdout
+    func = None
+    bodies: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        if line.endswith(">:"):
+            m = WAIT_FOR_TICK.match(line)
+            func = m.group(1) if m else None
+            if func:
+                bodies[func] = []
+            continue
+        if func:
+            bodies[func].append(line)
+    if not bodies:
+        print("frame-pump: FAIL: waitForTick not found in the linked ELF")
+        return 1
+    if not any("<VIWaitForRetrace>" in l for body in bodies.values() for l in body):
+        print("frame-pump: FAIL: waitForTick blocks on JUTVideo's queue without driving VIWaitForRetrace")
+        return 1
+    print("frame-pump: PASS: waitForTick drives the platform frame boundary (VIWaitForRetrace)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

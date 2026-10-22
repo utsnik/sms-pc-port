@@ -463,11 +463,23 @@ namespace {
             u32 msg;
             do {
                 OSMessage received;  // pointer-sized on the port; the value is a retrace count
+#ifdef TARGET_WIIU
+                // Ruling R15: no retrace interrupt feeds JUTVideo's queue on Wii U. The
+                // platform frame boundary (VIWaitForRetrace: vsync, ProcUI, VI pre/post
+                // callbacks) runs on this thread, and JUTVideo::postRetraceProc posts the
+                // count from inside it. Drive it until a count arrives instead of blocking
+                // on a queue only this thread can fill.
+                while (!OSReceiveMessage(JUTVideo::getManager()->getMessageQueue(), &received, OS_MESSAGE_NOBLOCK)) {
+                    VIWaitForRetrace();
+                }
+                msg = static_cast< u32 >(reinterpret_cast< uintptr_t >(received));
+#else
                 if (!OSReceiveMessage(JUTVideo::getManager()->getMessageQueue(), &received, OS_MESSAGE_BLOCK)) {
                     msg = dummy;
                 } else {
                     msg = static_cast< u32 >(reinterpret_cast< uintptr_t >(received));
                 }
+#endif
             } while ((s32)(msg - nextCount) < 0);
             nextCount = msg + count;
         }
