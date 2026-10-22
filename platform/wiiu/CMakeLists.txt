@@ -16,6 +16,8 @@ if(PORT_GAME STREQUAL "smg")
     OSSleepThread=sms_wiiu_OSSleepThread
     OSWakeupThread=sms_wiiu_OSWakeupThread
     OSGetThreadPriority=sms_wiiu_OSGetThreadPriority
+    OSSetThreadPriority=sms_wiiu_OSSetThreadPriority
+    OSIsThreadSuspended=sms_wiiu_OSIsThreadSuspended
     OSDisableScheduler=sms_wiiu_OSDisableScheduler
     OSEnableScheduler=sms_wiiu_OSEnableScheduler
     OSYieldThread=sms_wiiu_OSYieldThread

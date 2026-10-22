@@ -39,6 +39,10 @@ void wut_OSYieldThread(void) __asm__("OSYieldThread");
 BOOL wut_OSDisableInterrupts(void) __asm__("OSDisableInterrupts");
 BOOL wut_OSRestoreInterrupts(BOOL) __asm__("OSRestoreInterrupts");
 uint32_t wut_OSGetSymbolName(uint32_t, char*, uint32_t) __asm__("OSGetSymbolName");
+#if defined(PORT_GAME_SMG)
+BOOL wut_OSSetThreadPriority(WutThread*, int32_t) __asm__("OSSetThreadPriority");
+BOOL wut_OSIsThreadSuspended(WutThread*) __asm__("OSIsThreadSuspended");
+#endif
 }
 
 /* GameCube code guards shared state by disabling interrupts, which only
@@ -399,6 +403,29 @@ long sms_wiiu_OSGetThreadPriority(OSThread* game)
 	ThreadRecord* r = record_for_game(game);
 	return r ? r->priority : (game ? game->priority : 31);
 }
+
+#if defined(PORT_GAME_SMG)
+/* Galaxy calls these with its own OSThread (FunctionAsyncExecInfo::execute,
+ * MR::isSuspendedAsyncExecuteThread). Unadapted, they reached coreinit with
+ * the game struct: the async executor never dropped from priority 1 to its
+ * job's priority, so the priority-2 JASAudioThread never ran initBuffer
+ * before AudSystem used JASDsp::FX_BUF. */
+extern "C" BOOL sms_wiiu_OSSetThreadPriority(OSThread* game, s32 priority)
+{
+	ThreadRecord* r = record_for_game(game);
+	if (!r || !wut_OSSetThreadPriority(r->wut, priority))
+		return FALSE;
+	r->priority = priority;
+	game->priority = priority;
+	return TRUE;
+}
+
+extern "C" BOOL sms_wiiu_OSIsThreadSuspended(OSThread* game)
+{
+	ThreadRecord* r = record_for_game(game);
+	return r ? wut_OSIsThreadSuspended(r->wut) : FALSE;
+}
+#endif
 
 BOOL sms_wiiu_OSDisableInterrupts(void) { return wut_OSDisableInterrupts(); }
 BOOL sms_wiiu_OSEnableInterrupts(void) { return wut_OSRestoreInterrupts(TRUE); }
