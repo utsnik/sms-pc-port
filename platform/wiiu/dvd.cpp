@@ -3,6 +3,9 @@
 
 #include <dolphin/dvd.h>
 #include <dolphin/os/OSCache.h>
+#if defined(PORT_GAME_SMG)
+#include <dolphin/os.h>
+#endif
 
 #include <cctype>
 #include <cstdio>
@@ -491,6 +494,10 @@ void port_dvd_init(void)
 		return;
 	}
 	std::fclose(boot);
+	/* The Wii IPL leaves the disc ID at physical 0 (game code "RMGx");
+	 * Galaxy reads it there to pick its language table. */
+	if (void* low = OSPhysicalToCached(0))
+		std::memcpy(low, &s_disk_id, sizeof(s_disk_id));
 #else
 	if (boot) {
 		std::fread(&s_disk_id, 1, sizeof(s_disk_id), boot);

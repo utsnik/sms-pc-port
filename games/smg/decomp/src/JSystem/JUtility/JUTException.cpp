@@ -234,7 +234,12 @@ bool JUTException::searchPartialModule(u32 address, u32* module_id, u32* section
         return false;
     }
 
+#ifdef TARGET_WIIU
+    /* The module list head is Wii low memory 0x30C8: served by the platform block. */
+    OSModuleInfo* module = *(OSModuleInfo**)OSPhysicalToCached(0x30C8);
+#else
     OSModuleInfo* module = *(OSModuleInfo**)0x800030C8;
+#endif
     while (module) {
         OSSectionInfo* section = reinterpret_cast< OSSectionInfo* >(module->sectionInfoOffset);
         for (u32 i = 0; i < module->numSections; section = section + 1, i++) {

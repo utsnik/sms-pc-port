@@ -17,6 +17,13 @@ extern "C" {
 #ifdef __MWERKS__
 u32 __OSBusClock : (0x8000 << 16 | 0x00F8);
 u32 __MEM2End : (0x8000 << 16 | 0x3128);
+#elif defined(TARGET_WIIU)
+/* Wii U: nothing is mapped at 0x80000000. The bus clock is the platform's
+ * real global (platform/wiiu/os_core.cpp sets it); other low-memory words are
+ * served from the platform's Wii-format low-memory block through the
+ * OSPhysicalToCached() function below. */
+extern u32 __OSBusClock;
+#define __MEM2End (*(volatile u32*)OSPhysicalToCached(0x3128))
 #else
 /* OS globals live at fixed addresses in low MEM1, which the port maps at 0x80000000. */
 #define __OSBusClock (*(volatile u32*)0x800000F8)
@@ -51,10 +58,19 @@ void* OSPhysicalToUncached(u32);
 #define OS_BASE_CACHED (OS_CACHED_REGION_PREFIX << 16)
 #define OS_BASE_UNCACHED (OS_UNCACHED_REGION_PREFIX << 16)
 
+#if defined(TARGET_WIIU)
+/* Wii U: physical addresses resolve through the platform (os_core.cpp maps
+ * them into its MEM2 window, whose first 0x4000 bytes are the Wii low-memory
+ * block: OSBootInfo, disc ID, memory size). The Wii cached base is unmapped. */
+void* OSPhysicalToCached(u32 paddr);
+#else
 #define OSPhysicalToCached(paddr) ((void*)((u32)(paddr) + OS_BASE_CACHED))
+#endif
 #define OSCachedToPhysical(caddr) ((u32)((u8*)(caddr)-OS_BASE_CACHED))
 #define OSUncachedToPhysical(ucaddr) ((u32)((u32)(ucaddr) & (~OS_BASE_UNCACHED)))
+#if !defined(TARGET_WIIU)
 #define OSPhysicalToUncached(paddr) ((void*)((u32)(paddr) + OS_BASE_UNCACHED))
+#endif
 
 #define OSIsMEM1Region(addr) (((u32)(addr)&0x30000000) == 0x00000000)
 #define OSIsMEM2Region(addr) (((u32)(addr)&0x30000000) == 0x10000000)
