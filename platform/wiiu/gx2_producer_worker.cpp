@@ -190,6 +190,7 @@ static Counters delta(const Counters& now, const Counters& before) {
     d.core1ReplayMicros -= before.core1ReplayMicros;
     d.segments -= before.segments;
     d.listsCalled -= before.listsCalled;
+    d.dlBegins -= before.dlBegins;
     d.appendFailures -= before.appendFailures;
     d.serviceFailures -= before.serviceFailures;
     return d;
@@ -290,7 +291,14 @@ bool append(const uint8_t* bytes, uint32_t size) {
         s_wokenAt = s_byteWrite;
         wakeWorker();
     }
+    /* Keep display-list calls flowing while the game is producing.  The
+     * compare is intentionally cheap when the service ring is empty. */
+    if (s_serviceRead != s_serviceWrite) service();
     return true;
+}
+
+void wake() {
+    if (s_started) wakeWorker();
 }
 
 void wait(uint32_t kind) {
@@ -330,6 +338,14 @@ bool enqueueService(ServiceFn fn, void* arg) {
 
 void publish_token(uint16_t token) {
     if (s_started && s_hooks.publish_token) s_hooks.publish_token(token);
+}
+
+void record_dl_begin() {
+    if (s_started) add(&s_totals.dlBegins, 1);
+}
+
+void record_service_failure() {
+    if (s_started) add(&s_totals.serviceFailures, 1);
 }
 
 void bind_service(ServiceCallback callback) { s_serviceCallback = callback; }
@@ -408,6 +424,7 @@ void snapshot(Counters* out) {
     value.queueHighWaterBytes = load(&s_totals.queueHighWaterBytes);
     value.segments = load(&s_totals.segments);
     value.listsCalled = load(&s_totals.listsCalled);
+    value.dlBegins = load(&s_totals.dlBegins);
     value.appendFailures = load(&s_totals.appendFailures);
     value.serviceFailures = load(&s_totals.serviceFailures);
     *out = value;
@@ -421,20 +438,15 @@ Counters counters() {
 
 void note_frame(uint32_t frame) {
     if (!frame || frame % 30 || frame == s_lastLogFrame) return;
-    if (!s_started) {
-        port_log("SMS Wii U: [prod] frame=%u mode=0 core=0 us/30 append=0 waitPeek=0 waitDrawsync=0 waitDrawdone=0 waitPresent=0 worker=0 replay=0 queueHigh=0 segments=0 lists=0 appendFail=0 serviceFail=0\n",
-                 frame);
-        s_lastLogFrame = frame;
-        return;
-    }
+    if (!s_started) return;
     const Counters now = counters();
     const Counters d = delta(now, s_lastLog);
-    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u appendFail=%u serviceFail=%u\n",
+    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u dlBegins=%u appendFail=%u serviceFail=%u\n",
              frame, now.mode, now.workerCore, d.producerAppendMicros,
              d.waitMicros[WAIT_PEEK], d.waitMicros[WAIT_DRAWSYNC],
              d.waitMicros[WAIT_DRAWDONE], d.waitMicros[WAIT_PRESENT_DRAIN],
              d.workerBusyMicros, d.core1ReplayMicros,
-             now.queueHighWaterBytes, d.segments, d.listsCalled,
+             now.queueHighWaterBytes, d.segments, d.listsCalled, d.dlBegins,
              d.appendFailures, d.serviceFailures);
     s_lastLog = now;
     s_lastLogFrame = frame;

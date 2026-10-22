@@ -33,6 +33,10 @@ struct ProducerDrawSyncJob { void (*callback)(uint16_t); uint16_t token; };
 static ProducerDrawSyncJob s_producerDrawSync[256];
 static uint32_t s_producerDrawSyncWrite;
 static void producerDrawSyncService(void* opaque);
+
+extern "C" void sms_wiiu_gx2prod_reset_draw_sync_jobs(void) {
+    s_producerDrawSyncWrite = 0;
+}
 #endif
 
 State g;
@@ -379,11 +383,13 @@ void writeBP(uint32_t value) {
             flushBatch();
 #ifdef __WIIU__
             if (producerMode()) {
-                if (s_producerDrawSyncWrite < sizeof(s_producerDrawSync) / sizeof(s_producerDrawSync[0])) {
-                    ProducerDrawSyncJob& job = s_producerDrawSync[s_producerDrawSyncWrite++];
+                const uint32_t capacity = sizeof(s_producerDrawSync) / sizeof(s_producerDrawSync[0]);
+                if (s_producerDrawSyncWrite < capacity) {
+                    ProducerDrawSyncJob& job = s_producerDrawSync[s_producerDrawSyncWrite++ % capacity];
                     job.callback = drawSyncCallback;
                     job.token = g.drawSyncToken;
-                    ::gx2prod::enqueueService(producerDrawSyncService, &job);
+                    if (!::gx2prod::enqueueService(producerDrawSyncService, &job))
+                        logmsg("gx2prod draw-sync service queue rejected callback");
                 } else {
                     logmsg("gx2prod draw-sync callback queue overflow");
                 }

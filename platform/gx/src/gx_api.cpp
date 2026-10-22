@@ -273,7 +273,7 @@ GXFifoObj* GXInit(void* base, u32 size) {
 void GXSetMisc(GXMiscToken, u32) {}
 void GXFlush(void) {
 #ifdef __WIIU__
-    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+    if (producerMode()) { ::gx2prod::wake(); return; }
 #endif
     drainCommandStream(); flushBatch();
 }
@@ -407,7 +407,10 @@ void GXRestoreWriteGatherPipe(void) { setPipeRedirect(nullptr); }
 // ================================================================== display lists
 void GXBeginDisplayList(void* list, u32 size) {
 #ifdef __WIIU__
-    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+    if (producerMode()) {
+        ::gx2prod::record_dl_begin();
+        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+    }
     else
 #endif
     flushBatch();
@@ -1493,7 +1496,7 @@ void GXInitTlutRegion(GXTlutRegion* region, u32 addr, GXTlutSize size) {
 void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
 void GXInvalidateTexAll(void) {
 #ifdef __WIIU__
-    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+    if (producerMode()) return;
 #endif
     flushBatch();
     textureInvalidateAll();

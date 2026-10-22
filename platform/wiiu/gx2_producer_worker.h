@@ -43,6 +43,7 @@ struct Counters {
     uint32_t queueHighWaterBytes;
     uint32_t segments;
     uint32_t listsCalled;
+    uint32_t dlBegins;
     uint32_t appendFailures;
     uint32_t serviceFailures;
 };
@@ -56,9 +57,11 @@ bool enabled();
 /* Producer/core-1 API.  False is a hard probe failure (normally a full
  * byte ring); callers must not silently fall back to same-thread parsing. */
 bool append(const uint8_t* bytes, uint32_t size);
+/* Wake the worker without waiting for a boundary; used by GXFlush. */
+void wake();
 /* Every wait kind services through its worker-published barrier before it
- * returns.  In particular kWaitFlush and kWaitPresent cannot leave a
- * completed display-list call queued on the worker side. */
+ * returns; present drains cannot leave a completed display-list call queued
+ * on the worker side. */
 void wait(uint32_t kind);
 void service();
 void stop();
@@ -71,6 +74,10 @@ bool enqueue_list(void* displayList, uint32_t bytes);
  * by the renderer and must stay valid through the next wait/present drain. */
 bool enqueueService(ServiceFn fn, void* arg);
 void publish_token(uint16_t token);
+/* Count a GXBeginDisplayList wait for the producer report. */
+void record_dl_begin();
+/* Include renderer-side service-ordering failures in the prod report. */
+void record_service_failure();
 
 /* Bind before lists can be emitted.  The callback is invoked only by
  * service(), hence on the integrating core-1 service path. */
