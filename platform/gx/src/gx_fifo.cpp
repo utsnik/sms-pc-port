@@ -26,6 +26,8 @@
 namespace gx {
 
 State g;
+State gProducer;
+ParserContext g_parser = {&g, 0};
 extern uint32_t g_traceLastVat;
 void (*drawSyncCallback)(uint16_t) = nullptr;
 
@@ -262,6 +264,9 @@ void resetState() {
         memcpy(&g.xfMem[60 * 4 + i], &ident[i], 4);
         memcpy(&g.xfMem[0x500 + 61 * 4 + i], &ident[i], 4);
     }
+    gProducer = g;
+    g_parser.consumer = &g;
+    g_parser.displayListDepth = 0;
     (void)be;
 }
 
@@ -270,6 +275,60 @@ void resetState() {
 // that allocate (onStateChange's flush, executeCopy, the vertex batch) open
 // their own; the draw-sync callback is game code and must stay unscoped.
 uint32_t g_xfDirtyLo = ~0u, g_xfDirtyHi = 0;
+
+// Producer-side register shadows.  These mirror only the state mutation of
+// the consumer writers; renderer hooks, copies, texture invalidation, and
+// draw-sync delivery remain exclusively in writeBP/writeXF/writeCP after the
+// command stream is drained.
+void shadowBP(uint32_t value) {
+    State& s = gProducer;
+    uint32_t reg = value >> 24;
+    uint32_t data = value & 0xFFFFFF;
+    if (reg == BP_MASK) { s.bpMask = data; return; }
+    if (s.bpMask != 0xFFFFFF) {
+        data = (s.bp[reg] & ~s.bpMask) | (data & s.bpMask);
+        s.bpMask = 0xFFFFFF;
+    }
+    if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) {
+        s.kreg[reg & 7] = data;
+        return;
+    }
+    s.bp[reg] = data;
+    if (reg == BP_PE_TOKEN_INT || reg == BP_PE_TOKEN)
+        s.drawSyncToken = uint16_t(data & 0xFFFF);
+    if (reg == BP_COPY_DST) s.copyDest = physToPtr(data << 5);
+    if ((reg >= BP_TX_IMAGE3 && reg < BP_TX_IMAGE3 + 4) ||
+        (reg >= BP_TX_IMAGE3 + 0x20 && reg < BP_TX_IMAGE3 + 0x24)) {
+        int map = (reg & 3) + ((reg & 0x20) ? 4 : 0);
+        s.texImage[map] = static_cast<const uint8_t*>(physToPtr(data << 5));
+    }
+}
+
+void shadowCP(uint8_t reg, uint32_t value) {
+    State& s = gProducer;
+    switch (reg & 0xF0) {
+    case CP_MATIDX_A: s.cpMatA = value; break;
+    case CP_MATIDX_B: s.cpMatB = value; break;
+    case CP_VCD_LO: s.cpVcdLo = value; break;
+    case CP_VCD_HI: s.cpVcdHi = value; break;
+    case CP_VAT_A: s.cpVatA[reg & 7] = value; break;
+    case CP_VAT_B: s.cpVatB[reg & 7] = value; break;
+    case CP_VAT_C: s.cpVatC[reg & 7] = value; break;
+    case CP_ARRAY_BASE: s.arrayBase[reg & 15] = static_cast<const uint8_t*>(physToPtr(value)); break;
+    case CP_ARRAY_STRIDE: s.arrayStride[reg & 15] = value & 0xFF; break;
+    default: break;
+    }
+}
+
+void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words) {
+    State& s = gProducer;
+    for (uint32_t i = 0; i < count; ++i, ++addr) {
+        const uint32_t v = words[i];
+        if (addr < XF_MEM_WORDS) s.xfMem[addr] = v;
+        else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT)
+            s.xfReg[addr - XF_REG_BASE] = v;
+    }
+}
 
 void writeBP(uint32_t value) {
     uint32_t reg = value >> 24;
@@ -960,7 +1019,6 @@ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
 }
 
 // ------------------------------------------------------------------ command parser
-static uint32_t s_dlDepth = 0;
 static bool s_dlRecFail = false;  // the list being recorded does more than draw
 
 // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
@@ -1004,10 +1062,10 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
             if (avail < len) break;
             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(be32(p + 1)));
             uint32_t sz = be32(p + 5);
-            if (s_dlDepth < 4 && dl) {
-                s_dlDepth++;
+            if (g_parser.displayListDepth < 4 && dl) {
+                g_parser.displayListDepth++;
                 runCommands(dl, sz);
-                s_dlDepth--;
+                g_parser.displayListDepth--;
             }
         } else if (op == 0x61) {
             len = 5;
@@ -1308,10 +1366,10 @@ static void dlReplayState(const DlEntry& e) {
             break;
         case 0x40: {
             const uint8_t* dl = static_cast<const uint8_t*>(physToPtr(s.n));
-            if (s_dlDepth < 4 && dl) {
-                s_dlDepth++;
+            if (g_parser.displayListDepth < 4 && dl) {
+                g_parser.displayListDepth++;
                 runCommands(dl, s.v);
-                s_dlDepth--;
+                g_parser.displayListDepth--;
             }
             break;
         }
@@ -1483,6 +1541,19 @@ static void pipeRun() {
         memmove(s_pipeBuf, s_pipeBuf + used, s_pipeLen - used);
         s_pipeLen -= used;
         s_pipeNeed = need;
+    }
+    pipeFastUpdate();
+}
+
+void drainCommandStream() {
+    // GXPC_Put* normally drains as soon as a complete command is available.
+    // A final explicit pass makes the producer/consumer boundary observable
+    // at the synchronous GX fences without changing FIFO byte order or the
+    // parser's incomplete-command handling.
+    while (s_pipeLen) {
+        const uint32_t before = s_pipeLen;
+        pipeRun();
+        if (s_pipeLen == before) break;
     }
     pipeFastUpdate();
 }
