@@ -114,7 +114,7 @@ if(PORT_GAME STREQUAL "smg")
   target_include_directories(smg_wiiu_shared BEFORE PRIVATE ${SMG_WIIU_SHARED_INCLUDE_DIRS})
   target_compile_definitions(smg_wiiu_shared PRIVATE
     GEKKO=1 TARGET_PC=1 TARGET_WIIU=1 __WIIU__=1 ESPRESSO=1 NDEBUG=1 DEBUG=1 VERSION=0
-    SMS_AUDIO_DSP_HLE=1
+    SMS_AUDIO_DSP_HLE=1 PORT_GAME_SMG=1
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
   target_compile_options(smg_wiiu_shared PRIVATE
     ${SMG_GAME_FLAGS} -std=gnu++11

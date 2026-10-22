@@ -13,6 +13,7 @@
 #include <revolution/mtx.h>
 
 #include <math.h>
+#include <cassert>
 #include <stdarg.h>
 #include <stdio.h>
 
@@ -25,15 +26,19 @@ u32 __OSFpscrEnableBits;
 
 namespace {
 
-constexpr size_t kArenaBytes = 16u * 1024u * 1024u;
+constexpr size_t kMem1ArenaBytes = 24u * 1024u * 1024u;
+constexpr size_t kMem2ArenaBytes = 64u * 1024u * 1024u;
+static_assert(kMem1ArenaBytes == 25165824u, "SMG MEM1 arena size changed");
+static_assert(kMem2ArenaBytes == 67108864u, "SMG MEM2 arena size changed");
 const char kAppRootCandidates[][128] = {
     "fs:/vol/external01/wiiu/apps/smg/",
     "wiiu/apps/smg/",
     "/vol/external01/wiiu/apps/smg/",
 };
 
-alignas(64) unsigned char s_arena[kArenaBytes];
-size_t s_arena_used;
+alignas(64) unsigned char s_mem1_arena[kMem1ArenaBytes];
+alignas(64) unsigned char s_mem2_arena[kMem2ArenaBytes];
+size_t s_mem2_arena_used;
 int s_initialized;
 int s_alloc_scope_depth;
 int s_log_file_warned;
@@ -74,12 +79,12 @@ void* arena_alloc(size_t size, size_t alignment)
     if (alignment < 4 || (alignment & (alignment - 1)) != 0)
         alignment = 4;
 
-    const size_t aligned = (s_arena_used + alignment - 1) & ~(alignment - 1);
-    if (aligned > kArenaBytes || size > kArenaBytes - aligned)
+    const size_t aligned = (s_mem2_arena_used + alignment - 1) & ~(alignment - 1);
+    if (aligned > kMem2ArenaBytes || size > kMem2ArenaBytes - aligned)
         return nullptr;
 
-    void* result = s_arena + aligned;
-    s_arena_used = aligned + size;
+    void* result = s_mem2_arena + aligned;
+    s_mem2_arena_used = aligned + size;
     return result;
 }
 
@@ -89,10 +94,10 @@ extern "C" {
 
 /* Sunshine's shared GX parser uses these names for its 32-bit target window.
  * Stage 1 points that window at fixed target-owned storage. */
-u8* port_mem1_base = s_arena;
-u32 port_mem1_size = (u32)kArenaBytes;
-u8* sms_wiiu_mem2_base = s_arena;
-u32 sms_wiiu_mem2_size = (u32)kArenaBytes;
+u8* port_mem1_base = s_mem1_arena;
+u32 port_mem1_size = (u32)kMem1ArenaBytes;
+u8* sms_wiiu_mem2_base = s_mem2_arena;
+u32 sms_wiiu_mem2_size = (u32)kMem2ArenaBytes;
 
 void* smg_wiiu_arena_alloc(size_t size, size_t alignment)
 {
@@ -101,7 +106,7 @@ void* smg_wiiu_arena_alloc(size_t size, size_t alignment)
 
 uint32_t smg_wiiu_arena_used(void)
 {
-    return (uint32_t)s_arena_used;
+    return (uint32_t)s_mem2_arena_used;
 }
 
 const char* sms_wiiu_app_root(void) { return kAppRootCandidates[s_app_root_index]; }
@@ -111,10 +116,12 @@ void smg_wiiu_runtime_init(void)
 {
     if (s_initialized)
         return;
+    assert((reinterpret_cast<uintptr_t>(s_mem1_arena) & 63u) == 0);
+    assert((reinterpret_cast<uintptr_t>(s_mem2_arena) & 63u) == 0);
     resolve_app_root();
     s_initialized = 1;
-    port_log("SMG Wii U: stage2 runtime initialized; fixed arena=%u bytes",
-             (unsigned)kArenaBytes);
+    port_log("SMG Wii U: arenas MEM1=25165824 MEM2=67108864 alignment=64");
+    port_log("SMG Wii U: stage2 runtime initialized; static arenas");
     smg_wiiu_load_dol_data();
     smg_wiiu_gx_link_stub_init();
 }
@@ -163,8 +170,9 @@ int port_use_game_heap(void) { return 0; }
 
 int port_is_game_heap_ptr(const void* pointer)
 {
-    const unsigned char* p = static_cast<const unsigned char*>(pointer);
-    return p >= s_arena && p < s_arena + kArenaBytes;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(pointer);
+    const uintptr_t lo = reinterpret_cast<uintptr_t>(s_mem2_arena);
+    return p >= lo && p < lo + kMem2ArenaBytes;
 }
 
 void port_host_alloc_scope_enter(void) { ++s_alloc_scope_depth; }
@@ -182,14 +190,14 @@ int port_is_game_memory(const void* p) { return port_is_game_heap_ptr(p); }
 
 void* port_phys_to_host(uint32_t physical)
 {
-    return physical < kArenaBytes ? s_arena + physical : nullptr;
+    return physical < kMem2ArenaBytes ? s_mem2_arena + physical : nullptr;
 }
 
 uint32_t port_host_to_phys(const void* pointer)
 {
     if (!port_is_game_memory(pointer))
         return 0;
-    return (uint32_t)(static_cast<const unsigned char*>(pointer) - s_arena);
+    return (uint32_t)(reinterpret_cast<const unsigned char*>(pointer) - s_mem2_arena);
 }
 
 void port_irq_set_handler(int, PortIrqHandler) {}

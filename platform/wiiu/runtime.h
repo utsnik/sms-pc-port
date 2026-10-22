@@ -9,9 +9,8 @@
 extern "C" {
 #endif
 
-/* Stage 2 owns an aligned MEM2 arena obtained from the Wii U default heap.
- * MEM1 is queried for the GameCube compatibility boundary but is not used as
- * the game heap because foreground/system services own most of it. */
+/* The active PORT_GAME runtime owns the target MEM1/MEM2 bounds.  SMG uses
+ * static Wii-sized arenas; SMS keeps its default-heap runtime ownership. */
 void sms_wiiu_runtime_init(void);
 void sms_wiiu_sdl_audio_preopen(int rate);
 

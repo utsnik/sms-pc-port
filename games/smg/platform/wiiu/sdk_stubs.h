@@ -25,9 +25,6 @@
   X(OSFillFPUContext) \
   X(OSRegisterVersion) \
   X(OSSetPowerCallback) \
-  X(OSSetMEM2ArenaHi) \
-  X(OSGetMEM2ArenaLo) \
-  X(OSGetMEM2ArenaHi) \
   X(OSShutdownSystem) \
   X(OSReturnToMenu) \
   X(OSRestart) \
