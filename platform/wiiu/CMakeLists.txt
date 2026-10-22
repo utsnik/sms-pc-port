@@ -41,7 +41,9 @@ if(PORT_GAME STREQUAL "smg")
     DSPUnhalt=smg_gc_DSPUnhalt
     DSPAddTask=smg_gc_DSPAddTask)
 
-  set(SMG_WIIU_PLATFORM_SOURCES
+  # Shared Sunshine providers are compiled once here. Do not add their
+  # Petari counterparts to SMG_GAME_SOURCES to resolve a missing symbol.
+  set(SMG_WIIU_SHARED_PROVIDER_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_api.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_fifo.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_vert.cpp
@@ -56,7 +58,10 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_mixer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/noaudio.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/ar/ar.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/mtx.cpp)
+  set(SMG_WIIU_PLATFORM_SOURCES
+    ${SMG_WIIU_SHARED_PROVIDER_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/sdk_stubs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 
   add_library(smg_game STATIC ${SMG_GAME_SOURCES})
@@ -68,7 +73,8 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
   target_compile_definitions(smg_game PRIVATE ${SMG_DEFS}
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
-  target_compile_options(smg_game PRIVATE ${SMG_GAME_FLAGS})
+  target_compile_options(smg_game PRIVATE ${SMG_GAME_FLAGS}
+    -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
 
   add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES})
   target_include_directories(smg BEFORE PRIVATE
@@ -79,7 +85,8 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
   target_compile_definitions(smg PRIVATE ${SMG_DEFS}
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
-  target_compile_options(smg PRIVATE ${SMG_GAME_FLAGS})
+  target_compile_options(smg PRIVATE ${SMG_GAME_FLAGS}
+    -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
   set_target_properties(smg PROPERTIES
     OUTPUT_NAME smg
     SUFFIX ".elf"

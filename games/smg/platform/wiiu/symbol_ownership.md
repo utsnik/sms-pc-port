@@ -63,3 +63,17 @@ shared provider or to a finite, named stub; a wildcard stub is forbidden.
 3. Stage 1 does not open DVD/FST, initialize NAND/save services, start game
    threads, or claim a renderer/audio implementation beyond the shared Wii U
    boundary.
+
+## Task 3 provider set
+
+`platform/wiiu/CMakeLists.txt` selects each shared Sunshine provider exactly
+once in `SMG_WIIU_SHARED_PROVIDER_SOURCES`: GX API/FIFO/vertex emission, OS
+core/thread/runtime, VI/DVD/PAD, AI/DSP/no-audio, AR, and MTX.  The Petari
+source manifest supplies only the five software readers/builders listed above.
+
+`games/smg/platform/wiiu/sdk_stubs.cpp` owns the finite
+`SMG_STAGE1_STUB_SYMBOLS` list in its header.  It covers only residual
+link-only NAND, KPAD/WPAD, GX peek/performance calls.  Each entry logs once
+and returns the documented zero safe failure.  It is not a weak wildcard and
+does not define a second GXInit, GXSet*, GD*, OS*, AI*, DSP*, VI*, DVD*, PAD*,
+or AR* provider.
