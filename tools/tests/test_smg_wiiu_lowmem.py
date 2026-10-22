@@ -42,6 +42,20 @@ LOADS_STORES = {
 WII_HIGH = {-32768: 0x8000, -16384: 0xC000, -13312: 0xCC00, -13056: 0xCD00}
 
 
+RAM_TEST_FUNCS = (
+    "_ZN4nw4r3lyt6TexMap12ReplaceImageEP10TPLPalettej",
+    "_ZN15DrawSyncManager10threadFuncEPv",
+)
+
+
+def function_body(text: str, name: str):
+    start = text.find(f"<{name}>:\n")
+    if start < 0:
+        return None
+    end = text.find("\n\n", start)
+    return text[start:end if end > 0 else None]
+
+
 def tool(elf: Path, use_docker: bool, binary: str, flag: str) -> str:
     if use_docker:
         cmd = [
@@ -112,6 +126,8 @@ def main() -> int:
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--no-docker", action="store_true")
     parser.add_argument("--allow", action="append", default=[])
+    parser.add_argument("--require-wiiu-ram-tests", action="store_true",
+                        help="bound-pointer tests must use the Wii U RAM base (0x10000000)")
     args = parser.parse_args()
     elf = args.elf.resolve()
     docker = not args.no_docker
@@ -123,7 +139,19 @@ def main() -> int:
     if not rpl:
         print("lowmem: FAIL: no RPL import sections found (readelf parse)")
         return 1
-    hits = [h for h in scan(tool(elf, docker, OBJDUMP, "-d"))
+    disassembly = tool(elf, docker, OBJDUMP, "-d")
+    if args.require_wiiu_ram_tests:
+        # port_is_ram_address(): `value >= 0x10000000` compiles to a compare
+        # with lis 0x0fff (4095); the retail `>= 0x80000000` is a sign test.
+        for func in RAM_TEST_FUNCS:
+            body = function_body(disassembly, func)
+            if body is None:
+                print(f"lowmem: FAIL: {func} not found in the linked ELF")
+                return 1
+            if not re.search(r"\blis\s+r\d+,4095\b", body):
+                print(f"lowmem: FAIL: {func} still tests pointers against the Wii base 0x80000000")
+                return 1
+    hits = [h for h in scan(disassembly)
             if not any(lo <= h[3] < hi for lo, hi in rpl)]
     bad = [h for h in hits if not any(a in h[0] for a in args.allow)]
     for func, off, op, ea in bad:

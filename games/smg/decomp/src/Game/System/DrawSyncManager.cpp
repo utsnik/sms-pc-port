@@ -78,7 +78,7 @@ void* DrawSyncManager::threadFunc(void* pArg) {
         OSMessage message;
         OSReceiveMessage(&pManager->mQueue, &message, OS_MESSAGE_BLOCK);
 
-        if (reinterpret_cast< u32 >(message) >= 0x80000000) {
+        if (port_is_ram_address(reinterpret_cast< u32 >(message))) {
             pManager->mFifo->push(message);
             const bool aborted = pManager->mAborted;
 

@@ -267,6 +267,20 @@ void port_fatal(const char* fmt, ...) __attribute__((format(printf, 1, 2), noret
 #define _C SMG_FIELD_C
 #endif
 
+// Retail code tells a relocated RAM pointer from a file offset or a small
+// token by testing for the Wii's cached base (>= 0x80000000): TPL palettes in
+// nw4r::lyt::TexMap::ReplaceImage, GX FIFO tokens in DrawSyncManager.  Wii U
+// game memory (the .bss arenas and heaps) lives at 0x10000000 and up, so a
+// bound pointer there failed the test and was relocated a second time.
+static inline int port_is_ram_address(unsigned int value)
+{
+#if defined(__WIIU__)
+    return value >= 0x10000000u;
+#else
+    return value >= 0x80000000u;
+#endif
+}
+
 // MSL <cmath> helpers (MSL's M_PI is a float literal).
 #define DEG_TO_RAD(degrees) (degrees * (3.14159265358979323846f / 180.0f))
 #define RAD_TO_DEG(radians) (radians * (180.0f / 3.14159265358979323846f))
