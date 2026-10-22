@@ -304,6 +304,8 @@ void wake() {
     if (s_started) wakeWorker();
 }
 
+static void serviceImpl(bool allowNested);
+
 void wait(uint32_t kind) {
     if (!s_started) return;
     const OSTime startTime = OSGetTime();
@@ -314,7 +316,7 @@ void wait(uint32_t kind) {
     s_requestId = request;
     wakeWorker();
     while (!reached(s_serviceDone, request)) {
-        service();
+        serviceImpl(true);
         if (!reached(s_serviceDone, request))
             wut_OSSleepTicks(62156250 / 20000); // about 50 us
     }
@@ -353,7 +355,11 @@ void record_service_failure() {
 
 void bind_service(ServiceCallback callback) { s_serviceCallback = callback; }
 
-void service() {
+static bool s_inService;
+
+/* allowNested: wait() may be reached from inside a serviced callback and must
+ * still make progress; append's opportunistic pump must not nest. */
+static void serviceImpl(bool allowNested) {
     if (!s_started) return;
     if (OSGetCoreId() != 1) {
         add(&s_totals.serviceFailures, 1);
@@ -364,6 +370,12 @@ void service() {
         }
         return;
     }
+    /* A record can reach game code (draw-sync callbacks) that issues GX and
+     * so appends, which pumps this queue again: never nest, and retire each
+     * record before running it so nothing runs twice. */
+    if (s_inService && !allowNested) return;
+    const bool outer = !s_inService;
+    s_inService = true;
     const OSTime startTime = OSGetTime();
     uint32_t serviced = 0;
     for (;;) {
@@ -371,6 +383,10 @@ void service() {
         acquireBarrier();
         if (read == s_serviceWrite) break;
         const ServiceRecord record = s_serviceRing[read % kServiceRingSize];
+        if (record.type != SERVICE_BARRIER) {
+            releaseBarrier();
+            s_serviceRead = read + 1;
+        }
         if (record.type == SERVICE_LIST) {
             if (s_serviceCallback) {
                 s_serviceCallback(record.list, record.bytes);
@@ -385,10 +401,7 @@ void service() {
         } else if (record.type == SERVICE_CALLBACK) {
             record.fn(record.arg);
         }
-        if (record.type != SERVICE_BARRIER) {
-            releaseBarrier();
-            s_serviceRead = read + 1;
-        } else {
+        if (record.type == SERVICE_BARRIER) {
             /* Retire the queue slot before publishing completion.  A waiter
              * observing s_serviceDone may return immediately. */
             releaseBarrier();
@@ -398,8 +411,11 @@ void service() {
         }
         ++serviced;
     }
+    if (outer) s_inService = false;
     if (serviced) add(&s_totals.core1ReplayMicros, microsSince(startTime));
 }
+
+void service() { serviceImpl(false); }
 
 void stop() {
     if (!s_started) return;
