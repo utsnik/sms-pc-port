@@ -143,9 +143,12 @@ void HeapMemoryWatcher::createRootHeap() {
     HeapMemoryWatcher::sRootHeapGDDR3 = pHeap;
 }
 
-#ifdef TARGET_PC
+#if defined(TARGET_PC) && !defined(TARGET_WIIU)
 // Objects are larger on the 64-bit port (pointers, vtables); the port's
 // memory banks are 128 MiB each, so the fixed-size heaps get more room.
+// Not on Wii U: it is 32-bit with the Wii's 24 MiB MEM1 / 64 MiB MEM2, and the
+// doubled stationed heaps left the game heaps too small for the scene's
+// 0x1040400-byte file cache (HeapMemoryWatcher OSPanic in initializeScene).
 #define PORT_HEAP(size) ((size) * 2)
 #else
 #define PORT_HEAP(size) (size)
