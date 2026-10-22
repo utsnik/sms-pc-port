@@ -1550,6 +1550,17 @@ static bool vertexAluReadsPvPs(uint64_t op) {
     return ((word1 >> 15) & 7) != 0 && vertexAluPvPs(word1 & 0x1ff);
 }
 
+// AR (set by MOVA) does not survive a clause boundary either, so a group that
+// addresses a source or destination relatively must stay with the MOVA that
+// precedes it.
+static bool vertexAluUsesAr(uint64_t op) {
+    const uint32_t word0 = __builtin_bswap32(uint32_t(op >> 32));
+    const uint32_t word1 = __builtin_bswap32(uint32_t(op));
+    if (((word0 >> 9) & 1) || ((word0 >> 22) & 1) || ((word1 >> 28) & 1))
+        return true;
+    return ((word1 >> 15) & 7) != 0 && ((word1 >> 9) & 1);
+}
+
 static bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
                                   std::vector<VertexAluClause>& clauses) {
     const uint64_t aluLast = to_QWORD(to_LE(1ull << 31), 0);
@@ -1558,7 +1569,7 @@ static bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
         bool readsPvPs = false, hasLiteral = false, ended = false;
         size_t end = begin;
         while (end < alu.size()) {
-            readsPvPs = readsPvPs || vertexAluReadsPvPs(alu[end]);
+            readsPvPs = readsPvPs || vertexAluReadsPvPs(alu[end]) || vertexAluUsesAr(alu[end]);
             const uint32_t word0 = __builtin_bswap32(uint32_t(alu[end] >> 32));
             const uint32_t word1 = __builtin_bswap32(uint32_t(alu[end]));
             hasLiteral = hasLiteral || ((word0 & 0x1ff) == ALU_SRC_LITERAL) ||
@@ -1582,7 +1593,8 @@ static bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
     }
     if (groups.empty()) return false;
 
-    // A boundary before a PV/PS reader would discard the producer's value.
+    // A boundary before a PV/PS reader (or an AR user) would discard the
+    // producer's value.
     // Turn each such adjacency into an indivisible component, then pack whole
     // components.  This also naturally keeps every boundary at a LAST bit.
     std::vector<std::pair<size_t, size_t>> components;
