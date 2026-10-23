@@ -62,6 +62,7 @@ BOOL wut_OSCancelAlarm(WutAlarm*) __asm__("OSCancelAlarm");
 void wut_OSSetAlarmUserData(WutAlarm*, void*) __asm__("OSSetAlarmUserData");
 void* wut_OSGetAlarmUserData(WutAlarm*) __asm__("OSGetAlarmUserData");
 OSTime wut_OSGetTime(void) __asm__("OSGetTime");
+void* wut_OSGetCurrentThread(void) __asm__("OSGetCurrentThread");
 BOOL wut_spin_acquire(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Acquire");
 BOOL wut_spin_release(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Release");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
@@ -95,7 +96,8 @@ struct AlarmRecord {
 WutSpinLock s_lock;
 AlarmRecord s_alarms[kMaxAlarms];
 uint32_t s_release_seq;
-thread_local bool s_in_handler;
+void* s_handler_threads[kMaxAlarms];
+uint32_t s_handler_depth[kMaxAlarms];
 #if defined(SMG_ALARM_HOST_TEST)
 std::atomic<int> s_live_instances{0};
 #endif
@@ -112,6 +114,46 @@ struct Lock {
     Lock() { wut_spin_acquire(&s_lock); }
     ~Lock() { wut_spin_release(&s_lock); }
 };
+
+bool handler_thread_locked(void* thread)
+{
+    for (unsigned i = 0; i < kMaxAlarms; ++i)
+        if (s_handler_threads[i] == thread && s_handler_depth[i] != 0)
+            return true;
+    return false;
+}
+
+void begin_handler()
+{
+    void* thread = wut_OSGetCurrentThread();
+    Lock lock;
+    for (unsigned i = 0; i < kMaxAlarms; ++i) {
+        if (s_handler_threads[i] == thread) {
+            ++s_handler_depth[i];
+            return;
+        }
+    }
+    for (unsigned i = 0; i < kMaxAlarms; ++i) {
+        if (s_handler_depth[i] == 0) {
+            s_handler_threads[i] = thread;
+            s_handler_depth[i] = 1;
+            return;
+        }
+    }
+}
+
+void end_handler()
+{
+    void* thread = wut_OSGetCurrentThread();
+    Lock lock;
+    for (unsigned i = 0; i < kMaxAlarms; ++i) {
+        if (s_handler_threads[i] == thread && s_handler_depth[i] != 0) {
+            if (--s_handler_depth[i] == 0)
+                s_handler_threads[i] = nullptr;
+            return;
+        }
+    }
+}
 
 /* Caller holds s_lock. */
 AlarmRecord* find_locked(OSAlarm* game)
@@ -225,9 +267,9 @@ void trampoline(WutAlarm* wut, void* /*context*/)
         }
     }
     if (run) {
-        s_in_handler = true;
+        begin_handler();
         handler(game, nullptr);
-        s_in_handler = false;
+        end_handler();
     }
     {
         Lock lock;
@@ -255,11 +297,12 @@ void trampoline(WutAlarm* wut, void* /*context*/)
  * trampoline; its callback hold then keeps it alive through the handler. */
 void disarm(AlarmRecord* r)
 {
-    const bool defer_wait = s_in_handler;
+    bool defer_wait;
     AlarmInstance* instance;
     bool destroy = false;
     {
         Lock lock;
+        defer_wait = handler_thread_locked(wut_OSGetCurrentThread());
         r->armed = false;
         instance = r->instance;
         r->instance = nullptr;
