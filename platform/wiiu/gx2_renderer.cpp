@@ -5217,6 +5217,10 @@ static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
 // Single frames, end to end: over 34 ms misses 30 fps unpaced; over 41.7 ms
 // (1.25 frames at 30) is a missed vsync when paced.  [frames] lines, per 30.
 static uint32_t s_frameOver34, s_frameOver42, s_frameMaxUs;
+// [frames] missMask: bit i = the window's frame i went over 41.7 ms; logUs: core-1
+// time in the previous window's periodic report block (charged to frame 0).
+static uint32_t s_frameMissMask, s_reportUs;
+static OSTime s_reportStart;
 // [hitch]: one line for any frame over 60 ms (at most 200 a run), with where
 // its time went.  pre = previous renderer_end to this renderer_begin (the
 // game's own work before it draws), draw = renderer_begin to renderer_end.
@@ -6537,7 +6541,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfWall += perfNow - s_perfLastEnd;
         const uint32_t us = uint32_t(OSTicksToMicroseconds(perfNow - s_perfLastEnd));
         if (us > 34000) ++s_frameOver34;
-        if (us > 41700) ++s_frameOver42;
+        if (us > 41700) { ++s_frameOver42; if (s_perfFrames < 32) s_frameMissMask |= 1u << s_perfFrames; }
         if (us > s_frameMaxUs) s_frameMaxUs = us;
         if (us > 60000 && s_hitchLines < 200) {
             ++s_hitchLines;
@@ -6590,6 +6594,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     }
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
+        s_reportStart = OSGetTime();
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         uint32_t prodFrontend = 0, prodPeek = 0, prodPresent = 0, prodBlocked = 0;
         if (s_gx2ProdEnabled) {
@@ -6619,9 +6624,10 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked);
         tokReport();
         drawDoneReport();
-        WHBLogPrintf("SMS Wii U: [frames] frame=%u over34=%u over42=%u maxUs=%u", (unsigned)g_displayFrames,
-                     (unsigned)s_frameOver34, (unsigned)s_frameOver42, (unsigned)s_frameMaxUs);
-        s_frameOver34 = s_frameOver42 = s_frameMaxUs = 0;
+        WHBLogPrintf("SMS Wii U: [frames] frame=%u over34=%u over42=%u maxUs=%u missMask=%08x logUs=%u", (unsigned)g_displayFrames,
+                     (unsigned)s_frameOver34, (unsigned)s_frameOver42, (unsigned)s_frameMaxUs,
+                     (unsigned)s_frameMissMask, (unsigned)s_reportUs);
+        s_frameOver34 = s_frameOver42 = s_frameMaxUs = s_frameMissMask = 0;
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
             WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",
@@ -6660,6 +6666,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_drawsThisFrame = 0;
     ++g_displayFrames;
     gx2prod::note_frame(g_displayFrames);
+    if (s_reportStart) { s_reportUs = uint32_t(OSTicksToMicroseconds(OSGetTime() - s_reportStart)); s_reportStart = 0; }
 }
 
 } // namespace gx
