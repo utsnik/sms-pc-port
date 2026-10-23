@@ -83,8 +83,176 @@ static GX2DepthBuffer* renderDepth();
 static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
 static void gx2ProdBoundary(uint32_t kind);
 static void gx2ProdCallList(void* list, uint32_t bytes);
+static uint32_t textureCacheEntryCount();
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
+
+enum WorkerTimingOp {
+    kWorkerTextureMiss,
+    kWorkerTextureDecode,
+    kWorkerTextureRetile,
+    kWorkerTextureAlloc,
+    kWorkerCopyToTexture,
+    kWorkerVertexShader,
+    kWorkerTevShader,
+    kWorkerDlEnd,
+    kWorkerPackEvict,
+    kWorkerPackUpload,
+    kWorkerConsumeRemainder,
+    kWorkerTimingOpCount
+};
+
+struct WorkerTextureInfo {
+    uint32_t source, fmt, width, height, levels, tlut;
+};
+
+struct WorkerTimingSnapshot {
+    uint32_t micros[kWorkerTimingOpCount];
+    uint32_t counts[kWorkerTimingOpCount];
+};
+
+struct WorkerLargestTexture {
+    volatile uint32_t sequence;
+    volatile uint32_t micros;
+    volatile uint32_t source, fmt, width, height, levels, tlut;
+};
+
+static volatile WorkerTimingSnapshot s_workerTiming;
+static WorkerLargestTexture s_workerLargestTexture;
+static volatile uint32_t s_workerSlowLogs;
+
+static inline uint32_t workerAtomicLoad(const volatile uint32_t* value) {
+    return __sync_fetch_and_add(const_cast<volatile uint32_t*>(value), 0);
+}
+
+static inline uint32_t workerElapsedMicros(OSTime start) {
+    return static_cast<uint32_t>(OSTicksToMicroseconds(OSGetTime() - start));
+}
+
+static void workerRememberLargestTexture(const WorkerTextureInfo& info, uint32_t micros) {
+    if (micros <= workerAtomicLoad(&s_workerLargestTexture.micros)) return;
+    __sync_fetch_and_add(&s_workerLargestTexture.sequence, 1);
+    if (micros > workerAtomicLoad(&s_workerLargestTexture.micros)) {
+        s_workerLargestTexture.source = info.source;
+        s_workerLargestTexture.fmt = info.fmt;
+        s_workerLargestTexture.width = info.width;
+        s_workerLargestTexture.height = info.height;
+        s_workerLargestTexture.levels = info.levels;
+        s_workerLargestTexture.tlut = info.tlut;
+        __sync_synchronize();
+        s_workerLargestTexture.micros = micros;
+    }
+    __sync_synchronize();
+    __sync_fetch_and_add(&s_workerLargestTexture.sequence, 1);
+}
+
+static bool workerClaimSlowLog() {
+    uint32_t old = workerAtomicLoad(&s_workerSlowLogs);
+    while (old < 100 && !__sync_bool_compare_and_swap(&s_workerSlowLogs, old, old + 1))
+        old = workerAtomicLoad(&s_workerSlowLogs);
+    return old < 100;
+}
+
+static void workerSlowLog(const char* operation, uint32_t micros,
+                          const WorkerTextureInfo* texture, uint32_t cacheEntries) {
+    if (micros <= 15000 || !workerClaimSlowLog()) return;
+    if (texture) {
+        WHBLogPrintf("SMS Wii U: [wkslow] op=%s us=%u addr=%08x fmt=%u size=%ux%u levels=%u tlut=%u texCache=%u",
+                     operation, (unsigned)micros, (unsigned)texture->source,
+                     (unsigned)texture->fmt, (unsigned)texture->width, (unsigned)texture->height,
+                     (unsigned)texture->levels, (unsigned)texture->tlut, (unsigned)cacheEntries);
+    } else {
+        WHBLogPrintf("SMS Wii U: [wkslow] op=%s us=%u", operation, (unsigned)micros);
+    }
+}
+
+static void workerRecord(WorkerTimingOp operation, uint32_t micros,
+                         const WorkerTextureInfo* texture = nullptr, uint32_t cacheEntries = 0) {
+    __sync_fetch_and_add(&s_workerTiming.micros[operation], micros);
+    __sync_fetch_and_add(&s_workerTiming.counts[operation], 1);
+    if (operation == kWorkerTextureMiss && texture)
+        workerRememberLargestTexture(*texture, micros);
+    static const char* const names[kWorkerTimingOpCount] = {
+        "getTexture", "getTexture-decode", "getTexture-retile", "getTexture-alloc",
+        "copyToTexture", "vertexShaderForKey", "tevShaderForKey", "gx2DlEndCall",
+        "texture-pack-evict", "texture-pack-upload", "gx2ProdConsume-remainder"
+    };
+    workerSlowLog(names[operation], micros, texture, cacheEntries);
+}
+
+struct WorkerOpTimer {
+    WorkerTimingOp operation;
+    OSTime start;
+    WorkerTextureInfo texture;
+    bool hasTexture;
+    uint32_t cacheEntries;
+    bool active;
+
+    explicit WorkerOpTimer(WorkerTimingOp op)
+        : operation(op), start(OSGetTime()), texture{}, hasTexture(false), cacheEntries(0), active(true) {}
+    WorkerOpTimer(WorkerTimingOp op, const WorkerTextureInfo& info, uint32_t cache)
+        : operation(op), start(OSGetTime()), texture(info), hasTexture(true), cacheEntries(cache), active(true) {}
+    ~WorkerOpTimer() { finish(); }
+    void setTexture(const WorkerTextureInfo& info, uint32_t cache) {
+        texture = info; hasTexture = true; cacheEntries = cache;
+    }
+    void setCacheEntries(uint32_t cache) { cacheEntries = cache; }
+    void finish() {
+        if (!active) return;
+        active = false;
+        workerRecord(operation, workerElapsedMicros(start), hasTexture ? &texture : nullptr, cacheEntries);
+    }
+};
+
+static WorkerTimingSnapshot workerTimingSnapshot() {
+    WorkerTimingSnapshot result = {};
+    for (unsigned i = 0; i < kWorkerTimingOpCount; ++i) {
+        result.micros[i] = workerAtomicLoad(&s_workerTiming.micros[i]);
+        result.counts[i] = workerAtomicLoad(&s_workerTiming.counts[i]);
+    }
+    return result;
+}
+
+static WorkerTimingSnapshot workerTimingDelta(const WorkerTimingSnapshot& now,
+                                             const WorkerTimingSnapshot& before) {
+    WorkerTimingSnapshot result = {};
+    for (unsigned i = 0; i < kWorkerTimingOpCount; ++i) {
+        result.micros[i] = now.micros[i] - before.micros[i];
+        result.counts[i] = now.counts[i] - before.counts[i];
+    }
+    return result;
+}
+
+struct WorkerLargestTextureSnapshot {
+    uint32_t micros, source, fmt, width, height, levels, tlut;
+};
+
+static WorkerLargestTextureSnapshot workerLargestTextureSnapshot() {
+    WorkerLargestTextureSnapshot result = {};
+    for (;;) {
+        const uint32_t before = workerAtomicLoad(&s_workerLargestTexture.sequence);
+        if (before & 1) continue;
+        result.micros = workerAtomicLoad(&s_workerLargestTexture.micros);
+        result.source = workerAtomicLoad(&s_workerLargestTexture.source);
+        result.fmt = workerAtomicLoad(&s_workerLargestTexture.fmt);
+        result.width = workerAtomicLoad(&s_workerLargestTexture.width);
+        result.height = workerAtomicLoad(&s_workerLargestTexture.height);
+        result.levels = workerAtomicLoad(&s_workerLargestTexture.levels);
+        result.tlut = workerAtomicLoad(&s_workerLargestTexture.tlut);
+        const uint32_t after = workerAtomicLoad(&s_workerLargestTexture.sequence);
+        if (before == after) return result;
+    }
+}
+
+static void workerResetLargestTexture() {
+    __sync_fetch_and_add(&s_workerLargestTexture.sequence, 1);
+    s_workerLargestTexture.micros = 0;
+    s_workerLargestTexture.source = s_workerLargestTexture.fmt = 0;
+    s_workerLargestTexture.width = s_workerLargestTexture.height = 0;
+    s_workerLargestTexture.levels = s_workerLargestTexture.tlut = 0;
+    __sync_synchronize();
+    __sync_fetch_and_add(&s_workerLargestTexture.sequence, 1);
+}
 
 uint32_t g_displayFrames = 0;
 double g_flushSeconds = 0.0;
@@ -406,6 +574,9 @@ static std::deque<TextureEntry>& textureCache() {
     return *s_textureObject;
 }
 #define s_textures (textureCache())
+static uint32_t textureCacheEntryCount() {
+    return s_textureObject ? static_cast<uint32_t>(s_textureObject->size()) : 0;
+}
 // source address -> newest entry for it; every bind looked through all entries.
 static unsigned char s_textureIndexStorage[sizeof(std::unordered_map<const uint8_t*, uint32_t>)]
     __attribute__((aligned(8)));
@@ -1999,6 +2170,7 @@ static VertexProgram* vertexShaderForKey(const VertexKey& key) {
     if (s_vertexProgramIndex.full)
         for (VertexProgram* shader : s_vertexPrograms)
             if (!memcmp(&shader->key, &key, sizeof(key))) return shader->failed ? nullptr : shader;
+    WorkerOpTimer timing(kWorkerVertexShader);
     VertexProgram* shader = new VertexProgram();
     memset(shader, 0, sizeof(*shader));
     shader->key = key;
@@ -2848,6 +3020,7 @@ static TevShader* tevShaderForKey(const TevKey& key) {
     if (s_tevShaderIndex.full)
         for (TevShader* shader : s_tevShaders)
             if (!memcmp(&shader->key, &key, sizeof(key))) return shader;
+    WorkerOpTimer timing(kWorkerTevShader);
     TevShader* shader = new TevShader();
     memset(shader, 0, sizeof(*shader));
     shader->key = key;
@@ -3174,6 +3347,8 @@ static bool runningUnderCemu() {
 }
 static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
+    const WorkerTextureInfo info = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dest)), fmt, w, h, 1, 0};
+    WorkerOpTimer timing(kWorkerCopyToTexture, info, textureCacheEntryCount());
     ++s_perfCopies;
     ++s_copyGeneration;
     GX2ColorBuffer* cb = renderColour();
@@ -3305,6 +3480,8 @@ struct ProducerResolvedCopy {
 static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, uint32_t y,
                                                 uint32_t w, uint32_t h, bool half,
                                                 uint32_t fmt, uint32_t pe) {
+    const WorkerTextureInfo info = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dest)), fmt, w, h, 1, 0};
+    WorkerOpTimer timing(kWorkerCopyToTexture, info, textureCacheEntryCount());
     ProducerResolvedCopy result = {};
     ++s_perfCopies;
     ++s_copyGeneration;
@@ -3581,11 +3758,17 @@ static TextureEntry* getTexture(int map) {
             return &e;
         }
     }
+    const WorkerTextureInfo textureInfo = {
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(source)), fmt, w, h, levels, tlut
+    };
+    WorkerOpTimer missTiming(kWorkerTextureMiss, textureInfo, textureCacheEntryCount());
     SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
+    WorkerOpTimer allocationTiming(kWorkerTextureAlloc, textureInfo, textureCacheEntryCount());
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
     e.next = first;
     index[source] = uint32_t(s_textures.size() - 1);
+    missTiming.setCacheEntries(static_cast<uint32_t>(s_textures.size()));
     e.source = source; e.fmt = fmt; e.width = w; e.height = h; e.tlut = tlut; e.tlutFmt = tlutFmt;
     e.levels = levels;
     e.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
@@ -3660,6 +3843,8 @@ static TextureEntry* getTexture(int map) {
     uint8_t* rgba = readable ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     uint8_t* prev = (readable && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
+    allocationTiming.setCacheEntries(static_cast<uint32_t>(s_textures.size()));
+    allocationTiming.finish();
     if (!rgba || (surf.mipLevels > 1 && !prev)) {
         if (s_whiteFillLogs < 40) {
             ++s_whiteFillLogs;
@@ -3675,6 +3860,8 @@ static TextureEntry* getTexture(int map) {
         const uint8_t* src = source;
         float mipDiff = 0.0f;
         uint32_t pw = w, ph = h;
+        WorkerOpTimer decodeTiming(kWorkerTextureDecode, textureInfo,
+                                   static_cast<uint32_t>(s_textures.size()));
         for (uint32_t l = 0; l < surf.mipLevels; ++l) {
             const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
             gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
@@ -3687,13 +3874,17 @@ static TextureEntry* getTexture(int map) {
             pw = lw; ph = lh;
             src += texLevelBytes(fmt, lw, lh);
         }
+        decodeTiming.finish();
         e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
     }
     if (rgba) MEMFreeToDefaultHeap(rgba);
     if (prev) MEMFreeToDefaultHeap(prev);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
     if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
+    WorkerOpTimer retileTiming(kWorkerTextureRetile, textureInfo,
+                               static_cast<uint32_t>(s_textures.size()));
     retileTexture(e.texture);
+    retileTiming.finish();
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
     e.valid = true;
     if (texturePackEnabled()) {
@@ -3813,10 +4004,15 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
 }
 
 static void packInstall(TextureEntry& e) {
+    const WorkerTextureInfo info = {
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(e.source)), e.fmt, e.width, e.height, e.levels, e.tlut
+    };
+    WorkerOpTimer evictionTiming(kWorkerPackEvict, info, static_cast<uint32_t>(s_textures.size()));
     uint64_t bytes = uint64_t(e.packTiled.surface.imageSize) + e.packTiled.surface.mipmapSize;
     uint32_t evicted[kTexturePackMaxResidents];
     const uint32_t n = s_packLru.evict(s_packFrame, bytes, evicted, kTexturePackMaxResidents);
     for (uint32_t i = 0; i < n; ++i) if (TextureEntry* old = packTextureForRequest(evicted[i])) packEvict(*old);
+    evictionTiming.finish();
     if (!s_packLru.add(e.packRequestId, bytes, s_packFrame)) {
         packFreeLoading(e); e.packState = 2; return;
     }
@@ -3846,9 +4042,17 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     }
     TexturePackUploadBudget budget(512u << 10);
     TexturePackUploadChunk chunk;
+    WorkerOpTimer uploadTiming(kWorkerPackUpload);
     while (texturePackPopUploadChunk(&chunk)) {
         if (!budget.consume(chunk.bytes)) break;
         TextureEntry* e = packTextureForRequest(chunk.requestId);
+        if (e) {
+            const WorkerTextureInfo info = {
+                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(e->source)), e->fmt,
+                e->width, e->height, e->levels, e->tlut
+            };
+            uploadTiming.setTexture(info, static_cast<uint32_t>(s_textures.size()));
+        }
         if (!e || e->packState != 1 || !packCopyChunk(*e, chunk)) {
             if (e) { packFreeLoading(*e); e->packState = 2; ++s_packFallback; }
             texturePackReleaseUploadChunk(); continue;
@@ -3856,6 +4060,7 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
         texturePackReleaseUploadChunk();
         if (e->packEntry && e->packLevelDone == ((1u << e->packEntry->mipCount) - 1u)) packInstall(*e);
     }
+    uploadTiming.finish();
     const uint32_t pumpMicros = uint32_t(OSTicksToMicroseconds(OSGetTime() - pumpStart));
     s_packUploadBytes += budget.bytes;
     s_packUploadMicros += pumpMicros;
@@ -4864,8 +5069,17 @@ static void gx2ProdCallList(void* list, uint32_t bytes) {
 }
 
 static void gx2ProdConsume(const uint8_t* bytes, uint32_t size) {
+    const OSTime start = OSGetTime();
+    const WorkerTimingSnapshot before = workerTimingSnapshot();
     SMS_PORT_HEAP_SCOPE();
     producerConsume(bytes, size);
+    const WorkerTimingSnapshot after = workerTimingSnapshot();
+    const uint32_t nested = (after.micros[kWorkerTextureMiss] - before.micros[kWorkerTextureMiss]) +
+                            (after.micros[kWorkerCopyToTexture] - before.micros[kWorkerCopyToTexture]) +
+                            (after.micros[kWorkerVertexShader] - before.micros[kWorkerVertexShader]) +
+                            (after.micros[kWorkerTevShader] - before.micros[kWorkerTevShader]);
+    const uint32_t total = workerElapsedMicros(start);
+    workerRecord(kWorkerConsumeRemainder, total > nested ? total - nested : 0);
 }
 static void gx2ProdBoundary(uint32_t kind) {
     SMS_PORT_HEAP_SCOPE();
@@ -4905,6 +5119,7 @@ static bool gx2DlBegin(void** outList) {
 }
 
 static bool gx2DlEndCall(void* list) {
+    WorkerOpTimer timing(kWorkerDlEnd);
     if (!s_gx2DlRecording) return false;
     const uint32_t bytes = GX2EndDisplayList(list);
     s_gx2DlRecording = false;
@@ -5000,6 +5215,7 @@ struct HitchShadow {
     uint32_t copies, peeks, clears, draws;
     OSTime fence;
     gx2prod::Counters prod;
+    WorkerTimingSnapshot worker;
 };
 static HitchShadow s_hitchLast;
 static uint32_t s_hitchLines;
@@ -6299,6 +6515,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
     const OSTime perfNow = OSGetTime();
+    const WorkerTimingSnapshot workerNow = workerTimingSnapshot();
+    const WorkerTimingSnapshot worker = workerTimingDelta(workerNow, s_hitchLast.worker);
+    const WorkerLargestTextureSnapshot workerMax = workerLargestTextureSnapshot();
     if (s_gx2ProdEnabled && s_prodFrontendStart)
         gx2prod::record_core1_frontend(prodMicros(s_prodFrontendStart));
     if (s_perfLastEnd) {
@@ -6318,7 +6537,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             WHBLogPrintf("SMS Wii U: [hitch] frame=%u us=%u pre=%u draw=%u wPeek=%u wSync=%u wDone=%u wPresent=%u "
                          "c1Blocked=%u c1Present=%u c1List=%u c1CopyClear=%u c1Retile=%u c1Callback=%u wkBusy=%u "
                          "wkBlocked=%u svcFull=%u packUs=%u packBytes=%u copies=%u peeks=%u clears=%u draws=%u fenceUs=%u "
-                         "ddMaxLr=%08x ddMaxUs=%u",
+                         "ddMaxLr=%08x ddMaxUs=%u "
+                         "wkTexUs=%u wkTexN=%u wkDecodeUs=%u wkDecodeN=%u wkRetileUs=%u wkRetileN=%u "
+                         "wkAllocUs=%u wkAllocN=%u wkCopyUs=%u wkCopyN=%u wkVtxUs=%u wkVtxN=%u "
+                         "wkTevUs=%u wkTevN=%u wkDlUs=%u wkDlN=%u wkEvictUs=%u wkEvictN=%u "
+                         "wkUploadUs=%u wkUploadN=%u wkRestUs=%u wkRestN=%u "
+                         "wkTexMaxAddr=%08x wkTexMaxFmt=%u wkTexMaxSize=%ux%u wkTexMaxLevels=%u wkTexMaxTlut=%u wkTexMaxUs=%u",
                          (unsigned)g_displayFrames, (unsigned)us, (unsigned)pre, (unsigned)draw,
                          (unsigned)(p.waitMicros[0] - q.waitMicros[0]), (unsigned)(p.waitMicros[1] - q.waitMicros[1]),
                          (unsigned)(p.waitMicros[2] - q.waitMicros[2]), (unsigned)(p.waitMicros[3] - q.waitMicros[3]),
@@ -6334,7 +6558,21 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                          (unsigned)s_framePackBytes, (unsigned)(s_perfCopies - s_hitchLast.copies),
                          (unsigned)(s_perfPeeks - s_hitchLast.peeks), (unsigned)(s_perfClears - s_hitchLast.clears),
                          (unsigned)(s_perfDraws - s_hitchLast.draws), usOf(s_vertexFenceWait - s_hitchLast.fence),
-                         (unsigned)s_ddFrameMaxLr, usOf(s_ddFrameMax));
+                         (unsigned)s_ddFrameMaxLr, usOf(s_ddFrameMax),
+                         (unsigned)worker.micros[kWorkerTextureMiss], (unsigned)worker.counts[kWorkerTextureMiss],
+                         (unsigned)worker.micros[kWorkerTextureDecode], (unsigned)worker.counts[kWorkerTextureDecode],
+                         (unsigned)worker.micros[kWorkerTextureRetile], (unsigned)worker.counts[kWorkerTextureRetile],
+                         (unsigned)worker.micros[kWorkerTextureAlloc], (unsigned)worker.counts[kWorkerTextureAlloc],
+                         (unsigned)worker.micros[kWorkerCopyToTexture], (unsigned)worker.counts[kWorkerCopyToTexture],
+                         (unsigned)worker.micros[kWorkerVertexShader], (unsigned)worker.counts[kWorkerVertexShader],
+                         (unsigned)worker.micros[kWorkerTevShader], (unsigned)worker.counts[kWorkerTevShader],
+                         (unsigned)worker.micros[kWorkerDlEnd], (unsigned)worker.counts[kWorkerDlEnd],
+                         (unsigned)worker.micros[kWorkerPackEvict], (unsigned)worker.counts[kWorkerPackEvict],
+                         (unsigned)worker.micros[kWorkerPackUpload], (unsigned)worker.counts[kWorkerPackUpload],
+                         (unsigned)worker.micros[kWorkerConsumeRemainder], (unsigned)worker.counts[kWorkerConsumeRemainder],
+                         (unsigned)workerMax.source, (unsigned)workerMax.fmt,
+                         (unsigned)workerMax.width, (unsigned)workerMax.height, (unsigned)workerMax.levels,
+                         (unsigned)workerMax.tlut, (unsigned)workerMax.micros);
         }
     }
     s_perfLastEnd = perfNow;
@@ -6399,7 +6637,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_hitchLast.clears = s_perfClears;
     s_hitchLast.draws = s_perfDraws;
     s_hitchLast.fence = s_vertexFenceWait;
+    s_hitchLast.worker = workerNow;
     if (s_gx2ProdEnabled) gx2prod::snapshot(&s_hitchLast.prod);
+    workerResetLargestTexture();
     s_framePackBytes = s_framePackMicros = 0;
     s_ddFrameMax = 0;
     s_ddFrameMaxLr = 0;
