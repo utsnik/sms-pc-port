@@ -251,9 +251,12 @@ void markXfMemDirty();
 extern uint32_t g_xfDirtyLo, g_xfDirtyHi;
 uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
 uint32_t peekZ(int x, int y);      // 24-bit
-// Producer mode with the "peekeof" SD marker: peeks read the end-of-frame
-// snapshot and must not wait for the worker.
+// Producer mode with the "peekeof" SD marker: peeks read the snapshot taken at
+// their draw-sync token and must not wait for the worker.
 bool peekEofNoWait();
+// Wii U: a draw-sync token with a callback reached the GX stream (the worker's,
+// in producer mode), before the callback is run or queued.
+void peekToken(uint16_t token, uint32_t peFormat);
 void pixMetricClear();
 uint32_t pixMetricRead();
 

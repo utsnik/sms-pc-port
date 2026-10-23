@@ -382,6 +382,7 @@ void writeBP(uint32_t value) {
         if (reg == BP_PE_TOKEN_INT && drawSyncCallback) {
             flushBatch();
 #ifdef __WIIU__
+            peekToken(g.drawSyncToken, g.bp[BP_PE_CONTROL] & 7);
             if (producerMode()) {
                 const uint32_t capacity = sizeof(s_producerDrawSync) / sizeof(s_producerDrawSync[0]);
                 if (s_producerDrawSyncWrite < capacity) {

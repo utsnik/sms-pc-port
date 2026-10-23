@@ -611,7 +611,7 @@ static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
 static bool s_gx2ProdEnabled;
 static bool s_gx2ProdMarker;
-static int s_peekEofMode;  // 0 off, 1 "peekeof", 2 "peekcmp" (see eofSnapshot)
+static int s_peekEofMode;  // 0 off, 1 "peekeof", 2 "peekcmp" (see peekToken)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
@@ -5643,18 +5643,23 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     return true;
 }
 
-// End-of-frame peek snapshots (producer mode, console only).  The only
+// Token-ordered peek snapshots (producer mode, console only).  The only
 // per-frame peeks are Mario's occlusion probe (GXPeekARGB from
-// TMario::drawSyncCallback) and the sun glare (GXPeekZ from
-// TSunModel::getZBufValue); both already answer from a frame-old snapshot.
-// prod6 took that snapshot mid-frame after gx2prod::wait(kWaitPeek) drained the
-// worker, ~11 ms of core 1 per Plaza frame.  With "peekeof" a peek only reads
-// the last snapshot and asks for a new one, and renderer_end takes it after its
-// own present drain, where the worker is idle anyway.  With "peekcmp" the game
-// keeps prod6's answers (and wait) while the end-of-frame snapshot is read at
-// the same points, and [peekeof] lines count how often the two disagree.
-// The colour snapshot is only a kEofRect square around the frame's last probe
-// point (GX2CopySurfaceEx): a whole-target copy every frame cost ~2.5 ms of a
+// TMario::drawSyncCallback, token 0x7C from TAlphaCatch) and the sun glare
+// (GXPeekZ from TSunModel::getZBufValue, token 0x7D from TZBufferCatch).  The
+// game reads the target while the GPU is held at its breakpoint after the
+// token: Mario's box wrote alpha 0x10 just before, and a second box writes 0
+// right after.  The snapshot must therefore be taken at the token's place in
+// the GPU stream, not later.  prod6 drained the worker (gx2prod::wait
+// kWaitPeek, ~11 ms of core 1 per Plaza frame) and copied whatever the target
+// held by then.  With "peekeof" the worker splits its list at the token and
+// queues an ordered core-1 service that copies there, and a peek only reads the
+// newest finished snapshot (one frame old, as before).  With "peekcmp" the game
+// keeps prod6's answers (and wait) while the token snapshot is read at the same
+// points, and [peekeof] lines count how often the two disagree.  Every mode
+// counts the alpha byte the probe gets (0x10 means Mario visible).
+// The colour snapshot is only a kEofRect square around the last probe point
+// (GX2CopySurfaceEx): a whole-target copy every frame cost ~2.5 ms of a
 // GPU-bound frame.  kEofRing squares are kept so a peek can read the newest one
 // the GPU has finished, if it still covers the point.
 static constexpr int kEofRect = 128;
@@ -5680,6 +5685,9 @@ extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Su
 struct EofStats {
     uint32_t cPeeks, cVisible, cOccluded, cMismatch, cNotReady, cOutside, cAgeSum;
     uint32_t zPeeks, zFar, zMismatch, zFarMismatch, zNotReady, copies, logged;
+    // Alpha bytes: [0] 0x10, [1] 0x00, [2] 0xff, [3] other, [4] no answer.
+    // aGame is what the game got, aSnap what the token snapshot held (peekcmp).
+    uint32_t aGame[5], aSnap[5], tokens, splits, peFormat;
 };
 static EofStats s_eofStats;
 
@@ -5809,12 +5817,16 @@ static void eofLogMismatch(const char* what, int x, int y, uint32_t prod6, uint3
                  x, y, (unsigned)prod6, (unsigned)eof);
 }
 
-// renderer_end, producer mode, after the present drain and service(): the
-// worker is idle, so core 1 may copy and touch the renderer's caches exactly
-// like prod6's mid-frame peek did after its own drain.
-static void eofSnapshot() {
-    const bool wantColour = s_eof.colourWanted, wantDepth = s_eof.depthWanted;
-    s_eof.colourWanted = s_eof.depthWanted = false;
+// Core 1, as an ordered service between the replayed lists: the GPU runs this
+// copy exactly where the token sat in the GX stream.
+struct TokenSnapJob { uint16_t token; };
+static TokenSnapJob s_tokenSnapJobs[16];
+static uint32_t s_tokenSnapWrite;
+static void tokenSnapService(void* opaque) {
+    const uint16_t token = static_cast<TokenSnapJob*>(opaque)->token;
+    const bool wantColour = token == 0x7C && s_eof.colourWanted, wantDepth = token == 0x7D && s_eof.depthWanted;
+    if (wantColour) s_eof.colourWanted = false;
+    if (wantDepth) s_eof.depthWanted = false;
     if ((!wantColour && !wantDepth) || !ProcUIInForeground() || !eofAllocate()) return;
     GX2ColorBuffer* cb = renderColour();
     GX2DepthBuffer* db = renderDepth();
@@ -5831,7 +5843,7 @@ static void eofSnapshot() {
         GX2Rect rect = {left, top, left + kEofRect, top + kEofRect};
         GX2Point at = {0, 0};
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
-        GX2CopySurfaceEx(&cb->surface, 0, 0, &slot.surface, 0, 0, 1, &rect, &at); invalidateVertexUniforms();
+        GX2CopySurfaceEx(&cb->surface, 0, 0, &slot.surface, 0, 0, 1, &rect, &at);
         slot.left = left;
         slot.top = top;
         colour = true;
@@ -5839,13 +5851,13 @@ static void eofSnapshot() {
     if (wantDepth && db && db->surface.width == s_eof.depthTiled.width && db->surface.height == s_eof.depthTiled.height &&
         db->surface.format == GX2_SURFACE_FORMAT_FLOAT_R32 && db->surface.aa == GX2_AA_MODE1X) {
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
-        GX2ConvertDepthBufferToTextureSurface(db, &s_eof.depthTiled, 0, 0); invalidateVertexUniforms();
-        GX2CopySurface(&s_eof.depthTiled, 0, 0, &s_eof.depthLinear, 0, 0); invalidateVertexUniforms();
+        GX2ConvertDepthBufferToTextureSurface(db, &s_eof.depthTiled, 0, 0);
+        GX2CopySurface(&s_eof.depthTiled, 0, 0, &s_eof.depthLinear, 0, 0);
         depth = true;
     }
     if (!colour && !depth) return;
-    rebindTvTarget();
-    GX2Flush();
+    rebindTvTarget(false);  // the copies leave their destination bound
+    GX2Flush();             // so the stamp below covers them
     const uint64_t stamp = GX2GetLastSubmittedTimeStamp();
     if (colour) {
         slot.stamp = stamp;
@@ -5857,18 +5869,54 @@ static void eofSnapshot() {
     ++s_eofStats.copies;
 }
 
+// gx_fifo, at every callback token: the worker in producer mode, else the
+// game thread just before it runs the callback.
+void peekToken(uint16_t token, uint32_t peFormat) {
+    if (token != 0x7C && token != 0x7D) return;
+    ++s_eofStats.tokens;
+    s_eofStats.peFormat = peFormat;
+    if (!s_gx2ProdEnabled || !s_peekEofMode || OSGetCoreId() == 1) return;
+    if (s_tokenSnapWrite >= sizeof(s_tokenSnapJobs) / sizeof(s_tokenSnapJobs[0])) return;
+    gx2DlSplit(kDlSplitCopy);
+    ++s_eofStats.splits;
+    TokenSnapJob& job = s_tokenSnapJobs[s_tokenSnapWrite++];
+    job.token = token;
+    if (!gx2prod::enqueueService(tokenSnapService, &job, gx2prod::SERVICE_COUNTER_COPY_CLEAR))
+        WHBLogPrintf("SMS Wii U: [peekeof] service queue rejected token %02x", (unsigned)token);
+    invalidateVertexUniforms();  // the copy clobbers what the next list inherits
+    gx2DlOpenForDraw();
+}
+
 static void eofReport() {
-    if (!s_peekEofMode) return;
     const EofStats& e = s_eofStats;
+    if (!s_peekEofMode && !e.tokens && !e.cPeeks) return;
     WHBLogPrintf("SMS Wii U: [peekeof] frame=%u mode=%d snaps=%u cPeeks=%u cVisible=%u cOccluded=%u cMismatch=%u cNotReady=%u "
-                 "cOutside=%u cAgeSum=%u zPeeks=%u zFar=%u zMismatch=%u zFarMismatch=%u zNotReady=%u",
+                 "cOutside=%u cAgeSum=%u zPeeks=%u zFar=%u zMismatch=%u zFarMismatch=%u zNotReady=%u "
+                 "tokens=%u splits=%u pf=%u aGame=%u/%u/%u/%u/%u aSnap=%u/%u/%u/%u/%u",
                  (unsigned)g_displayFrames, s_peekEofMode, (unsigned)e.copies, (unsigned)e.cPeeks, (unsigned)e.cVisible,
                  (unsigned)e.cOccluded, (unsigned)e.cMismatch, (unsigned)e.cNotReady, (unsigned)e.cOutside,
                  (unsigned)e.cAgeSum, (unsigned)e.zPeeks, (unsigned)e.zFar,
-                 (unsigned)e.zMismatch, (unsigned)e.zFarMismatch, (unsigned)e.zNotReady);
+                 (unsigned)e.zMismatch, (unsigned)e.zFarMismatch, (unsigned)e.zNotReady, (unsigned)e.tokens,
+                 (unsigned)e.splits, (unsigned)e.peFormat, (unsigned)e.aGame[0], (unsigned)e.aGame[1],
+                 (unsigned)e.aGame[2], (unsigned)e.aGame[3], (unsigned)e.aGame[4], (unsigned)e.aSnap[0],
+                 (unsigned)e.aSnap[1], (unsigned)e.aSnap[2], (unsigned)e.aSnap[3], (unsigned)e.aSnap[4]);
     const uint32_t logged = e.logged;
     s_eofStats = EofStats{};
     s_eofStats.logged = logged;
+}
+
+// Buckets one alpha byte; the first 8 distinct values are logged once each.
+static void eofCountAlpha(uint32_t* h, bool answered, uint32_t c) {
+    if (!answered) { ++h[4]; return; }
+    const uint32_t a = c >> 24;
+    ++h[a == 0x10 ? 0 : a == 0x00 ? 1 : a == 0xff ? 2 : 3];
+    static uint32_t s_seen[8], s_seenCount;
+    for (uint32_t i = 0; i < s_seenCount; ++i)
+        if (s_seen[i] == a) return;
+    if (s_seenCount >= 8) return;
+    s_seen[s_seenCount++] = a;
+    WHBLogPrintf("SMS Wii U: [peekeof] alpha %02x first seen frame=%u argb=%08x", (unsigned)a, (unsigned)g_displayFrames,
+                 (unsigned)c);
 }
 
 static void eofCountColour(uint32_t c) {
@@ -5885,7 +5933,9 @@ uint32_t peekColor(int x, int y) {
         eofWantColour(x, y);
         ++s_eofStats.cPeeks;
         uint32_t c;
-        if (eofReadColour(x, y, &c)) s_eof.lastColour = c;
+        const bool read = eofReadColour(x, y, &c);
+        eofCountAlpha(s_eofStats.aGame, read, c);
+        if (read) s_eof.lastColour = c;
         else c = s_eof.lastColour;
         eofCountColour(c);
         return c;
@@ -5894,13 +5944,17 @@ uint32_t peekColor(int x, int y) {
     if (x < 0 || y < 0) return 0;
     const int point[1][2] = {{x, y}};
     uint32_t c = 0;
-    if (!readTvPixels(point, 1, &c)) return 0;
+    const bool read = readTvPixels(point, 1, &c);
+    eofCountAlpha(s_eofStats.aGame, read, c);
+    if (!read) return 0;
     if (s_peekEofMode == 2) {
         eofWantColour(x, y);
         ++s_eofStats.cPeeks;
         eofCountColour(c);
         uint32_t e;
-        if (eofReadColour(x, y, &e) && ((c & 0xff000000) == 0x10000000) != ((e & 0xff000000) == 0x10000000)) {
+        const bool snap = eofReadColour(x, y, &e);
+        eofCountAlpha(s_eofStats.aSnap, snap, e);
+        if (snap && ((c & 0xff000000) == 0x10000000) != ((e & 0xff000000) == 0x10000000)) {
             ++s_eofStats.cMismatch;
             eofLogMismatch("colour", x, y, c, e);
         }
@@ -6172,7 +6226,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         g_producerDraws = 0;
         if (sms_wiiu_gx2prod_reset_draw_sync_jobs)
             sms_wiiu_gx2prod_reset_draw_sync_jobs();
-        if (s_peekEofMode) eofSnapshot();
+        s_tokenSnapWrite = 0;
     } else
 #endif
     flushBatch();
