@@ -39,7 +39,9 @@ def main():
     required = {
         "compat": ("PORT_HOST_BIG_ENDIAN", "__BYTE_ORDER__", "__ORDER_BIG_ENDIAN__"),
         "intrinsics": ("#if PORT_HOST_BIG_ENDIAN", "__lwbrx", "__lhbrx", "__stwbrx", "__sthbrx"),
-        "fifo": ("#if !PORT_HOST_BIG_ENDIAN", "__PortGXFifo_u32"),
+        # The FIFO writers feed sms_gx's big-endian pipe byte by byte, the
+        # stream GXBegin and the GX API write (no separate buffer, no swap).
+        "fifo": ("__PortGXFifo_u32", "GXPC_Write32", "GXPC_PipeBuf"),
         "string": ("#if !PORT_HOST_BIG_ENDIAN", "convertUTF16ToASCII"),
         "unit_heap": ("PORT_HOST_BIG_ENDIAN", "__builtin_bswap32"),
         "tpl": ("PORT_HOST_BIG_ENDIAN", "uintptr_t", "descriptorArray"),
