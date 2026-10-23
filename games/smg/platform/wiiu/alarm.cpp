@@ -22,8 +22,9 @@
  *    cannot observe a later arming's user data. Under the lock the callback
  *    checks that its generation is still the record's current generation and
  *    that its arming is due: OSGetTime() >= due, where due is computed from
- *    the same coreinit timebase when the alarm is armed. A one-shot then
- *    disarms; a periodic alarm advances due to its next period.
+ *    the same coreinit timebase when the alarm is armed. Native alarms are
+ *    always one-shot: a game periodic alarm advances its due time and
+ *    re-arms the same native alarm before its handler runs.
  *  - Every arming takes a free record (least recently released first).
  *    Instances have explicit record, native-alarm and callback references;
  *    callback-context disarm retires them without waiting, while external
@@ -57,7 +58,6 @@ struct WutSpinLock {
 extern "C" {
 void wut_OSCreateAlarm(WutAlarm*) __asm__("OSCreateAlarm");
 BOOL wut_OSSetAlarm(WutAlarm*, OSTime, WutAlarmCallback) __asm__("OSSetAlarm");
-BOOL wut_OSSetPeriodicAlarm(WutAlarm*, OSTime, OSTime, WutAlarmCallback) __asm__("OSSetPeriodicAlarm");
 BOOL wut_OSCancelAlarm(WutAlarm*) __asm__("OSCancelAlarm");
 void wut_OSSetAlarmUserData(WutAlarm*, void*) __asm__("OSSetAlarmUserData");
 void* wut_OSGetAlarmUserData(WutAlarm*) __asm__("OSGetAlarmUserData");
@@ -75,9 +75,8 @@ struct AlarmInstance {
     AlarmRecord* record;
     uint64_t generation;          // immutable identity of this arming
     uint32_t refs;                // record + native alarm + callback holders
-    bool periodic;
-    bool native_release_pending;  // OSCancelAlarm returned false
-    bool native_released;
+    bool periodic;                // game alarm is periodic
+    bool native_held;              // the currently armed native one-shot
 };
 
 struct AlarmRecord {
@@ -150,6 +149,27 @@ bool release_locked(AlarmInstance* instance)
     return --instance->refs == 0;
 }
 
+/* Caller holds s_lock. Each native one-shot has one native hold. A callback
+ * consumes that hold on entry; cancellation consumes it only when native
+ * cancellation succeeds. */
+bool release_native_locked(AlarmInstance* instance)
+{
+    if (!instance->native_held)
+        return false;
+    instance->native_held = false;
+    return release_locked(instance);
+}
+
+/* Caller holds s_lock. Return the first start+n*period deadline after now;
+ * unlike incrementing the previous due time, this cannot accumulate handler
+ * or dispatch latency. */
+OSTime next_period_due(const AlarmRecord* r, OSTime now)
+{
+    if (now < r->start)
+        return r->start;
+    return r->start + ((now - r->start) / r->period + 1) * r->period;
+}
+
 void trampoline(WutAlarm* wut, void* /*context*/)
 {
     AlarmInstance* instance = reinterpret_cast<AlarmInstance*>(wut);
@@ -166,16 +186,37 @@ void trampoline(WutAlarm* wut, void* /*context*/)
         if (!r || r < s_alarms || r >= s_alarms + kMaxAlarms)
             return;
         ++instance->refs;             // callback holder; native holder keeps it alive
+        bool native_destroy = release_native_locked(instance);
+        if (native_destroy)
+            destroy = true;
         void* data = wut_OSGetAlarmUserData(&instance->wut);
         const uint64_t generation = data ? *static_cast<uint64_t*>(data) : 0;
         if (instance == r->instance && generation == r->generation &&
-            r->active && r->armed && r->handler) {
+            r->active && r->armed) {
             const OSTime now = wut_OSGetTime();
-            if (now >= r->due) {
-                if (r->period > 0)
-                    r->due = r->start + ((now - r->start) / r->period + 1) * r->period;
-                else
-                    r->armed = false;     // a one-shot fires once
+            const bool due = now >= r->due;
+            if (r->period > 0) {
+                if (due)
+                    r->due = next_period_due(r, now);
+                /* A game periodic alarm is represented by a succession of
+                 * native one-shots. Keep this native hold across the re-arm,
+                 * and do it before releasing s_lock or entering the game
+                 * handler. */
+                ++instance->refs;
+                instance->native_held = true;
+                if (!wut_OSSetAlarm(&instance->wut, r->due - now, trampoline)) {
+                    instance->native_held = false;
+                    if (release_locked(instance))
+                        destroy = true;
+                    r->armed = false;
+                    r->instance = nullptr;
+                    if (release_locked(instance))
+                        destroy = true;
+                }
+            } else if (due) {
+                r->armed = false;     // a one-shot fires once
+            }
+            if (due && r->handler) {
                 handler = r->handler;
                 game = r->game;
                 ++r->in_flight;
@@ -201,16 +242,6 @@ void trampoline(WutAlarm* wut, void* /*context*/)
                 destroy = true;
         }
 
-        /* One-shots have no future native callback. A cancelled periodic
-         * alarm releases its native hold when its already-dequeued callback
-         * reaches this point. */
-        if ((!instance->periodic ||
-             instance->native_release_pending) &&
-            !instance->native_released) {
-            instance->native_released = true;
-            if (release_locked(instance))
-                destroy = true;
-        }
         if (release_locked(instance))
             destroy = true;
     }
@@ -220,7 +251,8 @@ void trampoline(WutAlarm* wut, void* /*context*/)
 
 /* Disarm and stop the coreinit alarm. Callback-context callers do not wait;
  * external callers wait for handlers after the native transition. The native
- * hold keeps a dequeued callback's instance alive until it returns. */
+ * native hold keeps a dequeued callback's instance alive until it enters the
+ * trampoline; its callback hold then keeps it alive through the handler. */
 void disarm(AlarmRecord* r)
 {
     const bool defer_wait = s_in_handler;
@@ -237,15 +269,10 @@ void disarm(AlarmRecord* r)
 
             /* Keep the adapter lock through the native transition. A
              * callback already in flight can finish only after this block;
-             * a callback not yet entered observes the pending native hold. */
+             * a callback not yet entered owns the native hold until entry. */
             const BOOL cancelled = wut_OSCancelAlarm(&instance->wut);
-            if (cancelled) {
-                instance->native_released = true;
-                if (release_locked(instance))
-                    destroy = true;
-            } else {
-                instance->native_release_pending = true;
-            }
+            if (cancelled && release_native_locked(instance))
+                destroy = true;
         }
     }
     if (instance && !defer_wait) {
@@ -321,10 +348,9 @@ AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, OSTime first, OS
     wut_OSCreateAlarm(&instance->wut);
     wut_OSSetAlarmUserData(&instance->wut, &instance->generation);
     instance->refs = 2;                // record holder + native alarm holder
-    if (period > 0)
-        wut_OSSetPeriodicAlarm(&instance->wut, start, period, trampoline);
-    else
-        wut_OSSetAlarm(&instance->wut, first, trampoline);
+    instance->native_held = true;
+    const OSTime delay = period > 0 ? r->due - now : first;
+    wut_OSSetAlarm(&instance->wut, delay, trampoline);
     return r;
 }
 

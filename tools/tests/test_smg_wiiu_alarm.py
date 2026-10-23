@@ -25,6 +25,12 @@ timing: with Galaxy's __OSBusClock set as port_os_init sets it (coreinit's
         Wii Remote speaker's period) must fire at 150 Hz on the coreinit
         timebase. With the old GameCube 162 MHz clock it fires 1.53x fast;
         --expect-bus-clock lets the red case be shown.
+requeue: the fake native layer requeues a periodic alarm before delivering its
+late callback.  The adapter must use no native periodic API, must reclaim the
+instance after the one final callback, and must receive no further callbacks.
+drift: a late periodic callback advances the fake clock by several periods;
+the adapter must schedule the next future start+n*period deadline rather than
+accumulating overdue periods into a burst.
 --mode runs one of them (default all). The script also checks that
 platform/wiiu/os_core.cpp derives __OSBusClock from coreinit's busClockSpeed
 for PORT_GAME_SMG.
@@ -74,12 +80,17 @@ typedef void (*WutCb)(void*, void*);
 struct FakeState {
     std::atomic<bool> cancelled{false};
     std::atomic<bool> dequeued{false};
+    std::atomic<bool> requeued{false};
 };
 static std::mutex g_fake;
 static std::map<void*, void*> g_user;                     // alarm -> user data
 static std::map<void*, std::shared_ptr<FakeState>> g_state;
 static std::vector<std::thread> g_threads;
 static std::mutex g_spin;
+static std::atomic<int> g_native_periodic_calls{0};
+static std::atomic<int> g_native_callback_calls{0};
+static std::atomic<OSTime> g_time_offset_ticks{0};
+static std::vector<OSTime> g_native_set_ticks;
 // stale test: the next dequeued callback is held in its dispatch window until
 // released (coreinit has taken the alarm off its queue; the callback has not
 // read the alarm's user data yet).
@@ -105,13 +116,17 @@ static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s
     std::mt19937 rng(reinterpret_cast<uintptr_t>(alarm) ^ (uintptr_t)period_s);
     std::this_thread::sleep_for(std::chrono::duration<double>(first_s));
     for (;;) {
-        // Dequeue and cancellation are one serialized transition: a cancel
-        // that returns success guarantees that this callback will not start.
+        // A native periodic alarm is requeued before its callback is
+        // dispatched.  If cancellation loses that dequeue race, deliver the
+        // already-requeued callback once more, even though cancelled is set.
         {
             std::lock_guard<std::mutex> l(g_fake);
-            if (st->cancelled.load())
+            if (st->cancelled.load() && !st->requeued.load())
                 return;
+            st->requeued = false;
             st->dequeued = true;
+            if (period_s > 0 && !st->cancelled.load())
+                st->requeued = true;
         }
         // Dispatch window: a cancel or re-arm may land between coreinit
         // dequeuing the alarm and the callback running.
@@ -128,6 +143,7 @@ static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s
         void* user;
         { std::lock_guard<std::mutex> l(g_fake); user = g_user[alarm]; }
         (void)user;
+        g_native_callback_calls++;
         t_is_cb = true;
         t_held_once = false;
         cb(alarm, nullptr);
@@ -161,10 +177,15 @@ int fake_set(void* a, OSTime t, WutCb cb) {
             g_handoff_cv.wait(l, [] { return g_handoff_release; });
         }
     }
+    { std::lock_guard<std::mutex> l(g_fake); g_native_set_ticks.push_back(t); }
     arm(a, t / kTimerHz, 0, cb); return 1;
 }
 int fake_setp(void* a, OSTime start, OSTime period, WutCb cb) __asm__("OSSetPeriodicAlarm");
-int fake_setp(void* a, OSTime, OSTime period, WutCb cb) { arm(a, period / kTimerHz, period / kTimerHz, cb); return 1; }
+int fake_setp(void* a, OSTime, OSTime period, WutCb cb) {
+    g_native_periodic_calls++;
+    arm(a, period / kTimerHz, period / kTimerHz, cb);
+    return 1;
+}
 int fake_cancel(void* a) __asm__("OSCancelAlarm");
 int fake_cancel(void* a) {
     {
@@ -209,7 +230,7 @@ OSTime fake_time(void) __asm__("OSGetTime");
 OSTime fake_time(void) {
     using namespace std::chrono;
     const auto ns = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
-    return OSTime((long double)ns * kTimerHz / 1e9L);
+    return OSTime((long double)ns * kTimerHz / 1e9L) + g_time_offset_ticks.load();
 }
 void* fake_self(void) __asm__("OSGetCurrentThread");
 void* fake_self(void) { static thread_local char tag; return &tag; }
@@ -401,6 +422,79 @@ static bool periodic_leak_test() {
     return smg_wiiu_alarm_live_instances() == baseline && g_late_periodic_hits.load() == 0 &&
            g_one_shot_hits.load() == 1;
 }
+
+static bool periodic_requeue_test() {
+    g_late_periodic_hits = 0;
+    g_native_periodic_calls = 0;
+    g_native_callback_calls = 0;
+    const int baseline = smg_wiiu_alarm_live_instances();
+    {
+        std::lock_guard<std::mutex> l(g_hold_m);
+        g_hold = true;
+        g_held = false;
+        g_release = false;
+    }
+    smg_wiiu_OSSetPeriodicAlarm(&g_alarms[0], 0, OSTime(kTimerHz * 0.001), handler_late_periodic);
+    {
+        std::unique_lock<std::mutex> l(g_hold_m);
+        if (!g_hold_cv.wait_for(l, std::chrono::seconds(2), [] { return g_held; }))
+            return false;
+    }
+    smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+    {
+        std::lock_guard<std::mutex> l(g_hold_m);
+        g_release = true;
+        g_hold_cv.notify_all();
+    }
+    for (int i = 0; i < 200 && smg_wiiu_alarm_live_instances() != baseline; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool ok = g_native_periodic_calls.load() == 0 &&
+                    g_native_callback_calls.load() == 1 &&
+                    g_late_periodic_hits.load() == 0 &&
+                    smg_wiiu_alarm_live_instances() == baseline;
+    std::printf("alarm-host: native periodic calls=%d callbacks=%d live=%d/%d late-handler-hits=%d\n",
+                g_native_periodic_calls.load(), g_native_callback_calls.load(),
+                smg_wiiu_alarm_live_instances(), baseline, g_late_periodic_hits.load());
+    return ok;
+}
+
+static std::atomic<int> g_drift_hits{0};
+static const OSTime kDriftPeriod = OSTime(kTimerHz * 0.001);
+static void handler_drift(OSAlarm* alarm, OSContext*) {
+    const int hit = ++g_drift_hits;
+    if (hit == 1)
+        g_time_offset_ticks = kDriftPeriod * 5;
+    if (hit >= 3)
+        smg_wiiu_OSCancelAlarm(alarm);
+}
+
+static bool drift_test() {
+    g_drift_hits = 0;
+    g_native_periodic_calls = 0;
+    g_native_callback_calls = 0;
+    g_time_offset_ticks = 0;
+    {
+        std::lock_guard<std::mutex> l(g_fake);
+        g_native_set_ticks.clear();
+    }
+    smg_wiiu_OSSetPeriodicAlarm(&g_alarms[0], 0, kDriftPeriod, handler_drift);
+    for (int i = 0; i < 300 && g_drift_hits.load() < 3; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+    std::vector<OSTime> sets;
+    {
+        std::lock_guard<std::mutex> l(g_fake);
+        sets = g_native_set_ticks;
+    }
+    bool positive = sets.size() >= 3;
+    for (OSTime ticks : sets)
+        positive = positive && ticks > 0;
+    const bool ok = g_native_periodic_calls.load() == 0 && g_drift_hits.load() >= 3 && positive;
+    std::printf("alarm-host: catch-up hits=%d native-periodic=%d one-shot-arms=%zu positive-delays=%s\n",
+                g_drift_hits.load(), g_native_periodic_calls.load(), sets.size(), positive ? "yes" : "no");
+    return ok;
+}
 static bool wait_self(int want) {
     for (int i = 0; i < 200 && g_self_done.load() < want; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -555,6 +649,28 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+    if (mode == "requeue" || mode == "all") {
+        if (!periodic_requeue_test()) {
+            std::printf("alarm-host: FAIL: native periodic delivery was used or requeued a callback\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        if (mode == "requeue") {
+            for (auto& t : g_threads) t.join();
+            return 0;
+        }
+    }
+    if (mode == "drift" || mode == "all") {
+        if (!drift_test()) {
+            std::printf("alarm-host: FAIL: periodic catch-up accumulated drift or burst deadlines\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        if (mode == "drift") {
+            for (auto& t : g_threads) t.join();
+            return 0;
+        }
+    }
     if (mode == "handoff" || mode == "all") {
         if (!handoff_test()) {
             std::printf("alarm-host: FAIL: same-alarm native arm/cancel handoff raced\n");
@@ -634,7 +750,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=ROOT / "games/smg/platform/wiiu/alarm.cpp")
     parser.add_argument("--os-core", type=Path, default=ROOT / "platform/wiiu/os_core.cpp")
-    parser.add_argument("--mode", choices=("all", "self", "wrap", "stale", "race", "cross", "leak", "handoff", "timing"), default="all")
+    parser.add_argument("--mode", choices=("all", "self", "wrap", "stale", "race", "cross", "leak", "requeue", "drift", "handoff", "timing"), default="all")
     parser.add_argument("--expect-bus-clock", type=int,
                         help="run the timing test with this __OSBusClock (red: 162000000)")
     args = parser.parse_args()
@@ -703,6 +819,8 @@ def main() -> int:
            "stale": "alarm: PASS: a dequeued callback cannot run a handler after cancel or slot reuse",
            "cross": "alarm: PASS: cross-alarm cancellation does not deadlock",
            "leak": "alarm: PASS: periodic late callbacks release their instances",
+           "requeue": "alarm: PASS: native periodic requeue is impossible and late cancellation reclaims once",
+           "drift": "alarm: PASS: periodic catch-up uses future start+n*period deadlines",
            "handoff": "alarm: PASS: same-alarm native arm/cancel is serialized",
            "timing": "alarm: PASS: coreinit-consistent ticks"}[args.mode])
     return 0
