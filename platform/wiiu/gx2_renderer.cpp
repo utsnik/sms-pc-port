@@ -6543,7 +6543,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         if (us > 34000) ++s_frameOver34;
         if (us > 41700) { ++s_frameOver42; if (s_perfFrames < 32) s_frameMissMask |= 1u << s_perfFrames; }
         if (us > s_frameMaxUs) s_frameMaxUs = us;
-        if (us > 60000 && s_hitchLines < 200) {
+        if (us > 45000 && s_hitchLines < 200) {
             ++s_hitchLines;
             const auto usOf = [](OSTime t) { return uint32_t(OSTicksToMicroseconds(t)); };
             const uint32_t pre = s_frameBeginTime > s_perfLastEnd ? usOf(s_frameBeginTime - s_perfLastEnd) : 0;
