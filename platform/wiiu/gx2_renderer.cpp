@@ -611,7 +611,7 @@ static OSTime s_vertexFenceWait;
 static bool s_vertexArenaInvalidated;
 static bool s_gx2ProdEnabled;
 static bool s_gx2ProdMarker;
-static int s_peekEofMode;  // 0 off, 1 "peekeof", 2 "peekcmp" (see peekToken)
+static int s_peekTokenMode;  // 0 prod6 ("peekprod6"), 1 token snapshots (default), 2 "peekcmp" (see peekToken)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
@@ -4650,13 +4650,14 @@ void rendererInit(float) {
             setProducerMode(true);
             s_gx2ProdEnabled = true;
             if (!runningUnderCemu()) {
-                // Cemu's copies never reach guest memory, so both stay console only.
-                if (sdMarkerPresent("peekcmp")) s_peekEofMode = 2;
-                else if (sdMarkerPresent("peekeof")) s_peekEofMode = 1;
+                // Cemu's copies never reach guest memory, so token snapshots
+                // stay console only and Cemu keeps prod6's drained peeks.
+                if (sdMarkerPresent("peekcmp")) s_peekTokenMode = 2;
+                else if (!sdMarkerPresent("peekprod6")) s_peekTokenMode = 1;
             }
-            if (s_peekEofMode)
-                WHBLogPrintf("SMS Wii U: [peekeof] %s", s_peekEofMode == 1 ? "peeks read end-of-frame snapshots (no worker wait)"
-                                                                           : "compare: prod6 peeks + end-of-frame snapshots");
+            WHBLogPrintf("SMS Wii U: [peektok] %s", s_peekTokenMode == 1 ? "peeks read token snapshots (no worker wait)"
+                                                  : s_peekTokenMode == 2 ? "compare: prod6 peeks + token snapshots"
+                                                                         : "prod6 peeks (worker drained per peek)");
             WHBLogPrintf("SMS Wii U: [gx2prod] worker started core=%u (default core 0; core 2 override=%s)",
                          s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "on" : "off");
         } else {
@@ -4981,6 +4982,9 @@ static bool gx2DlOpenForDraw() {
 }
 // Per-frame CPU cost of the renderer, logged with the [perf] line.
 static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
+// Single frames, end to end: over 34 ms misses 30 fps unpaced; over 41.7 ms
+// (1.25 frames at 30) is a missed vsync when paced.  [frames] lines, per 30.
+static uint32_t s_frameOver34, s_frameOver42, s_frameMaxUs;
 static OSTime s_prodFrontendStart;
 
 static uint32_t prodMicros(OSTime start) {
@@ -5652,50 +5656,51 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
 // right after.  The snapshot must therefore be taken at the token's place in
 // the GPU stream, not later.  prod6 drained the worker (gx2prod::wait
 // kWaitPeek, ~11 ms of core 1 per Plaza frame) and copied whatever the target
-// held by then.  With "peekeof" the worker splits its list at the token and
+// held by then.  By default the worker splits its list at the token and
 // queues an ordered core-1 service that copies there, and a peek only reads the
 // newest finished snapshot (one frame old, as before).  With "peekcmp" the game
 // keeps prod6's answers (and wait) while the token snapshot is read at the same
-// points, and [peekeof] lines count how often the two disagree.  Every mode
+// points, and [peektok] lines count how often the two disagree.  With
+// "peekprod6" every peek drains the worker as prod6 did.  Every mode
 // counts the alpha byte the probe gets (0x10 means Mario visible).
-// The colour snapshot is only a kEofRect square around the last probe point
+// The colour snapshot is only a kTokRect square around the last probe point
 // (GX2CopySurfaceEx): a whole-target copy every frame cost ~2.5 ms of a
-// GPU-bound frame.  kEofRing squares are kept so a peek can read the newest one
+// GPU-bound frame.  kTokRing squares are kept so a peek can read the newest one
 // the GPU has finished, if it still covers the point.
-static constexpr int kEofRect = 128;
-static constexpr int kEofRing = 3;
-struct EofColourSlot {
+static constexpr int kTokRect = 128;
+static constexpr int kTokRing = 3;
+struct TokenColourSlot {
     GX2Surface surface;
     uint64_t stamp;
     int32_t left, top;
     uint32_t frame;
     bool queued;
 };
-struct EofSnapshots {
-    EofColourSlot colour[kEofRing];
+struct TokenSnapshots {
+    TokenColourSlot colour[kTokRing];
     GX2Surface depthTiled, depthLinear;
     bool allocated, failed, depthQueued, colourWanted, depthWanted;
     uint32_t colourNext, colourPx, colourPy;
     uint64_t depthStamp;
     uint32_t lastColour = 0x10000000;  // until the first snapshot: Mario visible
 };
-static EofSnapshots s_eof;
+static TokenSnapshots s_tok;
 extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
                                                       uint32_t dstSlice);
-struct EofStats {
+struct TokenStats {
     uint32_t cPeeks, cVisible, cOccluded, cMismatch, cNotReady, cOutside, cAgeSum;
     uint32_t zPeeks, zFar, zMismatch, zFarMismatch, zNotReady, copies, logged;
     // Alpha bytes: [0] 0x10, [1] 0x00, [2] 0xff, [3] other, [4] no answer.
     // aGame is what the game got, aSnap what the token snapshot held (peekcmp).
     uint32_t aGame[5], aSnap[5], tokens, splits, peFormat;
 };
-static EofStats s_eofStats;
+static TokenStats s_tokStats;
 
-bool peekEofNoWait() { return s_peekEofMode == 1; }
+bool peekTokenNoWait() { return s_peekTokenMode == 1; }
 
-static bool eofAllocate() {
-    if (s_eof.allocated) return true;
-    if (s_eof.failed) return false;
+static bool tokAllocate() {
+    if (s_tok.allocated) return true;
+    if (s_tok.failed) return false;
     GX2ColorBuffer* cb = renderColour();
     GX2DepthBuffer* db = renderDepth();
     if (!cb || !db) return false;
@@ -5703,15 +5708,15 @@ static bool eofAllocate() {
     memset(&c, 0, sizeof(c));
     c.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
     c.dim = GX2_SURFACE_DIM_TEXTURE_2D;
-    c.width = kEofRect;
-    c.height = kEofRect;
+    c.width = kTokRect;
+    c.height = kTokRect;
     c.depth = 1;
     c.mipLevels = 1;
     c.format = cb->surface.format;
     c.aa = GX2_AA_MODE1X;
     c.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&c);
-    GX2Surface& t = s_eof.depthTiled;
+    GX2Surface& t = s_tok.depthTiled;
     memset(&t, 0, sizeof(t));
     t.dim = GX2_SURFACE_DIM_TEXTURE_2D;
     t.width = db->surface.width;
@@ -5722,99 +5727,99 @@ static bool eofAllocate() {
     t.aa = GX2_AA_MODE1X;
     t.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
     t.tileMode = GX2_TILE_MODE_DEFAULT;
-    s_eof.depthLinear = t;
-    s_eof.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    s_tok.depthLinear = t;
+    s_tok.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&t);
-    GX2CalcSurfaceSizeAndAlignment(&s_eof.depthLinear);
+    GX2CalcSurfaceSizeAndAlignment(&s_tok.depthLinear);
     bool ok = true;
-    for (int i = 0; i < kEofRing; ++i) {
-        s_eof.colour[i].surface = c;
-        s_eof.colour[i].surface.image = ok ? alignedZero(c.alignment, c.imageSize) : nullptr;
-        ok = s_eof.colour[i].surface.image != nullptr;
+    for (int i = 0; i < kTokRing; ++i) {
+        s_tok.colour[i].surface = c;
+        s_tok.colour[i].surface.image = ok ? alignedZero(c.alignment, c.imageSize) : nullptr;
+        ok = s_tok.colour[i].surface.image != nullptr;
     }
     t.image = ok ? alignedZero(t.alignment, t.imageSize) : nullptr;
-    s_eof.depthLinear.image = t.image ? alignedZero(s_eof.depthLinear.alignment, s_eof.depthLinear.imageSize) : nullptr;
-    const unsigned bytes = unsigned(kEofRing * c.imageSize + t.imageSize + s_eof.depthLinear.imageSize);
-    if (!s_eof.depthLinear.image) {
+    s_tok.depthLinear.image = t.image ? alignedZero(s_tok.depthLinear.alignment, s_tok.depthLinear.imageSize) : nullptr;
+    const unsigned bytes = unsigned(kTokRing * c.imageSize + t.imageSize + s_tok.depthLinear.imageSize);
+    if (!s_tok.depthLinear.image) {
         if (t.image) MEMFreeToDefaultHeap(t.image);
-        for (int i = 0; i < kEofRing; ++i)
-            if (s_eof.colour[i].surface.image) MEMFreeToDefaultHeap(s_eof.colour[i].surface.image);
-        s_eof.failed = true;
-        WHBLogPrintf("SMS Wii U: [peekeof] out of memory for %u bytes of snapshots; peeks answer visible/far", bytes);
+        for (int i = 0; i < kTokRing; ++i)
+            if (s_tok.colour[i].surface.image) MEMFreeToDefaultHeap(s_tok.colour[i].surface.image);
+        s_tok.failed = true;
+        WHBLogPrintf("SMS Wii U: [peektok] out of memory for %u bytes of snapshots; peeks answer visible/far", bytes);
         return false;
     }
-    for (int i = 0; i < kEofRing; ++i) DCFlushRange(s_eof.colour[i].surface.image, c.imageSize);
+    for (int i = 0; i < kTokRing; ++i) DCFlushRange(s_tok.colour[i].surface.image, c.imageSize);
     DCFlushRange(t.image, t.imageSize);
-    DCFlushRange(s_eof.depthLinear.image, s_eof.depthLinear.imageSize);
-    s_eof.allocated = true;
-    WHBLogPrintf("SMS Wii U: [peekeof] snapshots allocated: %u bytes (colour %dx%d x%d, depth %ux%u)", bytes, kEofRect,
-                 kEofRect, kEofRing, unsigned(t.width), unsigned(t.height));
+    DCFlushRange(s_tok.depthLinear.image, s_tok.depthLinear.imageSize);
+    s_tok.allocated = true;
+    WHBLogPrintf("SMS Wii U: [peektok] snapshots allocated: %u bytes (colour %dx%d x%d, depth %ux%u)", bytes, kTokRect,
+                 kTokRect, kTokRing, unsigned(t.width), unsigned(t.height));
     return true;
 }
 
 // Game coordinates to TV-target pixels, clamped to w x h.
-static void eofPixel(int x, int y, uint32_t w, uint32_t h, uint32_t* px, uint32_t* py) {
+static void tokPixel(int x, int y, uint32_t w, uint32_t h, uint32_t* px, uint32_t* py) {
     *px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
     *py = uint32_t((float(y) + 0.5f) * s_gameScale);
     if (*px >= w) *px = w - 1;
     if (*py >= h) *py = h - 1;
 }
 
-static uint8_t* eofTexel(const GX2Surface& s, int x, int y) {
+static uint8_t* tokTexel(const GX2Surface& s, int x, int y) {
     uint32_t px, py;
-    eofPixel(x, y, s.width, s.height, &px, &py);
+    tokPixel(x, y, s.width, s.height, &px, &py);
     uint8_t* texel = static_cast<uint8_t*>(s.image) + (size_t(py) * s.pitch + px) * 4;
     DCInvalidateRange(texel, 4);
     return texel;
 }
 
 // Remembers the TV-target pixel of a colour probe for the next snapshot.
-static void eofWantColour(int x, int y) {
+static void tokWantColour(int x, int y) {
     GX2ColorBuffer* cb = renderColour();
     if (!cb) return;
-    eofPixel(x, y, cb->surface.width, cb->surface.height, &s_eof.colourPx, &s_eof.colourPy);
-    s_eof.colourWanted = true;
+    tokPixel(x, y, cb->surface.width, cb->surface.height, &s_tok.colourPx, &s_tok.colourPy);
+    s_tok.colourWanted = true;
 }
 
 // The newest finished square that covers the point; false (counted) if none.
-static bool eofReadColour(int x, int y, uint32_t* out) {
+static bool tokReadColour(int x, int y, uint32_t* out) {
     GX2ColorBuffer* cb = renderColour();
     if (!cb) return false;
     uint32_t px, py;
-    eofPixel(x, y, cb->surface.width, cb->surface.height, &px, &py);
+    tokPixel(x, y, cb->surface.width, cb->surface.height, &px, &py);
     const uint64_t retired = GX2GetRetiredTimeStamp();
     bool anyDone = false;
-    for (int k = 1; k <= kEofRing; ++k) {
-        const EofColourSlot& s = s_eof.colour[(s_eof.colourNext + kEofRing - k) % kEofRing];
+    for (int k = 1; k <= kTokRing; ++k) {
+        const TokenColourSlot& s = s_tok.colour[(s_tok.colourNext + kTokRing - k) % kTokRing];
         if (!s.queued || retired < s.stamp) continue;
         anyDone = true;
         const int32_t rx = int32_t(px) - s.left, ry = int32_t(py) - s.top;
-        if (rx < 0 || ry < 0 || rx >= kEofRect || ry >= kEofRect) continue;
+        if (rx < 0 || ry < 0 || rx >= kTokRect || ry >= kTokRect) continue;
         uint8_t* t = static_cast<uint8_t*>(s.surface.image) + (size_t(ry) * s.surface.pitch + rx) * 4;
         DCInvalidateRange(t, 4);
         *out = uint32_t(t[3]) << 24 | uint32_t(t[0]) << 16 | uint32_t(t[1]) << 8 | t[2];
-        s_eofStats.cAgeSum += g_displayFrames - s.frame;
+        s_tokStats.cAgeSum += g_displayFrames - s.frame;
         return true;
     }
-    if (anyDone) ++s_eofStats.cOutside;
-    else ++s_eofStats.cNotReady;
+    if (anyDone) ++s_tokStats.cOutside;
+    else ++s_tokStats.cNotReady;
     return false;
 }
 
-static bool eofReadDepth(int x, int y, uint32_t* out) {
-    if (!s_eof.depthQueued || GX2GetRetiredTimeStamp() < s_eof.depthStamp) return false;
+static bool tokReadDepth(int x, int y, uint32_t* out) {
+    if (!s_tok.depthQueued || GX2GetRetiredTimeStamp() < s_tok.depthStamp) return false;
     float d;
-    memcpy(&d, eofTexel(s_eof.depthLinear, x, y), 4);
+    memcpy(&d, tokTexel(s_tok.depthLinear, x, y), 4);
     if (!(d >= 0.0f)) d = 0.0f;  // NaN
     *out = d >= 1.0f ? 0xffffff : uint32_t(d * 16777215.0f);
     return true;
 }
 
-static void eofLogMismatch(const char* what, int x, int y, uint32_t prod6, uint32_t eof) {
-    if (s_eofStats.logged >= 40) return;
-    ++s_eofStats.logged;
-    WHBLogPrintf("SMS Wii U: [peekeof] mismatch %s frame=%u (%d,%d) prod6=%08x eof=%08x", what, (unsigned)g_displayFrames,
-                 x, y, (unsigned)prod6, (unsigned)eof);
+static void tokLogMismatch(const char* what, int x, int y, uint32_t prod6, uint32_t tok) {
+    if (s_tokStats.logged >= 40) return;
+    ++s_tokStats.logged;
+    WHBLogPrintf("SMS Wii U: [peektok] mismatch %s frame=%u (%d,%d) prod6=%08x tok=%08x", what, (unsigned)g_displayFrames,
+                 x, y, (unsigned)prod6, (unsigned)tok);
 }
 
 // Core 1, as an ordered service between the replayed lists: the GPU runs this
@@ -5824,23 +5829,23 @@ static TokenSnapJob s_tokenSnapJobs[16];
 static uint32_t s_tokenSnapWrite;
 static void tokenSnapService(void* opaque) {
     const uint16_t token = static_cast<TokenSnapJob*>(opaque)->token;
-    const bool wantColour = token == 0x7C && s_eof.colourWanted, wantDepth = token == 0x7D && s_eof.depthWanted;
-    if (wantColour) s_eof.colourWanted = false;
-    if (wantDepth) s_eof.depthWanted = false;
-    if ((!wantColour && !wantDepth) || !ProcUIInForeground() || !eofAllocate()) return;
+    const bool wantColour = token == 0x7C && s_tok.colourWanted, wantDepth = token == 0x7D && s_tok.depthWanted;
+    if (wantColour) s_tok.colourWanted = false;
+    if (wantDepth) s_tok.depthWanted = false;
+    if ((!wantColour && !wantDepth) || !ProcUIInForeground() || !tokAllocate()) return;
     GX2ColorBuffer* cb = renderColour();
     GX2DepthBuffer* db = renderDepth();
     bool colour = false, depth = false;
-    EofColourSlot& slot = s_eof.colour[s_eof.colourNext];
-    if (wantColour && cb && cb->surface.width >= uint32_t(kEofRect) && cb->surface.height >= uint32_t(kEofRect) &&
+    TokenColourSlot& slot = s_tok.colour[s_tok.colourNext];
+    if (wantColour && cb && cb->surface.width >= uint32_t(kTokRect) && cb->surface.height >= uint32_t(kTokRect) &&
         cb->surface.format == slot.surface.format && cb->surface.aa == GX2_AA_MODE1X) {
         const int32_t w = int32_t(cb->surface.width), h = int32_t(cb->surface.height);
-        int32_t left = int32_t(s_eof.colourPx) - kEofRect / 2, top = int32_t(s_eof.colourPy) - kEofRect / 2;
+        int32_t left = int32_t(s_tok.colourPx) - kTokRect / 2, top = int32_t(s_tok.colourPy) - kTokRect / 2;
         if (left < 0) left = 0;
         if (top < 0) top = 0;
-        if (left > w - kEofRect) left = w - kEofRect;
-        if (top > h - kEofRect) top = h - kEofRect;
-        GX2Rect rect = {left, top, left + kEofRect, top + kEofRect};
+        if (left > w - kTokRect) left = w - kTokRect;
+        if (top > h - kTokRect) top = h - kTokRect;
+        GX2Rect rect = {left, top, left + kTokRect, top + kTokRect};
         GX2Point at = {0, 0};
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
         GX2CopySurfaceEx(&cb->surface, 0, 0, &slot.surface, 0, 0, 1, &rect, &at);
@@ -5848,11 +5853,11 @@ static void tokenSnapService(void* opaque) {
         slot.top = top;
         colour = true;
     }
-    if (wantDepth && db && db->surface.width == s_eof.depthTiled.width && db->surface.height == s_eof.depthTiled.height &&
+    if (wantDepth && db && db->surface.width == s_tok.depthTiled.width && db->surface.height == s_tok.depthTiled.height &&
         db->surface.format == GX2_SURFACE_FORMAT_FLOAT_R32 && db->surface.aa == GX2_AA_MODE1X) {
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
-        GX2ConvertDepthBufferToTextureSurface(db, &s_eof.depthTiled, 0, 0);
-        GX2CopySurface(&s_eof.depthTiled, 0, 0, &s_eof.depthLinear, 0, 0);
+        GX2ConvertDepthBufferToTextureSurface(db, &s_tok.depthTiled, 0, 0);
+        GX2CopySurface(&s_tok.depthTiled, 0, 0, &s_tok.depthLinear, 0, 0);
         depth = true;
     }
     if (!colour && !depth) return;
@@ -5863,39 +5868,39 @@ static void tokenSnapService(void* opaque) {
         slot.stamp = stamp;
         slot.frame = g_displayFrames;
         slot.queued = true;
-        s_eof.colourNext = (s_eof.colourNext + 1) % kEofRing;
+        s_tok.colourNext = (s_tok.colourNext + 1) % kTokRing;
     }
-    if (depth) { s_eof.depthStamp = stamp; s_eof.depthQueued = true; }
-    ++s_eofStats.copies;
+    if (depth) { s_tok.depthStamp = stamp; s_tok.depthQueued = true; }
+    ++s_tokStats.copies;
 }
 
 // gx_fifo, at every callback token: the worker in producer mode, else the
 // game thread just before it runs the callback.
 void peekToken(uint16_t token, uint32_t peFormat) {
     if (token != 0x7C && token != 0x7D) return;
-    ++s_eofStats.tokens;
-    s_eofStats.peFormat = peFormat;
-    if (!s_gx2ProdEnabled || !s_peekEofMode || OSGetCoreId() == 1) return;
+    ++s_tokStats.tokens;
+    s_tokStats.peFormat = peFormat;
+    if (!s_gx2ProdEnabled || !s_peekTokenMode || OSGetCoreId() == 1) return;
     if (s_tokenSnapWrite >= sizeof(s_tokenSnapJobs) / sizeof(s_tokenSnapJobs[0])) return;
     gx2DlSplit(kDlSplitCopy);
-    ++s_eofStats.splits;
+    ++s_tokStats.splits;
     TokenSnapJob& job = s_tokenSnapJobs[s_tokenSnapWrite++];
     job.token = token;
     if (!gx2prod::enqueueService(tokenSnapService, &job, gx2prod::SERVICE_COUNTER_COPY_CLEAR))
-        WHBLogPrintf("SMS Wii U: [peekeof] service queue rejected token %02x", (unsigned)token);
+        WHBLogPrintf("SMS Wii U: [peektok] service queue rejected token %02x", (unsigned)token);
     // The copy clobbers what the next list inherits.  That list opens with its
     // first draw: 0x7C and 0x7D often come back to back, and a list opened here
     // would end empty (0 bytes, rejected and logged as a failed list).
     invalidateVertexUniforms();
 }
 
-static void eofReport() {
-    const EofStats& e = s_eofStats;
-    if (!s_peekEofMode && !e.tokens && !e.cPeeks) return;
-    WHBLogPrintf("SMS Wii U: [peekeof] frame=%u mode=%d snaps=%u cPeeks=%u cVisible=%u cOccluded=%u cMismatch=%u cNotReady=%u "
+static void tokReport() {
+    const TokenStats& e = s_tokStats;
+    if (!s_peekTokenMode && !e.tokens && !e.cPeeks) return;
+    WHBLogPrintf("SMS Wii U: [peektok] frame=%u mode=%d snaps=%u cPeeks=%u cVisible=%u cOccluded=%u cMismatch=%u cNotReady=%u "
                  "cOutside=%u cAgeSum=%u zPeeks=%u zFar=%u zMismatch=%u zFarMismatch=%u zNotReady=%u "
                  "tokens=%u splits=%u pf=%u aGame=%u/%u/%u/%u/%u aSnap=%u/%u/%u/%u/%u",
-                 (unsigned)g_displayFrames, s_peekEofMode, (unsigned)e.copies, (unsigned)e.cPeeks, (unsigned)e.cVisible,
+                 (unsigned)g_displayFrames, s_peekTokenMode, (unsigned)e.copies, (unsigned)e.cPeeks, (unsigned)e.cVisible,
                  (unsigned)e.cOccluded, (unsigned)e.cMismatch, (unsigned)e.cNotReady, (unsigned)e.cOutside,
                  (unsigned)e.cAgeSum, (unsigned)e.zPeeks, (unsigned)e.zFar,
                  (unsigned)e.zMismatch, (unsigned)e.zFarMismatch, (unsigned)e.zNotReady, (unsigned)e.tokens,
@@ -5903,12 +5908,12 @@ static void eofReport() {
                  (unsigned)e.aGame[2], (unsigned)e.aGame[3], (unsigned)e.aGame[4], (unsigned)e.aSnap[0],
                  (unsigned)e.aSnap[1], (unsigned)e.aSnap[2], (unsigned)e.aSnap[3], (unsigned)e.aSnap[4]);
     const uint32_t logged = e.logged;
-    s_eofStats = EofStats{};
-    s_eofStats.logged = logged;
+    s_tokStats = TokenStats{};
+    s_tokStats.logged = logged;
 }
 
 // Buckets one alpha byte; the first 8 distinct values are logged once each.
-static void eofCountAlpha(uint32_t* h, bool answered, uint32_t c) {
+static void tokCountAlpha(uint32_t* h, bool answered, uint32_t c) {
     if (!answered) { ++h[4]; return; }
     const uint32_t a = c >> 24;
     ++h[a == 0x10 ? 0 : a == 0x00 ? 1 : a == 0xff ? 2 : 3];
@@ -5917,29 +5922,29 @@ static void eofCountAlpha(uint32_t* h, bool answered, uint32_t c) {
         if (s_seen[i] == a) return;
     if (s_seenCount >= 8) return;
     s_seen[s_seenCount++] = a;
-    WHBLogPrintf("SMS Wii U: [peekeof] alpha %02x first seen frame=%u argb=%08x", (unsigned)a, (unsigned)g_displayFrames,
+    WHBLogPrintf("SMS Wii U: [peektok] alpha %02x first seen frame=%u argb=%08x", (unsigned)a, (unsigned)g_displayFrames,
                  (unsigned)c);
 }
 
-static void eofCountColour(uint32_t c) {
-    if ((c & 0xff000000) == 0x10000000) ++s_eofStats.cVisible;
-    else ++s_eofStats.cOccluded;
+static void tokCountColour(uint32_t c) {
+    if ((c & 0xff000000) == 0x10000000) ++s_tokStats.cVisible;
+    else ++s_tokStats.cOccluded;
 }
 
 uint32_t peekColor(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
-    if (s_peekEofMode == 1) {
+    if (s_peekTokenMode == 1) {
         ProdPeekScope prodPeek(true);
         ++s_perfPeeks;
         if (x < 0 || y < 0) return 0;
-        eofWantColour(x, y);
-        ++s_eofStats.cPeeks;
+        tokWantColour(x, y);
+        ++s_tokStats.cPeeks;
         uint32_t c;
-        const bool read = eofReadColour(x, y, &c);
-        eofCountAlpha(s_eofStats.aGame, read, c);
-        if (read) s_eof.lastColour = c;
-        else c = s_eof.lastColour;
-        eofCountColour(c);
+        const bool read = tokReadColour(x, y, &c);
+        tokCountAlpha(s_tokStats.aGame, read, c);
+        if (read) s_tok.lastColour = c;
+        else c = s_tok.lastColour;
+        tokCountColour(c);
         return c;
     }
     if (!s_gx2ProdEnabled) flushBatch();
@@ -5947,18 +5952,18 @@ uint32_t peekColor(int x, int y) {
     const int point[1][2] = {{x, y}};
     uint32_t c = 0;
     const bool read = readTvPixels(point, 1, &c);
-    eofCountAlpha(s_eofStats.aGame, read, c);
+    tokCountAlpha(s_tokStats.aGame, read, c);
     if (!read) return 0;
-    if (s_peekEofMode == 2) {
-        eofWantColour(x, y);
-        ++s_eofStats.cPeeks;
-        eofCountColour(c);
+    if (s_peekTokenMode == 2) {
+        tokWantColour(x, y);
+        ++s_tokStats.cPeeks;
+        tokCountColour(c);
         uint32_t e;
-        const bool snap = eofReadColour(x, y, &e);
-        eofCountAlpha(s_eofStats.aSnap, snap, e);
+        const bool snap = tokReadColour(x, y, &e);
+        tokCountAlpha(s_tokStats.aSnap, snap, e);
         if (snap && ((c & 0xff000000) == 0x10000000) != ((e & 0xff000000) == 0x10000000)) {
-            ++s_eofStats.cMismatch;
-            eofLogMismatch("colour", x, y, c, e);
+            ++s_tokStats.cMismatch;
+            tokLogMismatch("colour", x, y, c, e);
         }
     }
 #if SMS_GX2_DEBUG_PIXEL_TRACE
@@ -6078,30 +6083,30 @@ static uint32_t peekZProd6(int x, int y) {
 }
 uint32_t peekZ(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
-    if (s_peekEofMode == 1) {
+    if (s_peekTokenMode == 1) {
         ProdPeekScope prodPeek(true);
         static int s_noPeekZ = -1;
         if (s_noPeekZ < 0) s_noPeekZ = sdMarkerPresent("nopeekz") ? 1 : 0;
         if (x < 0 || y < 0 || s_noPeekZ) return 0xffffff;
-        s_eof.depthWanted = true;
-        ++s_eofStats.zPeeks;
+        s_tok.depthWanted = true;
+        ++s_tokStats.zPeeks;
         uint32_t z;
-        if (!eofReadDepth(x, y, &z)) { ++s_eofStats.zNotReady; return 0xffffff; }
-        if (z == 0xffffff) ++s_eofStats.zFar;
+        if (!tokReadDepth(x, y, &z)) { ++s_tokStats.zNotReady; return 0xffffff; }
+        if (z == 0xffffff) ++s_tokStats.zFar;
         return z;
     }
     const uint32_t z = peekZProd6(x, y);
-    if (s_peekEofMode == 2 && x >= 0 && y >= 0) {
-        s_eof.depthWanted = true;
-        ++s_eofStats.zPeeks;
-        if (z == 0xffffff) ++s_eofStats.zFar;
+    if (s_peekTokenMode == 2 && x >= 0 && y >= 0) {
+        s_tok.depthWanted = true;
+        ++s_tokStats.zPeeks;
+        if (z == 0xffffff) ++s_tokStats.zFar;
         uint32_t e;
-        if (!eofReadDepth(x, y, &e)) ++s_eofStats.zNotReady;
+        if (!tokReadDepth(x, y, &e)) ++s_tokStats.zNotReady;
         else if (e != z) {
-            ++s_eofStats.zMismatch;
+            ++s_tokStats.zMismatch;
             if ((e == 0xffffff) != (z == 0xffffff)) {
-                ++s_eofStats.zFarMismatch;
-                eofLogMismatch("depth-far", x, y, z, e);
+                ++s_tokStats.zFarMismatch;
+                tokLogMismatch("depth-far", x, y, z, e);
             }
         }
     }
@@ -6239,7 +6244,13 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     const OSTime perfNow = OSGetTime();
     if (s_gx2ProdEnabled && s_prodFrontendStart)
         gx2prod::record_core1_frontend(prodMicros(s_prodFrontendStart));
-    if (s_perfLastEnd) s_perfWall += perfNow - s_perfLastEnd;
+    if (s_perfLastEnd) {
+        s_perfWall += perfNow - s_perfLastEnd;
+        const uint32_t us = uint32_t(OSTicksToMicroseconds(perfNow - s_perfLastEnd));
+        if (us > 34000) ++s_frameOver34;
+        if (us > 41700) ++s_frameOver42;
+        if (us > s_frameMaxUs) s_frameMaxUs = us;
+    }
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
@@ -6269,7 +6280,10 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
                      (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked);
-        eofReport();
+        tokReport();
+        WHBLogPrintf("SMS Wii U: [frames] frame=%u over34=%u over42=%u maxUs=%u", (unsigned)g_displayFrames,
+                     (unsigned)s_frameOver34, (unsigned)s_frameOver42, (unsigned)s_frameMaxUs);
+        s_frameOver34 = s_frameOver42 = s_frameMaxUs = 0;
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
             WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",

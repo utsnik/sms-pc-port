@@ -1266,7 +1266,7 @@ static bool noPeekWait() {
 void GXPeekARGB(u16 x, u16 y, u32* color) {
 #ifdef __WIIU__
     if (producerMode() && noPeekWait()) { *color = 0x10000000; return; }
-    if (producerMode() && peekEofNoWait()) { *color = peekColor(x, y); return; }
+    if (producerMode() && peekTokenNoWait()) { *color = peekColor(x, y); return; }
     if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
     else
 #endif
@@ -1276,7 +1276,7 @@ void GXPeekARGB(u16 x, u16 y, u32* color) {
 void GXPeekZ(u16 x, u16 y, u32* z) {
 #ifdef __WIIU__
     if (producerMode() && noPeekWait()) { *z = 0xffffff; return; }
-    if (producerMode() && peekEofNoWait()) { *z = peekZ(x, y); return; }
+    if (producerMode() && peekTokenNoWait()) { *z = peekZ(x, y); return; }
     if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
     else
 #endif
