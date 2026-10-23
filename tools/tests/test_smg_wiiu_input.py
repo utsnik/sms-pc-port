@@ -156,15 +156,32 @@ enum {
     VPAD_BUTTON_PLUS = 0x0008,
     VPAD_BUTTON_MINUS = 0x0004,
     VPAD_BUTTON_HOME = 0x0002,
+    VPAD_BUTTON_ZL = 0x0080,
+    VPAD_BUTTON_ZR = 0x0040,
+    VPAD_BUTTON_L = 0x0020,
+    VPAD_BUTTON_R = 0x0010,
 };
 typedef struct VPADVec2D { float x, y; } VPADVec2D;
+typedef struct VPADVec3D { float x, y, z; } VPADVec3D;
+typedef struct VPADTouchData {
+    uint16_t x, y, touched, validity;
+} VPADTouchData;
+enum { VPAD_VALID = 0 };
 typedef struct VPADStatus {
     uint32_t hold;
+    uint32_t trigger;
+    uint32_t release;
     VPADVec2D leftStick;
     VPADVec2D rightStick;
+    unsigned char accelerometer_padding[0x1c];
+    VPADVec3D gyro;
+    unsigned char gyro_padding[0x0e];
+    VPADTouchData tpNormal;
 } VPADStatus;
 extern "C" int32_t VPADRead(VPADChan, VPADStatus*, uint32_t, VPADReadError*);
 extern "C" void VPADInit(void);
+extern "C" void VPADGetTPCalibratedPoint(VPADChan, VPADTouchData*,
+                                           const VPADTouchData*);
 """
 
 
@@ -181,6 +198,13 @@ static uint32_t g_field;
 static uint32_t g_vpad_hold;
 static float g_stick_x;
 static float g_stick_y;
+static uint16_t g_touch_x;
+static uint16_t g_touch_y;
+static uint16_t g_touch_touched;
+static uint16_t g_touch_validity;
+static float g_gyro_x;
+static float g_gyro_y;
+static int g_calibrated_calls;
 static std::string g_root;
 static std::string g_log;
 static volatile unsigned char g_stack_sink;
@@ -206,10 +230,21 @@ extern "C" int32_t VPADRead(VPADChan, VPADStatus* status, uint32_t count,
     status->hold = g_vpad_hold;
     status->leftStick.x = g_stick_x;
     status->leftStick.y = g_stick_y;
+    status->tpNormal.x = g_touch_x;
+    status->tpNormal.y = g_touch_y;
+    status->tpNormal.touched = g_touch_touched;
+    status->tpNormal.validity = g_touch_validity;
+    status->gyro.x = g_gyro_x;
+    status->gyro.y = g_gyro_y;
     if (error) *error = VPAD_READ_SUCCESS;
     return 1;
 }
 extern "C" void VPADInit(void) {}
+extern "C" void VPADGetTPCalibratedPoint(VPADChan, VPADTouchData* output,
+                                            const VPADTouchData* input) {
+    ++g_calibrated_calls;
+    *output = *input;
+}
 
 static void fail(const char* message) {
     std::fprintf(stderr, "input-host: FAIL: %s\n", message);
@@ -297,7 +332,8 @@ int main(int argc, char** argv) {
 
     g_field = 14;
     status = read_status();
-    check(status.dpd_valid_fg == 0, "pointer hold window");
+    check(status.dpd_valid_fg == 2 && status.pos.x == 0.0f && status.pos.y == 0.0f,
+          "script pointer yields to gyro fallback");
 
     g_vpad_hold = VPAD_BUTTON_A | VPAD_BUTTON_LEFT;
     g_stick_x = -0.75f;
@@ -307,6 +343,83 @@ int main(int argc, char** argv) {
               (WPAD_BUTTON_A | WPAD_BUTTON_LEFT), "VPAD button mapping");
     check(status.ex_status.fs.stick.x < -0.7f, "VPAD stick mapping");
     check(status.trig & WPAD_BUTTON_A, "VPAD trigger mapping");
+
+    g_vpad_hold = VPAD_BUTTON_A | VPAD_BUTTON_B | VPAD_BUTTON_X | VPAD_BUTTON_Y |
+                  VPAD_BUTTON_ZR | VPAD_BUTTON_ZL | VPAD_BUTTON_L;
+    g_stick_x = 0.25f;
+    g_stick_y = -0.5f;
+    g_touch_touched = 0;
+    g_gyro_x = 0.0f;
+    g_gyro_y = 0.0f;
+    g_field = 25;
+    status = read_status();
+    check((status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_1 |
+                          WPAD_BUTTON_2 | WPAD_BUTTON_Z | WPAD_BUTTON_C)) ==
+              (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_1 | WPAD_BUTTON_2 |
+               WPAD_BUTTON_Z | WPAD_BUTTON_C),
+          "GamePad A/ZR/ZL/L/Y/X mapping");
+    check(status.ex_status.fs.stick.x > 0.2f && status.ex_status.fs.stick.y < -0.4f,
+          "GamePad left-stick mapping");
+    std::puts("input-host: PASS: GamePad A/ZR/ZL/L/Y/X and left-stick mappings");
+
+    g_vpad_hold = 0;
+    g_touch_x = 427;
+    g_touch_y = 240;
+    g_touch_touched = 1;
+    g_touch_validity = VPAD_VALID;
+    g_gyro_x = 0.75f;
+    g_gyro_y = -0.75f;
+    g_field = 30;
+    status = read_status();
+    check(g_calibrated_calls > 0, "calibrated touchscreen sample");
+    check(status.dpd_valid_fg == 2 && status.pos.x > -0.01f && status.pos.x < 0.01f &&
+              status.pos.y > -0.01f && status.pos.y < 0.01f,
+          "touchscreen pointer is primary");
+    int touch_log_count = 0;
+    for (size_t at = 0; (at = g_log.find("hardware pointer source: touch", at)) !=
+                           std::string::npos; ++at)
+        ++touch_log_count;
+    check(touch_log_count == 1, "touch source diagnostic is edge-triggered");
+
+    g_touch_touched = 0;
+    g_touch_validity = 1;
+    g_gyro_x = 2.0f;
+    g_gyro_y = -2.0f;
+    g_field = 31;
+    status = read_status();
+    check(status.dpd_valid_fg == 2 && status.pos.x == 1.0f && status.pos.y == -1.0f,
+          "gyro pointer fallback and clamp");
+    check(status.horizon.x == 1.0f && status.horizon.y == 0.0f,
+          "neutral pointer horizon");
+    g_field = 32;
+    KPADStatus five_frame_status{};
+    for (int frame = 0; frame < 5; ++frame) {
+        five_frame_status = read_status();
+        check(five_frame_status.dpd_valid_fg >= 2, "five-frame DPD validity");
+    }
+    g_vpad_hold = VPAD_BUTTON_R;
+    g_gyro_x = 0.25f;
+    g_gyro_y = -0.25f;
+    g_field = 38;
+    status = read_status();
+    check(status.pos.x == 0.0f && status.pos.y == 0.0f &&
+              (status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_Z |
+                              WPAD_BUTTON_C)) == 0,
+          "R recentres gyro without Wii button");
+    int gyro_log_count = 0;
+    for (size_t at = 0; (at = g_log.find("hardware pointer source: gyro", at)) !=
+                           std::string::npos; ++at)
+        ++gyro_log_count;
+    check(gyro_log_count == 1, "gyro source diagnostic is edge-triggered");
+    g_vpad_hold = VPAD_BUTTON_A;
+    g_field = 39;
+    status = read_status();
+    check(status.trig & WPAD_BUTTON_A, "pointer A trigger edge");
+    g_field = 40;
+    status = read_status();
+    check((status.hold & WPAD_BUTTON_A) && !(status.trig & WPAD_BUTTON_A),
+          "pointer A is not a repeating trigger");
+    std::puts("input-host: PASS: touchscreen pointer and gyro fallback; five-frame DPD validity");
 
     check(g_log.find("[smg-input] autoplay: press a field 2") != std::string::npos,
           "exact button log after script buffer lifetime");
@@ -382,6 +495,9 @@ def main() -> int:
     parser.add_argument("--require-connected", action="store_true")
     parser.add_argument("--require-nunchuk", action="store_true")
     parser.add_argument("--require-a-b-stick-script", action="store_true")
+    parser.add_argument("--require-stage3-gamepad", action="store_true")
+    parser.add_argument("--require-touch-pointer", action="store_true")
+    parser.add_argument("--require-gyro-pointer", action="store_true")
     args = parser.parse_args()
 
     if not args.provider.is_file():
@@ -410,6 +526,21 @@ def main() -> int:
         missing = [token for token in required if token not in source]
         if missing or "pointer" not in source:
             return fail("missing autoplay vocabulary: " + ", ".join(missing + ["pointer"] if missing else ["pointer"]))
+    if args.require_stage3_gamepad:
+        required = ("VPAD_BUTTON_ZR", "VPAD_BUTTON_ZL", "VPAD_BUTTON_L", "VPAD_BUTTON_R")
+        missing = [token for token in required if token not in source]
+        if missing:
+            return fail("missing Stage 3 GamePad controls: " + ", ".join(missing))
+    if args.require_touch_pointer:
+        required = ("VPADGetTPCalibratedPoint", "VPAD_VALID", "touch.touched")
+        missing = [token for token in required if token not in source]
+        if missing:
+            return fail("missing touchscreen pointer path: " + ", ".join(missing))
+    if args.require_gyro_pointer:
+        required = ("vpad.gyro", "dpd_valid_fg", "clamp_normalized")
+        missing = [token for token in required if token not in source]
+        if missing:
+            return fail("missing gyro pointer path: " + ", ".join(missing))
     try:
         output = host_check(args.provider)
     except RuntimeError as exc:

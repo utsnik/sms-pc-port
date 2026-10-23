@@ -38,6 +38,19 @@ u32 s_previous_hold;
 u32 s_vpad_hold;
 f32 s_vpad_stick_x;
 f32 s_vpad_stick_y;
+f32 s_gyro_pointer_x;
+f32 s_gyro_pointer_y;
+f32 s_gyro_center_x;
+f32 s_gyro_center_y;
+enum PointerSource {
+    POINTER_SOURCE_NONE,
+    POINTER_SOURCE_TOUCH,
+    POINTER_SOURCE_GYRO,
+};
+PointerSource s_pointer_source;
+bool s_hardware_pointer_valid;
+f32 s_hardware_pointer_x;
+f32 s_hardware_pointer_y;
 /* Revolution's Nunchuk+ACC+DPD format is 5; wut names this family
  * WPAD_FMT_NUNCHUK_ACC_DPD only in some SDK revisions. */
 u32 s_data_format = 5;
@@ -160,6 +173,63 @@ void clamp_pointer(const char* axis, f32* value)
                  *value);
         *value = 1.0f;
     }
+}
+
+void clamp_normalized(f32* value)
+{
+    if (*value < -1.0f)
+        *value = -1.0f;
+    else if (*value > 1.0f)
+        *value = 1.0f;
+}
+
+void set_pointer_source(PointerSource source)
+{
+    if (source == s_pointer_source)
+        return;
+    const PointerSource previous = s_pointer_source;
+    s_pointer_source = source;
+    if (previous == POINTER_SOURCE_NONE)
+        return;
+    if (source == POINTER_SOURCE_TOUCH)
+        port_log("[smg-input] hardware pointer source: touch\n");
+    else if (source == POINTER_SOURCE_GYRO)
+        port_log("[smg-input] hardware pointer source: gyro\n");
+}
+
+void update_hardware_pointer(const VPADStatus& vpad)
+{
+    VPADTouchData touch;
+    std::memset(&touch, 0, sizeof(touch));
+    VPADGetTPCalibratedPoint(VPAD_CHAN_0, &touch, &vpad.tpNormal);
+    if (touch.touched && touch.validity == VPAD_VALID) {
+        /* The GamePad touch surface is 854x480, matching the Wii U render
+         * target used by the Galaxy port.  KPAD expects -1..1 coordinates. */
+        s_hardware_pointer_x = static_cast<f32>(touch.x) / 427.0f - 1.0f;
+        s_hardware_pointer_y = static_cast<f32>(touch.y) / 240.0f - 1.0f;
+        s_hardware_pointer_valid = true;
+        set_pointer_source(POINTER_SOURCE_TOUCH);
+        return;
+    }
+
+    /* The DRC gyro is exposed as a normalized aiming position relative to
+     * the current R-button baseline.  R is intentionally not forwarded as a
+     * Wii button: it recentres this fallback pointer. */
+    if (vpad.hold & VPAD_BUTTON_R) {
+        s_gyro_center_x = vpad.gyro.x;
+        s_gyro_center_y = vpad.gyro.y;
+        s_gyro_pointer_x = 0.0f;
+        s_gyro_pointer_y = 0.0f;
+    } else {
+        s_gyro_pointer_x = vpad.gyro.x - s_gyro_center_x;
+        s_gyro_pointer_y = vpad.gyro.y - s_gyro_center_y;
+    }
+    clamp_normalized(&s_gyro_pointer_x);
+    clamp_normalized(&s_gyro_pointer_y);
+    s_hardware_pointer_x = s_gyro_pointer_x;
+    s_hardware_pointer_y = s_gyro_pointer_y;
+    s_hardware_pointer_valid = true;
+    set_pointer_source(POINTER_SOURCE_GYRO);
 }
 
 bool append_button_or_stick(char* name, char* timing)
@@ -313,6 +383,9 @@ void map_vpad(const VPADStatus& vpad)
     if (vpad.hold & VPAD_BUTTON_B) result |= WPAD_BUTTON_B;
     if (vpad.hold & VPAD_BUTTON_X) result |= WPAD_BUTTON_1;
     if (vpad.hold & VPAD_BUTTON_Y) result |= WPAD_BUTTON_2;
+    if (vpad.hold & VPAD_BUTTON_ZR) result |= WPAD_BUTTON_B;
+    if (vpad.hold & VPAD_BUTTON_ZL) result |= WPAD_BUTTON_Z;
+    if (vpad.hold & VPAD_BUTTON_L) result |= WPAD_BUTTON_C;
     if (vpad.hold & VPAD_BUTTON_LEFT) result |= WPAD_BUTTON_LEFT;
     if (vpad.hold & VPAD_BUTTON_RIGHT) result |= WPAD_BUTTON_RIGHT;
     if (vpad.hold & VPAD_BUTTON_UP) result |= WPAD_BUTTON_UP;
@@ -323,6 +396,7 @@ void map_vpad(const VPADStatus& vpad)
     s_vpad_hold = result;
     s_vpad_stick_x = vpad.leftStick.x;
     s_vpad_stick_y = vpad.leftStick.y;
+    update_hardware_pointer(vpad);
 }
 
 void poll_vpad()
@@ -394,6 +468,10 @@ void fill_status(KPADStatus& status)
     status.acc_value = 1.0f;
     status.pos.x = pointer ? pointer->pointer_x : 0.0f;
     status.pos.y = pointer ? pointer->pointer_y : 0.0f;
+    if (!pointer && s_hardware_pointer_valid) {
+        status.pos.x = s_hardware_pointer_x;
+        status.pos.y = s_hardware_pointer_y;
+    }
     status.horizon.x = 1.0f;
     status.horizon.y = 0.0f;
     status.dist = 2.0f;
@@ -401,7 +479,7 @@ void fill_status(KPADStatus& status)
     status.acc_vertical.y = 0.0f;
     status.dev_type = WPAD_DEV_FREESTYLE;
     status.wpad_err = WPAD_ERR_NONE;
-    status.dpd_valid_fg = pointer ? 2 : 0;
+    status.dpd_valid_fg = (pointer || s_hardware_pointer_valid) ? 2 : 0;
     status.data_format = static_cast<u8>(s_data_format);
     status.ex_status.fs.stick.x = stick_x;
     status.ex_status.fs.stick.y = stick_y;
@@ -425,6 +503,14 @@ void WPADInit(void)
     s_vpad_hold = 0;
     s_vpad_stick_x = 0.0f;
     s_vpad_stick_y = 0.0f;
+    s_gyro_pointer_x = 0.0f;
+    s_gyro_pointer_y = 0.0f;
+    s_gyro_center_x = 0.0f;
+    s_gyro_center_y = 0.0f;
+    s_pointer_source = POINTER_SOURCE_NONE;
+    s_hardware_pointer_valid = false;
+    s_hardware_pointer_x = 0.0f;
+    s_hardware_pointer_y = 0.0f;
     std::memset(s_extension_callbacks, 0, sizeof(s_extension_callbacks));
     std::memset(s_connect_callbacks, 0, sizeof(s_connect_callbacks));
     std::memset(s_sampling_callbacks, 0, sizeof(s_sampling_callbacks));
