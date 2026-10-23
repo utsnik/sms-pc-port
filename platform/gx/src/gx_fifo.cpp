@@ -1478,11 +1478,16 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         }
         const bool arena = arenaEnabled() && !traceFile();  // traces list the batch's own vertices
         g_dlCurList = data; g_dlCurSize = size; g_dlCurMisses = e.misses;
+        // Store a run only for a list that hit without misses: a list drawn
+        // with several states per frame is re-recorded on each mismatch, and
+        // storing each fresh copy leaked ~32 KB of arena a frame until the
+        // pool wrapped and every run in the scene was stored again (a ~90 ms
+        // Plaza frame every ~620).  Such lists are decoded instead.
         for (DlRun& r : e.runs) {
             const uint32_t nidx = uint32_t(r.idx.size());
             if (arena && nidx &&
                 (r.arena.gen == arenaGeneration() ||
-                 arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena)))
+                 (e.misses == 0 && arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena))))
                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());
             else
                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
