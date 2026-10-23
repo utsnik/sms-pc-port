@@ -28,7 +28,7 @@ void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
 void port_os_init(void);
 void port_os_threads_init(void);
 void port_vi_init(void);
-void smg_wiiu_gx_link_stub_init(void);
+void sms_wiiu_gfx_init(void);
 void port_pad_init(void);
 
 /* Opens the target audio output before JAudio's own initializer creates its

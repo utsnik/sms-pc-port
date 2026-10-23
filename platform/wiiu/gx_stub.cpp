@@ -46,6 +46,11 @@ bool s_logged;
 bool s_gfx_initialized;
 bool s_frame_open;
 
+#if defined(PORT_GAME_SMG)
+alignas(64) uint8_t s_smg_fifo[64 * 1024];
+bool s_smg_z_scale_logged;
+#endif
+
 extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
@@ -461,6 +466,9 @@ extern "C" void sms_wiiu_gfx_init(void)
 {
 	if (s_gfx_initialized)
 		return;
+#if defined(PORT_GAME_SMG)
+	GXPC_SetMemoryWindow(nullptr, 0x40000000u);
+#endif
 	s_gfx_initialized = WHBGfxInit() != FALSE;
 	if (!s_gfx_initialized)
 		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
@@ -516,6 +524,29 @@ extern "C" int sms_wiiu_gfx_is_initialized(void)
 {
 	return s_gfx_initialized ? 1 : 0;
 }
+
+#if defined(PORT_GAME_SMG)
+/* Galaxy's generated GX writes use a target-owned FIFO before the shared GX
+ * parser consumes it.  The selected renderer owns this bridge; the old SMG
+ * link stub must not provide a second GX namespace. */
+extern "C" uint8_t* __PortGXFifoPtr = s_smg_fifo;
+extern "C" uint8_t* __PortGXFifoLimit = s_smg_fifo + sizeof(s_smg_fifo) - 64;
+extern "C" void __PortGXFifoOverflow(void)
+{
+	__PortGXFifoPtr = s_smg_fifo;
+}
+extern "C" GXRenderModeObj GXNtsc480Int = {};
+
+extern "C" void GXSetZScaleOffset(float, float)
+{
+	if (!s_smg_z_scale_logged) {
+		s_smg_z_scale_logged = true;
+		port_log("SMG Wii U: unsupported Stage 4 call: GXSetZScaleOffset");
+	}
+}
+extern "C" void port_gx_marker(unsigned int) {}
+extern "C" void port_gx_camera(const float*) {}
+#endif
 
 extern "C" int64_t wut_OSGetTime_stub(void) __asm__("OSGetTime");
 /* Where a presented frame waits: FinishRender ends with GX2DrawDone (the GPU

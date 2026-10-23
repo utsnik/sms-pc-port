@@ -4579,7 +4579,7 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     }
     uint8_t* base = s_dlArena + s_dlArenaUsed;
     for (uint32_t off = 0; off < ioff; off += 32)
-        asm volatile("dcbz 0,%0" : : "r"(base + off) : "memory");
+        __asm__ volatile("dcbz 0,%0" : : "r"(base + off) : "memory");
     uint8_t defaults[9];
     matrixDefaults(defaults);
     for (uint32_t i = 0; i < n; ++i)
@@ -4913,7 +4913,7 @@ void flushBatch() {
         // writes every vertex here, and cold write-allocate fills were the
         // top CPU cost.  Covers the sentinel slot too.  block is 256-aligned.
         for (uint32_t off = 0; off < vboBytes; off += 32)
-            asm volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
+            __asm__ volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
     } else {
         memset(block + vertexCount * vertexStride, 0, vertexStride);
     }

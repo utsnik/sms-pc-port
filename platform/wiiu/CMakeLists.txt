@@ -76,6 +76,11 @@ if(PORT_GAME STREQUAL "smg")
   # Shared Sunshine providers are compiled once here. Do not add their
   # Petari counterparts to SMG_GAME_SOURCES to resolve a missing symbol.
   set(SMG_WIIU_SHARED_PROVIDER_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/gx_stub.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/gx2_texture_pack.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/gx2_texture.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/gx2_renderer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_texture_pack_common.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_api.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_fifo.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/gx/src/gx_vert.cpp
@@ -109,7 +114,6 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gx_link_stub.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)
 
   # The MSL printf shim calls newlib's snprintf: keep compat.h's printf

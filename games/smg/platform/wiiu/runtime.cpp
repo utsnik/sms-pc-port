@@ -471,28 +471,6 @@ volatile int sms_wiiu_crash_pending;
 void sms_wiiu_crash_return_to_menu(void) { WHBProcStopRunning(); }
 void sms_wiiu_profiler_tick(void) {}
 void sms_wiiu_profiler_stop(void) {}
-int sms_wiiu_gfx_is_initialized(void) { return 0; }
-void sms_wiiu_gfx_frame(void) {}
-uint32_t sms_wiiu_presents(void) { return 0; }
-/* The VI retrace count advances by this many fields per frame boundary.
- * Sunshine counts real GX2 vsyncs; this target has no GX2 renderer yet, so pace
- * on the timebase at 60 Hz. Returning 0 froze the count: Galaxy's
- * MainLoopFramework waitForTick waits for the count to move and spun forever. */
-uint32_t sms_wiiu_vsync_fields(void)
-{
-    static OSTime s_next;
-    const OSTime frame = static_cast<OSTime>(OSTimerClockSpeed / 60);
-    OSTime now = OSGetSystemTime();
-    if (!s_next)
-        s_next = now + frame;
-    if (now < s_next) {
-        OSSleepTicks(s_next - now);
-        now = OSGetSystemTime();
-    }
-    const uint32_t fields = 1u + static_cast<uint32_t>((now - s_next) / frame);
-    s_next += static_cast<OSTime>(fields) * frame;
-    return fields;
-}
 void sms_wiiu_exit(void) { WHBProcStopRunning(); }
 
 } // extern "C"
