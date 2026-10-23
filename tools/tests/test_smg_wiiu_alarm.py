@@ -72,13 +72,13 @@ extern "C" void port_log(const char*, ...) {}
 typedef void (*WutCb)(void*, void*);
 struct FakeState {
     std::atomic<bool> cancelled{false};
+    std::atomic<bool> dequeued{false};
 };
 static std::mutex g_fake;
 static std::map<void*, void*> g_user;                     // alarm -> user data
 static std::map<void*, std::shared_ptr<FakeState>> g_state;
 static std::vector<std::thread> g_threads;
 static std::mutex g_spin;
-static std::atomic<bool> g_late{true};
 // stale test: the next dequeued callback is held in its dispatch window until
 // released (coreinit has taken the alarm off its queue; the callback has not
 // read the alarm's user data yet).
@@ -98,15 +98,20 @@ static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s
     std::mt19937 rng(reinterpret_cast<uintptr_t>(alarm) ^ (uintptr_t)period_s);
     std::this_thread::sleep_for(std::chrono::duration<double>(first_s));
     for (;;) {
-        bool was_cancelled = st->cancelled.load();
-        if (was_cancelled && !g_late.load())
-            return;
+        // Dequeue and cancellation are one serialized transition: a cancel
+        // that returns success guarantees that this callback will not start.
+        {
+            std::lock_guard<std::mutex> l(g_fake);
+            if (st->cancelled.load())
+                return;
+            st->dequeued = true;
+        }
         // Dispatch window: a cancel or re-arm may land between coreinit
         // dequeuing the alarm and the callback running.
         std::this_thread::sleep_for(std::chrono::microseconds(rng() % 400));
         {
             std::unique_lock<std::mutex> l(g_hold_m);
-            if (g_hold && !was_cancelled) {
+            if (g_hold) {
                 g_hold = false;
                 g_held = true;
                 g_hold_cv.notify_all();
@@ -120,7 +125,8 @@ static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s
         t_held_once = false;
         cb(alarm, nullptr);
         t_is_cb = false;
-        if (was_cancelled || period_s <= 0)
+        st->dequeued = false;
+        if (period_s <= 0)
             return;                                        // at most one late call
         std::this_thread::sleep_for(std::chrono::duration<double>(period_s));
     }
@@ -143,7 +149,15 @@ int fake_set(void* a, OSTime t, WutCb cb) { arm(a, t / kTimerHz, 0, cb); return 
 int fake_setp(void* a, OSTime start, OSTime period, WutCb cb) __asm__("OSSetPeriodicAlarm");
 int fake_setp(void* a, OSTime, OSTime period, WutCb cb) { arm(a, period / kTimerHz, period / kTimerHz, cb); return 1; }
 int fake_cancel(void* a) __asm__("OSCancelAlarm");
-int fake_cancel(void* a) { std::lock_guard<std::mutex> l(g_fake); auto& s = g_state[a]; if (s) s->cancelled = true; return 1; }
+int fake_cancel(void* a) {
+    std::lock_guard<std::mutex> l(g_fake);
+    auto& s = g_state[a];
+    if (!s)
+        return 1;
+    const bool pending = s->dequeued.load();
+    s->cancelled = true;
+    return pending ? 0 : 1;
+}
 void fake_setud(void* a, void* u) __asm__("OSSetAlarmUserData");
 void fake_setud(void* a, void* u) { std::lock_guard<std::mutex> l(g_fake); g_user[a] = u; }
 void* fake_getud(void* a) __asm__("OSGetAlarmUserData");
@@ -215,6 +229,7 @@ static void handler_b(OSAlarm* a, OSContext*) {
     std::this_thread::sleep_for(std::chrono::microseconds(150));
     check_call(a, handler_b);
 }
+static void handler_wrap(OSAlarm* a, OSContext*) { hit(a, 1); }
 
 // Deterministic case (MainLoopFramework's per-frame stack alarm): alarm 0's
 // callback is dequeued and held; alarm 0 is cancelled and alarm 1 armed with
@@ -257,9 +272,10 @@ static bool self_test() {
 // Forced wraparound: alarm 0's callback is parked at the adapter's lock (after
 // any lock-free read); alarm 0 is cancelled; 255 arm/cancel cycles on alarm 1
 // cycle every side-table record and identity ring the adapter has (32 records,
-// 256 tickets in a7101af); a 256th arming of alarm 1 with a 1 s deadline lands
-// on alarm 0's old record and ticket. The parked callback then proceeds: no
-// handler may run (alarm 0 is cancelled and alarm 1 is not due).
+// 256 tickets in a7101af); a 256th arming of alarm 1 with a short deadline
+// lands on alarm 0's old record and ticket. The parked callback then proceeds
+// after the replacement alarm is due: only the replacement's one callback is
+// legitimate.
 static bool wrap_test() {
     for (auto& r : g_hits) r[0] = r[1] = 0;
     g_lockhold = true;
@@ -275,16 +291,16 @@ static bool wrap_test() {
     smg_wiiu_OSCancelAlarm(&g_alarms[0]);
     smg_wiiu_OSCreateAlarm(&g_alarms[1]);
     for (int n = 0; n < 255; ++n) {
-        smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 1.0), handler_b);
+        smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 1.0), handler_wrap);
         smg_wiiu_OSCancelAlarm(&g_alarms[1]);
     }
-    smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 1.0), handler_b);
+    smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 0.001), handler_wrap);
     { std::lock_guard<std::mutex> l(g_lh_m); g_lh_release = true; g_lh_cv.notify_all(); }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     smg_wiiu_OSCancelAlarm(&g_alarms[1]);
     const int a0 = g_hits[0][0] + g_hits[0][1], b1 = g_hits[1][0] + g_hits[1][1];
     std::printf("alarm-host: parked callback after 256 armings: alarm0 calls=%d alarm1 calls=%d\n", a0, b1);
-    return a0 == 0 && b1 == 0;
+    return a0 == 0 && b1 == 1;
 }
 
 static bool stale_test() {
@@ -375,7 +391,6 @@ int main(int argc, char** argv) {
         }
     }
     if (mode == "wrap") {
-        g_late = false;
         const bool ok = wrap_test();
         std::printf(ok ? "alarm-host: wrap PASS\n"
                        : "alarm-host: FAIL: a parked callback ran a handler after identity wraparound\n");
@@ -409,7 +424,6 @@ int main(int argc, char** argv) {
     }
 
 timing:
-    g_late = false;
     smg_wiiu_OSCreateAlarm(&g_speaker);
     // SpkSpeakerCtrl::setup: OSSetPeriodicAlarm(&sSpeakerAlarm, OSGetTime(), OSNanosecondsToTicks(6666667), ...)
     smg_wiiu_OSSetPeriodicAlarm(&g_speaker, 0, OSNanosecondsToTicks(6666667), speaker);
