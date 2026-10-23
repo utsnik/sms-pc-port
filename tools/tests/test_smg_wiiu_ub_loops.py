@@ -7,7 +7,8 @@ optimizations used the array bound to drop the exit test, so the loop allocated
 CameraShake tasks until the FileSelect scene heap was exhausted (OSPanic in
 GameSystemSceneController::initializeScene). The SMG game flags must carry
 -fno-aggressive-loop-optimizations, and the linked function must test its
-counter (a conditional backward branch).
+counter (a conditional backward branch). sms_msl_sqrtf must not branch to
+itself (port_compat.h's sqrtf macro inside msl_math.c made it "b .").
 """
 
 from __future__ import annotations
@@ -51,6 +52,17 @@ def main() -> int:
                 back = True
         if not back:
             print("ub-loops: FAIL: createSinglyHorizontalTask has no loop exit (endless allocation)")
+            return 1
+        # sms_msl_sqrtf (platform/misc/msl_math.c) once became "b ." in the SMG
+        # build: port_compat.h's sqrtf macro turned its libm call into itself.
+        start = text.find("<sms_msl_sqrtf>:\n")
+        body = text[start:text.find("\n\n", start)] if start >= 0 else ""
+        for m in re.finditer(r"^\s*([0-9a-f]+):\s+(?:[0-9a-f]{2} ){4}\s*b\s+([0-9a-f]+)\b", body, re.M):
+            if m.group(1) == m.group(2):
+                print("ub-loops: FAIL: sms_msl_sqrtf branches to itself (sqrtf macro recursion)")
+                return 1
+        if "<sqrtf>" not in body:
+            print("ub-loops: FAIL: sms_msl_sqrtf does not reach the C library's sqrtf")
             return 1
     print("ub-loops: PASS: retail out-of-bounds loops keep their exit tests")
     return 0

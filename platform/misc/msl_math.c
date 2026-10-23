@@ -630,7 +630,14 @@ float sms_msl_sqrtf(float x)
 {
 	if (x > 0.0f) {
 		if (x < float_huge.f)
+#if defined(PORT_GAME_SMG)
+			/* The SMG shared build force-includes src/port_compat.h, whose
+			 * sqrtf(x) macro names this function: the call compiled to a
+			 * branch to itself. (sqrtf) is the C library's. */
+			return (sqrtf)(x);
+#else
 			return sqrtf(x);
+#endif
 		return u2f(0x7fc00000); /* the Gekko's default NaN, rounded to single */
 	}
 	return x;
