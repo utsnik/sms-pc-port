@@ -24,6 +24,7 @@ int main(int, char**)
     port_dvd_init();
     smg_wiiu_load_dol_data();
     port_vi_init();
+    smg_wiiu_gx_link_stub_init();
     port_pad_init();
     const s32 nand_result = NANDInit();
     port_log("SMG Wii U: NAND initialized result=%d", nand_result);

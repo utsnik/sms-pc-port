@@ -36,6 +36,12 @@ extern "C" void __PortGXFifoOverflow(void)
 extern "C" void smg_wiiu_gx_link_stub_init(void)
 {
     note_stub();
+    /* As Sunshine's runtime does: a GX window at address 0, so GX "physical"
+     * addresses are the Wii U pointers themselves (the decoder's 30-bit mask
+     * keeps 0x1xxxxxxx heaps). The default 0x80000000 window (Wii MEM1) sent
+     * every indexed vertex array to a wrong address: gx::readVec faulted on
+     * the FileSelect scene's first indexed draw. */
+    GXPC_SetMemoryWindow(nullptr, 0x40000000u);
 }
 
 /* Sunshine's GX API, FIFO parser, and vertex loader remain the sole owners of
