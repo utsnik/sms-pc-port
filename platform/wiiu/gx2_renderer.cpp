@@ -229,7 +229,9 @@ struct WorkerLargestTextureSnapshot {
 
 static WorkerLargestTextureSnapshot workerLargestTextureSnapshot() {
     WorkerLargestTextureSnapshot result = {};
-    for (;;) {
+    // Bounded: core 1 must never wait on a worker suspended mid-update (that
+    // would freeze the console); a torn diagnostic read is acceptable.
+    for (uint32_t tries = 0; tries < 1000; ++tries) {
         const uint32_t before = workerAtomicLoad(&s_workerLargestTexture.sequence);
         if (before & 1) continue;
         result.micros = workerAtomicLoad(&s_workerLargestTexture.micros);
@@ -242,6 +244,7 @@ static WorkerLargestTextureSnapshot workerLargestTextureSnapshot() {
         const uint32_t after = workerAtomicLoad(&s_workerLargestTexture.sequence);
         if (before == after) return result;
     }
+    return result;
 }
 
 static void workerResetLargestTexture() {
