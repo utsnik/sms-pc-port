@@ -394,6 +394,7 @@ static uint32_t s_packEvictions;
 static uint32_t s_packFallback;
 static uint32_t s_packUploadBytes;
 static uint32_t s_packUploadMicros;
+static uint32_t s_framePackBytes, s_framePackMicros;  // this frame only, for [hitch]
 static uint32_t s_packDiagFrames;
 // A deque, not a vector: getTexture hands out pointers, and a draw binds up to
 // eight maps; a vector growing on the second map's miss moved the first map's
@@ -3855,8 +3856,11 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
         texturePackReleaseUploadChunk();
         if (e->packEntry && e->packLevelDone == ((1u << e->packEntry->mipCount) - 1u)) packInstall(*e);
     }
+    const uint32_t pumpMicros = uint32_t(OSTicksToMicroseconds(OSGetTime() - pumpStart));
     s_packUploadBytes += budget.bytes;
-    s_packUploadMicros += uint32_t(OSTicksToMicroseconds(OSGetTime() - pumpStart));
+    s_packUploadMicros += pumpMicros;
+    s_framePackBytes += budget.bytes;
+    s_framePackMicros += pumpMicros;
     if (++s_packDiagFrames == 30) {
         TexturePackStats stats = {};
         texturePackGetStats(&stats);
@@ -4985,6 +4989,20 @@ static OSTime s_perfFlush, s_perfTex, s_perfXform, s_perfLastEnd, s_perfWall;
 // Single frames, end to end: over 34 ms misses 30 fps unpaced; over 41.7 ms
 // (1.25 frames at 30) is a missed vsync when paced.  [frames] lines, per 30.
 static uint32_t s_frameOver34, s_frameOver42, s_frameMaxUs;
+// [hitch]: one line for any frame over 60 ms (at most 200 a run), with where
+// its time went.  pre = previous renderer_end to this renderer_begin (the
+// game's own work before it draws), draw = renderer_begin to renderer_end.
+// The rest are this frame's deltas: worker waits by kind (peek, draw-sync,
+// draw-done, present drain), core-1 and worker time, texture-pack uploads,
+// copies/peeks/clears/draws and the vertex-fence wait.
+static OSTime s_frameBeginTime;
+struct HitchShadow {
+    uint32_t copies, peeks, clears, draws;
+    OSTime fence;
+    gx2prod::Counters prod;
+};
+static HitchShadow s_hitchLast;
+static uint32_t s_hitchLines;
 static OSTime s_prodFrontendStart;
 
 static uint32_t prodMicros(OSTime start) {
@@ -6168,6 +6186,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
     if (s_gx2ProdEnabled) s_prodFrontendStart = OSGetTime();
+    s_frameBeginTime = OSGetTime();
     beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     // The generated vertex programs use up to R60; the default split gives
@@ -6250,6 +6269,33 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         if (us > 34000) ++s_frameOver34;
         if (us > 41700) ++s_frameOver42;
         if (us > s_frameMaxUs) s_frameMaxUs = us;
+        if (us > 60000 && s_hitchLines < 200) {
+            ++s_hitchLines;
+            const auto usOf = [](OSTime t) { return uint32_t(OSTicksToMicroseconds(t)); };
+            const uint32_t pre = s_frameBeginTime > s_perfLastEnd ? usOf(s_frameBeginTime - s_perfLastEnd) : 0;
+            const uint32_t draw = s_frameBeginTime > s_perfLastEnd ? usOf(perfNow - s_frameBeginTime) : 0;
+            gx2prod::Counters p = {};
+            if (s_gx2ProdEnabled) gx2prod::snapshot(&p);
+            const gx2prod::Counters& q = s_hitchLast.prod;
+            WHBLogPrintf("SMS Wii U: [hitch] frame=%u us=%u pre=%u draw=%u wPeek=%u wSync=%u wDone=%u wPresent=%u "
+                         "c1Blocked=%u c1Present=%u c1List=%u c1CopyClear=%u c1Retile=%u c1Callback=%u wkBusy=%u "
+                         "wkBlocked=%u svcFull=%u packUs=%u packBytes=%u copies=%u peeks=%u clears=%u draws=%u fenceUs=%u",
+                         (unsigned)g_displayFrames, (unsigned)us, (unsigned)pre, (unsigned)draw,
+                         (unsigned)(p.waitMicros[0] - q.waitMicros[0]), (unsigned)(p.waitMicros[1] - q.waitMicros[1]),
+                         (unsigned)(p.waitMicros[2] - q.waitMicros[2]), (unsigned)(p.waitMicros[3] - q.waitMicros[3]),
+                         (unsigned)(p.core1BlockedMicros - q.core1BlockedMicros),
+                         (unsigned)(p.core1PresentMicros - q.core1PresentMicros),
+                         (unsigned)(p.core1ListMicros - q.core1ListMicros),
+                         (unsigned)(p.core1CopyClearMicros - q.core1CopyClearMicros),
+                         (unsigned)(p.core1RetileMicros - q.core1RetileMicros),
+                         (unsigned)(p.core1CallbackMicros - q.core1CallbackMicros),
+                         (unsigned)(p.workerBusyMicros - q.workerBusyMicros),
+                         (unsigned)(p.workerBlockedMicros - q.workerBlockedMicros),
+                         (unsigned)(p.serviceFullWaits - q.serviceFullWaits), (unsigned)s_framePackMicros,
+                         (unsigned)s_framePackBytes, (unsigned)(s_perfCopies - s_hitchLast.copies),
+                         (unsigned)(s_perfPeeks - s_hitchLast.peeks), (unsigned)(s_perfClears - s_hitchLast.clears),
+                         (unsigned)(s_perfDraws - s_hitchLast.draws), usOf(s_vertexFenceWait - s_hitchLast.fence));
+        }
     }
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
@@ -6306,6 +6352,14 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }
+    // [hitch] shadows, taken after any 30-frame reset above.
+    s_hitchLast.copies = s_perfCopies;
+    s_hitchLast.peeks = s_perfPeeks;
+    s_hitchLast.clears = s_perfClears;
+    s_hitchLast.draws = s_perfDraws;
+    s_hitchLast.fence = s_vertexFenceWait;
+    if (s_gx2ProdEnabled) gx2prod::snapshot(&s_hitchLast.prod);
+    s_framePackBytes = s_framePackMicros = 0;
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;
