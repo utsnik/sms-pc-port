@@ -257,6 +257,9 @@ bool peekTokenNoWait();
 // Wii U: a draw-sync token with a callback reached the GX stream (the worker's,
 // in producer mode), before the callback is run or queued.
 void peekToken(uint16_t token, uint32_t peFormat);
+// Wii U producer mode: GXSetDrawDone/GXWaitDrawDone/GXDrawDone drain the
+// worker here; the caller's return address is kept for [drawdone] lines.
+void producerDrawDoneWait(void* caller);
 void pixMetricClear();
 uint32_t pixMetricRead();
 

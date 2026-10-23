@@ -5003,6 +5003,44 @@ struct HitchShadow {
 };
 static HitchShadow s_hitchLast;
 static uint32_t s_hitchLines;
+// Draw-done drains by call site (the GX call's return address; map it with
+// addr2line on sms.elf).  [drawdone] lines per 30 frames; [hitch] lines name
+// the frame's longest one.
+struct DrawDoneSite { uintptr_t lr; uint32_t calls; OSTime ticks; };
+static DrawDoneSite s_ddSites[8];
+static uint32_t s_ddOther;
+static uintptr_t s_ddFrameMaxLr;
+static OSTime s_ddFrameMax;
+void producerDrawDoneWait(void* caller) {
+    const OSTime t0 = OSGetTime();
+    gx2prod::wait(gx2prod::kWaitDrawDone);
+    const OSTime dt = OSGetTime() - t0;
+    const uintptr_t lr = reinterpret_cast<uintptr_t>(caller);
+    if (dt > s_ddFrameMax) { s_ddFrameMax = dt; s_ddFrameMaxLr = lr; }
+    for (DrawDoneSite& site : s_ddSites) {
+        if (site.lr && site.lr != lr) continue;
+        site.lr = lr;
+        ++site.calls;
+        site.ticks += dt;
+        return;
+    }
+    ++s_ddOther;
+}
+static void drawDoneReport() {
+    char text[320];
+    int n = 0;
+    for (DrawDoneSite& site : s_ddSites) {
+        if (!site.lr) break;
+        n += std::snprintf(text + n, sizeof(text) - size_t(n), " %08x:%u:%u", (unsigned)site.lr, (unsigned)site.calls,
+                           (unsigned)OSTicksToMicroseconds(site.ticks));
+        if (n >= int(sizeof(text))) break;
+        site = DrawDoneSite{};
+    }
+    if (n || s_ddOther)
+        WHBLogPrintf("SMS Wii U: [drawdone] frame=%u lr:calls:us%s other=%u", (unsigned)g_displayFrames, n ? text : " -",
+                     (unsigned)s_ddOther);
+    s_ddOther = 0;
+}
 static OSTime s_prodFrontendStart;
 
 static uint32_t prodMicros(OSTime start) {
@@ -6279,7 +6317,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             const gx2prod::Counters& q = s_hitchLast.prod;
             WHBLogPrintf("SMS Wii U: [hitch] frame=%u us=%u pre=%u draw=%u wPeek=%u wSync=%u wDone=%u wPresent=%u "
                          "c1Blocked=%u c1Present=%u c1List=%u c1CopyClear=%u c1Retile=%u c1Callback=%u wkBusy=%u "
-                         "wkBlocked=%u svcFull=%u packUs=%u packBytes=%u copies=%u peeks=%u clears=%u draws=%u fenceUs=%u",
+                         "wkBlocked=%u svcFull=%u packUs=%u packBytes=%u copies=%u peeks=%u clears=%u draws=%u fenceUs=%u "
+                         "ddMaxLr=%08x ddMaxUs=%u",
                          (unsigned)g_displayFrames, (unsigned)us, (unsigned)pre, (unsigned)draw,
                          (unsigned)(p.waitMicros[0] - q.waitMicros[0]), (unsigned)(p.waitMicros[1] - q.waitMicros[1]),
                          (unsigned)(p.waitMicros[2] - q.waitMicros[2]), (unsigned)(p.waitMicros[3] - q.waitMicros[3]),
@@ -6294,7 +6333,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                          (unsigned)(p.serviceFullWaits - q.serviceFullWaits), (unsigned)s_framePackMicros,
                          (unsigned)s_framePackBytes, (unsigned)(s_perfCopies - s_hitchLast.copies),
                          (unsigned)(s_perfPeeks - s_hitchLast.peeks), (unsigned)(s_perfClears - s_hitchLast.clears),
-                         (unsigned)(s_perfDraws - s_hitchLast.draws), usOf(s_vertexFenceWait - s_hitchLast.fence));
+                         (unsigned)(s_perfDraws - s_hitchLast.draws), usOf(s_vertexFenceWait - s_hitchLast.fence),
+                         (unsigned)s_ddFrameMaxLr, usOf(s_ddFrameMax));
         }
     }
     s_perfLastEnd = perfNow;
@@ -6327,6 +6367,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
                      (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked);
         tokReport();
+        drawDoneReport();
         WHBLogPrintf("SMS Wii U: [frames] frame=%u over34=%u over42=%u maxUs=%u", (unsigned)g_displayFrames,
                      (unsigned)s_frameOver34, (unsigned)s_frameOver42, (unsigned)s_frameMaxUs);
         s_frameOver34 = s_frameOver42 = s_frameMaxUs = 0;
@@ -6360,6 +6401,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_hitchLast.fence = s_vertexFenceWait;
     if (s_gx2ProdEnabled) gx2prod::snapshot(&s_hitchLast.prod);
     s_framePackBytes = s_framePackMicros = 0;
+    s_ddFrameMax = 0;
+    s_ddFrameMaxLr = 0;
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;

@@ -311,7 +311,7 @@ void GXSetDrawDone(void) {
     apiBP(BP_DRAWDONE, 2);
 #ifdef __WIIU__
     if (producerMode()) {
-        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+        producerDrawDoneWait(__builtin_return_address(0));
         if (s_drawDoneCb) s_drawDoneCb();
         return;
     }
@@ -321,14 +321,14 @@ void GXSetDrawDone(void) {
 }
 void GXWaitDrawDone(void) {
 #ifdef __WIIU__
-    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitDrawDone); return; }
+    if (producerMode()) { producerDrawDoneWait(__builtin_return_address(0)); return; }
 #endif
     drainCommandStream(); flushBatch();
 }
 void GXDrawDone(void) {
 #ifdef __WIIU__
     if (producerMode()) {
-        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+        producerDrawDoneWait(__builtin_return_address(0));
         if (s_drawDoneCb) s_drawDoneCb();
         return;
     }
