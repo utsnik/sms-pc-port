@@ -1,4 +1,7 @@
 #include "Game/System/GameSystemSceneController.hpp"
+#ifdef TARGET_WIIU
+#include "port/port.h"
+#endif
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/NameObj/NameObjHolder.hpp"
 #include "Game/Scene/IntermissionScene.hpp"
@@ -124,10 +127,16 @@ void GameSystemSceneController::initializeScene() {
 
     MR::resetWPad();
 
+#ifdef TARGET_WIIU
+    port_log("[smg-scene] init scene=%s stage=%s", mCurrSceneControlInfo.mScene, mCurrSceneControlInfo.mStage);
+#endif
     mScene = MR::createScene(mCurrSceneControlInfo.mScene);
     mScene->initNameObjListExecutor();
     mScene->initSceneObjHolder();
     mScene->init();
+#ifdef TARGET_WIIU
+    port_log("[smg-scene] initialized scene=%s", mCurrSceneControlInfo.mScene);
+#endif
 
     SceneFunction::allocateDrawBufferActorList();
     MR::clearFileLoaderRequestFileInfo(mIsResetProcessing);
@@ -202,6 +211,9 @@ bool GameSystemSceneController::isFirstUpdateSceneNerveNormal() const {
 }
 
 void GameSystemSceneController::startScene() {
+#ifdef TARGET_WIIU
+    port_log("[smg-scene] start scene=%s stage=%s", mCurrSceneControlInfo.mScene, mCurrSceneControlInfo.mStage);
+#endif
     mScene->start();
     GameSystemFunction::restartControllerLeaveWatcher();
     requestChangeNerve(GET_NERVE(GameSystemSceneController, GameSystemSceneControllerNormal));

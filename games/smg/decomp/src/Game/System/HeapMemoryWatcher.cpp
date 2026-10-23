@@ -1,4 +1,8 @@
 #include "Game/System/HeapMemoryWatcher.hpp"
+#ifdef TARGET_WIIU
+#include "Game/Util/SingletonHolder.hpp"
+#include "port/port.h"
+#endif
 #include "Game/Util/MemoryUtil.hpp"
 #include <JSystem/JKernel/JKRExpHeap.hpp>
 #include <JSystem/JKernel/JKRSolidHeap.hpp>
@@ -179,7 +183,16 @@ HeapMemoryWatcher::HeapMemoryWatcher()
     createHeaps();
 }
 
-void HeapMemoryWatcher::memoryErrorCallback(void*, u32, int) {
+void HeapMemoryWatcher::memoryErrorCallback(void* pHeap, u32 size, int align) {
+#ifdef TARGET_WIIU
+    JKRHeap* heap = static_cast< JKRHeap* >(pHeap);
+    HeapMemoryWatcher* w = SingletonHolder< HeapMemoryWatcher >::get();
+    port_log("[smg-heap] alloc failed heap=%p size=0x%x align=%d free=0x%x total_free=0x%x heap_size=0x%x "
+             "(sceneNapa=%p sceneGDDR=%p gameNapa=%p gameGDDR=%p fileCache=%p)",
+             pHeap, size, align, heap ? heap->getFreeSize() : 0, heap ? heap->getTotalFreeSize() : 0,
+             heap ? heap->mSize : 0, w ? w->mSceneHeapNapa : nullptr, w ? w->mSceneHeapGDDR : nullptr,
+             w ? w->mGameHeapNapa : nullptr, w ? w->mGameHeapGDDR : nullptr, w ? w->mFileCacheHeap : nullptr);
+#endif
     OSPanic(__FILE__, 537, "");
 }
 
