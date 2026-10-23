@@ -659,6 +659,8 @@ static const uint8_t* arrayElem(int slot, uint32_t idx) {
 static uint32_t s_vertsLoaded = 0;
 uint32_t g_dlReplayIdx = 0;  // indices drawn from cached display lists (perf counter)
 uint64_t g_dlTicks = 0;
+const uint8_t* g_dlCurList = nullptr;  // list being replayed, for the Wii U [dlstore] diagnostic
+uint32_t g_dlCurSize = 0, g_dlCurMisses = 0;
 bool g_perfStages = false;
 double g_decodeSeconds = 0;  // detailed timers: time in the vertex loader
 extern double g_flushSeconds;
@@ -1475,6 +1477,7 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
             return;
         }
         const bool arena = arenaEnabled() && !traceFile();  // traces list the batch's own vertices
+        g_dlCurList = data; g_dlCurSize = size; g_dlCurMisses = e.misses;
         for (DlRun& r : e.runs) {
             const uint32_t nidx = uint32_t(r.idx.size());
             if (arena && nidx &&

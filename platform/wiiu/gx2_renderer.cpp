@@ -4993,6 +4993,8 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
     }
     if (s_dlArenaUsed + total > kDlArenaBytes) {
+        WHBLogPrintf("SMS Wii U: [dlarena] wrap frame=%u gen=%u used=%u", (unsigned)g_displayFrames,
+                     (unsigned)s_dlArenaGen, (unsigned)s_dlArenaUsed);
         // Every stored run goes: let the GPU finish reading them first.
         if (!s_gx2ProdEnabled) GX2DrawDone();
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
@@ -5016,6 +5018,14 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     ref.key = matrixDefaultsKey();
     s_dlArenaUsed += total;
     ++s_perfDlUploads;
+    static uint32_t s_dlStoreLogs;
+    if (g_displayFrames >= 3000 && s_dlStoreLogs < 400) {
+        ++s_dlStoreLogs;
+        WHBLogPrintf("SMS Wii U: [dlstore] frame=%u list=%08x size=%u misses=%u n=%u nidx=%u bytes=%u used=%u",
+                     (unsigned)g_displayFrames, (unsigned)reinterpret_cast<uintptr_t>(g_dlCurList),
+                     (unsigned)g_dlCurSize, (unsigned)g_dlCurMisses, (unsigned)n, (unsigned)nidx,
+                     (unsigned)total, (unsigned)s_dlArenaUsed);
+    }
     return true;
 }
 
