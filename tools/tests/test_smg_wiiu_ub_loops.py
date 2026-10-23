@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Galaxy's out-of-bounds retail loops must keep their exits on Wii U.
+"""Galaxy's out-of-bounds retail loops must be bounded on Wii U.
 
-CameraShaker::createSinglyHorizontalTask runs i < 7 over a 3-entry array (a
-Nintendo bug that CodeWarrior compiled literally). GCC's aggressive loop
-optimizations used the array bound to drop the exit test, so the loop allocated
-CameraShake tasks until the FileSelect scene heap was exhausted (OSPanic in
-GameSystemSceneController::initializeScene). The SMG game flags must carry
--fno-aggressive-loop-optimizations, and the linked function must test its
-counter (a conditional backward branch). sms_msl_sqrtf must not branch to
-itself (port_compat.h's sqrtf macro inside msl_math.c made it "b .").
+CameraShaker::createSinglyHorizontalTask runs i < 7 over the 3-entry
+mHorizontalTasks (this+0x28), a Nintendo bug that CodeWarrior compiled
+literally: entries 3..6 land in mInfinityTasks (this+0x34), which
+createInfinityTask then overwrites. GCC used the array bound to drop the exit
+test, so the loop allocated CameraShake tasks until the FileSelect scene heap
+was exhausted. The Wii U build bounds the loop to the array (TARGET_WIIU) with
+no global -fno-aggressive-loop-optimizations to mask it: the linked function
+must test its counter (a conditional backward branch) and store only into
+this+0x28..0x33. sms_msl_sqrtf must not branch to itself (port_compat.h's sqrtf
+macro inside msl_math.c made it "b .").
 """
 
 from __future__ import annotations
@@ -29,8 +31,8 @@ def main() -> int:
     parser.add_argument("--cmake", type=Path, required=True)
     parser.add_argument("--elf", type=Path)
     args = parser.parse_args()
-    if "-fno-aggressive-loop-optimizations" not in args.cmake.read_text(encoding="utf-8"):
-        print("ub-loops: FAIL: SMG game flags lack -fno-aggressive-loop-optimizations")
+    if "-fno-aggressive-loop-optimizations" in args.cmake.read_text(encoding="utf-8"):
+        print("ub-loops: FAIL: a global -fno-aggressive-loop-optimizations masks out-of-bounds loops")
         return 1
     if args.elf:
         elf = args.elf.resolve()
@@ -53,6 +55,29 @@ def main() -> int:
         if not back:
             print("ub-loops: FAIL: createSinglyHorizontalTask has no loop exit (endless allocation)")
             return 1
+        # Bounded behaviour: the task pointers are stored through a cursor
+        # (stwu rC,step(rC)) set from this (r3) and compared against an end
+        # pointer also set from this. Every store must land inside
+        # mHorizontalTasks, this+0x28..0x33.
+        base = {m.group(1): int(m.group(2)) for m in
+                re.finditer(r"\baddi\s+(r\d+),r3,(-?\d+)", body)}
+        store = next((m for m in re.finditer(r"\bstwu\s+(r\d+),(-?\d+)\((r\d+)\)", body)
+                      if m.group(3) in base), None)
+        cmp = re.search(r"\bcmplw\s+(?:cr\d,)?(r\d+),(r\d+)", body)
+        if not store or not cmp or store.group(3) not in base:
+            print("ub-loops: FAIL: createSinglyHorizontalTask store loop not recognised")
+            return 1
+        cursor = store.group(3)
+        end_reg = cmp.group(2) if cmp.group(1) == cursor else cmp.group(1)
+        if end_reg not in base:
+            print("ub-loops: FAIL: createSinglyHorizontalTask loop end not recognised")
+            return 1
+        step = int(store.group(2))
+        first, last = base[cursor] + step, base[end_reg]
+        if first < 0x28 or last > 0x34 - 4:
+            print(f"ub-loops: FAIL: createSinglyHorizontalTask stores this+{first:#x}..{last:#x}, "
+                  "outside mHorizontalTasks (0x28..0x33)")
+            return 1
         # sms_msl_sqrtf (platform/misc/msl_math.c) once became "b ." in the SMG
         # build: port_compat.h's sqrtf macro turned its libm call into itself.
         start = text.find("<sms_msl_sqrtf>:\n")
@@ -64,7 +89,7 @@ def main() -> int:
         if "<sqrtf>" not in body:
             print("ub-loops: FAIL: sms_msl_sqrtf does not reach the C library's sqrtf")
             return 1
-    print("ub-loops: PASS: retail out-of-bounds loops keep their exit tests")
+    print("ub-loops: PASS: retail out-of-bounds loops are bounded (no global loop-opt flag)")
     return 0
 
 

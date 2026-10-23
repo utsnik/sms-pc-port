@@ -70,7 +70,17 @@ void CameraShaker::createSinglyHorizontalTask() {
     static const f32 cSinglyIntensity[] = {0.3f, 1.0f, 3.0f};
 
     // Should be i < NR_HORIZONTAL_TASKS
+#ifdef TARGET_WIIU
+    // Retail writes entries 3..6 past mHorizontalTasks into mInfinityTasks[0..3]
+    // (reading cSinglyIntensity out of bounds), and createInfinityTask() then
+    // overwrites all four: the only lasting effect is four leaked tasks. GCC
+    // treats the out-of-bounds write as undefined and dropped the loop exit
+    // (endless allocation in FileSelect). Bound the loop to the array; the
+    // resulting object state is retail's.
+    for (u32 i = 0; i < NR_HORIZONTAL_TASKS; i++) {
+#else
     for (u32 i = 0; i < NR_VERTICAL_TASKS; i++) {
+#endif
         CameraShakePatternSingly* singly = new CameraShakePatternSingly(cSinglyIntensity[i]);
 
         singly->setDirection(TVec2f(1.0f, 0.0f));
