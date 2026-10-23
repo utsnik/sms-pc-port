@@ -28,6 +28,11 @@ if(PORT_GAME STREQUAL "smg")
     # CodeWarrior's wchar_t is 16 bits; Galaxy reads its UTF-16 message data
     # through wchar_t* (games/smg/platform/wiiu/wstring.cpp).
     -fshort-wchar
+    # Nintendo's code has out-of-bounds loops that CodeWarrior compiled
+    # literally (CameraShaker::createSinglyHorizontalTask writes 7 entries of a
+    # 3-entry array); GCC used the bound to drop the loop exit and allocated
+    # forever. Derive no iteration bounds from undefined behaviour.
+    -fno-aggressive-loop-optimizations
     # MSL printf semantics (games/smg/platform/wiiu/msl_printf.cpp): keep GCC
     # from folding e.g. sprintf(d, "%s", s) into strcpy behind the shim.
     -fno-builtin-sprintf -fno-builtin-snprintf -fno-builtin-vsprintf
