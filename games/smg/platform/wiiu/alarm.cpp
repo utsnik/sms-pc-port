@@ -24,12 +24,13 @@
  *    that its arming is due: OSGetTime() >= due, where due is computed from
  *    the same coreinit timebase when the alarm is armed. A one-shot then
  *    disarms; a periodic alarm advances due to its next period.
- *  - Every arming takes a free record (least recently released first);
- *    re-arming or cancelling retires the old one: disarm, OSCancelAlarm,
- *    then wait for its handlers still running, except one running on the
- *    calling thread (a handler cancelling or re-arming its own alarm), which
- *    would otherwise wait for itself. A record with a handler in flight is
- *    never reused.
+ *  - Every arming takes a free record (least recently released first).
+ *    Instances have explicit record, native-alarm and callback references;
+ *    callback-context disarm retires them without waiting, while external
+ *    disarm still waits for handlers so its return remains a completion
+ *    boundary. Records with handlers in flight are not reused. The native
+ *    arm/cancel handoff is made while s_lock is held, so cancellation cannot
+ *    race the instance selected for arming.
  */
 #include "port/port.h"
 
@@ -39,6 +40,9 @@
 #include <cstdint>
 #include <cstring>
 #include <new>
+#if defined(SMG_ALARM_HOST_TEST)
+#include <atomic>
+#endif
 
 namespace {
 
@@ -58,27 +62,22 @@ BOOL wut_OSCancelAlarm(WutAlarm*) __asm__("OSCancelAlarm");
 void wut_OSSetAlarmUserData(WutAlarm*, void*) __asm__("OSSetAlarmUserData");
 void* wut_OSGetAlarmUserData(WutAlarm*) __asm__("OSGetAlarmUserData");
 OSTime wut_OSGetTime(void) __asm__("OSGetTime");
-void* wut_OSGetCurrentThread(void) __asm__("OSGetCurrentThread");
 BOOL wut_spin_acquire(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Acquire");
 BOOL wut_spin_release(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Release");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
 }
 
 const unsigned kMaxAlarms = 32;
-const unsigned kMaxRunners = 4;
-
 struct AlarmRecord;
 
 struct AlarmInstance {
     WutAlarm wut;                 // first: a callback's alarm is its instance
     AlarmRecord* record;
     uint64_t generation;          // immutable identity of this arming
-    uint32_t callbacks;           // coreinit callbacks using this instance
-    bool callback_started;
+    uint32_t refs;                // record + native alarm + callback holders
     bool periodic;
-    bool retired;
-    bool cleanup_claimed;
-    bool disarm_in_progress;
+    bool native_release_pending;  // OSCancelAlarm returned false
+    bool native_released;
 };
 
 struct AlarmRecord {
@@ -87,7 +86,6 @@ struct AlarmRecord {
     OSAlarmHandler handler;
     OSTime due;                   // the arming's next due time (coreinit ticks)
     OSTime start, period;         // period 0 = one-shot
-    void* runners[kMaxRunners];   // threads running this record's handler
     uint32_t in_flight;           // handlers running for this record
     uint32_t released;            // release sequence (0 = never used)
     uint64_t generation;          // next generation for this record
@@ -98,6 +96,18 @@ struct AlarmRecord {
 WutSpinLock s_lock;
 AlarmRecord s_alarms[kMaxAlarms];
 uint32_t s_release_seq;
+thread_local bool s_in_handler;
+#if defined(SMG_ALARM_HOST_TEST)
+std::atomic<int> s_live_instances{0};
+#endif
+
+void destroy_instance(AlarmInstance* instance)
+{
+#if defined(SMG_ALARM_HOST_TEST)
+    --s_live_instances;
+#endif
+    delete instance;
+}
 
 struct Lock {
     Lock() { wut_spin_acquire(&s_lock); }
@@ -134,36 +144,30 @@ AlarmRecord* claim_locked(OSAlarm* game)
     return best;
 }
 
-/* Caller holds s_lock: handlers of r running on the calling thread. */
-uint32_t self_runs_locked(const AlarmRecord* r, void* self)
+/* Caller holds s_lock. Return whether the final holder was released. */
+bool release_locked(AlarmInstance* instance)
 {
-    uint32_t n = 0;
-    for (unsigned i = 0; i < kMaxRunners; ++i)
-        if (r->runners[i] == self)
-            ++n;
-    return n;
+    return --instance->refs == 0;
 }
 
 void trampoline(WutAlarm* wut, void* /*context*/)
 {
     AlarmInstance* instance = reinterpret_cast<AlarmInstance*>(wut);
-    if (!instance || !instance->record)
+    if (!instance)
         return;
-    AlarmRecord* r = instance->record;
-    if (r < s_alarms || r >= s_alarms + kMaxAlarms)
-        return;
-    void* self = wut_OSGetCurrentThread();
-    void* data = wut_OSGetAlarmUserData(&instance->wut);
-    const uint64_t generation = data ? *static_cast<uint64_t*>(data) : 0;
     OSAlarmHandler handler;
     OSAlarm* game;
-    unsigned slot = kMaxRunners;
+    AlarmRecord* r;
     bool run = false;
     bool destroy = false;
     {
         Lock lock;
-        ++instance->callbacks;
-        instance->callback_started = true;
+        r = instance->record;
+        if (!r || r < s_alarms || r >= s_alarms + kMaxAlarms)
+            return;
+        ++instance->refs;             // callback holder; native holder keeps it alive
+        void* data = wut_OSGetAlarmUserData(&instance->wut);
+        const uint64_t generation = data ? *static_cast<uint64_t*>(data) : 0;
         if (instance == r->instance && generation == r->generation &&
             r->active && r->armed && r->handler) {
             const OSTime now = wut_OSGetTime();
@@ -175,77 +179,87 @@ void trampoline(WutAlarm* wut, void* /*context*/)
                 handler = r->handler;
                 game = r->game;
                 ++r->in_flight;
-                for (unsigned i = 0; i < kMaxRunners; ++i)
-                    if (!r->runners[i]) {
-                        r->runners[i] = self;
-                        slot = i;
-                        break;
-                    }
                 run = true;
             }
         }
     }
-    if (run)
+    if (run) {
+        s_in_handler = true;
         handler(game, nullptr);
+        s_in_handler = false;
+    }
     {
         Lock lock;
-        if (run) {
-            if (slot < kMaxRunners)
-                r->runners[slot] = nullptr;
+        if (run)
             --r->in_flight;
+
+        /* A fired one-shot no longer needs the record's instance hold. Keep
+         * the record itself active so a later cancel/re-arm can retire it. */
+        if (!instance->periodic && r->instance == instance && !r->armed) {
+            r->instance = nullptr;
+            if (release_locked(instance))
+                destroy = true;
         }
-        --instance->callbacks;
-        if (instance->retired && instance->callbacks == 0 &&
-            !instance->cleanup_claimed && !instance->disarm_in_progress) {
-            instance->cleanup_claimed = true;
+
+        /* One-shots have no future native callback. A cancelled periodic
+         * alarm releases its native hold when its already-dequeued callback
+         * reaches this point. */
+        if ((!instance->periodic ||
+             instance->native_release_pending) &&
+            !instance->native_released) {
+            instance->native_released = true;
+            if (release_locked(instance))
+                destroy = true;
+        }
+        if (release_locked(instance))
             destroy = true;
-        }
     }
     if (destroy)
-        delete instance;
+        destroy_instance(instance);
 }
 
-/* Disarm, stop the coreinit alarm, and wait for handlers still running on
- * other threads (one running on this thread is the caller itself). */
+/* Disarm and stop the coreinit alarm. Callback-context callers do not wait;
+ * external callers wait for handlers after the native transition. The native
+ * hold keeps a dequeued callback's instance alive until it returns. */
 void disarm(AlarmRecord* r)
 {
-    void* self = wut_OSGetCurrentThread();
+    const bool defer_wait = s_in_handler;
     AlarmInstance* instance;
+    bool destroy = false;
     {
         Lock lock;
         r->armed = false;
         instance = r->instance;
         r->instance = nullptr;
         if (instance) {
-            instance->retired = true;
-            instance->disarm_in_progress = true;
+            if (release_locked(instance))
+                destroy = true;       // drop the record holder
+
+            /* Keep the adapter lock through the native transition. A
+             * callback already in flight can finish only after this block;
+             * a callback not yet entered observes the pending native hold. */
+            const BOOL cancelled = wut_OSCancelAlarm(&instance->wut);
+            if (cancelled) {
+                instance->native_released = true;
+                if (release_locked(instance))
+                    destroy = true;
+            } else {
+                instance->native_release_pending = true;
+            }
         }
     }
-    if (!instance)
-        return;
-    const BOOL cancelled = wut_OSCancelAlarm(&instance->wut);
-    for (;;) {
-        {
-            Lock lock;
-            if (r->in_flight <= self_runs_locked(r, self))
-                break;
+    if (instance && !defer_wait) {
+        for (;;) {
+            {
+                Lock lock;
+                if (r->in_flight == 0)
+                    break;
+            }
+            wut_OSYieldThread();
         }
-        wut_OSYieldThread();
-    }
-    bool destroy = false;
-    {
-        Lock lock;
-        /* A cancelled alarm cannot start a callback after this point. A
-         * one-shot whose callback already ran is likewise finished even
-         * though coreinit reports it was no longer queued. */
-        destroy = instance->callbacks == 0 &&
-                  (cancelled || (!instance->periodic && instance->callback_started));
-        if (destroy)
-            instance->cleanup_claimed = true;
-        instance->disarm_in_progress = false;
     }
     if (destroy)
-        delete instance;
+        destroy_instance(instance);
 }
 
 /* Disarm the game alarm's record, if any, and return it to the free pool. */
@@ -278,11 +292,14 @@ AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, OSTime first, OS
         port_log("[smg-alarm] alarm instance allocation failed");
         return nullptr;
     }
+#if defined(SMG_ALARM_HOST_TEST)
+    ++s_live_instances;
+#endif
     Lock lock;
     AlarmRecord* r = claim_locked(alarm);
     if (!r) {
         port_log("[smg-alarm] alarm side table exhausted");
-        delete instance;
+        destroy_instance(instance);
         return nullptr;
     }
     instance->record = r;
@@ -298,8 +315,16 @@ AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, OSTime first, OS
     else
         r->due = now + first;
     r->armed = true;
+    alarm->handler = handler;
+    alarm->start = start;
+    alarm->period = period;
     wut_OSCreateAlarm(&instance->wut);
     wut_OSSetAlarmUserData(&instance->wut, &instance->generation);
+    instance->refs = 2;                // record holder + native alarm holder
+    if (period > 0)
+        wut_OSSetPeriodicAlarm(&instance->wut, start, period, trampoline);
+    else
+        wut_OSSetAlarm(&instance->wut, first, trampoline);
     return r;
 }
 
@@ -322,8 +347,7 @@ void smg_wiiu_OSSetAlarm(OSAlarm* alarm, OSTime tick, OSAlarmHandler handler)
     AlarmRecord* r = arm_record(alarm, handler, tick, 0, 0);
     if (!r)
         return;
-    alarm->handler = handler;
-    wut_OSSetAlarm(&r->instance->wut, tick, trampoline);
+    (void)r;
 }
 
 void smg_wiiu_OSSetPeriodicAlarm(OSAlarm* alarm, OSTime start, OSTime period,
@@ -334,10 +358,7 @@ void smg_wiiu_OSSetPeriodicAlarm(OSAlarm* alarm, OSTime start, OSTime period,
     AlarmRecord* r = arm_record(alarm, handler, 0, start, period);
     if (!r)
         return;
-    alarm->handler = handler;
-    alarm->start = start;
-    alarm->period = period;
-    wut_OSSetPeriodicAlarm(&r->instance->wut, start, period, trampoline);
+    (void)r;
 }
 
 void smg_wiiu_OSCancelAlarm(OSAlarm* alarm)
@@ -351,3 +372,10 @@ void smg_wiiu_OSCancelAlarm(OSAlarm* alarm)
 }
 
 } // extern "C"
+
+#if defined(SMG_ALARM_HOST_TEST)
+extern "C" int smg_wiiu_alarm_live_instances()
+{
+    return s_live_instances.load();
+}
+#endif

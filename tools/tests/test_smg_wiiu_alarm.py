@@ -7,7 +7,7 @@ still deliver one late callback (the dispatch window between coreinit taking
 the alarm off its queue and the callback reading the alarm's user data).
 
 self:   handlers that cancel / re-arm (periodic -> one-shot) their own alarm
-        must return (cancel used to wait for the in-flight handler itself).
+        must return without waiting for their own in-flight handler.
 wrap:   deterministic forced wraparound: a callback parked at the adapter's
         lock while 256 armings cycle all records and identities, the last
         landing on its old record; it must not run a handler.
@@ -62,6 +62,7 @@ extern "C" void smg_wiiu_OSCreateAlarm(OSAlarm*);
 extern "C" void smg_wiiu_OSSetAlarm(OSAlarm*, OSTime, OSAlarmHandler);
 extern "C" void smg_wiiu_OSSetPeriodicAlarm(OSAlarm*, OSTime, OSTime, OSAlarmHandler);
 extern "C" void smg_wiiu_OSCancelAlarm(OSAlarm*);
+extern "C" int smg_wiiu_alarm_live_instances();
 
 // ---- fake coreinit ---------------------------------------------------------
 static const uint32_t kBusClock = 248625000u;            // Wii U busClockSpeed
@@ -85,6 +86,12 @@ static std::mutex g_spin;
 static std::mutex g_hold_m;
 static std::condition_variable g_hold_cv;
 static bool g_hold = false, g_held = false, g_release = false;
+
+// handoff test: hold the fake native arm after the adapter has entered it.
+static std::mutex g_handoff_m;
+static std::condition_variable g_handoff_cv;
+static bool g_handoff_gate = false, g_handoff_entered = false;
+static bool g_handoff_release = false, g_handoff_cancel_called = false;
 
 // wrap test: the next callback to take the adapter's spinlock is parked just
 // before it gets it (it has read whatever it reads without the lock).
@@ -145,11 +152,28 @@ extern "C" {
 void fake_create(void* a) __asm__("OSCreateAlarm");
 void fake_create(void* a) { std::lock_guard<std::mutex> l(g_fake); auto& s = g_state[a]; if (s) s->cancelled = true; s.reset(); }
 int fake_set(void* a, OSTime t, WutCb cb) __asm__("OSSetAlarm");
-int fake_set(void* a, OSTime t, WutCb cb) { arm(a, t / kTimerHz, 0, cb); return 1; }
+int fake_set(void* a, OSTime t, WutCb cb) {
+    {
+        std::unique_lock<std::mutex> l(g_handoff_m);
+        if (g_handoff_gate) {
+            g_handoff_entered = true;
+            g_handoff_cv.notify_all();
+            g_handoff_cv.wait(l, [] { return g_handoff_release; });
+        }
+    }
+    arm(a, t / kTimerHz, 0, cb); return 1;
+}
 int fake_setp(void* a, OSTime start, OSTime period, WutCb cb) __asm__("OSSetPeriodicAlarm");
 int fake_setp(void* a, OSTime, OSTime period, WutCb cb) { arm(a, period / kTimerHz, period / kTimerHz, cb); return 1; }
 int fake_cancel(void* a) __asm__("OSCancelAlarm");
 int fake_cancel(void* a) {
+    {
+        std::lock_guard<std::mutex> l(g_handoff_m);
+        if (g_handoff_gate) {
+            g_handoff_cancel_called = true;
+            g_handoff_cv.notify_all();
+        }
+    }
     std::lock_guard<std::mutex> l(g_fake);
     auto& s = g_state[a];
     if (!s)
@@ -245,6 +269,137 @@ static void handler_self_cancel(OSAlarm* a, OSContext*) {
 static void handler_self_rearm(OSAlarm* a, OSContext*) {
     smg_wiiu_OSSetAlarm(a, OSTime(kTimerHz * 10.0), handler_noop);
     g_self_done++;
+}
+
+// Both handlers cancel the other alarm while both records have a handler in
+// flight. Disarm must not wait for the other callback to return.
+static std::atomic<int> g_cross_entered{0}, g_cross_done{0};
+static void handler_cross_a(OSAlarm* a, OSContext*) {
+    g_cross_entered++;
+    while (g_cross_entered.load() < 2)
+        std::this_thread::yield();
+    smg_wiiu_OSCancelAlarm(&g_alarms[5]);
+    g_cross_done++;
+}
+static void handler_cross_b(OSAlarm* a, OSContext*) {
+    g_cross_entered++;
+    while (g_cross_entered.load() < 2)
+        std::this_thread::yield();
+    smg_wiiu_OSCancelAlarm(&g_alarms[4]);
+    g_cross_done++;
+}
+static bool cross_cancel_test() {
+    g_cross_entered = 0;
+    g_cross_done = 0;
+    smg_wiiu_OSCreateAlarm(&g_alarms[4]);
+    smg_wiiu_OSCreateAlarm(&g_alarms[5]);
+    smg_wiiu_OSSetAlarm(&g_alarms[4], OSTime(kTimerHz * 0.001), handler_cross_a);
+    smg_wiiu_OSSetAlarm(&g_alarms[5], OSTime(kTimerHz * 0.001), handler_cross_b);
+    for (int i = 0; i < 200 && g_cross_done.load() != 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool ok = g_cross_done.load() == 2;
+    std::printf("alarm-host: cross-cancel %s\n", ok ? "returned" : "DEADLOCKED");
+    if (ok) {
+        smg_wiiu_OSCancelAlarm(&g_alarms[4]);
+        smg_wiiu_OSCancelAlarm(&g_alarms[5]);
+    }
+    return ok;
+}
+
+static std::atomic<int> g_handoff_hits{0};
+static void handler_handoff(OSAlarm*, OSContext*) { g_handoff_hits++; }
+static bool handoff_test() {
+    g_handoff_hits = 0;
+    {
+        std::lock_guard<std::mutex> l(g_handoff_m);
+        g_handoff_gate = true;
+        g_handoff_entered = false;
+        g_handoff_release = false;
+        g_handoff_cancel_called = false;
+    }
+    smg_wiiu_OSCreateAlarm(&g_alarms[0]);
+    std::atomic<bool> set_done{false};
+    std::thread setter([&] {
+        smg_wiiu_OSSetAlarm(&g_alarms[0], OSTime(kTimerHz * 0.001), handler_handoff);
+        set_done = true;
+    });
+    {
+        std::unique_lock<std::mutex> l(g_handoff_m);
+        if (!g_handoff_cv.wait_for(l, std::chrono::seconds(2), [] { return g_handoff_entered; }))
+            return false;
+    }
+    std::atomic<bool> cancel_done{false};
+    std::thread canceller([&] {
+        smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+        cancel_done = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    bool cancel_early;
+    {
+        std::lock_guard<std::mutex> l(g_handoff_m);
+        cancel_early = g_handoff_cancel_called;
+    }
+    {
+        std::lock_guard<std::mutex> l(g_handoff_m);
+        g_handoff_release = true;
+        g_handoff_cv.notify_all();
+    }
+    setter.join();
+    canceller.join();
+    {
+        std::lock_guard<std::mutex> l(g_handoff_m);
+        g_handoff_gate = false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+    const bool ok = !cancel_early && set_done && cancel_done && g_handoff_hits.load() == 0;
+    std::printf("alarm-host: same-alarm set/cancel handoff %s (set=%d cancel=%d hits=%d)\n",
+                ok ? "PASS" : "FAIL", int(set_done.load()), int(cancel_done.load()), g_handoff_hits.load());
+    return ok;
+}
+
+static std::atomic<int> g_late_periodic_hits{0};
+static void handler_late_periodic(OSAlarm*, OSContext*) { g_late_periodic_hits++; }
+static std::atomic<int> g_one_shot_hits{0};
+static void handler_one_shot(OSAlarm*, OSContext*) { g_one_shot_hits++; }
+static bool periodic_leak_test() {
+    g_late_periodic_hits = 0;
+    g_one_shot_hits = 0;
+    const int baseline = smg_wiiu_alarm_live_instances();
+    for (int n = 0; n < 50; ++n) {
+        {
+            std::lock_guard<std::mutex> l(g_hold_m);
+            g_hold = true;
+            g_held = false;
+            g_release = false;
+        }
+        smg_wiiu_OSSetPeriodicAlarm(&g_alarms[0], 0, OSTime(kTimerHz * 0.001), handler_late_periodic);
+        {
+            std::unique_lock<std::mutex> l(g_hold_m);
+            if (!g_hold_cv.wait_for(l, std::chrono::seconds(2), [] { return g_held; }))
+                return false;
+        }
+        smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+        {
+            std::lock_guard<std::mutex> l(g_hold_m);
+            g_release = true;
+            g_hold_cv.notify_all();
+        }
+        for (int i = 0; i < 100 && smg_wiiu_alarm_live_instances() != baseline; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (smg_wiiu_alarm_live_instances() != baseline)
+            return false;
+    }
+    smg_wiiu_OSSetAlarm(&g_alarms[0], OSTime(kTimerHz * 0.001), handler_one_shot);
+    for (int i = 0; i < 200 && g_one_shot_hits.load() == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    for (int i = 0; i < 100 && smg_wiiu_alarm_live_instances() != baseline; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::printf("alarm-host: periodic late-callback instances baseline=%d live=%d hits=%d; one-shot live=%d hits=%d\n",
+                baseline, smg_wiiu_alarm_live_instances(), g_late_periodic_hits.load(),
+                smg_wiiu_alarm_live_instances(), g_one_shot_hits.load());
+    return smg_wiiu_alarm_live_instances() == baseline && g_late_periodic_hits.load() == 0 &&
+           g_one_shot_hits.load() == 1;
 }
 static bool wait_self(int want) {
     for (int i = 0; i < 200 && g_self_done.load() < want; ++i)
@@ -378,6 +533,39 @@ int main(int argc, char** argv) {
 
     if (mode == "timing")
         goto timing;
+    if (mode == "cross" || mode == "all") {
+        if (!cross_cancel_test()) {
+            std::printf("alarm-host: FAIL: cross-alarm cancellation deadlocked\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        if (mode == "cross") {
+            for (auto& t : g_threads) t.join();
+            return 0;
+        }
+    }
+    if (mode == "leak" || mode == "all") {
+        if (!periodic_leak_test()) {
+            std::printf("alarm-host: FAIL: periodic late callback leaked an instance or ran\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        if (mode == "leak") {
+            for (auto& t : g_threads) t.join();
+            return 0;
+        }
+    }
+    if (mode == "handoff" || mode == "all") {
+        if (!handoff_test()) {
+            std::printf("alarm-host: FAIL: same-alarm native arm/cancel handoff raced\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        if (mode == "handoff") {
+            for (auto& t : g_threads) t.join();
+            return 0;
+        }
+    }
     if (mode == "self" || mode == "all") {
         if (!self_test()) {
             std::printf("alarm-host: FAIL: a handler cancelling/re-arming its own alarm deadlocked\n");
@@ -446,7 +634,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=ROOT / "games/smg/platform/wiiu/alarm.cpp")
     parser.add_argument("--os-core", type=Path, default=ROOT / "platform/wiiu/os_core.cpp")
-    parser.add_argument("--mode", choices=("all", "self", "wrap", "stale", "race", "timing"), default="all")
+    parser.add_argument("--mode", choices=("all", "self", "wrap", "stale", "race", "cross", "leak", "handoff", "timing"), default="all")
     parser.add_argument("--expect-bus-clock", type=int,
                         help="run the timing test with this __OSBusClock (red: 162000000)")
     args = parser.parse_args()
@@ -490,7 +678,7 @@ def main() -> int:
             encoding="utf-8")
         (stub / "port/port.h").write_text("#pragma once\nextern \"C\" void port_log(const char*, ...);\n",
                                           encoding="utf-8")
-        defs = ["-DTARGET_WIIU=1", "-D__WIIU__=1",
+        defs = ["-DTARGET_WIIU=1", "-D__WIIU__=1", "-DSMG_ALARM_HOST_TEST=1",
                 "-DOSCreateAlarm=smg_wiiu_OSCreateAlarm", "-DOSSetAlarm=smg_wiiu_OSSetAlarm",
                 "-DOSSetPeriodicAlarm=smg_wiiu_OSSetPeriodicAlarm", "-DOSCancelAlarm=smg_wiiu_OSCancelAlarm"]
         inc = ["-I", str(stub)]
@@ -513,6 +701,9 @@ def main() -> int:
            "self": "alarm: PASS: a handler can cancel or re-arm its own alarm (no self-wait)",
            "wrap": "alarm: PASS: a parked callback cannot run a handler after identity wraparound",
            "stale": "alarm: PASS: a dequeued callback cannot run a handler after cancel or slot reuse",
+           "cross": "alarm: PASS: cross-alarm cancellation does not deadlock",
+           "leak": "alarm: PASS: periodic late callbacks release their instances",
+           "handoff": "alarm: PASS: same-alarm native arm/cancel is serialized",
            "timing": "alarm: PASS: coreinit-consistent ticks"}[args.mode])
     return 0
 
