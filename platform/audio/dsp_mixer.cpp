@@ -140,7 +140,8 @@ int bus_index(uint16_t addr)
 // setFXLine uses for the FX returns, names buses 3-6 eight words in: 0x0DC8,
 // 0x0E28, 0x0E88, 0x0EE8 (Sunshine's: 0x0DC0, 0x0E20, 0x0E80, 0x0EE0; the
 // voice sends' connect_table is unchanged). The return is mixed into that bus
-// (assumed: the 8-word offset, likely an 8-sample delay, is not modelled).
+// (unverified: the 8-word history prefix may represent an 8-sample delay, and
+// neither reading is modelled).
 int fx_return_bus(uint16_t addr)
 {
 	const int b = bus_index(addr);

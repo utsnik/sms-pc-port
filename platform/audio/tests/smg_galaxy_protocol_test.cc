@@ -275,6 +275,7 @@ void release_subframe()
 
 void sync_frame(uint16_t level)
 {
+	// Galaxy sends master level 0x4000 (dspproc.cpp:35); callers use 0x8000 here.
 	// DsyncFrame2ch: five words, the last two zero.
 	uint32_t w[5] = { 0x82000000u | 7u << 16 | level, addr32(g_dac), addr32(g_dac + 560), 0, 0 };
 	send(w, 5);

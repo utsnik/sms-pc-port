@@ -31,10 +31,6 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--require-no-nested-boundary", action="store_true")
-    parser.add_argument("--require-stub-skip-decode", action="store_true",
-                        help="without a renderer, gx::decodeVertices must skip the vertex decode")
-    parser.add_argument("--require-gx-window", action="store_true",
-                        help="main must set the GX memory window at address 0 (as Sunshine's runtime does)")
     parser.add_argument("--require-paced-retrace", action="store_true",
                         help="sms_wiiu_vsync_fields must pace (OSSleepTicks) and never freeze the retrace count")
     args = parser.parse_args()
@@ -47,31 +43,6 @@ def main() -> int:
             check=True, capture_output=True, text=True).stdout
 
     text = tool(OBJDUMP, "-d")
-    if args.require_stub_skip_decode:
-        # Decoding every FileSelect draw into the stub's sink cost minutes per
-        # frame in Cemu's interpreter; the decoder must ask rendererReady().
-        # GCC splits the check from the decode (.part clones), so accept any
-        # function that asks rendererReady() and calls the decoder or is it.
-        found = False
-        for m in re.finditer(r"^[0-9a-f]+ <([^>]+)>:\n", text, re.M):
-            body = text[m.start():text.find("\n\n", m.start())]
-            if "<_ZN2gx13rendererReadyEv>" in body and "14decodeVertices" in body:
-                found = True
-                break
-        if not found:
-            print("frame-pump: FAIL: gx::decodeVertices decodes without a renderer")
-            return 1
-    if args.require_gx_window:
-        # The default 0x80000000 window (Wii MEM1) resolved every indexed
-        # vertex array to a wrong address (gx::readVec fault in FileSelect).
-        def body_of(name: str) -> str:
-            start = text.find(f"<{name}>:\n")
-            return text[start:text.find("\n\n", start)] if start >= 0 else ""
-        init = body_of("smg_wiiu_gx_link_stub_init")
-        if "<smg_wiiu_gx_link_stub_init>" not in body_of("main") or \
-                "<GXPC_SetMemoryWindow>" not in init or not re.search(r"\bli\s+r3,0\b", init):
-            print("frame-pump: FAIL: main does not set the GX window at address 0")
-            return 1
     if args.require_paced_retrace:
         # Without GX2 the retrace count must still advance at 60 Hz: a vsync
         # source returning 0 froze VIGetRetraceCount and waitForTick spun.

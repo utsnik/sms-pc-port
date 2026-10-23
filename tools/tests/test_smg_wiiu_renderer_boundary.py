@@ -4,6 +4,7 @@
 from pathlib import Path
 import argparse
 import re
+import subprocess
 import sys
 
 
@@ -17,6 +18,8 @@ def main() -> int:
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--runtime", type=Path, required=True)
     parser.add_argument("--stub", type=Path, required=True)
+    parser.add_argument("--elf", type=Path)
+    parser.add_argument("--require-linked-renderer", action="store_true")
     parser.add_argument("--require-base-renderer", action="store_true")
     parser.add_argument("--require-one-gx-owner", action="store_true")
     parser.add_argument("--require-no-stage4-effects", action="store_true")
@@ -50,7 +53,7 @@ def main() -> int:
         errors.append("SMG still selects gx_link_stub.cpp")
 
     if re.search(r"void\s+sms_wiiu_gfx_frame\s*\([^)]*\)\s*\{\s*\}", runtime):
-        errors.append("Galaxy runtime still defines no-op sms_wiiu_gfx_init()/sms_wiiu_gfx_frame()")
+        errors.append("Galaxy runtime still defines a no-op sms_wiiu_gfx_frame()")
     if re.search(r"int\s+sms_wiiu_gfx_is_initialized\s*\([^)]*\)\s*\{\s*return\s+0\s*;\s*\}", runtime):
         errors.append("Galaxy runtime still owns no-op graphics initialization")
     if "smg_wiiu_gx_link_stub_init" in runtime or "smg_wiiu_gx_link_stub_init" in smg_branch:
@@ -78,6 +81,27 @@ def main() -> int:
             errors.append("SMG selects Stage 4-only effect units: " + ", ".join(stage4_units))
         else:
             print("renderer-boundary: PASS: Stage 4-only indirect/bloom/EFB/peek features remain out of scope")
+
+    if args.require_linked_renderer:
+        if not args.elf or not args.elf.is_file():
+            errors.append("linked renderer check requires --elf smg.elf")
+        else:
+            nm = "/opt/devkitpro/devkitPPC/bin/powerpc-eabi-nm"
+            result = subprocess.run(
+                ["docker", "run", "--rm", "--network", "none", "-v",
+                 f"{args.elf.parent.resolve()}:/e:ro", "soh-wiiu-builder:latest", nm,
+                 "-C", str(Path("/e") / args.elf.name)],
+                check=False, capture_output=True, text=True)
+            if result.returncode:
+                errors.append("builder nm could not inspect smg.elf")
+            else:
+                symbols = result.stdout
+                if "rendererReady" not in symbols:
+                    errors.append("linked ELF lacks rendererReady")
+                if not re.search(r"\bGX2Init(?:\s|$)", symbols):
+                    errors.append("linked ELF lacks GX2Init import")
+                if not errors:
+                    print("renderer-boundary: PASS: linked ELF retains rendererReady and GX2Init")
 
     if errors:
         for error in errors:

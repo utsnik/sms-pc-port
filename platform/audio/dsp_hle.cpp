@@ -54,6 +54,9 @@ extern "C" void port_host_free(void*);
 #include <vector>
 
 extern "C" u8* port_aram_ptr(u32 addr);
+#if defined(PORT_GAME_SMG)
+extern "C" const u8* port_varam_ptr(u32 addr);
+#endif
 extern "C" void __DSPHandler(int interrupt, void* context); // JSystem/osdsp_task.c
 
 namespace {
@@ -108,7 +111,6 @@ Hle g;
  * MEM2 arena low mark that HeapMemoryWatcher::createRootHeap reserves and
  * RVL_SDK aralt's ARInit maps ARAM offset 0 to. port_varam_ptr resolves that
  * main-memory address (NULL outside the window); before 0x8E nothing resolves. */
-extern "C" const u8* port_varam_ptr(u32 addr);
 u32 s_varam;
 const uint8_t* aram_lookup(uint32_t a) { return s_varam ? port_varam_ptr(s_varam + a) : NULL; }
 #else

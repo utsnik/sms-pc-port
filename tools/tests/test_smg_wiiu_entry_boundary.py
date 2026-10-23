@@ -52,7 +52,9 @@ extern "C" OSTime OSGetSystemTime(void);
 
 HOST_FASTMUTEX = r"""
 #pragma once
-typedef struct OSFastMutex { int locked; } OSFastMutex;
+#include <mutex>
+#include <new>
+typedef struct OSFastMutex { std::mutex mutex; } OSFastMutex;
 extern "C" void OSFastMutex_Init(OSFastMutex*, const char*);
 extern "C" void OSFastMutex_Lock(OSFastMutex*);
 extern "C" void OSFastMutex_Unlock(OSFastMutex*);
@@ -91,17 +93,20 @@ HOST_HARNESS = r"""
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 extern "C" void WHBLogPrintf(const char*, ...) {}
 extern "C" void WHBProcStopRunning(void) {}
 extern "C" OSTime OSGetTime(void) { return 0; }
 extern "C" OSTime OSGetSystemTime(void) { return 0; }
 extern "C" void OSSleepTicks(OSTime) {}
-extern "C" void OSFastMutex_Init(OSFastMutex* m, const char*) { m->locked = 0; }
-extern "C" void OSFastMutex_Lock(OSFastMutex* m) { m->locked = 1; }
-extern "C" void OSFastMutex_Unlock(OSFastMutex* m) { m->locked = 0; }
+extern "C" void OSFastMutex_Init(OSFastMutex* m, const char*) { new (m) OSFastMutex; }
+extern "C" void OSFastMutex_Lock(OSFastMutex* m) { m->mutex.lock(); }
+extern "C" void OSFastMutex_Unlock(OSFastMutex* m) { m->mutex.unlock(); }
 extern "C" void PSMTXMultVecSR(const Mtx, const Vec* source, Vec* target) {
     *target = *source;
 }
@@ -135,6 +140,8 @@ int main(int argc, char** argv) {
     const std::filesystem::path log = app / "stage2.log";
     const std::filesystem::path marker = app / "stage2log";
 
+    smg_wiiu_runtime_init();
+
     port_log("without marker");
     check(!std::filesystem::exists(log), "stage2.log must be marker-gated");
 
@@ -155,7 +162,36 @@ int main(int argc, char** argv) {
         check(content == "first line\nsecond line\n", "append writes must be complete");
     }
     check(!has_open_log_fd(log), "stage2.log must close after every write");
-    std::puts("entry-host: PASS: marker gate, flush, append, and close");
+
+    constexpr int kWriters = 8;
+    constexpr int kWritesPerThread = 32;
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < kWriters; ++writer) {
+        writers.emplace_back([writer]() {
+            for (int sequence = 0; sequence < kWritesPerThread; ++sequence)
+                port_log("thread-%d-write-%d", writer, sequence);
+        });
+    }
+    for (std::thread& writer : writers)
+        writer.join();
+
+    {
+        std::ifstream input(log);
+        std::string content((std::istreambuf_iterator<char>(input)), {});
+        content.erase(0, std::string("first line\nsecond line\n").size());
+        size_t lines = 0;
+        for (size_t start = 0; start < content.size();) {
+            const size_t end = content.find('\n', start);
+            check(end != std::string::npos, "threaded writes must end in newline");
+            check(content.substr(start, end - start).find("thread-") == 0,
+                  "threaded writes must not interleave");
+            start = end + 1;
+            ++lines;
+        }
+        check(lines == kWriters * kWritesPerThread, "all threaded writes must be present");
+    }
+    check(!has_open_log_fd(log), "stage2.log must close after threaded writes");
+    std::puts("entry-host: PASS: marker gate, flush, append, threaded writes, and close");
     return 0;
 }
 """
