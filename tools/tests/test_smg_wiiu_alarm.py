@@ -6,6 +6,11 @@ each armed coreinit alarm fires from its own thread, and a cancelled one may
 still deliver one late callback (the dispatch window between coreinit taking
 the alarm off its queue and the callback reading the alarm's user data).
 
+self:   handlers that cancel / re-arm (periodic -> one-shot) their own alarm
+        must return (cancel used to wait for the in-flight handler itself).
+wrap:   deterministic forced wraparound: a callback parked at the adapter's
+        lock while 256 armings cycle all records and identities, the last
+        landing on its old record; it must not run a handler.
 stale:  deterministic: alarm 0's callback is dequeued and held in its
         dispatch window; alarm 0 is cancelled and alarm 1 armed with a 1 s
         deadline; the held callback then proceeds. No handler may run (it
@@ -81,6 +86,14 @@ static std::mutex g_hold_m;
 static std::condition_variable g_hold_cv;
 static bool g_hold = false, g_held = false, g_release = false;
 
+// wrap test: the next callback to take the adapter's spinlock is parked just
+// before it gets it (it has read whatever it reads without the lock).
+static thread_local bool t_is_cb = false, t_held_once = false;
+static std::atomic<bool> g_lockhold{false};
+static std::mutex g_lh_m;
+static std::condition_variable g_lh_cv;
+static bool g_lh_parked = false, g_lh_release = false;
+
 static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s, double period_s, WutCb cb) {
     std::mt19937 rng(reinterpret_cast<uintptr_t>(alarm) ^ (uintptr_t)period_s);
     std::this_thread::sleep_for(std::chrono::duration<double>(first_s));
@@ -103,7 +116,10 @@ static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s
         void* user;
         { std::lock_guard<std::mutex> l(g_fake); user = g_user[alarm]; }
         (void)user;
+        t_is_cb = true;
+        t_held_once = false;
         cb(alarm, nullptr);
+        t_is_cb = false;
         if (was_cancelled || period_s <= 0)
             return;                                        // at most one late call
         std::this_thread::sleep_for(std::chrono::duration<double>(period_s));
@@ -133,11 +149,32 @@ void fake_setud(void* a, void* u) { std::lock_guard<std::mutex> l(g_fake); g_use
 void* fake_getud(void* a) __asm__("OSGetAlarmUserData");
 void* fake_getud(void* a) { std::lock_guard<std::mutex> l(g_fake); return g_user[a]; }
 int fake_spin_acq(void*) __asm__("OSUninterruptibleSpinLock_Acquire");
-int fake_spin_acq(void*) { g_spin.lock(); return 1; }
+int fake_spin_acq(void*) {
+    if (t_is_cb && !t_held_once) {
+        t_held_once = true;
+        bool expected = true;
+        if (g_lockhold.compare_exchange_strong(expected, false)) {
+            std::unique_lock<std::mutex> l(g_lh_m);
+            g_lh_parked = true;
+            g_lh_cv.notify_all();
+            g_lh_cv.wait(l, [] { return g_lh_release; });
+        }
+    }
+    g_spin.lock();
+    return 1;
+}
 int fake_spin_rel(void*) __asm__("OSUninterruptibleSpinLock_Release");
 int fake_spin_rel(void*) { g_spin.unlock(); return 1; }
 void fake_yield(void) __asm__("OSYieldThread");
 void fake_yield(void) { std::this_thread::yield(); }
+OSTime fake_time(void) __asm__("OSGetTime");
+OSTime fake_time(void) {
+    using namespace std::chrono;
+    const auto ns = duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+    return OSTime((long double)ns * kTimerHz / 1e9L);
+}
+void* fake_self(void) __asm__("OSGetCurrentThread");
+void* fake_self(void) { static thread_local char tag; return &tag; }
 }
 
 // ---- race test --------------------------------------------------------------
@@ -183,6 +220,73 @@ static void handler_b(OSAlarm* a, OSContext*) {
 // callback is dequeued and held; alarm 0 is cancelled and alarm 1 armed with
 // a 1 s deadline (a slot reuse candidate); then the held callback proceeds.
 // Neither handler may run: alarm 0 was cancelled, alarm 1 is not due.
+// Handlers that cancel or re-arm their own alarm (must not wait for themselves).
+static std::atomic<int> g_self_done{0};
+static void handler_noop(OSAlarm*, OSContext*) {}
+static void handler_self_cancel(OSAlarm* a, OSContext*) {
+    smg_wiiu_OSCancelAlarm(a);
+    g_self_done++;
+}
+static void handler_self_rearm(OSAlarm* a, OSContext*) {
+    smg_wiiu_OSSetAlarm(a, OSTime(kTimerHz * 10.0), handler_noop);
+    g_self_done++;
+}
+static bool wait_self(int want) {
+    for (int i = 0; i < 200 && g_self_done.load() < want; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return g_self_done.load() >= want;
+}
+static bool self_test() {
+    smg_wiiu_OSCreateAlarm(&g_alarms[2]);
+    smg_wiiu_OSSetAlarm(&g_alarms[2], OSTime(kTimerHz * 0.001), handler_self_cancel);
+    const bool cancel_ok = wait_self(1);
+    std::printf("alarm-host: self-cancel from its handler %s\n", cancel_ok ? "returned" : "DEADLOCKED");
+    if (!cancel_ok)
+        return false;
+    smg_wiiu_OSCreateAlarm(&g_alarms[3]);
+    smg_wiiu_OSSetPeriodicAlarm(&g_alarms[3], 0, OSTime(kTimerHz * 0.001), handler_self_rearm);
+    const bool rearm_ok = wait_self(2);
+    std::printf("alarm-host: self-rearm from its handler %s\n", rearm_ok ? "returned" : "DEADLOCKED");
+    if (!rearm_ok)
+        return false;
+    smg_wiiu_OSCancelAlarm(&g_alarms[3]);
+    smg_wiiu_OSCancelAlarm(&g_alarms[2]);
+    return true;
+}
+
+// Forced wraparound: alarm 0's callback is parked at the adapter's lock (after
+// any lock-free read); alarm 0 is cancelled; 255 arm/cancel cycles on alarm 1
+// cycle every side-table record and identity ring the adapter has (32 records,
+// 256 tickets in a7101af); a 256th arming of alarm 1 with a 1 s deadline lands
+// on alarm 0's old record and ticket. The parked callback then proceeds: no
+// handler may run (alarm 0 is cancelled and alarm 1 is not due).
+static bool wrap_test() {
+    for (auto& r : g_hits) r[0] = r[1] = 0;
+    g_lockhold = true;
+    smg_wiiu_OSCreateAlarm(&g_alarms[0]);
+    smg_wiiu_OSSetAlarm(&g_alarms[0], OSTime(kTimerHz * 0.001), handler_a);
+    {
+        std::unique_lock<std::mutex> l(g_lh_m);
+        if (!g_lh_cv.wait_for(l, std::chrono::seconds(2), [] { return g_lh_parked; })) {
+            std::printf("alarm-host: wrap: callback never reached the adapter lock\n");
+            return false;
+        }
+    }
+    smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+    smg_wiiu_OSCreateAlarm(&g_alarms[1]);
+    for (int n = 0; n < 255; ++n) {
+        smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 1.0), handler_b);
+        smg_wiiu_OSCancelAlarm(&g_alarms[1]);
+    }
+    smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 1.0), handler_b);
+    { std::lock_guard<std::mutex> l(g_lh_m); g_lh_release = true; g_lh_cv.notify_all(); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    smg_wiiu_OSCancelAlarm(&g_alarms[1]);
+    const int a0 = g_hits[0][0] + g_hits[0][1], b1 = g_hits[1][0] + g_hits[1][1];
+    std::printf("alarm-host: parked callback after 256 armings: alarm0 calls=%d alarm1 calls=%d\n", a0, b1);
+    return a0 == 0 && b1 == 0;
+}
+
 static bool stale_test() {
     for (auto& r : g_hits) r[0] = r[1] = 0;
     { std::lock_guard<std::mutex> l(g_hold_m); g_hold = true; g_held = false; g_release = false; }
@@ -258,6 +362,26 @@ int main(int argc, char** argv) {
 
     if (mode == "timing")
         goto timing;
+    if (mode == "self" || mode == "all") {
+        if (!self_test()) {
+            std::printf("alarm-host: FAIL: a handler cancelling/re-arming its own alarm deadlocked\n");
+            std::fflush(stdout);
+            std::_Exit(1);
+        }
+        std::printf("alarm-host: self PASS\n");
+        if (mode == "self") {
+            std::fflush(stdout);
+            std::_Exit(0);
+        }
+    }
+    if (mode == "wrap") {
+        g_late = false;
+        const bool ok = wrap_test();
+        std::printf(ok ? "alarm-host: wrap PASS\n"
+                       : "alarm-host: FAIL: a parked callback ran a handler after identity wraparound\n");
+        std::fflush(stdout);
+        std::_Exit(ok ? 0 : 1);
+    }
     if (mode == "stale" || mode == "all") {
         if (!stale_test()) {
             std::printf("alarm-host: FAIL: a dequeued callback ran a handler after cancel/reuse\n");
@@ -308,14 +432,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, default=ROOT / "games/smg/platform/wiiu/alarm.cpp")
     parser.add_argument("--os-core", type=Path, default=ROOT / "platform/wiiu/os_core.cpp")
-    parser.add_argument("--mode", choices=("all", "stale", "race", "timing"), default="all")
+    parser.add_argument("--mode", choices=("all", "self", "wrap", "stale", "race", "timing"), default="all")
     parser.add_argument("--expect-bus-clock", type=int,
                         help="run the timing test with this __OSBusClock (red: 162000000)")
     args = parser.parse_args()
 
     core = args.os_core.read_text(encoding="utf-8")
     m = re.search(r"#if defined\(PORT_GAME_SMG\)[^#]*__OSBusClock\s*=\s*wut_OSGetSystemInfo\(\)->busClockSpeed;", core)
-    if not m and args.expect_bus_clock is None and args.mode not in ("race", "stale"):
+    if not m and args.expect_bus_clock is None and args.mode not in ("race", "stale", "self", "wrap"):
         print("alarm: FAIL: os_core.cpp does not set Galaxy's __OSBusClock from coreinit's busClockSpeed")
         return 1
 
@@ -362,14 +486,18 @@ def main() -> int:
         if build.returncode:
             print("alarm: FAIL: host build\n" + build.stderr[-1500:])
             return 1
-        cmd = [str(exe), args.mode] + ([str(args.expect_bus_clock)] if args.expect_bus_clock else [])
-        run = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        print((run.stdout + run.stderr).strip())
-        if run.returncode:
-            print("alarm: FAIL")
-            return 1
-    print({"all": "alarm: PASS: ticketed, quarantined side table (no stale or reused-record callbacks) and coreinit-consistent ticks",
-           "race": "alarm: PASS: ticketed side table (no reused-record callbacks)",
+        clock = [str(args.expect_bus_clock)] if args.expect_bus_clock else []
+        # wrap runs in a fresh process: it counts the adapter's armings from zero.
+        for mode in (("wrap", "all") if args.mode == "all" else (args.mode,)):
+            run = subprocess.run([str(exe), mode] + clock, capture_output=True, text=True, timeout=120)
+            print((run.stdout + run.stderr).strip())
+            if run.returncode:
+                print("alarm: FAIL")
+                return 1
+    print({"all": "alarm: PASS: due-checked side table (no stale, wrapped or self-deadlocking callbacks) and coreinit-consistent ticks",
+           "race": "alarm: PASS: no handler call for an alarm not armed with it (threaded stress)",
+           "self": "alarm: PASS: a handler can cancel or re-arm its own alarm (no self-wait)",
+           "wrap": "alarm: PASS: a parked callback cannot run a handler after identity wraparound",
            "stale": "alarm: PASS: a dequeued callback cannot run a handler after cancel or slot reuse",
            "timing": "alarm: PASS: coreinit-consistent ticks"}[args.mode])
     return 0

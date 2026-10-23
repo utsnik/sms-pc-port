@@ -14,20 +14,23 @@
  * two handlers ignore it).
  *
  * Concurrency: callbacks run on coreinit's alarm context while game threads
- * create, arm and cancel, all under one uninterruptible spinlock.
- *  - Every arming takes a fresh record and a fresh ticket (the coreinit
- *    alarm's user data). A callback runs the handler only if its ticket is
- *    still its record's current one, and pins the record (in-flight count)
- *    while the handler runs.
- *  - Re-arming or cancelling retires the record: its ticket is cleared, the
- *    coreinit alarm cancelled, in-flight handlers are waited for, and the
- *    record joins the free pool stamped with a release sequence.
- *  - A callback coreinit has already dequeued but that has not yet read its
- *    user data is beyond cancel's reach. Free records are therefore reused
- *    least recently released first: with kMaxAlarms records and two or three
- *    live alarms, a record is quarantined for ~30 releases (about half a
- *    second of MainLoopFramework's per-frame alarm) before its coreinit alarm
- *    is re-created, so such a callback finds no current ticket and returns.
+ * create, arm and cancel; all adapter state is under one uninterruptible
+ * spinlock, and a callback reads nothing before taking it.
+ *  - A coreinit callback is only a wake-up. Its record is the coreinit alarm
+ *    it was called with (records are static and never change identity), and
+ *    under the lock it runs the game handler only if that record is armed
+ *    and its arming is due: OSGetTime() >= due, where due is computed from
+ *    the same coreinit timebase when the alarm is armed. A one-shot then
+ *    disarms; a periodic alarm advances due to its next period. So a late
+ *    callback left over from an earlier arming, however old and whatever
+ *    has been reused since, can neither run a handler early nor twice: no
+ *    ticket or generation has to survive a wraparound.
+ *  - Every arming takes a free record (least recently released first);
+ *    re-arming or cancelling retires the old one: disarm, OSCancelAlarm,
+ *    then wait for its handlers still running, except one running on the
+ *    calling thread (a handler cancelling or re-arming its own alarm), which
+ *    would otherwise wait for itself. A record with a handler in flight is
+ *    never reused.
  */
 #include "port/port.h"
 
@@ -52,37 +55,31 @@ void wut_OSCreateAlarm(WutAlarm*) __asm__("OSCreateAlarm");
 BOOL wut_OSSetAlarm(WutAlarm*, OSTime, WutAlarmCallback) __asm__("OSSetAlarm");
 BOOL wut_OSSetPeriodicAlarm(WutAlarm*, OSTime, OSTime, WutAlarmCallback) __asm__("OSSetPeriodicAlarm");
 BOOL wut_OSCancelAlarm(WutAlarm*) __asm__("OSCancelAlarm");
-void wut_OSSetAlarmUserData(WutAlarm*, void*) __asm__("OSSetAlarmUserData");
-void* wut_OSGetAlarmUserData(WutAlarm*) __asm__("OSGetAlarmUserData");
+OSTime wut_OSGetTime(void) __asm__("OSGetTime");
+void* wut_OSGetCurrentThread(void) __asm__("OSGetCurrentThread");
 BOOL wut_spin_acquire(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Acquire");
 BOOL wut_spin_release(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Release");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
 }
 
 const unsigned kMaxAlarms = 32;
-const unsigned kMaxTickets = 256;
-
-struct AlarmRecord;
-
-struct Ticket {
-    AlarmRecord* record;
-    OSAlarm* game;
-    OSAlarmHandler handler;
-};
+const unsigned kMaxRunners = 4;
 
 struct AlarmRecord {
-    WutAlarm wut;
+    WutAlarm wut;                 // first: a callback's alarm is its record
     OSAlarm* game;
-    Ticket* current;      // the live arming; nullptr when unarmed
-    uint32_t in_flight;   // handlers running for this record
-    uint32_t released;    // release sequence (0 = never used)
-    bool active;          // owned by a game alarm
+    OSAlarmHandler handler;
+    OSTime due;                   // the arming's next due time (coreinit ticks)
+    OSTime start, period;         // period 0 = one-shot
+    void* runners[kMaxRunners];   // threads running this record's handler
+    uint32_t in_flight;           // handlers running for this record
+    uint32_t released;            // release sequence (0 = never used)
+    bool armed;                   // an arming is live
+    bool active;                  // owned by a game alarm
 };
 
 WutSpinLock s_lock;
 AlarmRecord s_alarms[kMaxAlarms];
-Ticket s_tickets[kMaxTickets];
-unsigned s_next_ticket;
 uint32_t s_release_seq;
 
 struct Lock {
@@ -114,65 +111,73 @@ AlarmRecord* claim_locked(OSAlarm* game)
     if (!best)
         return nullptr;
     best->game = game;
-    best->current = nullptr;
+    best->armed = false;
     best->active = true;
     wut_OSCreateAlarm(&best->wut);
     return best;
 }
 
-/* Caller holds s_lock. Tickets are a ring: one is reused only after
- * kMaxTickets later armings, and a stale callback still finds it is not its
- * record's current ticket. */
-Ticket* new_ticket_locked(AlarmRecord* r, OSAlarm* game, OSAlarmHandler handler)
+/* Caller holds s_lock: handlers of r running on the calling thread. */
+uint32_t self_runs_locked(const AlarmRecord* r, void* self)
 {
-    Ticket* t = &s_tickets[s_next_ticket++ % kMaxTickets];
-    t->record = r;
-    t->game = game;
-    t->handler = handler;
-    r->current = t;
-    return t;
+    uint32_t n = 0;
+    for (unsigned i = 0; i < kMaxRunners; ++i)
+        if (r->runners[i] == self)
+            ++n;
+    return n;
 }
 
-void trampoline(WutAlarm*, void* /*context*/);
-
-void dispatch(Ticket* t)
+void trampoline(WutAlarm* wut, void* /*context*/)
 {
-    OSAlarmHandler handler = nullptr;
-    OSAlarm* game = nullptr;
-    AlarmRecord* r = nullptr;
+    AlarmRecord* r = reinterpret_cast<AlarmRecord*>(wut);
+    if (r < s_alarms || r >= s_alarms + kMaxAlarms)
+        return;
+    void* self = wut_OSGetCurrentThread();
+    OSAlarmHandler handler;
+    OSAlarm* game;
+    unsigned slot = kMaxRunners;
     {
         Lock lock;
-        if (!t || !t->record || t->record->current != t || !t->record->active)
+        if (!r->active || !r->armed || !r->handler)
             return;
-        r = t->record;
-        handler = t->handler;
-        game = t->game;
+        const OSTime now = wut_OSGetTime();
+        if (now < r->due)
+            return;                       // not this arming's fire: stale
+        if (r->period > 0)
+            r->due = r->start + ((now - r->start) / r->period + 1) * r->period;
+        else
+            r->armed = false;             // a one-shot fires once
+        handler = r->handler;
+        game = r->game;
         ++r->in_flight;
+        for (unsigned i = 0; i < kMaxRunners; ++i)
+            if (!r->runners[i]) {
+                r->runners[i] = self;
+                slot = i;
+                break;
+            }
     }
-    if (handler)
-        handler(game, nullptr);
+    handler(game, nullptr);
     Lock lock;
+    if (slot < kMaxRunners)
+        r->runners[slot] = nullptr;
     --r->in_flight;
 }
 
-void trampoline(WutAlarm* wut, void*)
-{
-    dispatch(static_cast<Ticket*>(wut_OSGetAlarmUserData(wut)));
-}
-
-/* Retire the record's ticket, stop the coreinit alarm, and wait for handlers
- * already running. Not for use from inside the alarm's own handler. */
+/* Disarm, stop the coreinit alarm, and wait for handlers still running on
+ * other threads (one running on this thread is the caller itself). */
 void disarm(AlarmRecord* r)
 {
+    void* self = wut_OSGetCurrentThread();
     {
         Lock lock;
-        r->current = nullptr;
+        r->armed = false;
     }
     wut_OSCancelAlarm(&r->wut);
     for (;;) {
         {
             Lock lock;
-            if (!r->in_flight)
+            if (r->in_flight <= self_runs_locked(r, self))
                 return;
         }
         wut_OSYieldThread();
@@ -193,10 +198,15 @@ void retire(OSAlarm* game)
     Lock lock;
     r->active = false;
     r->game = nullptr;
+    r->handler = nullptr;
     r->released = ++s_release_seq;
 }
 
-AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, Ticket** ticket)
+/* Claim a fresh record for this arming; due/period are set before the
+ * coreinit alarm is armed, from an earlier OSGetTime than coreinit's own, so
+ * coreinit's fire time is never before due. */
+AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, OSTime first, OSTime start,
+                        OSTime period)
 {
     retire(alarm);
     Lock lock;
@@ -205,8 +215,15 @@ AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, Ticket** ticket)
         port_log("[smg-alarm] alarm side table exhausted");
         return nullptr;
     }
-    *ticket = new_ticket_locked(r, alarm, handler);
-    wut_OSSetAlarmUserData(&r->wut, *ticket);
+    const OSTime now = wut_OSGetTime();
+    r->handler = handler;
+    r->period = period;
+    r->start = start;
+    if (period > 0)
+        r->due = start > now ? start : start + ((now - start) / period + 1) * period;
+    else
+        r->due = now + first;
+    r->armed = true;
     return r;
 }
 
@@ -226,8 +243,7 @@ void smg_wiiu_OSSetAlarm(OSAlarm* alarm, OSTime tick, OSAlarmHandler handler)
 {
     if (!alarm)
         return;
-    Ticket* ticket = nullptr;
-    AlarmRecord* r = arm_record(alarm, handler, &ticket);
+    AlarmRecord* r = arm_record(alarm, handler, tick, 0, 0);
     if (!r)
         return;
     alarm->handler = handler;
@@ -239,8 +255,7 @@ void smg_wiiu_OSSetPeriodicAlarm(OSAlarm* alarm, OSTime start, OSTime period,
 {
     if (!alarm)
         return;
-    Ticket* ticket = nullptr;
-    AlarmRecord* r = arm_record(alarm, handler, &ticket);
+    AlarmRecord* r = arm_record(alarm, handler, 0, start, period);
     if (!r)
         return;
     alarm->handler = handler;
