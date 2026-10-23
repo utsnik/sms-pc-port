@@ -5883,8 +5883,10 @@ void peekToken(uint16_t token, uint32_t peFormat) {
     job.token = token;
     if (!gx2prod::enqueueService(tokenSnapService, &job, gx2prod::SERVICE_COUNTER_COPY_CLEAR))
         WHBLogPrintf("SMS Wii U: [peekeof] service queue rejected token %02x", (unsigned)token);
-    invalidateVertexUniforms();  // the copy clobbers what the next list inherits
-    gx2DlOpenForDraw();
+    // The copy clobbers what the next list inherits.  That list opens with its
+    // first draw: 0x7C and 0x7D often come back to back, and a list opened here
+    // would end empty (0 bytes, rejected and logged as a failed list).
+    invalidateVertexUniforms();
 }
 
 static void eofReport() {
