@@ -107,6 +107,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/dol_data.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/alarm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gx_link_stub.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)
@@ -115,6 +116,7 @@ if(PORT_GAME STREQUAL "smg")
   # bindings out of its own translation unit.
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
     PROPERTIES COMPILE_DEFINITIONS PORT_PLATFORM_CODE=1)
   set_source_files_properties(
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S

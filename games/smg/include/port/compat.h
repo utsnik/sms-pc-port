@@ -23,6 +23,27 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <float.h>
+#if defined(__WIIU__) && !defined(PORT_PLATFORM_CODE)
+// Galaxy's wchar_t is 16 bits (-fshort-wchar); newlib's wide functions are
+// 32-bit, and <cwchar> #undefs the rename macros below. Bind the names to the
+// 16-bit implementations (games/smg/platform/wiiu/wstring.cpp) before <wchar.h>
+// declares them, so its declarations inherit the labels.
+#ifdef __cplusplus
+extern "C" {
+#endif
+size_t wcslen(const wchar_t*) __asm__("port_wcslen");
+wchar_t* wcsncpy(wchar_t*, const wchar_t*, size_t) __asm__("port_wcsncpy");
+wchar_t* wcscpy(wchar_t*, const wchar_t*) __asm__("port_wcscpy");
+int wcscmp(const wchar_t*, const wchar_t*) __asm__("port_wcscmp");
+int wcsncmp(const wchar_t*, const wchar_t*, size_t) __asm__("port_wcsncmp");
+wchar_t* wcschr(const wchar_t*, wchar_t) __asm__("port_wcschr");
+wchar_t* wcscat(wchar_t*, const wchar_t*) __asm__("port_wcscat");
+int swprintf(wchar_t*, size_t, const wchar_t*, ...) __asm__("port_swprintf");
+int vswprintf(wchar_t*, size_t, const wchar_t*, va_list) __asm__("port_vswprintf");
+#ifdef __cplusplus
+}
+#endif
+#endif
 #include <wchar.h>
 #if defined(__WIIU__) && !defined(PORT_PLATFORM_CODE)
 // libstdc++'s <cstdio> #undefs the rename macros below, so on Wii U they never

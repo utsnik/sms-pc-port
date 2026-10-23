@@ -25,6 +25,9 @@ if(PORT_GAME STREQUAL "smg")
     -w -fno-strict-aliasing -fwrapv -ffunction-sections -fdata-sections
     -fno-stack-protector -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0
     -mcpu=750 -meabi -mhard-float -Wno-narrowing
+    # CodeWarrior's wchar_t is 16 bits; Galaxy reads its UTF-16 message data
+    # through wchar_t* (games/smg/platform/wiiu/wstring.cpp).
+    -fshort-wchar
     # MSL printf semantics (games/smg/platform/wiiu/msl_printf.cpp): keep GCC
     # from folding e.g. sprintf(d, "%s", s) into strcpy behind the shim.
     -fno-builtin-sprintf -fno-builtin-snprintf -fno-builtin-vsprintf
