@@ -84,6 +84,17 @@ void set_mem2_arena_hi(void* p)
 
 } // namespace
 
+#if defined(PORT_GAME_SMG)
+namespace {
+struct WutSystemInfo {
+	uint32_t busClockSpeed;
+	uint32_t pad;
+	uint32_t coreClockSpeed;
+};
+extern "C" const WutSystemInfo* wut_OSGetSystemInfo(void) __asm__("OSGetSystemInfo");
+} // namespace
+#endif
+
 extern "C" {
 
 void port_os_init(void)
@@ -96,7 +107,15 @@ void port_os_init(void)
 	if (!sms_wiiu_mem2_base || !sms_wiiu_mem2_size)
 		return;
 #endif
+#if defined(PORT_GAME_SMG)
+	/* Galaxy's tick math (OS_TIMER_CLOCK = __OSBusClock / 4) must match the
+	 * clock its OSGetTime and alarms really run on: coreinit's timebase,
+	 * busClockSpeed / 4 (62.15625 MHz). The GameCube 162 MHz made every
+	 * alarm period and elapsed-time conversion 1.53x off. */
+	__OSBusClock = wut_OSGetSystemInfo()->busClockSpeed;
+#else
 	__OSBusClock = 162000000;
+#endif
 	__OSCoreClock = 486000000;
 	__OSPhysicalMemSize = port_mem1_size;
 	__OSSimulatedMemSize = port_mem1_size;
