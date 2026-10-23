@@ -1,4 +1,7 @@
 #include "Game/Map/FileSelector.hpp"
+#ifdef TARGET_WIIU
+#include "port/port.h"
+#endif
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/Map/FileSelectCameraController.hpp"
 #include "Game/Map/FileSelectEffect.hpp"
@@ -974,6 +977,9 @@ void FileSelector::exeTitleEnd() {
         invalidateSelectAll();
         MR::startStarPointerModeFileSelect(this);
         MR::startStageBGM("MBGM_FILE_SELECT", false);
+#ifdef TARGET_WIIU
+        port_log("[smg-milestone] file select: items shown, BGM MBGM_FILE_SELECT requested");
+#endif
     }
 
     if (mCameraController->isAtFarPoint()) {

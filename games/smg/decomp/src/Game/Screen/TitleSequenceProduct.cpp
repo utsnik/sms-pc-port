@@ -1,4 +1,7 @@
 #include "Game/Screen/TitleSequenceProduct.hpp"
+#ifdef TARGET_WIIU
+#include "port/port.h"
+#endif
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/Screen/EncouragePal60Window.hpp"
 #include "Game/System/GameDataFunction.hpp"
@@ -76,6 +79,9 @@ void TitleSequenceProduct::exeDisplayEncouragePal60Window() {
 
 void TitleSequenceProduct::exeBgmPrepare() {
     if (MR::isFirstStep(this)) {
+#ifdef TARGET_WIIU
+        port_log("[smg-milestone] title: BGM STM_TITLE requested");
+#endif
         MR::startStageBGM("STM_TITLE", true);
     }
 
@@ -115,6 +121,9 @@ void TitleSequenceProduct::exeLogoWait() {
 
 void TitleSequenceProduct::exeLogoDisplay() {
     if (MR::isFirstStep(this)) {
+#ifdef TARGET_WIIU
+        port_log("[smg-milestone] title: logo + PRESS A+B displayed");
+#endif
         mPressStartLayout->appear();
         MR::startAnim(mPressStartLayout, "Appear", 0);
     }
@@ -141,6 +150,9 @@ void TitleSequenceProduct::exeLogoDisplay() {
 
 void TitleSequenceProduct::exeDecide() {
     if (MR::isFirstStep(this)) {
+#ifdef TARGET_WIIU
+        port_log("[smg-milestone] title: A+B accepted");
+#endif
         MR::startAnim(mLogoLayout, "Decide", 0);
         MR::deleteEffectAll(mLogoLayout);
         MR::startAnim(mPressStartLayout, "End", 0);
