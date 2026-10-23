@@ -110,6 +110,24 @@ HARNESS = r'''
 
 static std::string g_root;
 
+// POSIX: realpath's resolved buffer must hold PATH_MAX bytes, and newlib's may
+// use all of it (devkitPPC PATH_MAX is 4096). Model that contract so a smaller
+// caller buffer is a stack-buffer-overflow under -fsanitize=address: a 256-byte
+// buffer smashed the NAND thread's stack on Wii U (return to address 0).
+#include <climits>
+extern "C" char* __real_realpath(const char*, char*);
+extern "C" char* __wrap_realpath(const char* path, char* resolved) {
+    if (!resolved)
+        return __real_realpath(path, nullptr);
+    static char scratch[PATH_MAX];
+    char* result = __real_realpath(path, scratch);
+    std::memset(resolved, 0, PATH_MAX);
+    if (!result)
+        return nullptr;
+    std::strcpy(resolved, scratch);
+    return resolved;
+}
+
 extern "C" const char* smg_wiiu_save_root(void) { return g_root.c_str(); }
 
 static void fail(const char* message) {
@@ -283,6 +301,7 @@ def main() -> int:
             [
                 "g++", "-std=c++17", "-Wall", "-Wextra",
                 "-fpermissive", "-Wno-unused-function", "-Wno-ignored-qualifiers",
+                "-fsanitize=address", "-Wl,--wrap=realpath",
                 "-I", str(Path(temporary) / "include"),
                 "-I", str(args.source.parent),
                 str(args.source), str(harness), "-o", str(executable),

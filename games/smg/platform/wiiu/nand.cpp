@@ -3,6 +3,7 @@
 #include <revolution/nand.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,11 +51,13 @@ bool within_root(const char* root, const char* path)
 
 bool path_stays_in_root(const char* path)
 {
-    char root[kMaxHostPath];
+    // realpath() may use its whole PATH_MAX (4096 on devkitPPC) output buffer;
+    // 256-byte buffers overran into the caller's frame on the NAND thread.
+    char root[PATH_MAX];
     if (realpath(smg_wiiu_save_root(), root) == nullptr)
         return false;
 
-    char resolved[kMaxHostPath];
+    char resolved[PATH_MAX];
     if (realpath(path, resolved) != nullptr)
         return within_root(root, resolved);
 
