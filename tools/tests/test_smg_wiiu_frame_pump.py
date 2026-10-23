@@ -31,6 +31,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--elf", type=Path, required=True)
     parser.add_argument("--require-no-nested-boundary", action="store_true")
+    parser.add_argument("--require-gx-window", action="store_true",
+                        help="the linked graphics init must set the GX window at address 0")
     parser.add_argument("--require-paced-retrace", action="store_true",
                         help="sms_wiiu_vsync_fields must pace (OSSleepTicks) and never freeze the retrace count")
     args = parser.parse_args()
@@ -43,6 +45,23 @@ def main() -> int:
             check=True, capture_output=True, text=True).stdout
 
     text = tool(OBJDUMP, "-d")
+    def body_of(name: str) -> str:
+        start = text.find(f"<{name}>:\n")
+        return text[start:text.find("\n\n", start)] if start >= 0 else ""
+
+    if args.require_gx_window:
+        # SMG's linked entry path calls sms_wiiu_gfx_init(), whose GX2/GX
+        # provider setup must establish the address-zero window before indexed
+        # vertex addresses are consumed. The old link-stub check no longer
+        # covered the real linked implementation after the stub was removed.
+        main = body_of("main")
+        init = body_of("sms_wiiu_gfx_init")
+        if "<sms_wiiu_gfx_init>" not in main or \
+                "<GXPC_SetMemoryWindow>" not in init or \
+                not re.search(r"\bli\s+r3,0\b", init) or \
+                not re.search(r"\blis\s+r4,16384\b", init):
+            print("frame-pump: FAIL: linked graphics init does not set the GX window at address 0")
+            return 1
     if args.require_paced_retrace:
         # Without GX2 the retrace count must still advance at 60 Hz: a vsync
         # source returning 0 froze VIGetRetraceCount and waitForTick spun.
@@ -72,8 +91,7 @@ def main() -> int:
         lo = flag_addr - (hi << 16)
         hi_s = hi - 0x10000 if hi >= 0x8000 else hi
         for name in ("sms_wiiu_frame_boundary", "VIFlush", "VIWaitForRetrace"):
-            start = text.find(f"<{name}>:\n")
-            body = text[start:text.find("\n\n", start)] if start >= 0 else ""
+            body = body_of(name)
             if not (re.search(rf"\blis\s+r\d+,{hi_s}\b", body) and
                     re.search(rf"\b(lbz|stb)\s+r\d+,{lo}\(r\d+\)", body)):
                 print(f"frame-pump: FAIL: {name} does not check s_in_boundary (nested boundary)")
