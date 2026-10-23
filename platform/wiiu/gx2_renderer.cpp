@@ -5653,17 +5653,32 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
 // own present drain, where the worker is idle anyway.  With "peekcmp" the game
 // keeps prod6's answers (and wait) while the end-of-frame snapshot is read at
 // the same points, and [peekeof] lines count how often the two disagree.
+// The colour snapshot is only a kEofRect square around the frame's last probe
+// point (GX2CopySurfaceEx): a whole-target copy every frame cost ~2.5 ms of a
+// GPU-bound frame.  kEofRing squares are kept so a peek can read the newest one
+// the GPU has finished, if it still covers the point.
+static constexpr int kEofRect = 128;
+static constexpr int kEofRing = 3;
+struct EofColourSlot {
+    GX2Surface surface;
+    uint64_t stamp;
+    int32_t left, top;
+    uint32_t frame;
+    bool queued;
+};
 struct EofSnapshots {
-    GX2Surface colour, depthTiled, depthLinear;
-    bool allocated, failed, colourQueued, depthQueued, colourWanted, depthWanted;
-    uint64_t colourStamp, depthStamp;
+    EofColourSlot colour[kEofRing];
+    GX2Surface depthTiled, depthLinear;
+    bool allocated, failed, depthQueued, colourWanted, depthWanted;
+    uint32_t colourNext, colourPx, colourPy;
+    uint64_t depthStamp;
     uint32_t lastColour = 0x10000000;  // until the first snapshot: Mario visible
 };
 static EofSnapshots s_eof;
 extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
                                                       uint32_t dstSlice);
 struct EofStats {
-    uint32_t cPeeks, cVisible, cOccluded, cMismatch, cNotReady;
+    uint32_t cPeeks, cVisible, cOccluded, cMismatch, cNotReady, cOutside, cAgeSum;
     uint32_t zPeeks, zFar, zMismatch, zFarMismatch, zNotReady, copies, logged;
 };
 static EofStats s_eofStats;
@@ -5676,12 +5691,12 @@ static bool eofAllocate() {
     GX2ColorBuffer* cb = renderColour();
     GX2DepthBuffer* db = renderDepth();
     if (!cb || !db) return false;
-    GX2Surface& c = s_eof.colour;
+    GX2Surface c;
     memset(&c, 0, sizeof(c));
     c.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
     c.dim = GX2_SURFACE_DIM_TEXTURE_2D;
-    c.width = cb->surface.width;
-    c.height = cb->surface.height;
+    c.width = kEofRect;
+    c.height = kEofRect;
     c.depth = 1;
     c.mipLevels = 1;
     c.format = cb->surface.format;
@@ -5703,41 +5718,79 @@ static bool eofAllocate() {
     s_eof.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&t);
     GX2CalcSurfaceSizeAndAlignment(&s_eof.depthLinear);
-    c.image = alignedZero(c.alignment, c.imageSize);
-    t.image = c.image ? alignedZero(t.alignment, t.imageSize) : nullptr;
+    bool ok = true;
+    for (int i = 0; i < kEofRing; ++i) {
+        s_eof.colour[i].surface = c;
+        s_eof.colour[i].surface.image = ok ? alignedZero(c.alignment, c.imageSize) : nullptr;
+        ok = s_eof.colour[i].surface.image != nullptr;
+    }
+    t.image = ok ? alignedZero(t.alignment, t.imageSize) : nullptr;
     s_eof.depthLinear.image = t.image ? alignedZero(s_eof.depthLinear.alignment, s_eof.depthLinear.imageSize) : nullptr;
-    const unsigned bytes = unsigned(c.imageSize + t.imageSize + s_eof.depthLinear.imageSize);
+    const unsigned bytes = unsigned(kEofRing * c.imageSize + t.imageSize + s_eof.depthLinear.imageSize);
     if (!s_eof.depthLinear.image) {
         if (t.image) MEMFreeToDefaultHeap(t.image);
-        if (c.image) MEMFreeToDefaultHeap(c.image);
+        for (int i = 0; i < kEofRing; ++i)
+            if (s_eof.colour[i].surface.image) MEMFreeToDefaultHeap(s_eof.colour[i].surface.image);
         s_eof.failed = true;
         WHBLogPrintf("SMS Wii U: [peekeof] out of memory for %u bytes of snapshots; peeks answer visible/far", bytes);
         return false;
     }
-    DCFlushRange(c.image, c.imageSize);
+    for (int i = 0; i < kEofRing; ++i) DCFlushRange(s_eof.colour[i].surface.image, c.imageSize);
     DCFlushRange(t.image, t.imageSize);
     DCFlushRange(s_eof.depthLinear.image, s_eof.depthLinear.imageSize);
     s_eof.allocated = true;
-    WHBLogPrintf("SMS Wii U: [peekeof] snapshots allocated: %u bytes (colour %ux%u, depth %ux%u)", bytes,
-                 unsigned(c.width), unsigned(c.height), unsigned(t.width), unsigned(t.height));
+    WHBLogPrintf("SMS Wii U: [peekeof] snapshots allocated: %u bytes (colour %dx%d x%d, depth %ux%u)", bytes, kEofRect,
+                 kEofRect, kEofRing, unsigned(t.width), unsigned(t.height));
     return true;
 }
 
+// Game coordinates to TV-target pixels, clamped to w x h.
+static void eofPixel(int x, int y, uint32_t w, uint32_t h, uint32_t* px, uint32_t* py) {
+    *px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
+    *py = uint32_t((float(y) + 0.5f) * s_gameScale);
+    if (*px >= w) *px = w - 1;
+    if (*py >= h) *py = h - 1;
+}
+
 static uint8_t* eofTexel(const GX2Surface& s, int x, int y) {
-    uint32_t px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
-    uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScale);
-    if (px >= s.width) px = s.width - 1;
-    if (py >= s.height) py = s.height - 1;
+    uint32_t px, py;
+    eofPixel(x, y, s.width, s.height, &px, &py);
     uint8_t* texel = static_cast<uint8_t*>(s.image) + (size_t(py) * s.pitch + px) * 4;
     DCInvalidateRange(texel, 4);
     return texel;
 }
 
+// Remembers the TV-target pixel of a colour probe for the next snapshot.
+static void eofWantColour(int x, int y) {
+    GX2ColorBuffer* cb = renderColour();
+    if (!cb) return;
+    eofPixel(x, y, cb->surface.width, cb->surface.height, &s_eof.colourPx, &s_eof.colourPy);
+    s_eof.colourWanted = true;
+}
+
+// The newest finished square that covers the point; false (counted) if none.
 static bool eofReadColour(int x, int y, uint32_t* out) {
-    if (!s_eof.colourQueued || GX2GetRetiredTimeStamp() < s_eof.colourStamp) return false;
-    const uint8_t* t = eofTexel(s_eof.colour, x, y);
-    *out = uint32_t(t[3]) << 24 | uint32_t(t[0]) << 16 | uint32_t(t[1]) << 8 | t[2];
-    return true;
+    GX2ColorBuffer* cb = renderColour();
+    if (!cb) return false;
+    uint32_t px, py;
+    eofPixel(x, y, cb->surface.width, cb->surface.height, &px, &py);
+    const uint64_t retired = GX2GetRetiredTimeStamp();
+    bool anyDone = false;
+    for (int k = 1; k <= kEofRing; ++k) {
+        const EofColourSlot& s = s_eof.colour[(s_eof.colourNext + kEofRing - k) % kEofRing];
+        if (!s.queued || retired < s.stamp) continue;
+        anyDone = true;
+        const int32_t rx = int32_t(px) - s.left, ry = int32_t(py) - s.top;
+        if (rx < 0 || ry < 0 || rx >= kEofRect || ry >= kEofRect) continue;
+        uint8_t* t = static_cast<uint8_t*>(s.surface.image) + (size_t(ry) * s.surface.pitch + rx) * 4;
+        DCInvalidateRange(t, 4);
+        *out = uint32_t(t[3]) << 24 | uint32_t(t[0]) << 16 | uint32_t(t[1]) << 8 | t[2];
+        s_eofStats.cAgeSum += g_displayFrames - s.frame;
+        return true;
+    }
+    if (anyDone) ++s_eofStats.cOutside;
+    else ++s_eofStats.cNotReady;
+    return false;
 }
 
 static bool eofReadDepth(int x, int y, uint32_t* out) {
@@ -5766,10 +5819,21 @@ static void eofSnapshot() {
     GX2ColorBuffer* cb = renderColour();
     GX2DepthBuffer* db = renderDepth();
     bool colour = false, depth = false;
-    if (wantColour && cb && cb->surface.width == s_eof.colour.width && cb->surface.height == s_eof.colour.height &&
-        cb->surface.format == s_eof.colour.format && cb->surface.aa == GX2_AA_MODE1X) {
+    EofColourSlot& slot = s_eof.colour[s_eof.colourNext];
+    if (wantColour && cb && cb->surface.width >= uint32_t(kEofRect) && cb->surface.height >= uint32_t(kEofRect) &&
+        cb->surface.format == slot.surface.format && cb->surface.aa == GX2_AA_MODE1X) {
+        const int32_t w = int32_t(cb->surface.width), h = int32_t(cb->surface.height);
+        int32_t left = int32_t(s_eof.colourPx) - kEofRect / 2, top = int32_t(s_eof.colourPy) - kEofRect / 2;
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        if (left > w - kEofRect) left = w - kEofRect;
+        if (top > h - kEofRect) top = h - kEofRect;
+        GX2Rect rect = {left, top, left + kEofRect, top + kEofRect};
+        GX2Point at = {0, 0};
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
-        GX2CopySurface(&cb->surface, 0, 0, &s_eof.colour, 0, 0); invalidateVertexUniforms();
+        GX2CopySurfaceEx(&cb->surface, 0, 0, &slot.surface, 0, 0, 1, &rect, &at); invalidateVertexUniforms();
+        slot.left = left;
+        slot.top = top;
         colour = true;
     }
     if (wantDepth && db && db->surface.width == s_eof.depthTiled.width && db->surface.height == s_eof.depthTiled.height &&
@@ -5783,7 +5847,12 @@ static void eofSnapshot() {
     rebindTvTarget();
     GX2Flush();
     const uint64_t stamp = GX2GetLastSubmittedTimeStamp();
-    if (colour) { s_eof.colourStamp = stamp; s_eof.colourQueued = true; }
+    if (colour) {
+        slot.stamp = stamp;
+        slot.frame = g_displayFrames;
+        slot.queued = true;
+        s_eof.colourNext = (s_eof.colourNext + 1) % kEofRing;
+    }
     if (depth) { s_eof.depthStamp = stamp; s_eof.depthQueued = true; }
     ++s_eofStats.copies;
 }
@@ -5792,9 +5861,10 @@ static void eofReport() {
     if (!s_peekEofMode) return;
     const EofStats& e = s_eofStats;
     WHBLogPrintf("SMS Wii U: [peekeof] frame=%u mode=%d snaps=%u cPeeks=%u cVisible=%u cOccluded=%u cMismatch=%u cNotReady=%u "
-                 "zPeeks=%u zFar=%u zMismatch=%u zFarMismatch=%u zNotReady=%u",
+                 "cOutside=%u cAgeSum=%u zPeeks=%u zFar=%u zMismatch=%u zFarMismatch=%u zNotReady=%u",
                  (unsigned)g_displayFrames, s_peekEofMode, (unsigned)e.copies, (unsigned)e.cPeeks, (unsigned)e.cVisible,
-                 (unsigned)e.cOccluded, (unsigned)e.cMismatch, (unsigned)e.cNotReady, (unsigned)e.zPeeks, (unsigned)e.zFar,
+                 (unsigned)e.cOccluded, (unsigned)e.cMismatch, (unsigned)e.cNotReady, (unsigned)e.cOutside,
+                 (unsigned)e.cAgeSum, (unsigned)e.zPeeks, (unsigned)e.zFar,
                  (unsigned)e.zMismatch, (unsigned)e.zFarMismatch, (unsigned)e.zNotReady);
     const uint32_t logged = e.logged;
     s_eofStats = EofStats{};
@@ -5812,11 +5882,11 @@ uint32_t peekColor(int x, int y) {
         ProdPeekScope prodPeek(true);
         ++s_perfPeeks;
         if (x < 0 || y < 0) return 0;
-        s_eof.colourWanted = true;
+        eofWantColour(x, y);
         ++s_eofStats.cPeeks;
         uint32_t c;
         if (eofReadColour(x, y, &c)) s_eof.lastColour = c;
-        else { ++s_eofStats.cNotReady; c = s_eof.lastColour; }
+        else c = s_eof.lastColour;
         eofCountColour(c);
         return c;
     }
@@ -5826,12 +5896,11 @@ uint32_t peekColor(int x, int y) {
     uint32_t c = 0;
     if (!readTvPixels(point, 1, &c)) return 0;
     if (s_peekEofMode == 2) {
-        s_eof.colourWanted = true;
+        eofWantColour(x, y);
         ++s_eofStats.cPeeks;
         eofCountColour(c);
         uint32_t e;
-        if (!eofReadColour(x, y, &e)) ++s_eofStats.cNotReady;
-        else if (((c & 0xff000000) == 0x10000000) != ((e & 0xff000000) == 0x10000000)) {
+        if (eofReadColour(x, y, &e) && ((c & 0xff000000) == 0x10000000) != ((e & 0xff000000) == 0x10000000)) {
             ++s_eofStats.cMismatch;
             eofLogMismatch("colour", x, y, c, e);
         }
