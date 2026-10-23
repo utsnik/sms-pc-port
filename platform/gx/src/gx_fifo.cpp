@@ -988,6 +988,14 @@ static struct DlEntry* s_dlRec = nullptr;  // the display list being recorded in
 
 static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t count, const VtxLayout& L, int vat) {
     s_vertsLoaded += count;
+#if defined(PORT_GAME_SMG)
+    // The SMG Wii U target links no renderer yet (games/smg/platform/wiiu/
+    // gx_link_stub.cpp): the decoded vertices would only be discarded, and
+    // decoding every draw of the FileSelect scene in Cemu's interpreter took
+    // minutes per frame. Keep the command stream walk, skip the decode.
+    if (!rendererReady())
+        return p + size_t(count) * L.size;
+#endif
     static DecSetup s_setup[8];
     DecSetup& S = s_setup[vat];
     if (S.layoutGen != L.gen || S.arrayGen != g_arrayGen || S.matA != g.xfReg[XFR_MATIDX_A] ||
