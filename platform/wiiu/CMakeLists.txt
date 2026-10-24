@@ -1,6 +1,10 @@
 if(PORT_GAME STREQUAL "smg")
   set(SMG_WIIU_BUILD_DIR "${PORT_WIIU_BUILD_DIR}" CACHE PATH
       "Galaxy Stage 1 Wii U output directory")
+  option(SMG_WIIU_ENABLE_RESCUE
+    "Enable Galaxy's Wii U rescue thread for the crash-test build" OFF)
+  option(SMG_WIIU_CRASH_TEST
+    "Fault Galaxy at its fixed post-frame crash-test boundary" OFF)
 
   set(SMG_WIIU_OS_ADAPTER_DEFS
     OSInitThreadQueue=sms_wiiu_OSInitThreadQueue
@@ -106,6 +110,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/input.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/nand.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/exception.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio_sdl.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
@@ -152,6 +157,8 @@ if(PORT_GAME STREQUAL "smg")
   target_compile_definitions(smg_wiiu_shared PRIVATE
     GEKKO=1 TARGET_PC=1 TARGET_WIIU=1 __WIIU__=1 ESPRESSO=1 NDEBUG=1 DEBUG=1 VERSION=0
     SMS_AUDIO_DSP_HLE=1 PORT_GAME_SMG=1
+    SMG_WIIU_ENABLE_RESCUE=$<BOOL:${SMG_WIIU_ENABLE_RESCUE}>
+    SMG_WIIU_CRASH_TEST=$<BOOL:${SMG_WIIU_CRASH_TEST}>
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
   target_compile_options(smg_wiiu_shared PRIVATE
     ${SMG_GAME_FLAGS} -std=gnu++11
@@ -179,6 +186,8 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform
     ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
   target_compile_definitions(smg PRIVATE ${SMG_DEFS} SMS_AUDIO_DSP_HLE=1
+    SMG_WIIU_ENABLE_RESCUE=$<BOOL:${SMG_WIIU_ENABLE_RESCUE}>
+    SMG_WIIU_CRASH_TEST=$<BOOL:${SMG_WIIU_CRASH_TEST}>
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
   target_compile_options(smg PRIVATE ${SMG_GAME_FLAGS}
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)

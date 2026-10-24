@@ -466,9 +466,6 @@ void smg_wiiu_audio_init(void)
     sms_wiiu_sdl_audio_preopen(32000);
 }
 void sms_wiiu_hang_check(void) {}
-volatile int sms_wiiu_crash_stage;
-volatile int sms_wiiu_crash_pending;
-void sms_wiiu_crash_return_to_menu(void) { WHBProcStopRunning(); }
 void sms_wiiu_profiler_tick(void) {}
 void sms_wiiu_profiler_stop(void) {}
 void sms_wiiu_exit(void) { WHBProcStopRunning(); }

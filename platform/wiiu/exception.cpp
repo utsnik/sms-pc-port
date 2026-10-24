@@ -19,6 +19,10 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(PORT_GAME_SMG) && !defined(SMG_WIIU_ENABLE_RESCUE)
+#define SMG_WIIU_ENABLE_RESCUE 0
+#endif
+
 /* The build maps OSCreateThread & co. to the GameCube adapters for every port
  * file (SMS_WIIU_OS_ADAPTER_DEFS); the crash path needs coreinit's own. */
 extern "C" {
@@ -140,6 +144,12 @@ BOOL fatal(const char* type, OSContext* context)
 		WHBLogPrint(s_trace);
 		dump(context);
 	}
+#if defined(PORT_GAME_SMG) && !SMG_WIIU_ENABLE_RESCUE
+	/* The release candidate records the fault and leaves the reliable fatal
+	 * screen/reboot path intact; no recovery thread is started. */
+	OSFatal(s_message);
+	return FALSE;
+#else
 	/* A second fault (or none of the recovery paths apply): the old behaviour,
 	 * an error screen that needs a reboot. */
 	if (!context || s_crashed++) {
@@ -171,6 +181,7 @@ BOOL fatal(const char* type, OSContext* context)
 		sms_wiiu_crash_pending = 1;
 	}
 	return TRUE;
+#endif
 }
 
 BOOL on_dsi(OSContext* c) { return fatal("DSI", c); }
@@ -180,6 +191,7 @@ BOOL on_program(OSContext* c) { return fatal("PROGRAM", c); }
 } // namespace
 
 namespace {
+#if !defined(PORT_GAME_SMG) || SMG_WIIU_ENABLE_RESCUE
 /* Waits on core 1 (ProcUI's core) at the top priority for a main-thread fault,
  * then takes the main thread's place: Menu, ProcUI, exit. */
 OSThread s_rescue;
@@ -193,12 +205,14 @@ int rescue(int, const char**)
 	sms_wiiu_crash_return_to_menu();
 	return 0;
 }
+#endif
 } // namespace
 
 extern "C" void sms_wiiu_install_exception_handlers(void)
 {
 	/* Priority 0 was refused (2026-10-20); the parked main thread no longer
 	 * competes, so any priority above the game's (16) will do. */
+#if !defined(PORT_GAME_SMG) || SMG_WIIU_ENABLE_RESCUE
 	static const int kPriorities[] = {1, 8, 15};
 	bool started = false;
 	for (int prio : kPriorities) {
@@ -212,6 +226,9 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 	}
 	if (!started)
 		WHBLogPrint("[crash] could not start the rescue thread");
+#else
+	WHBLogPrint("[crash] rescue thread disabled for the SMG no-rescue build");
+#endif
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_DSI, on_dsi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_ISI, on_isi);
 	OSSetExceptionCallbackEx(OS_EXCEPTION_MODE_GLOBAL_ALL_CORES, OS_EXCEPTION_TYPE_PROGRAM, on_program);

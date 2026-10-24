@@ -38,6 +38,11 @@ void sms_wiiu_sdl_audio_preopen(int rate);
 /* Opens AX/SDL and reserves the VARAM window before Galaxy JAudio2 starts. */
 void smg_wiiu_audio_init(void);
 
+/* Exception state is owned by platform/wiiu/exception.cpp in both ports. */
+extern volatile int sms_wiiu_crash_pending;
+extern volatile int sms_wiiu_crash_stage;
+void sms_wiiu_crash_return_to_menu(void);
+
 /* Task 3's native-Espresso-BE data loader. */
 void smg_wiiu_load_dol_data(void);
 

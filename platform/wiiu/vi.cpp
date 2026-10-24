@@ -162,6 +162,17 @@ void sms_wiiu_frame_boundary(void)
 		         sms_port_heap_fallbacks(), sms_port_heap_fallback_bytes(),
 		         port_dvd_busy() ? "busy" : "idle");
 	}
+#if defined(PORT_GAME_SMG)
+#if defined(SMG_WIIU_CRASH_TEST) && SMG_WIIU_CRASH_TEST
+	/* The dedicated rescue build faults once at a fixed post-frame boundary;
+	 * this block is absent from the normal Galaxy binary. */
+	constexpr u32 kSmgCrashTestFrame = 300;
+	if (s_frame_count == kSmgCrashTestFrame) {
+		port_log("SMG Wii U: crash test at frame %u\n", s_frame_count);
+		*reinterpret_cast<volatile u32*>(uintptr_t(0x8)) = 0xDEADu;
+	}
+#endif
+#else
 	/* SMS_CRASHTEST=<frame> (autoplay file): a deliberate DSI on the main
 	 * thread, to prove the crash path returns to the Menu unattended. */
 	static int s_crash_test = -1;
@@ -174,6 +185,7 @@ void sms_wiiu_frame_boundary(void)
 		s_crash_test = 0;
 		*reinterpret_cast<volatile u32*>(uintptr_t(0x8)) = 0xDEADu;
 	}
+#endif
 	if (!s_soak_reported && s_frame_count >= 18000) {
 		s_soak_reported = true;
 		port_log("SMS Wii U: Stage 2 SOAK COMPLETE; GX link stub active\n");
