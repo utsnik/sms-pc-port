@@ -153,7 +153,7 @@ WutTime s_lastReport;
 
 #if defined(PORT_GAME_SMG)
 constexpr uint32_t kFrameSplitWindow = 60;
-enum FrameSplitBucket { kLogicCpu, kGxTranslate, kGpuWait, kAudio, kFrameSplitBuckets };
+enum FrameSplitBucket { kLogicCpu, kGxTranslate, kGpuWait, kAudio, kTotal, kFrameSplitBuckets };
 
 /* Frame split state is deliberately single-writer where it crosses threads:
  * the audio pacer is the only writer of s_splitAudioTicks, while the main
@@ -165,7 +165,7 @@ bool s_splitStarted;
 bool s_splitGxActive;
 bool s_splitGpuActive;
 bool s_splitAudioActive;
-uint32_t s_splitFrameStart;
+bool s_splitHavePrevFrameEnd;
 uint32_t s_splitGxStart;
 uint32_t s_splitGpuStart;
 uint32_t s_splitAudioStart;
@@ -173,6 +173,7 @@ uint32_t s_splitGxTicks;
 uint32_t s_splitGpuTicks;
 uint32_t s_splitAudioFrame;
 uint32_t s_splitAudioTicks;
+uint32_t s_splitPrevFrameEnd;
 uint32_t s_splitFields;
 uint32_t s_splitSamples;
 uint32_t s_splitValues[kFrameSplitBuckets][kFrameSplitWindow];
@@ -240,7 +241,7 @@ void split_report()
 {
 	const uint32_t count = s_splitSamples;
 	port_log("[framesplit] frame=%u stage=%s samples=%u fields=%u "
-	         "logic_cpu[p50=%u p90=%u max=%u] "
+	         "logic_cpu[p50=%u p90=%u max=%u] (logic_cpu=residual-incl-gx-writers) "
 	         "gx_translate[p50=%u p90=%u max=%u] "
 	         "gpu_wait[p50=%u p90=%u max=%u] "
 	         "audio[p50=%u p90=%u max=%u] "
@@ -258,8 +259,8 @@ void split_report()
 	         split_percentile_us(s_splitValues[kAudio], count, 50),
 	         split_percentile_us(s_splitValues[kAudio], count, 90),
 	         split_max_us(s_splitValues[kAudio], count),
-	         split_percentile_us(s_splitValues[kLogicCpu], count, 50),
-	         split_percentile_us(s_splitValues[kLogicCpu], count, 90));
+	         split_percentile_us(s_splitValues[kTotal], count, 50),
+	         split_percentile_us(s_splitValues[kTotal], count, 90));
 	/* The complete report is emitted before the window is reset. */
 	std::memset(s_splitValues, 0, sizeof(s_splitValues));
 	s_splitSamples = 0;
@@ -272,10 +273,8 @@ void split_frame_begin()
 		return;
 	s_splitStarted = true;
 	s_splitFrameActive = true;
-	s_splitFrameStart = split_now();
 	s_splitAudioFrame = s_splitAudioTicks;
-	if (!s_splitGxActive)
-		s_splitGxTicks = 0;
+	s_splitGxTicks = 0;
 	s_splitGpuTicks = 0;
 }
 
@@ -284,20 +283,37 @@ void split_frame_end(uint32_t fields)
 	if (!s_splitFrameActive)
 		return;
 	const uint32_t now = split_now();
-	split_add(kLogicCpu, now - s_splitFrameStart);
+	s_splitFrameActive = false;
+	if (!s_splitHavePrevFrameEnd) {
+		s_splitPrevFrameEnd = now;
+		s_splitHavePrevFrameEnd = true;
+		return;
+	}
+	const uint32_t total = now - s_splitPrevFrameEnd;
+	s_splitPrevFrameEnd = now;
+	uint32_t logic = total;
+	if (s_splitGxTicks >= logic)
+		logic = 0;
+	else
+		logic -= s_splitGxTicks;
+	if (s_splitGpuTicks >= logic)
+		logic = 0;
+	else
+		logic -= s_splitGpuTicks;
+	split_add(kLogicCpu, logic);
 	split_add(kGxTranslate, s_splitGxTicks);
 	split_add(kGpuWait, s_splitGpuTicks);
 	split_add(kAudio, s_splitAudioTicks - s_splitAudioFrame);
+	split_add(kTotal, total);
 	++s_splitSamples;
 	s_splitFields += fields ? fields : 1;
-	s_splitFrameActive = false;
 	if (s_splitFields >= kFrameSplitWindow)
 		split_report();
 }
 
 void split_gx_begin()
 {
-	if (!s_splitStarted || !split_enabled() || s_splitGxActive)
+	if (!s_splitStarted || !s_splitFrameActive || s_splitGxActive)
 		return;
 	s_splitGxStart = split_now();
 	s_splitGxActive = true;
@@ -307,13 +323,13 @@ void split_gx_end()
 {
 	if (!s_splitGxActive)
 		return;
-	s_splitGxTicks = split_now() - s_splitGxStart;
+	s_splitGxTicks += split_now() - s_splitGxStart;
 	s_splitGxActive = false;
 }
 
 void split_gpu_begin()
 {
-	if (!s_splitFrameActive || !split_enabled() || s_splitGpuActive)
+	if (!s_splitStarted || !s_splitFrameActive || s_splitGpuActive)
 		return;
 	s_splitGpuStart = split_now();
 	s_splitGpuActive = true;
@@ -323,13 +339,13 @@ void split_gpu_end()
 {
 	if (!s_splitGpuActive)
 		return;
-	s_splitGpuTicks = split_now() - s_splitGpuStart;
+	s_splitGpuTicks += split_now() - s_splitGpuStart;
 	s_splitGpuActive = false;
 }
 
 void split_audio_begin()
 {
-	if (!split_enabled() || s_splitAudioActive)
+	if (!s_splitStarted || s_splitAudioActive)
 		return;
 	s_splitAudioStart = split_now();
 	s_splitAudioActive = true;

@@ -4951,6 +4951,12 @@ void flushBatch() {
         s_dlPending = {};
         return;
     }
+#if defined(PORT_GAME_SMG)
+    struct FrameSplitBatchScope {
+        FrameSplitBatchScope() { sms_wiiu_frame_split_gx_begin(); }
+        ~FrameSplitBatchScope() { sms_wiiu_frame_split_gx_end(); }
+    } frameSplitBatchScope;
+#endif
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
     disablePerDrawCaches();
@@ -5612,9 +5618,6 @@ extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
-#if defined(PORT_GAME_SMG)
-    sms_wiiu_frame_split_gx_begin();
-#endif
     beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     // The generated vertex programs use up to R60; the default split gives
@@ -5717,9 +5720,6 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;
-#if defined(PORT_GAME_SMG)
-    sms_wiiu_frame_split_gx_end();
-#endif
 }
 
 } // namespace gx

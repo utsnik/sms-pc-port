@@ -5,12 +5,56 @@ from __future__ import annotations
 
 import argparse
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
 def fail(message: str) -> str:
     return f"frame-split: FAIL: {message}"
+
+
+def run_host_harness(profiler: Path, harness: Path) -> str:
+    source = profiler.read_text(encoding="utf-8")
+    start_token = "#if defined(PORT_GAME_SMG)\nconstexpr uint32_t kFrameSplitWindow"
+    end_token = "\n#endif\n\nvoid on_alarm"
+    start = source.find(start_token)
+    if start < 0:
+        raise RuntimeError("cannot locate PORT_GAME_SMG split section")
+    body_start = source.find("\n", start) + 1
+    end = source.find(end_token, body_start)
+    if end < 0:
+        raise RuntimeError("cannot delimit PORT_GAME_SMG split section")
+    split_section = source[body_start:end]
+
+    with tempfile.TemporaryDirectory(prefix="smg-framesplit-") as temporary:
+        root = Path(temporary)
+        include = root / "smg_wiiu_frame_split.inc"
+        include.write_text(split_section, encoding="utf-8")
+        executable = root / "framesplit_host"
+        build = subprocess.run(
+            [
+                "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-pthread",
+                "-I", str(root), str(harness), "-o", str(executable),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        if build.returncode:
+            raise RuntimeError(
+                "host harness compile failed:\n"
+                + (build.stdout + build.stderr).rstrip()
+            )
+        run = subprocess.run(
+            [str(executable), str(root)], capture_output=True, text=True
+        )
+        output = (run.stdout + run.stderr).rstrip()
+        if run.returncode:
+            raise RuntimeError(
+                f"host harness failed ({run.returncode}):\n{output}"
+            )
+        return output
 
 
 def main() -> int:
@@ -24,6 +68,11 @@ def main() -> int:
     parser.add_argument("--require-udp-window", type=int)
     parser.add_argument("--require-stage-path")
     parser.add_argument("--require-target-ms")
+    parser.add_argument(
+        "--host-harness",
+        type=Path,
+        default=Path(__file__).with_name("smg_wiiu_frame_split_host.cpp"),
+    )
     args = parser.parse_args()
 
     paths = [args.profiler, args.vi, *args.gx, args.audio]
@@ -108,9 +157,16 @@ def main() -> int:
             print(fail(error))
         return 1
 
+    try:
+        host_output = run_host_harness(args.profiler, args.host_harness)
+    except (OSError, RuntimeError) as exc:
+        print(fail(str(exc)))
+        return 1
+
     print("frame-split: PASS: buckets=logic_cpu,gx_translate,gpu_wait,audio window=60")
     print("frame-split: PASS: percentiles=p50,p90 target-ms=16.7 UDP=port_log")
     print("frame-split: PASS: audio is reported as overlapping audio-thread CPU time")
+    print(host_output)
     return 0
 
 

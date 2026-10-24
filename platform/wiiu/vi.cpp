@@ -143,7 +143,13 @@ void sms_wiiu_frame_boundary(void)
 	sms_wiiu_input_poll();
 	/* The retrace count follows the TV: a retrace waits for a real vsync,
 	 * and one that ends late counts every field that passed. */
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_gpu_begin();
+#endif
 	const u32 fields = sms_wiiu_vsync_fields();
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_gpu_end();
+#endif
 	if (s_pre_callback)
 		s_pre_callback(s_retrace_count + fields);
 	sms_wiiu_gfx_frame();
