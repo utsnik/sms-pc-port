@@ -315,6 +315,21 @@ int main(int argc, char** argv) {
     check(g_log.find("[smg-input] autoplay: press stick_left field 95") != std::string::npos,
           "post-clobber stick log uses owned name");
 
+    g_field = 1240;
+    status = read_status();
+    check(status.hold & WPAD_BUTTON_A, "249-event script reaches final event");
+    check(g_log.find("[smg-input] autoplay: 512 scripted events") != std::string::npos,
+          "512-event script is fully loaded");
+    check(g_log.find("script full") != std::string::npos,
+          "512-event script reports capacity");
+    check(g_log.find("script larger than 16383 bytes, truncated at the last complete token") !=
+              std::string::npos,
+          "oversized autoplay script is reported once");
+    check(g_log.find("unknown token 'partial_unknown_") == std::string::npos,
+          "partial oversized token is dropped");
+    check(g_log.find("unknown token 'bogus'") != std::string::npos,
+          "unknown token after capacity is reported");
+
     g_field = 5;
     status = read_status();
     check((status.hold & WPAD_BUTTON_UP) && (status.trig & WPAD_BUTTON_UP),
@@ -454,10 +469,12 @@ def host_check(provider: Path) -> str:
         (include / "revolution" / "kpad.h").write_text(HOST_KPAD, encoding="utf-8")
         (include / "vpad" / "input.h").write_text(HOST_VPAD, encoding="utf-8")
         (root / "autopress").write_text("", encoding="utf-8")
+        extended_script = ",".join(f"a@{1000 + index}+1" for index in range(505))
         (root / "smg-autoplay").write_text(
             "a@2+3,b@2+3,up@5+2,stick_right@7+2,pointer@10,2,-2+4,"
             "b@90+2,stick_left@95+2,"
-            "pointer@12,0.75,up@15+1,unknown@1+2\n",
+            "pointer@12,0.75,up@15+1,unknown@1+2," + extended_script +
+            ",bogus@1,partial_unknown_" + "x" * 20000 + "\n",
             encoding="utf-8",
         )
         harness = root / "input_host.cpp"

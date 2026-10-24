@@ -27,9 +27,10 @@ struct ScriptEvent {
     bool logged;
 };
 
-static const u32 kMaxScriptEvents = 96;
+static const u32 kMaxScriptEvents = 512;
 ScriptEvent s_script[kMaxScriptEvents];
 u32 s_script_count;
+bool s_script_full_reported;
 bool s_initialized;
 bool s_connected;
 bool s_marker;
@@ -149,6 +150,15 @@ void log_unknown(const char* token)
     port_log("[smg-input] autoplay: unknown token '%s'\n", token);
 }
 
+void log_script_full()
+{
+    if (s_script_full_reported)
+        return;
+    s_script_full_reported = true;
+    port_log("[smg-input] autoplay: script full at %u events, dropping the rest\n",
+             (unsigned)s_script_count);
+}
+
 bool parse_timing(char* text, u32* at, u32* hold)
 {
     char* plus = std::strchr(text, '+');
@@ -232,10 +242,14 @@ void update_hardware_pointer(const VPADStatus& vpad)
     set_pointer_source(POINTER_SOURCE_GYRO);
 }
 
-bool append_button_or_stick(char* name, char* timing)
+enum AppendResult {
+    APPEND_INVALID,
+    APPEND_ADDED,
+    APPEND_DROPPED_FULL,
+};
+
+AppendResult append_button_or_stick(char* name, char* timing)
 {
-    if (s_script_count >= kMaxScriptEvents)
-        return false;
     u32 button = 0;
     f32 stick_x = 0.0f;
     f32 stick_y = 0.0f;
@@ -245,12 +259,16 @@ bool append_button_or_stick(char* name, char* timing)
     } else if (stick_control(name, &stick_x, &stick_y)) {
         kind = SCRIPT_STICK;
     } else {
-        return false;
+        return APPEND_INVALID;
     }
     u32 at = 0;
     u32 hold = 0;
     if (!parse_timing(timing, &at, &hold))
-        return false;
+        return APPEND_INVALID;
+    if (s_script_count >= kMaxScriptEvents) {
+        log_script_full();
+        return APPEND_DROPPED_FULL;
+    }
     ScriptEvent& event = s_script[s_script_count++];
     event = {};
     event.kind = kind;
@@ -260,20 +278,18 @@ bool append_button_or_stick(char* name, char* timing)
     event.at = at;
     event.until = at + hold;
     std::snprintf(event.name, sizeof(event.name), "%s", name);
-    return true;
+    return APPEND_ADDED;
 }
 
-bool append_pointer(char* timing)
+AppendResult append_pointer(char* timing)
 {
-    if (s_script_count >= kMaxScriptEvents)
-        return false;
     char* comma = std::strchr(timing, ',');
     if (!comma)
-        return false;
+        return APPEND_INVALID;
     *comma++ = '\0';
     char* second_comma = std::strchr(comma, ',');
     if (!second_comma)
-        return false;
+        return APPEND_INVALID;
     *second_comma++ = '\0';
     char* plus = std::strchr(second_comma, '+');
     if (plus)
@@ -285,7 +301,11 @@ bool append_pointer(char* timing)
     if (!parse_uint(timing, &at) || !parse_float(comma, &x) ||
         !parse_float(second_comma, &y) ||
         (plus && (!parse_uint(plus, &hold) || hold == 0)))
-        return false;
+        return APPEND_INVALID;
+    if (s_script_count >= kMaxScriptEvents) {
+        log_script_full();
+        return APPEND_DROPPED_FULL;
+    }
     clamp_pointer("x", &x);
     clamp_pointer("y", &y);
     ScriptEvent& event = s_script[s_script_count++];
@@ -296,7 +316,7 @@ bool append_pointer(char* timing)
     event.at = at;
     event.until = at + hold;
     std::snprintf(event.name, sizeof(event.name), "pointer");
-    return true;
+    return APPEND_ADDED;
 }
 
 void load_script()
@@ -322,9 +342,18 @@ void load_script()
     std::snprintf(script_path, sizeof(script_path), "%ssmg-autoplay", sms_wiiu_app_root());
     FILE* file = std::fopen(script_path, "rb");
     if (file) {
-        char buffer[4096];
+        static char buffer[16384]; // load_script runs once; keep 16 KB off the thread stack
         size_t length = std::fread(buffer, 1, sizeof(buffer) - 1, file);
+        const bool truncated = length == sizeof(buffer) - 1 && std::fgetc(file) != EOF;
         std::fclose(file);
+        if (truncated) {
+            while (length && buffer[length - 1] != ',' && buffer[length - 1] != '\r' &&
+                   buffer[length - 1] != '\n')
+                --length;
+            port_log("[smg-input] autoplay: script larger than %u bytes, "
+                     "truncated at the last complete token\n",
+                     (unsigned)(sizeof(buffer) - 1));
+        }
         buffer[length] = '\0';
         char* save = nullptr;
         char* token = ::strtok_r(buffer, ",\r\n", &save);
@@ -353,7 +382,7 @@ void load_script()
                             if (std::snprintf(pointer_timing, sizeof(pointer_timing),
                                               "%s,%s,%s", token + 8, x, y) >=
                                     static_cast<int>(sizeof(pointer_timing)) ||
-                                !append_pointer(pointer_timing))
+                                append_pointer(pointer_timing) == APPEND_INVALID)
                                 log_unknown(token);
                         }
                     }
@@ -364,7 +393,7 @@ void load_script()
                     } else {
                         *at++ = '\0';
                         trim(token);
-                        if (!append_button_or_stick(token, at))
+                        if (append_button_or_stick(token, at) == APPEND_INVALID)
                             log_unknown(token);
                     }
                 }
