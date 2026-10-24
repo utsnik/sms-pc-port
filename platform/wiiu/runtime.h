@@ -34,6 +34,16 @@ void sms_wiiu_gfx_init(void);
 void port_pad_init(void);
 void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
 int64_t sms_wiiu_OSGetTime(void);
+#if defined(PORT_GAME_SMG)
+void sms_wiiu_frame_split_begin(void);
+void sms_wiiu_frame_split_end(u32 fields);
+void sms_wiiu_frame_split_gx_begin(void);
+void sms_wiiu_frame_split_gx_end(void);
+void sms_wiiu_frame_split_gpu_begin(void);
+void sms_wiiu_frame_split_gpu_end(void);
+void sms_wiiu_frame_split_audio_begin(void);
+void sms_wiiu_frame_split_audio_end(void);
+#endif
 
 void port_init(int argc, char** argv);
 void port_log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));

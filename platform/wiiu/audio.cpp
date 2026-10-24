@@ -239,7 +239,13 @@ void issue_block()
 	s_framesAtDma = port_audio_dsp_frames_started();
 	s_dmaAt       = sms_wiiu_audio_system_time();
 	s_awaitFrame  = true;
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_audio_begin();
+#endif
 	dma_block();
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_audio_end();
+#endif
 }
 
 bool frame_busy()

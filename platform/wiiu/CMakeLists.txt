@@ -91,6 +91,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/os_core.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/os_thread.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/vi.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/profiler.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/dvd.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/wiiu/pad.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/audio/dsp_hle.cpp

@@ -132,6 +132,9 @@ void sms_wiiu_frame_boundary(void)
 		sms_wiiu_exit();
 		return;
 	}
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_begin();
+#endif
 	sms_wiiu_profiler_tick();
 	port_irq_check();
 	/* Deliver queued DVD async-read callbacks (GameCube ran them from the DVD
@@ -152,6 +155,9 @@ void sms_wiiu_frame_boundary(void)
 
 	std::strncpy(s_stage_path, port_dvd_stage_path(), sizeof(s_stage_path) - 1);
 	s_stage_path[sizeof(s_stage_path) - 1] = '\0';
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_end(fields);
+#endif
 	/* During boot, show where every game thread is waiting. */
 	if (s_frame_count % 600 == 0 && s_frame_count <= 3600)
 		sms_wiiu_dump_threads();

@@ -666,6 +666,9 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	if (!sms_wiiu_gx2_renderer_has_draws())
 		return;
 	sms_wiiu_gx2_renderer_end();
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_gpu_begin();
+#endif
 	const int64_t t0 = wut_OSGetTime_stub();
 	sms_wiiu_gx2_target_present();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
@@ -675,6 +678,9 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	present_diagnostics();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_begin_pipelined();
 	else WHBGfxBeginRender();
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_frame_split_gpu_end();
+#endif
 	const int64_t t2 = wut_OSGetTime_stub();
 	s_presentFinish += t1 - t0;
 	s_presentBegin += t2 - t1;

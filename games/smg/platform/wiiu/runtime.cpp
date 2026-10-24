@@ -465,9 +465,6 @@ void smg_wiiu_audio_init(void)
 {
     sms_wiiu_sdl_audio_preopen(32000);
 }
-void sms_wiiu_hang_check(void) {}
-void sms_wiiu_profiler_tick(void) {}
-void sms_wiiu_profiler_stop(void) {}
 void sms_wiiu_exit(void) { WHBProcStopRunning(); }
 
 } // extern "C"

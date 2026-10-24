@@ -151,6 +151,199 @@ volatile uint32_t s_frameTicks;  // frame boundaries seen, for the hang check
 bool s_running;
 WutTime s_lastReport;
 
+#if defined(PORT_GAME_SMG)
+constexpr uint32_t kFrameSplitWindow = 60;
+enum FrameSplitBucket { kLogicCpu, kGxTranslate, kGpuWait, kAudio, kFrameSplitBuckets };
+
+/* Frame split state is deliberately single-writer where it crosses threads:
+ * the audio pacer is the only writer of s_splitAudioTicks, while the main
+ * thread snapshots it at a frame boundary.  32-bit tick deltas wrap safely
+ * within the one-second window and avoid TLS and 64-bit atomics. */
+int s_splitMarker = -1;
+bool s_splitFrameActive;
+bool s_splitStarted;
+bool s_splitGxActive;
+bool s_splitGpuActive;
+bool s_splitAudioActive;
+uint32_t s_splitFrameStart;
+uint32_t s_splitGxStart;
+uint32_t s_splitGpuStart;
+uint32_t s_splitAudioStart;
+uint32_t s_splitGxTicks;
+uint32_t s_splitGpuTicks;
+uint32_t s_splitAudioFrame;
+uint32_t s_splitAudioTicks;
+uint32_t s_splitFields;
+uint32_t s_splitSamples;
+uint32_t s_splitValues[kFrameSplitBuckets][kFrameSplitWindow];
+
+uint32_t split_now()
+{
+	return static_cast<uint32_t>(wut_OSGetTime());
+}
+
+bool split_enabled()
+{
+	if (s_splitMarker < 0) {
+		char path[256];
+		std::snprintf(path, sizeof(path), "%sframesplit", sms_wiiu_app_root());
+		FILE* f = std::fopen(path, "rb");
+		s_splitMarker = f != nullptr;
+		if (f)
+			std::fclose(f);
+	}
+	return s_splitMarker != 0;
+}
+
+uint32_t split_to_us(uint32_t ticks)
+{
+	return static_cast<uint32_t>(static_cast<uint64_t>(ticks) * 1000000ull / static_cast<uint64_t>(kTimerHz));
+}
+
+uint32_t split_percentile_us(const uint32_t* values, uint32_t count, uint32_t percent)
+{
+	uint32_t sorted[kFrameSplitWindow];
+	for (uint32_t i = 0; i < count; ++i) {
+		sorted[i] = values[i];
+		uint32_t j = i;
+		while (j && sorted[j - 1] > sorted[j]) {
+			const uint32_t value = sorted[j - 1];
+			sorted[j - 1] = sorted[j];
+			sorted[j] = value;
+			--j;
+		}
+	}
+	if (!count)
+		return 0;
+	const uint32_t index = (count - 1) * percent / 100;
+	return split_to_us(sorted[index]);
+}
+
+uint32_t split_max_us(const uint32_t* values, uint32_t count)
+{
+	if (!count)
+		return 0;
+	uint32_t maximum = values[0];
+	for (uint32_t i = 1; i < count; ++i)
+		if (values[i] > maximum)
+			maximum = values[i];
+	return split_to_us(maximum);
+}
+
+void split_add(FrameSplitBucket bucket, uint32_t ticks)
+{
+	if (s_splitSamples < kFrameSplitWindow)
+		s_splitValues[bucket][s_splitSamples] = ticks;
+}
+
+void split_report()
+{
+	const uint32_t count = s_splitSamples;
+	port_log("[framesplit] frame=%u stage=%s samples=%u fields=%u "
+	         "logic_cpu[p50=%u p90=%u max=%u] "
+	         "gx_translate[p50=%u p90=%u max=%u] "
+	         "gpu_wait[p50=%u p90=%u max=%u] "
+	         "audio[p50=%u p90=%u max=%u] "
+	         "total[p50=%u p90=%u] target-ms=16.7 audio-overlap=thread",
+	         sms_wiiu_frame_count(), sms_wiiu_stage_path(), count, s_splitFields,
+	         split_percentile_us(s_splitValues[kLogicCpu], count, 50),
+	         split_percentile_us(s_splitValues[kLogicCpu], count, 90),
+	         split_max_us(s_splitValues[kLogicCpu], count),
+	         split_percentile_us(s_splitValues[kGxTranslate], count, 50),
+	         split_percentile_us(s_splitValues[kGxTranslate], count, 90),
+	         split_max_us(s_splitValues[kGxTranslate], count),
+	         split_percentile_us(s_splitValues[kGpuWait], count, 50),
+	         split_percentile_us(s_splitValues[kGpuWait], count, 90),
+	         split_max_us(s_splitValues[kGpuWait], count),
+	         split_percentile_us(s_splitValues[kAudio], count, 50),
+	         split_percentile_us(s_splitValues[kAudio], count, 90),
+	         split_max_us(s_splitValues[kAudio], count),
+	         split_percentile_us(s_splitValues[kLogicCpu], count, 50),
+	         split_percentile_us(s_splitValues[kLogicCpu], count, 90));
+	/* The complete report is emitted before the window is reset. */
+	std::memset(s_splitValues, 0, sizeof(s_splitValues));
+	s_splitSamples = 0;
+	s_splitFields = 0;
+}
+
+void split_frame_begin()
+{
+	if (!split_enabled())
+		return;
+	s_splitStarted = true;
+	s_splitFrameActive = true;
+	s_splitFrameStart = split_now();
+	s_splitAudioFrame = s_splitAudioTicks;
+	if (!s_splitGxActive)
+		s_splitGxTicks = 0;
+	s_splitGpuTicks = 0;
+}
+
+void split_frame_end(uint32_t fields)
+{
+	if (!s_splitFrameActive)
+		return;
+	const uint32_t now = split_now();
+	split_add(kLogicCpu, now - s_splitFrameStart);
+	split_add(kGxTranslate, s_splitGxTicks);
+	split_add(kGpuWait, s_splitGpuTicks);
+	split_add(kAudio, s_splitAudioTicks - s_splitAudioFrame);
+	++s_splitSamples;
+	s_splitFields += fields ? fields : 1;
+	s_splitFrameActive = false;
+	if (s_splitFields >= kFrameSplitWindow)
+		split_report();
+}
+
+void split_gx_begin()
+{
+	if (!s_splitStarted || !split_enabled() || s_splitGxActive)
+		return;
+	s_splitGxStart = split_now();
+	s_splitGxActive = true;
+}
+
+void split_gx_end()
+{
+	if (!s_splitGxActive)
+		return;
+	s_splitGxTicks = split_now() - s_splitGxStart;
+	s_splitGxActive = false;
+}
+
+void split_gpu_begin()
+{
+	if (!s_splitFrameActive || !split_enabled() || s_splitGpuActive)
+		return;
+	s_splitGpuStart = split_now();
+	s_splitGpuActive = true;
+}
+
+void split_gpu_end()
+{
+	if (!s_splitGpuActive)
+		return;
+	s_splitGpuTicks = split_now() - s_splitGpuStart;
+	s_splitGpuActive = false;
+}
+
+void split_audio_begin()
+{
+	if (!split_enabled() || s_splitAudioActive)
+		return;
+	s_splitAudioStart = split_now();
+	s_splitAudioActive = true;
+}
+
+void split_audio_end()
+{
+	if (!s_splitAudioActive)
+		return;
+	s_splitAudioTicks += split_now() - s_splitAudioStart;
+	s_splitAudioActive = false;
+}
+#endif
+
 void on_alarm(void*, void* context)
 {
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
@@ -333,6 +526,17 @@ void report(Table& t)
 }
 
 } // namespace
+
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_frame_split_begin(void) { split_frame_begin(); }
+extern "C" void sms_wiiu_frame_split_end(u32 fields) { split_frame_end(fields); }
+extern "C" void sms_wiiu_frame_split_gx_begin(void) { split_gx_begin(); }
+extern "C" void sms_wiiu_frame_split_gx_end(void) { split_gx_end(); }
+extern "C" void sms_wiiu_frame_split_gpu_begin(void) { split_gpu_begin(); }
+extern "C" void sms_wiiu_frame_split_gpu_end(void) { split_gpu_end(); }
+extern "C" void sms_wiiu_frame_split_audio_begin(void) { split_audio_begin(); }
+extern "C" void sms_wiiu_frame_split_audio_end(void) { split_audio_end(); }
+#endif
 
 /* Called from the frame boundary on the main thread: starts the sampler the
  * first time and reports every ~10 s. */

@@ -4915,9 +4915,16 @@ static inline OSTime stageLap(OSTime& acc, OSTime t) {
 static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfFrames;
 static uint32_t s_perfGpuDraws, s_perfCpuDraws, s_perfGpuVerts, s_perfCpuVerts;
 struct PerfScope {
+#if defined(PORT_GAME_SMG)
+    bool enabled;
+    OSTime& acc; OSTime t0;
+    explicit PerfScope(OSTime& a) : enabled(g_perfStages), acc(a), t0(enabled ? OSGetTime() : 0) {}
+    ~PerfScope() { if (enabled) acc += OSGetTime() - t0; }
+#else
     OSTime& acc; OSTime t0;
     explicit PerfScope(OSTime& a) : acc(a), t0(OSGetTime()) {}
     ~PerfScope() { acc += OSGetTime() - t0; }
+#endif
 };
 
 static void prepareDrawState(const TevKey& tevKey, TevShader* tevShader, FixedShader& shader,
@@ -4947,7 +4954,11 @@ void flushBatch() {
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
     disablePerDrawCaches();
+#if defined(PORT_GAME_SMG)
+    OSTime perfTex0 = g_perfStages ? OSGetTime() : 0;
+#else
     OSTime perfTex0 = OSGetTime();
+#endif
     const TevKey tevKey = currentTevKey();
     const bool textured = tevTextureMask(tevKey) != 0;
     TextureEntry* tevTextures[8] = {};
@@ -4980,7 +4991,11 @@ void flushBatch() {
     // The vertex layout must follow the shader actually bound: a material that
     // samples a texture we could not load still draws through the stage-1
     // fallback (8 or 10 floats), while the TEV path uses 28 floats.
+#if defined(PORT_GAME_SMG)
+    if (g_perfStages) s_perfTex += OSGetTime() - perfTex0;
+#else
     s_perfTex += OSGetTime() - perfTex0;
+#endif
     OSTime stT = g_perfStages ? OSGetTime() : 0;
     if (g_perfStages) s_stKey += stT - perfTex0;
     const bool useTex = !tevPath && textured && texture;
@@ -5086,7 +5101,11 @@ void flushBatch() {
     } else {
         memset(block + vertexCount * vertexStride, 0, vertexStride);
     }
+#if defined(PORT_GAME_SMG)
+    OSTime perfXform0 = g_perfStages ? OSGetTime() : 0;
+#else
     OSTime perfXform0 = OSGetTime();
+#endif
     HostVertex firstHv;
     float firstOut[28] = {};
     bool haveFirst = false;
@@ -5140,7 +5159,11 @@ void flushBatch() {
             }
         }
     }
+#if defined(PORT_GAME_SMG)
+    if (g_perfStages) s_perfXform += OSGetTime() - perfXform0;
+#else
     s_perfXform += OSGetTime() - perfXform0;
+#endif
     ++s_perfDraws;
     s_perfVerts += uint32_t(s_batch.indices.size());
     if (gpuPath) {
@@ -5589,6 +5612,9 @@ extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
+#if defined(PORT_GAME_SMG)
+    sms_wiiu_frame_split_gx_begin();
+#endif
     beginVertexArena();
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     // The generated vertex programs use up to R60; the default split gives
@@ -5640,6 +5666,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     endVertexArena();
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
+#if defined(PORT_GAME_SMG)
+    if (g_perfStages) {
+#endif
     const OSTime perfNow = OSGetTime();
     if (s_perfLastEnd) s_perfWall += perfNow - s_perfLastEnd;
     s_perfLastEnd = perfNow;
@@ -5682,9 +5711,15 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }
+#if defined(PORT_GAME_SMG)
+    }
+#endif
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;
+#if defined(PORT_GAME_SMG)
+    sms_wiiu_frame_split_gx_end();
+#endif
 }
 
 } // namespace gx
