@@ -275,7 +275,7 @@ void release_subframe()
 
 void sync_frame(uint16_t level)
 {
-	// Galaxy sends master level 0x4000 (dspproc.cpp:35); callers use 0x8000 here.
+	// Galaxy's DSP_MIXERLEVEL defaults to 0x4000 (dspproc.cpp:35).
 	// DsyncFrame2ch: five words, the last two zero.
 	uint32_t w[5] = { 0x82000000u | 7u << 16 | level, addr32(g_dac), addr32(g_dac + 560), 0, 0 };
 	send(w, 5);
@@ -292,6 +292,13 @@ bool logged(const char* text)
 // Source index played at output sample k for a Q12 ratio: the identity
 // resampler outputs window[1], which advances by ratio << 4 in 16.16.
 uint64_t source_at(uint64_t k, uint16_t pitch) { return k * ((uint64_t)pitch << 4) >> 16; }
+
+// port_dspmix_render applies the Galaxy master level after bus mixing.
+int master_scaled(int sample, uint16_t master)
+{
+	const int32_t scaled = (int32_t)(((int64_t)sample * master) >> 15);
+	return scaled < -32768 ? -32768 : scaled > 32767 ? 32767 : scaled;
+}
 
 } // namespace
 
@@ -450,7 +457,7 @@ int main(int argc, char** argv)
 	unsigned cursorOutside = 0, drifted = 0;
 	while (out < totalOut) {
 		const unsigned before = g_subframeMails;
-		sync_frame(0x8000);
+		sync_frame(0x4000);
 		for (int sub = 0; sub < 7; sub++) {
 			release_subframe();
 			uint8_t* v0 = voice(0);
@@ -518,7 +525,7 @@ int main(int argc, char** argv)
 		for (int k = 0; k < 560 && out < totalOut; k++, out++) {
 			const uint64_t si = source_at(out, pitch);
 			for (unsigned c = 0; c < 2; c++) {
-				const int got = g_dac[c * 560 + k], want = track_at(c, si);
+				const int got = g_dac[c * 560 + k], want = master_scaled(track_at(c, si), 0x4000);
 				if (got < want - 2 || got > want + 2) {
 					if (mismatches < 5)
 						fail("out[%u][%llu] = %d, source[%llu] = %d", c, (unsigned long long)out, got,
@@ -581,7 +588,7 @@ int main(int argc, char** argv)
 	bool grown = false;
 	uint32_t remainingAfterWrap = 0;
 	while (out2 < 4 * bs + 2000) {
-		sync_frame(0x8000);
+		sync_frame(0x4000);
 		for (int sub = 0; sub < 7; sub++) {
 			release_subframe();
 			uint8_t* v = voice(2);
@@ -596,7 +603,7 @@ int main(int argc, char** argv)
 		}
 		for (int k = 0; k < 560; k++, out2++) {
 			const int got = g_dac[k];
-			const int want = st.pcm[0][out2 % (4 * bs)];
+			const int want = master_scaled(st.pcm[0][out2 % (4 * bs)], 0x4000);
 			if (got < want - 2 || got > want + 2)
 				++bad2;
 		}
@@ -614,12 +621,12 @@ int main(int argc, char** argv)
 	start_stream_voice(3, ring4, 4 * bs, 1, 0x1000);
 	put<uint16_t>(voice(3), kLoopFlag, 0);
 	put<int32_t>(voice(3), kPosition, 1000);
-	sync_frame(0x8000);
+	sync_frame(0x4000);
 	for (int sub = 0; sub < 7; sub++)
 		release_subframe();
 	unsigned badSkip = 0;
 	for (int k = 0; k < 560; k++) {
-		const int want = st.pcm[0][1000 + k];
+		const int want = master_scaled(st.pcm[0][1000 + k], 0x4000);
 		badSkip += g_dac[k] < want - 2 || g_dac[k] > want + 2;
 	}
 	if (badSkip)
@@ -639,7 +646,7 @@ int main(int argc, char** argv)
 			g_window[adpcmBase + frame * 9 + 1 + i] = 0x88;
 	}
 	start_looping_adpcm4_voice(4, adpcmBase);
-	sync_frame(0x8000);
+	sync_frame(0x4000);
 	for (int sub = 0; sub < 7; sub++)
 		release_subframe();
 	unsigned adpcmNonzero = 0;
@@ -664,7 +671,7 @@ int main(int argc, char** argv)
 		g_window[i] = 0x88;
 	const unsigned missesBefore = g_windowMisses;
 	start_looping_adpcm4_voice(4, straddleBase);
-	sync_frame(0x8000);
+	sync_frame(0x4000);
 	release_subframe();
 	unsigned straddleNonzero = 0;
 	for (int k = 0; k < 80; k++)
@@ -701,7 +708,7 @@ int main(int argc, char** argv)
 	put<uint32_t>(line1, 0x04, addr32(delay1));
 	put<uint16_t>(line1, 0x08, 0x0DC8); // JASDsp::SEND_TABLE[2]
 	put<int16_t>(line1, 0x0A, 0x7FFF);
-	sync_frame(0x8000);
+	sync_frame(0x4000);
 	release_subframe();
 	unsigned badFx = 0;
 	for (int k = 8; k < 80; k++)

@@ -121,7 +121,8 @@ def main() -> int:
     args = parser.parse_args()
 
     galaxy = {p.name: p for p in args.galaxy}
-    need = ("JASDSPInterface.cpp", "JASAudioThread.cpp", "JASDSPChannel.cpp", "dspproc.cpp", "dsptask.cpp")
+    need = ("JASDSPInterface.cpp", "JASAudioThread.cpp", "JASDSPChannel.cpp", "dspproc.cpp", "dsptask.cpp",
+            "osdsp_task.cpp")
     missing = [n for n in need if n not in galaxy or not galaxy[n].exists()]
     if missing or not args.protocol.exists():
         return fail("sources missing: " + ", ".join(missing or [str(args.protocol)]))
@@ -166,9 +167,19 @@ def main() -> int:
             return fail(f"dspproc.cpp no longer sends 0x{cmd}")
     expect["cmd-0x81"] = "match" if "0x81000000" in protocol else "difference"
     pad = re.search(r"void DsyncFrame2ch[^{]*\{(.*?)\n\}", src["dspproc.cpp"], re.S)
-    expect["cmd-0x82"] = "compatible" if pad and "DSPSendCommands2(msgs, 5" in pad.group(1) else "match"
+    twoch = pad and "DSPSendCommands2(msgs, 5" in pad.group(1)
+    expect["cmd-0x82"] = "compatible" if twoch else "match"
     expect["cmd-0x8E"] = "difference" if "8E" in words and "0x8E" not in protocol else "match"
-    expect["cmd-4ch"] = "compatible"
+    fourch = re.search(r"void DsyncFrame4ch[^{]*\{(.*?)\n\}", src["dspproc.cpp"], re.S)
+    deferred_fourch = re.search(r"void DsyncFrame3[^{]*\{(.*?)\n\}", src["osdsp_task.cpp"], re.S)
+    fourch_requested = "case 2:" in src["osdsp_task.cpp"] and "DsyncFrame3(sync_stack" in src["osdsp_task.cpp"]
+    expect["cmd-4ch"] = (
+        "compatible"
+        if fourch and "DSPSendCommands2(msgs, 5" in fourch.group(1)
+        and deferred_fourch and "DsyncFrame4ch(" in deferred_fourch.group(1)
+        and fourch_requested
+        else "match"
+    )
 
     sub = re.search(r"sSubFrames = 0x0*(\d+);", src["JASAiCtrl.cpp"])
     expect["frame-size"] = "match" if sub and int(sub.group(1)) == 7 and "7 subframes of 80 samples" in protocol else "difference"

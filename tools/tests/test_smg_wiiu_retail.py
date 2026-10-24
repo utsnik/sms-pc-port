@@ -345,11 +345,13 @@ def main(argv=None):
             else:
                 if not path.is_file():
                     failures.append("missing FST file: %s" % paths[index])
-                elif path.stat().st_size != size:
+                    continue
+                if path.stat().st_size != size:
                     failures.append(
                         "size mismatch for %s: %d, expected %d"
                         % (paths[index], path.stat().st_size, size)
                     )
+                    continue
             mapped[paths[index].lower()] = path
         except (OSError, ValueError) as exc:
             failures.append(str(exc))
@@ -370,6 +372,8 @@ def main(argv=None):
         if is_dir:
             continue
         path = mapped.get(paths[index].lower())
+        if path is None:
+            continue
         try:
             with path.open("rb") as stream:
                 header = stream.read(16)

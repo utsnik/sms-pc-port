@@ -89,9 +89,11 @@ VARAM base: the DSP must read ARAM at the address where the CPU's DMA wrote it.
   - So ARAM offset *a* is main memory `VARAM + a` for both the copy and the DSP; offsets below 0x4000 are the ARAM allocator's reserved stack/header area, not audio heap data.
 - **With ar.cpp the base would be meaningless.**
   - Offsets index a private buffer, so `port_aram_ptr(a)` is right and `VARAM + a` is wrong.
-  - Galaxy does not currently reach direction-1 copies through
-    `JKRAramPiece::startDMA`; the shared VARAM base remains the decisive
-    compatibility requirement.
+  - `JKRAramPiece::startDMA` preserves aralt's direction convention: direction
+    0 takes main RAM from `src`, while direction 1 takes it from `dst`; both
+    directions use the same VARAM-relative ARAM offset and bounds checks in
+    `aram_dma_start`. The current audio paths predominantly issue direction 0,
+    but the port's direction-1 handling is part of the guaranteed interface.
 - **The donor port made the same choice.** GalaxyQuest `wiiu-stage2` links `aralt` (`CMakeLists.txt` `SDK_MODULES`) and resolves `varam + offset`.
 - **Other effects:**
   - `test_smg_wiiu_source_boundary.py` (which expects `aralt.c`) passes again.
