@@ -32,6 +32,7 @@ class ConsoleGateFixtures(unittest.TestCase):
             result = self.run_gate(
                 "--udp-log", str(FIXTURES / "task5_pass.log"),
                 "--stage2-report", str(FIXTURES / "stage2_pass_report.md"),
+                "--from-line", "0",
                 "--require-stage2-pass", "--require-main-start",
                 "--require-no-notrap", "--require-single-launch",
                 "--require-console-frame-split", "--require-good-egg",
@@ -41,10 +42,14 @@ class ConsoleGateFixtures(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("stage=EggStarGalaxy (Good Egg) reached", result.stdout)
             evidence = json.loads(record.read_text(encoding="utf-8"))
-            self.assertEqual(evidence["run_interval"]["start_line"], 2)
+            self.assertEqual(evidence["run_interval"]["start_line"], 1)
             self.assertEqual(evidence["run_interval"]["main_start_count"], 1)
             self.assertEqual(len(evidence["framesplit"]), 2)
-            self.assertTrue(any("EggStarGalaxy" in path for path in evidence["stage_path"]))
+            self.assertEqual(
+                [row["stage"] for row in evidence["framesplit"]],
+                ["FileSelect", "EggStarGalaxy"],
+            )
+            self.assertEqual(evidence["stage_path"], ["FileSelect", "EggStarGalaxy"])
 
     def test_task6_rescue_and_report_pass(self) -> None:
         result = self.run_gate(
@@ -63,7 +68,7 @@ class ConsoleGateFixtures(unittest.TestCase):
     def test_negative_fixtures(self) -> None:
         cases = (
             (("notrap.log", "--require-main-start", "--require-no-notrap"), "notrap RPX"),
-            (("two_launch.log", "--require-main-start", "--require-single-launch"), "exactly one"),
+            (("two_launch.log", "--from-line", "0", "--require-main-start", "--require-single-launch"), "exactly one"),
             (("heavens_only.log", "--require-main-start", "--require-good-egg"), "EggStarGalaxy"),
         )
         for (fixture, *arguments), expected in cases:
@@ -77,6 +82,34 @@ class ConsoleGateFixtures(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Cemu log paths", result.stdout)
+
+    def test_scene_stage_and_launch_window_negatives(self) -> None:
+        result = self.run_gate(
+            "--udp-log", str(FIXTURES / "egg_dvd_file_select.log"),
+            "--require-good-egg",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("EggStarGalaxy", result.stdout)
+
+        result = self.run_gate(
+            "--udp-log", str(FIXTURES / "prior_run_new_run.log"),
+            "--from-line", "4", "--require-main-start", "--require-single-launch",
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        result = self.run_gate(
+            "--udp-log", str(FIXTURES / "two_launch_window.log"),
+            "--from-line", "1", "--require-single-launch",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one", result.stdout)
+
+        result = self.run_gate(
+            "--udp-log", str(FIXTURES / "task5_pass.log"),
+            "--require-single-launch",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires --from-line", result.stdout)
 
     def test_source_format_self_check(self) -> None:
         result = self.run_gate("--self-check")

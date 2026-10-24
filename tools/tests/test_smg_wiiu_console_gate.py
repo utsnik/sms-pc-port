@@ -2,8 +2,9 @@
 """Offline evidence gate for the SMG Wii U Stage 3 console run.
 
 The gate only reads its arguments.  In particular, it never opens a network
-socket and never changes the UDP log.  A run is the suffix beginning at the
-last ``SMG Wii U: main entered`` marker.
+socket and never changes the UDP log.  By default a run is the suffix
+beginning at the last ``SMG Wii U: main entered`` marker.  ``--from-line``
+selects the append-only log window after a recorded pre-launch line count.
 """
 
 from __future__ import annotations
@@ -17,8 +18,12 @@ from typing import Any, Iterable
 
 
 MAIN_MARKER = "SMG Wii U: main entered"
-STAGE_RE = re.compile(r"(?:SMS Wii U: frame=\d+|\[framesplit\].*?frame=\d+)\s+stage=(\S+)")
+SCENE_RE = re.compile(
+    r"\[smg-scene\]\s+(?P<event>init|start)\s+"
+    r"scene=(?P<scene>\S+)\s+stage=(?P<stage>\S*)"
+)
 TIMESTAMP_RE = re.compile(
+    r"^\[(\d{2}:\d{2}:\d{2}\.\d{3})\]|"
     r"^(?:\[)?(\d{4}-\d{2}-\d{2}(?:T| )\d{2}:[0-9:.+-]+Z?)(?:\])?\s*"
 )
 FRAME_RE = re.compile(
@@ -48,6 +53,14 @@ SOURCE_PATTERNS = {
     "ProcUI exit": ("platform/wiiu/exception.cpp", "[crash] ProcUI exiting"),
     "frame split": ("platform/wiiu/profiler.cpp", "[framesplit] frame=%u stage=%s"),
     "stage heartbeat": ("platform/wiiu/vi.cpp", "SMS Wii U: frame=%u stage=%s"),
+    "scene init": (
+        "games/smg/decomp/src/Game/System/GameSystemSceneController.cpp",
+        "[smg-scene] init scene=%s stage=%s",
+    ),
+    "scene start": (
+        "games/smg/decomp/src/Game/System/GameSystemSceneController.cpp",
+        "[smg-scene] start scene=%s stage=%s",
+    ),
 }
 
 
@@ -71,7 +84,7 @@ def source_self_check(root: Path) -> list[str]:
 
 def timestamp(line: str) -> str | None:
     match = TIMESTAMP_RE.match(line)
-    return match.group(1) if match else None
+    return next((value for value in match.groups() if value is not None), None) if match else None
 
 
 def read_report(path: Path) -> tuple[str, list[str]]:
@@ -81,10 +94,27 @@ def read_report(path: Path) -> tuple[str, list[str]]:
         return "", [f"cannot read report {path}: {exc}"]
 
 
+def scene_stage(line: str) -> tuple[str, str] | None:
+    match = SCENE_RE.search(line)
+    if not match:
+        return None
+    return match.group("event"), match.group("stage") or "unknown"
+
+
 def parse_frames(lines: Iterable[tuple[int, str]]) -> tuple[list[dict[str, Any]], list[str]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
+    initialized_stage = "unknown"
+    started_stage: str | None = None
     for line_number, line in lines:
+        event = scene_stage(line)
+        if event is not None:
+            kind, stage = event
+            if kind == "start":
+                started_stage = stage
+            else:
+                initialized_stage = stage
+                started_stage = None
         if "[framesplit]" not in line:
             continue
         payload = line[line.index("[framesplit]"):].strip()
@@ -95,18 +125,33 @@ def parse_frames(lines: Iterable[tuple[int, str]]) -> tuple[list[dict[str, Any]]
         row: dict[str, Any] = {"line": line_number}
         for key, value in match.groupdict().items():
             row[key] = value if key == "stage" else float(value) if "." in value else int(value)
+        row["stage"] = started_stage if started_stage is not None else initialized_stage
         rows.append(row)
     return rows, errors
 
 
-def stage_paths(lines: Iterable[str]) -> list[str]:
-    paths: list[str] = []
+def scene_stages(lines: Iterable[str]) -> list[str]:
+    stages: list[str] = []
     for line in lines:
-        for match in STAGE_RE.finditer(line):
-            path = match.group(1)
-            if path not in paths:
-                paths.append(path)
-    return paths
+        event = scene_stage(line)
+        if event is None:
+            continue
+        _, stage = event
+        if stage != "unknown" and stage not in stages:
+            stages.append(stage)
+    return stages
+
+
+def scene_start_stages(lines: Iterable[str]) -> list[str]:
+    stages: list[str] = []
+    for line in lines:
+        event = scene_stage(line)
+        if event is None:
+            continue
+        kind, stage = event
+        if kind == "start" and stage != "unknown" and stage not in stages:
+            stages.append(stage)
+    return stages
 
 
 def report_has_buckets(report: str, buckets: list[str], percentiles: list[str]) -> list[str]:
@@ -124,6 +169,16 @@ def report_has_buckets(report: str, buckets: list[str], percentiles: list[str]) 
         ):
             errors.append(f"report is missing count/p50/p90/max row for {bucket}")
     return errors
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a non-negative integer") from exc
+    if result < 0:
+        raise argparse.ArgumentTypeError("must be a non-negative integer")
+    return result
 
 
 def record_run(path: Path, log_path: Path, lines: list[str], start: int,
@@ -161,6 +216,8 @@ def parser() -> argparse.ArgumentParser:
                         default=Path(__file__).parents[2] / "games/smg/platform/wiiu/STAGE2_REPORT.md")
     result.add_argument("--report", type=Path)
     result.add_argument("--record-run", type=Path)
+    result.add_argument("--from-line", type=nonnegative_int, metavar="N",
+                        help="use log lines after the N lines present before launch")
     result.add_argument("--require-log", action="append", default=[])
     result.add_argument("--require-stage-path")
     result.add_argument("--require-stage2-pass", action="store_true")
@@ -219,13 +276,20 @@ def main(argv: list[str] | None = None) -> int:
         errors.append(f"cannot read UDP log {log_path}: {exc}")
         text = ""
     lines = text.splitlines()
-    starts = [index for index, line in enumerate(lines) if MAIN_MARKER in line]
-    start = starts[-1] if starts else len(lines)
-    run_lines = lines[start:]
-    run_number = sum(MAIN_MARKER in line for line in run_lines)
+    all_starts = [index for index, line in enumerate(lines) if MAIN_MARKER in line]
+    if args.from_line is not None:
+        start = args.from_line
+        run_lines = lines[start:]
+        starts = [index for index in all_starts if index >= start]
+    else:
+        start = all_starts[-1] if all_starts else len(lines)
+        run_lines = lines[start:]
+        starts = [index for index in all_starts if index >= start]
+    run_number = len(starts)
     frames, frame_errors = parse_frames((index + 1, line) for index, line in enumerate(run_lines, start))
     errors.extend(frame_errors)
-    stages = stage_paths(run_lines)
+    stages = scene_stages(run_lines)
+    started_stages = scene_start_stages(run_lines)
 
     if args.require_stage2_pass:
         report, report_errors = read_report(args.stage2_report)
@@ -235,8 +299,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.require_main_start and not starts:
         errors.append("missing SMG Wii U main-start marker")
     if args.require_single_launch:
-        if len(starts) != 1 or run_number != 1:
-            errors.append(f"expected exactly one launch marker in the UDP log; found {len(starts)}")
+        if args.from_line is None:
+            errors.append("--require-single-launch requires --from-line")
+        elif run_number != 1:
+            errors.append(f"expected exactly one launch marker after --from-line; found {run_number}")
     if args.require_no_notrap and re.search(r"\b(?:cemu_)?notrap\b", "\n".join(run_lines), re.I):
         errors.append("notrap RPX name is present in the selected run")
     for pattern in args.require_log:
@@ -247,14 +313,15 @@ def main(argv: list[str] | None = None) -> int:
             errors.append(f"invalid --require-log regex {pattern!r}: {exc}")
         if not matched:
             errors.append(f"missing required run log pattern: /{pattern}/")
-    if args.require_stage_path and not any(args.require_stage_path in path for path in stages):
-        errors.append(f"required stage path {args.require_stage_path} was not observed")
-    if args.require_good_egg and not any("EggStarGalaxy" in path for path in stages):
-        errors.append("Good Egg gate requires EggStarGalaxy in the reported stage path")
-    if args.require_good_egg and frames and not any(
-        "EggStarGalaxy" in str(row["stage"]) for row in frames
+    if args.require_stage_path and not any(args.require_stage_path in stage for stage in stages):
+        errors.append(f"required stage path {args.require_stage_path} was not observed in scene logs")
+    good_egg_started = "EggStarGalaxy" in started_stages
+    if args.require_good_egg and not good_egg_started:
+        errors.append("Good Egg gate requires [smg-scene] start ... stage=EggStarGalaxy")
+    if args.require_good_egg and (args.require_console_frame_split or args.require_frame_p50_p90) and not any(
+        row["stage"] == "EggStarGalaxy" for row in frames
     ):
-        errors.append("Good Egg frame evidence requires an EggStarGalaxy [framesplit] row")
+        errors.append("Good Egg frame evidence requires an EggStarGalaxy-attributed [framesplit] row")
     if args.require_console_frame_split and not frames:
         errors.append("missing console [framesplit] rows")
     if args.require_console_frame_split and frames and any(
@@ -269,8 +336,9 @@ def main(argv: list[str] | None = None) -> int:
                 for bucket in BUCKETS:
                     if f"{bucket}_p50" not in row or f"{bucket}_p90" not in row:
                         errors.append(f"frame row {row['line']} is missing p50/p90 for {bucket}")
+    evidence_text = "\n".join(run_lines) if args.from_line is not None else text
     if args.require_rescue_disabled_run and not re.search(
-        r"no[- ]rescue|rescue thread disabled.*SMG", text, re.I
+        r"no[- ]rescue|rescue thread disabled.*SMG", evidence_text, re.I
     ):
         errors.append("no successful disabled-rescue run is identified in the UDP evidence")
     if args.require_rescue_enabled_run and not re.search(
