@@ -162,7 +162,6 @@ struct TevKey {
     uint32_t iref;     // BP_RAS1_IREF (zero without indirect stages)
 #if defined(PORT_GAME_SMG)
     uint32_t ztex2;    // BP_ZTEX2: format and GX_ZT_* operation
-    uint32_t ztexBias; // BP_ZTEX_BIAS, unsigned 24-bit
 #endif
 };
 
@@ -962,8 +961,8 @@ static TevKey currentTevKey() {
         k.iref = g.bp[BP_RAS1_IREF] & 0xffffff;
     }
 #if defined(PORT_GAME_SMG)
-    k.ztex2 = g.bp[BP_ZTEX2] & 0xf;
-    k.ztexBias = g.bp[BP_ZTEX_BIAS] & 0x00ffffffu;
+    const uint32_t ztex2 = g.bp[BP_ZTEX2] & 0xf;
+    if ((ztex2 >> 2) & 3) k.ztex2 = ztex2;
 #endif
     return k;
 }
@@ -1078,13 +1077,18 @@ struct TevAlloc {
     uint32_t ind[4];       // indirect lookup results
     uint32_t icoord[4];    // indirect lookup coordinates
 #if defined(PORT_GAME_SMG)
+    uint32_t pos;           // fragment position, used by GX_ZT_ADD
     uint32_t ztex;          // decoded Z texture sample
 #endif
     uint32_t scoord[16];   // texture coordinate of an indirect stage
     uint32_t bump[16];     // bump alpha after stage n (x: bumpA, y: bumpA | bumpA >> 5)
     uint32_t prevTc;       // the previous indirect stage's texel coordinate
     uint32_t inputs;       // imported semantics, in GPR order
+#if defined(PORT_GAME_SMG)
+    uint32_t semantic[11];  // ADD also reserves the fragment-position input
+#else
     uint32_t semantic[10];
+#endif
     uint32_t count;        // GPRs used
 };
 static TevAlloc s_ra;
@@ -2609,9 +2613,10 @@ static bool initTevPixel(TevShader& shader) {
     const uint32_t numInd = tevNumInd(key);
 #if defined(PORT_GAME_SMG)
     const int ztexStage = tevZTextureStage(key);
-    const bool ztexReplace = ztexStage >= 0 && ((key.ztex2 >> 2) & 3) == 2;
-#else
-    const bool ztexReplace = false;
+    const uint32_t ztexOp = ztexStage >= 0 ? ((key.ztex2 >> 2) & 3) : 0;
+    const bool ztexAdd = ztexOp == 1;
+    const bool ztexReplace = ztexOp == 2;
+    const bool ztexExport = ztexAdd || ztexReplace;
 #endif
     auto indStage = [&](uint32_t s) { return ((key.order[s] >> 6) & 1) && key.ind[s] != 0; };
     // ---- register allocation ----
@@ -2635,6 +2640,9 @@ static bool initTevPixel(TevShader& shader) {
 #endif
     uint32_t next = 0;
     ra.inputs = 0;
+#if defined(PORT_GAME_SMG)
+    if (ztexAdd) ra.pos = next++;
+#endif
     for (uint32_t c = 0; c < 8; ++c)
         if (useCoord[c]) { ra.coord[c] = next; ra.semantic[next++] = c; }
     for (uint32_t c = 0; c < 2; ++c)
@@ -2701,15 +2709,6 @@ static bool initTevPixel(TevShader& shader) {
         prepCount = program.size() - prepOffset;
     }
     tex1Offset = program.size();
-#if defined(PORT_GAME_SMG)
-    if (ztexStage >= 0) {
-        const uint32_t zorder = key.order[ztexStage];
-        const uint32_t zmap = zorder & 7, zcoord = (zorder >> 3) & 7;
-        uint64_t sample[2] = {TEX_SAMPLE(_R(ra.ztex), _x, _y, _z, _w, _R(ra.coord[zcoord]), _x, _y, _0, _x, zmap, zmap)};
-        program.push_back(sample[0]); program.push_back(sample[1]);
-        ++tex1Count;
-    }
-#endif
     for (uint32_t i = 0; i < numInd; ++i) {
         const uint32_t map = (key.iref >> (6 * i)) & 7;
         uint64_t sample[2] = {TEX_SAMPLE(_R(ra.ind[i]), _x, _y, _z, _w, _R(ra.icoord[i]), _x, _y, _0, _x, map, map)};
@@ -2723,6 +2722,13 @@ static bool initTevPixel(TevShader& shader) {
         uint64_t sample[2] = {TEX_SAMPLE(_R(ra.tex[stage]), _x, _y, _z, _w, _R(ra.coord[coord]), _x, _y, _0, _x, map, map)};
         program.push_back(sample[0]); program.push_back(sample[1]);
         ++tex1Count;
+#if defined(PORT_GAME_SMG)
+        if (ztexStage == int(stage)) {
+            uint64_t zsample[2] = {TEX_SAMPLE(_R(ra.ztex), _x, _y, _z, _w, _R(ra.coord[coord]), _x, _y, _0, _x, map, map)};
+            program.push_back(zsample[0]); program.push_back(zsample[1]);
+            ++tex1Count;
+        }
+#endif
     }
     if (anyInd) {
         indOffset = program.size();
@@ -2742,6 +2748,13 @@ static bool initTevPixel(TevShader& shader) {
             uint64_t sample[2] = {TEX_SAMPLE(_R(ra.tex[stage]), _x, _y, _z, _w, _R(ra.scoord[stage]), _x, _y, _0, _x, map, map)};
             program.push_back(sample[0]); program.push_back(sample[1]);
             ++tex2Count;
+#if defined(PORT_GAME_SMG)
+            if (ztexStage == int(stage)) {
+                uint64_t zsample[2] = {TEX_SAMPLE(_R(ra.ztex), _x, _y, _z, _w, _R(ra.scoord[stage]), _x, _y, _0, _x, map, map)};
+                program.push_back(zsample[0]); program.push_back(zsample[1]);
+                ++tex2Count;
+            }
+#endif
         }
     }
 
@@ -2836,10 +2849,11 @@ static bool initTevPixel(TevShader& shader) {
     flush();
 #if defined(PORT_GAME_SMG)
     // GX Z-texturing bypasses the TEV result and feeds the decoded texel to
-    // the depth compare.  The GX2 texture path presents Z8/Z16/Z24X8 as
-    // normalized RGBA8, so reconstruct the low-justified 24-bit integer and
-    // export it through Latte's computed-Z target (PIXEL 61).
-    if (ztexReplace) {
+    // the depth compare. The GX2 texture path presents Z8/Z16/Z24X8 as
+    // normalized RGBA8, so reconstruct the low-justified 24-bit integer,
+    // apply the operation and export it through Latte's computed-Z target
+    // (PIXEL 61).
+    if (ztexExport) {
         const uint32_t z = ra.t[0];
         const uint32_t zfmt = key.ztex2 & 3;
         if (zfmt == 0) {
@@ -2868,9 +2882,25 @@ static bool initTevPixel(TevShader& shader) {
             g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _z)));
             flush();
         }
+        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevC(42, _w)));
+        flush();
+        if (ztexAdd) {
+            g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.pos, _z), tevC(42, _z)));
+            flush();
+            g.push_back(tevOp1(kOpFloor, ra.t[1], _x, tevG(ra.t[1], _x)));
+            flush();
+            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(ra.t[1], _x)));
+            flush();
+        }
         g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(41, _y)));
         flush();
-        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevC(42, _w)));
+        g.push_back(tevOp1(kOpFloor, ra.t[1], _x, tevG(z, _x)));
+        flush();
+        g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.t[1], _x), tevC(41, _x)));
+        flush();
+        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevNeg(tevG(ra.t[1], _x))));
+        flush();
+        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(42, _y)));
         flush();
     }
 #endif
@@ -2886,13 +2916,13 @@ static bool initTevPixel(TevShader& shader) {
     // The alpha compare (with its literal thresholds) is a few slots, one clause.
     if (compareCount > 128) return false;
 #if defined(PORT_GAME_SMG)
-    if (cf + (ztexReplace ? 3 : 2) > kCfSlots) return false;
+    if (cf + (ztexExport ? 3 : 2) > kCfSlots) return false;
 #else
     if (cf + 2 > kCfSlots) return false;
 #endif
     program[cf++] = ALU(compareOffset, compareCount);
 #if defined(PORT_GAME_SMG)
-    if (ztexReplace) program[cf++] = EXP(PIX_Z, _R(ra.t[0]), _x, _0, _0, _0);
+    if (ztexExport) program[cf++] = EXP(PIX_Z, _R(ra.t[0]), _x, _0, _0, _0);
 #endif
     uint64_t exportOp = EXP_DONE(PIX0, _R(ra.stage), _x, _y, _z, _w);
     if (killed) exportOp |= to_QWORD(0, to_LE(1u << 22));
@@ -2907,11 +2937,21 @@ static bool initTevPixel(TevShader& shader) {
     // Import only the interpolated values the key reads, packed from R0.
     shader.pixel.regs.spi_ps_in_control_0 = ra.inputs | (1u << 26) | (1u << 28);
     shader.pixel.regs.num_spi_ps_input_cntl = ra.inputs;
+#if defined(PORT_GAME_SMG)
+    if (ztexAdd) {
+        shader.pixel.regs.spi_ps_in_control_0 |= 1u << 8;  // position_ena
+        shader.pixel.regs.spi_ps_input_cntls[0] = 0 | (1u << 8);
+        for (uint32_t i = 1; i < ra.inputs; ++i) shader.pixel.regs.spi_ps_input_cntls[i] = ra.semantic[i] | 0x100;
+    } else {
+        for (uint32_t i = 0; i < ra.inputs; ++i) shader.pixel.regs.spi_ps_input_cntls[i] = ra.semantic[i] | 0x100;
+    }
+#else
     for (uint32_t i = 0; i < ra.inputs; ++i) shader.pixel.regs.spi_ps_input_cntls[i] = ra.semantic[i] | 0x100;
+#endif
     shader.pixel.regs.cb_shader_mask = 0xf;
     shader.pixel.regs.cb_shader_control = 1;
 #if defined(PORT_GAME_SMG)
-    shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6) | (ztexReplace ? 1u : 0u);
+    shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6) | (ztexExport ? 1u : 0u);
 #else
     shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6);
 #endif
@@ -2965,7 +3005,7 @@ struct TevParamInputs {
     const TextureEntry* tex[8];
     uint32_t texW[8], texH[8];
 #if defined(PORT_GAME_SMG)
-    uint32_t ztex2, ztexBias;
+    uint32_t ztexBias;
 #endif
     uint32_t copyGeneration;
 };
@@ -2992,7 +3032,6 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     in.ss[1] = g.bp[BP_RAS1_SS1];
     for (int i = 0; i < 9; ++i) in.indMtx[i] = g.bp[BP_IND_MTX + i];
 #if defined(PORT_GAME_SMG)
-    in.ztex2 = g.bp[BP_ZTEX2] & 0xf;
     in.ztexBias = g.bp[BP_ZTEX_BIAS] & 0x00ffffffu;
 #endif
     in.copyGeneration = s_copyGeneration;
@@ -3080,7 +3119,9 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
                                         8388608.0f, 1.0f / 8, 8, 0};
     memcpy(&params[156], kIndConst, sizeof(kIndConst));
 #if defined(PORT_GAME_SMG)
-    params[171] = float(shader.key.ztexBias) / 16777216.0f;
+    params[169] = 1.0f / 16777215.0f;  // C42.y: GX's 24-bit depth range
+    params[170] = 16777215.0f;          // C42.z: rasterized 24-bit Z scale
+    params[171] = float(in.ztexBias);   // C42.w: unsigned 24-bit bias
 #endif
     // C43-C46: the TEV registers' low 8 bits (the A/B/C view of a register no
     // stage has written yet).
