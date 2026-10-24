@@ -40,6 +40,9 @@
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
 #include "gx2_texture_pack.h"
+#if defined(PORT_GAME_SMG)
+#include "gx2_ztex.h"
+#endif
 
 #include <gx2/draw.h>
 #include <gx2/swap.h>
@@ -157,6 +160,10 @@ struct TevKey {
     uint32_t alphaCompare;
     uint32_t ind[16];  // BP_IND_CMD per stage (zero without indirect stages)
     uint32_t iref;     // BP_RAS1_IREF (zero without indirect stages)
+#if defined(PORT_GAME_SMG)
+    uint32_t ztex2;    // BP_ZTEX2: format and GX_ZT_* operation
+    uint32_t ztexBias; // BP_ZTEX_BIAS, unsigned 24-bit
+#endif
 };
 
 struct TevShader {
@@ -954,6 +961,10 @@ static TevKey currentTevKey() {
         for (uint32_t s = 0; s < k.stages; ++s) k.ind[s] = g.bp[BP_IND_CMD + s] & 0x1fffff;
         k.iref = g.bp[BP_RAS1_IREF] & 0xffffff;
     }
+#if defined(PORT_GAME_SMG)
+    k.ztex2 = g.bp[BP_ZTEX2] & 0xf;
+    k.ztexBias = g.bp[BP_ZTEX_BIAS] & 0x00ffffffu;
+#endif
     return k;
 }
 
@@ -981,11 +992,24 @@ static VertexKey currentVertexKey(bool tevOutput, int fixedCoord, bool fixedText
 
 static void packRawVertex(const HostVertex& in, RawVertex& out) { out = in; }
 
+#if defined(PORT_GAME_SMG)
+static int tevZTextureStage(const TevKey& k) {
+    if (((k.ztex2 >> 2) & 3) == 0) return -1;
+    for (int s = int(k.stages) - 1; s >= 0; --s)
+        if ((k.order[s] >> 6) & 1) return s;
+    return -1;
+}
+#endif
+
 static uint32_t tevTextureMask(const TevKey& k) {
     uint32_t mask = 0;
     for (uint32_t s = 0; s < k.stages; ++s)
         if ((k.order[s] >> 6) & 1) mask |= 1u << (k.order[s] & 7);
     for (uint32_t i = 0; i < tevNumInd(k); ++i) mask |= 1u << ((k.iref >> (6 * i)) & 7);
+#if defined(PORT_GAME_SMG)
+    const int zstage = tevZTextureStage(k);
+    if (zstage >= 0) mask |= 1u << (k.order[zstage] & 7);
+#endif
     return mask;
 }
 
@@ -993,6 +1017,9 @@ static bool tevSupported(const TevKey& k) {
     for (uint32_t s = 0; s < k.stages; ++s) {
         if (((k.order[s] >> 6) & 1) && (k.order[s] & 7) >= 8) return false;
     }
+#if defined(PORT_GAME_SMG)
+    if (((k.ztex2 >> 2) & 3) != 0 && tevZTextureStage(k) < 0) return false;
+#endif
     return true;
 }
 
@@ -1050,6 +1077,9 @@ struct TevAlloc {
     uint32_t k[4];         // constant-file copies
     uint32_t ind[4];       // indirect lookup results
     uint32_t icoord[4];    // indirect lookup coordinates
+#if defined(PORT_GAME_SMG)
+    uint32_t ztex;          // decoded Z texture sample
+#endif
     uint32_t scoord[16];   // texture coordinate of an indirect stage
     uint32_t bump[16];     // bump alpha after stage n (x: bumpA, y: bumpA | bumpA >> 5)
     uint32_t prevTc;       // the previous indirect stage's texel coordinate
@@ -2577,6 +2607,12 @@ static bool initTevPixel(TevShader& shader) {
     const size_t kCfSlots = 40;
     const TevKey& key = shader.key;
     const uint32_t numInd = tevNumInd(key);
+#if defined(PORT_GAME_SMG)
+    const int ztexStage = tevZTextureStage(key);
+    const bool ztexReplace = ztexStage >= 0 && ((key.ztex2 >> 2) & 3) == 2;
+#else
+    const bool ztexReplace = false;
+#endif
     auto indStage = [&](uint32_t s) { return ((key.order[s] >> 6) & 1) && key.ind[s] != 0; };
     // ---- register allocation ----
     TevAlloc& ra = s_ra;
@@ -2594,6 +2630,9 @@ static bool initTevPixel(TevShader& shader) {
             if (cs[i] == 10 || cs[i] == 11 || as[i] == 5) { if (chan <= 1) useRas[chan] = true; }
         }
     }
+#if defined(PORT_GAME_SMG)
+    if (ztexStage >= 0) useCoord[(key.order[ztexStage] >> 3) & 7] = true;
+#endif
     uint32_t next = 0;
     ra.inputs = 0;
     for (uint32_t c = 0; c < 8; ++c)
@@ -2602,6 +2641,9 @@ static bool initTevPixel(TevShader& shader) {
         if (useRas[c]) { ra.ras[c] = next; ra.semantic[next++] = 8 + c; }
     ra.inputs = next;
     if (!ra.inputs) { ra.semantic[0] = 8; ra.inputs = 1; next = 1; }  // a pixel shader imports at least one value
+#if defined(PORT_GAME_SMG)
+    if (ztexStage >= 0) ra.ztex = next++;
+#endif
     for (uint32_t i = 0; i < numInd; ++i) { ra.ind[i] = next++; ra.icoord[i] = next++; }
     // A texture fetch may overwrite its coordinate's GPR when no later fetch
     // and no indirect stage (whose ALU runs after the fetches) reads it.
@@ -2659,6 +2701,15 @@ static bool initTevPixel(TevShader& shader) {
         prepCount = program.size() - prepOffset;
     }
     tex1Offset = program.size();
+#if defined(PORT_GAME_SMG)
+    if (ztexStage >= 0) {
+        const uint32_t zorder = key.order[ztexStage];
+        const uint32_t zmap = zorder & 7, zcoord = (zorder >> 3) & 7;
+        uint64_t sample[2] = {TEX_SAMPLE(_R(ra.ztex), _x, _y, _z, _w, _R(ra.coord[zcoord]), _x, _y, _0, _x, zmap, zmap)};
+        program.push_back(sample[0]); program.push_back(sample[1]);
+        ++tex1Count;
+    }
+#endif
     for (uint32_t i = 0; i < numInd; ++i) {
         const uint32_t map = (key.iref >> (6 * i)) & 7;
         uint64_t sample[2] = {TEX_SAMPLE(_R(ra.ind[i]), _x, _y, _z, _w, _R(ra.icoord[i]), _x, _y, _0, _x, map, map)};
@@ -2783,6 +2834,46 @@ static bool initTevPixel(TevShader& shader) {
     for (uint32_t ch = 0; ch < 4; ++ch)
         g.push_back(tevOp(kOpMul, ra.stage, ch, tevG(ch < 3 ? outColor : outAlpha, ch), tevC(13, _x)));
     flush();
+#if defined(PORT_GAME_SMG)
+    // GX Z-texturing bypasses the TEV result and feeds the decoded texel to
+    // the depth compare.  The GX2 texture path presents Z8/Z16/Z24X8 as
+    // normalized RGBA8, so reconstruct the low-justified 24-bit integer and
+    // export it through Latte's computed-Z target (PIXEL 61).
+    if (ztexReplace) {
+        const uint32_t z = ra.t[0];
+        const uint32_t zfmt = key.ztex2 & 3;
+        if (zfmt == 0) {
+            g.push_back(tevOp(kOpMul, z, _x, tevG(ra.ztex, _x), tevC(12, _w)));
+            flush();
+        } else if (zfmt == 1) {
+            g.push_back(tevOp(kOpMul, z, _x, tevG(ra.ztex, _w), tevC(12, _w)));
+            flush();
+            g.push_back(tevOp(kOpMul, z, _y, tevG(ra.ztex, _x), tevC(12, _w)));
+            flush();
+            g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(12, _x)));
+            flush();
+            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _y)));
+            flush();
+        } else {
+            for (uint32_t ch = 0; ch < 3; ++ch) {
+                g.push_back(tevOp(kOpMul, z, ch, tevG(ra.ztex, ch), tevC(12, _w)));
+                flush();
+            }
+            g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(12, _x)));
+            flush();
+            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _y)));
+            flush();
+            g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(12, _x)));
+            flush();
+            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _z)));
+            flush();
+        }
+        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(41, _y)));
+        flush();
+        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevC(42, _w)));
+        flush();
+    }
+#endif
     const size_t compareCount = program.size() - compareOffset;
 
     // ---- control flow ----
@@ -2794,8 +2885,15 @@ static bool initTevPixel(TevShader& shader) {
     if (!tevAluClauses(program, cf, aluOffset, aluCount)) return false;
     // The alpha compare (with its literal thresholds) is a few slots, one clause.
     if (compareCount > 128) return false;
+#if defined(PORT_GAME_SMG)
+    if (cf + (ztexReplace ? 3 : 2) > kCfSlots) return false;
+#else
     if (cf + 2 > kCfSlots) return false;
+#endif
     program[cf++] = ALU(compareOffset, compareCount);
+#if defined(PORT_GAME_SMG)
+    if (ztexReplace) program[cf++] = EXP(PIX_Z, _R(ra.t[0]), _x, _0, _0, _0);
+#endif
     uint64_t exportOp = EXP_DONE(PIX0, _R(ra.stage), _x, _y, _z, _w);
     if (killed) exportOp |= to_QWORD(0, to_LE(1u << 22));
     program[cf++] = exportOp END_OF_PROGRAM;
@@ -2812,7 +2910,11 @@ static bool initTevPixel(TevShader& shader) {
     for (uint32_t i = 0; i < ra.inputs; ++i) shader.pixel.regs.spi_ps_input_cntls[i] = ra.semantic[i] | 0x100;
     shader.pixel.regs.cb_shader_mask = 0xf;
     shader.pixel.regs.cb_shader_control = 1;
+#if defined(PORT_GAME_SMG)
+    shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6) | (ztexReplace ? 1u : 0u);
+#else
     shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6);
+#endif
     shader.pixel.size = uint32_t(programSize);
     shader.pixel.program = shader.psProgram;
     shader.pixel.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
@@ -2862,6 +2964,9 @@ struct TevParamInputs {
     uint32_t tevReg[8], kreg[8], ss[2], indMtx[9];
     const TextureEntry* tex[8];
     uint32_t texW[8], texH[8];
+#if defined(PORT_GAME_SMG)
+    uint32_t ztex2, ztexBias;
+#endif
     uint32_t copyGeneration;
 };
 
@@ -2886,6 +2991,10 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     in.ss[0] = g.bp[BP_RAS1_SS0];
     in.ss[1] = g.bp[BP_RAS1_SS1];
     for (int i = 0; i < 9; ++i) in.indMtx[i] = g.bp[BP_IND_MTX + i];
+#if defined(PORT_GAME_SMG)
+    in.ztex2 = g.bp[BP_ZTEX2] & 0xf;
+    in.ztexBias = g.bp[BP_ZTEX_BIAS] & 0x00ffffffu;
+#endif
     in.copyGeneration = s_copyGeneration;
     static TevParamInputs s_lastInputs;
     const bool sameInputs = s_tevPixelValid && !memcmp(&in, &s_lastInputs, sizeof(in));
@@ -2970,6 +3079,9 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
                                         1.0f / 32, 1.0f / 16, 16777216.0f, 1.0f / 16777216.0f,
                                         8388608.0f, 1.0f / 8, 8, 0};
     memcpy(&params[156], kIndConst, sizeof(kIndConst));
+#if defined(PORT_GAME_SMG)
+    params[171] = float(shader.key.ztexBias) / 16777216.0f;
+#endif
     // C43-C46: the TEV registers' low 8 bits (the A/B/C view of a register no
     // stage has written yet).
     for (int i = 0; i < 16; ++i) params[172 + i] = float(int(params[i]) & 255);
