@@ -105,7 +105,7 @@ static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
 static bool initTevVertex();
 #if defined(PORT_GAME_SMG)
-static constexpr uint32_t kZtexConstReg = 42;
+static constexpr uint32_t kZtexConstReg = 47;
 static constexpr uint32_t kZtexRangeInvChan = _y;
 static constexpr uint32_t kZtexRangeChan = _z;
 static constexpr uint32_t kZtexBiasChan = _w;
@@ -1055,10 +1055,26 @@ static uint32_t tevSwapChannel(const TevKey& k, uint32_t table, uint32_t channel
 // is an integer held exactly in a float (inputs 0..255, registers -1024..1023).
 // A, B and C read only the low 8 bits of a register (an unclamped stage can
 // wrap: Bianco's river and the file-select sea sparkle depend on it); D reads
-// the whole register. The constant file (setTevShader) holds:
-//   C0-3 TEVREG (PREV, REG0-2)  C4-7 KONST  C8-9 the k8 fractions
-//   C11 (255, 128, -, 0)  C12 (256, 1/256, 128, 255)  C13 (1/255, 1/128, -1024, 1023)
-//   C14 (-128, ...)
+// the whole register.
+//
+// Pixel constant-file allocation (setTevShader; params[] is four floats/reg):
+//   C0-C3   TEVREG PREV/REG0-2 (full signed 11-bit values)
+//   C4-C7   KONST values (four packed GX konst registers)
+//   C8-C9   fixed TEV constants k8[0..7]
+//   C10     reserved zero (no generated pixel consumer)
+//   C11     (255, 128, unused, 0)
+//   C12     (256, 1/256, 128, 255)
+//   C13     (1/255, 1/128, -1024, 1023)
+//   C14     (-128, unused, unused, unused)
+//   C15-C16 indirect coordinate scales (1/2^ss), two per stage
+//   C17-C22 indirect matrix rows and exponent scale
+//   C23-C30 texture-map offsets and texel sizes
+//   C31-C38 texture-map inverse sizes
+//   C39-C42 indirect wrap sizes and bump/24-bit helpers; C41.z=2^24,
+//           C41.w=1/2^24, and C42 is entirely owned by indirect texturing
+//   C43-C46 low-byte views of the four TEV registers
+//   C47     SMG z-texture only: y=1/16777215, z=16777215, w=bias;
+//           no other tevC() or uploader owns this register
 //
 // GPRs are allocated per shader (TevAlloc): the interpolated inputs the key
 // reads come first (the pixel shader imports only those semantics), then the
@@ -1070,7 +1086,11 @@ static uint32_t tevSwapChannel(const TevKey& k, uint32_t table, uint32_t channel
 //
 // The colour channels (and alpha, when its equation has the same shape) run
 // as one instruction group per operation, one slot per channel.
+#if defined(PORT_GAME_SMG)
+static const uint32_t kTevUniforms = 48;
+#else
 static const uint32_t kTevUniforms = 47;
+#endif
 struct TevAlloc {
     uint32_t coord[8];     // GPR of texcoord n (0xff: not imported)
     uint32_t ras[2];       // GPR of colour channel 0/1 (0xff: not imported)
@@ -2860,54 +2880,41 @@ static bool initTevPixel(TevShader& shader) {
     // apply the operation and export it through Latte's computed-Z target
     // (PIXEL 61).
     if (ztexExport) {
-        const uint32_t z = ra.t[0];
+        const uint32_t z = ra.t[0], q = ra.t[1];
         const uint32_t zfmt = key.ztex2 & 3;
-        if (zfmt == 0) {
-            g.push_back(tevOp(kOpMul, z, _x, tevG(ra.ztex, _x), tevC(12, _w)));
-            flush();
-        } else if (zfmt == 1) {
-            g.push_back(tevOp(kOpMul, z, _x, tevG(ra.ztex, _w), tevC(12, _w)));
-            flush();
-            g.push_back(tevOp(kOpMul, z, _y, tevG(ra.ztex, _x), tevC(12, _w)));
-            flush();
-            g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(12, _x)));
-            flush();
-            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _y)));
-            flush();
-        } else {
-            for (uint32_t ch = 0; ch < 3; ++ch) {
-                g.push_back(tevOp(kOpMul, z, ch, tevG(ra.ztex, ch), tevC(12, _w)));
-                flush();
+        const Gx2ZTextureOpTable ops = gx2ZTextureOpTable(zfmt, ztexAdd);
+        auto ztexReg = [&](uint32_t value) { return value == kGx2ZTexQ ? q : z; };
+        auto ztexSource = [&](uint32_t value) -> TevSource {
+            switch (value) {
+            case kGx2ZTexR: return tevG(ra.ztex, _x);
+            case kGx2ZTexG: return tevG(ra.ztex, _y);
+            case kGx2ZTexB: return tevG(ra.ztex, _z);
+            case kGx2ZTexA: return tevG(ra.ztex, _w);
+            case kGx2ZTexZ: return tevG(z, _x);
+            case kGx2ZTexQ: return tevG(q, _x);
+            case kGx2ZTexByteMax: return tevC(12, _w);
+            case kGx2ZTexByteScale: return tevC(12, _x);
+            case kGx2ZTexWrapInv: return tevC(41, _w);
+            case kGx2ZTexWrapRange: return tevC(41, _z);
+            case kGx2ZTexRangeInv: return tevC(kZtexConstReg, kZtexRangeInvChan);
+            case kGx2ZTexRange: return tevC(kZtexConstReg, kZtexRangeChan);
+            case kGx2ZTexBias: return tevC(kZtexConstReg, kZtexBiasChan);
+            case kGx2ZTexRaster: return tevG(ra.pos, _z);
+            default: return {ALU_SRC_0, 0};
             }
-            g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(12, _x)));
-            flush();
-            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _y)));
-            flush();
-            g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(12, _x)));
-            flush();
-            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _z)));
-            flush();
-        }
-        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevC(kZtexConstReg, kZtexBiasChan)));
-        flush();
-        if (ztexAdd) {
-            g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.pos, _z), tevC(kZtexConstReg, kZtexRangeChan)));
-            flush();
-            g.push_back(tevOp1(kOpFloor, ra.t[1], _x, tevG(ra.t[1], _x)));
-            flush();
-            g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(ra.t[1], _x)));
+        };
+        for (uint32_t i = 0; i < ops.count; ++i) {
+            const Gx2ZTextureOp& op = ops.ops[i];
+            if (op.alu == kGx2ZFloor) {
+                g.push_back(tevOp1(kOpFloor, ztexReg(op.dst), _x, ztexSource(op.lhs)));
+            } else {
+                TevSource rhs = ztexSource(op.rhs);
+                if (op.negateRhs) rhs = tevNeg(rhs);
+                g.push_back(tevOp(op.alu == kGx2ZMul ? kOpMul : kOpAdd,
+                                  ztexReg(op.dst), _x, ztexSource(op.lhs), rhs));
+            }
             flush();
         }
-        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(kZtexConstReg, kZtexRangeChan)));
-        flush();
-        g.push_back(tevOp1(kOpFloor, ra.t[1], _x, tevG(z, _x)));
-        flush();
-        g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.t[1], _x), tevC(kZtexConstReg, kZtexRangeInvChan)));
-        flush();
-        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevNeg(tevG(ra.t[1], _x))));
-        flush();
-        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(kZtexConstReg, kZtexRangeInvChan)));
-        flush();
     }
 #endif
     const size_t compareCount = program.size() - compareOffset;
@@ -3119,12 +3126,15 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
         params[124 + 4 * map + 0] = tr[2] / w;
         params[124 + 4 * map + 1] = tr[3] / h;
     }
-    // C39-C42: wrap sizes and other indirect constants.
+    // C39-C42: wrap sizes and other indirect constants. C41.z/w are the
+    // 2^24 quotient scale and modulus used by the SMG z-texture table;
+    // C42 remains exclusively owned by indirect texturing.
     static const float kIndConst[16] = {256, 128, 64, 32,  16, 1.0f / 256, 1.0f / 128, 1.0f / 64,
                                         1.0f / 32, 1.0f / 16, 16777216.0f, 1.0f / 16777216.0f,
                                         8388608.0f, 1.0f / 8, 8, 0};
     memcpy(&params[156], kIndConst, sizeof(kIndConst));
 #if defined(PORT_GAME_SMG)
+    // C47 is reserved for this path; do not place these in C39-C42.
     params[4 * kZtexConstReg + kZtexRangeInvChan] = 1.0f / 16777215.0f;
     params[4 * kZtexConstReg + kZtexRangeChan] = 16777215.0f;
     params[4 * kZtexConstReg + kZtexBiasChan] = float(in.ztexBias);

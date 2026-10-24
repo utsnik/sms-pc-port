@@ -5,6 +5,148 @@
 
 namespace gx {
 
+// These are the scalar values used by the generated z-texture ALU.  The
+// emitter and the host regression test both walk the same constexpr table;
+// keep the table in operation order because the intermediate precision and
+// the placement of the floor operations are part of the GX emulation.
+enum Gx2ZTextureValue : uint8_t {
+    kGx2ZTexR,
+    kGx2ZTexG,
+    kGx2ZTexB,
+    kGx2ZTexA,
+    kGx2ZTexZ,
+    kGx2ZTexQ,
+    kGx2ZTexByteMax,
+    kGx2ZTexByteScale,
+    kGx2ZTexWrapInv,
+    kGx2ZTexWrapRange,
+    kGx2ZTexRangeInv,
+    kGx2ZTexRange,
+    kGx2ZTexBias,
+    kGx2ZTexRaster,
+};
+
+enum Gx2ZTextureAlu : uint8_t {
+    kGx2ZMul,
+    kGx2ZAdd,
+    kGx2ZFloor,
+};
+
+struct Gx2ZTextureOp {
+    uint8_t alu;
+    uint8_t dst;
+    uint8_t lhs;
+    uint8_t rhs;
+    uint8_t negateRhs;
+};
+
+struct Gx2ZTextureOpTable {
+    const Gx2ZTextureOp* ops;
+    uint32_t count;
+};
+
+// Z8/Z16/Z24X8 decoding, GX_ZT_REPLACE, and the 24-bit wrap/normalisation.
+static constexpr Gx2ZTextureOp kGx2Z8ReplaceOps[] = {
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexR, kGx2ZTexByteMax, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexBias, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexZ, kGx2ZTexWrapInv, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexWrapRange, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 1},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexRangeInv, 0},
+};
+
+static constexpr Gx2ZTextureOp kGx2Z8AddOps[] = {
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexR, kGx2ZTexByteMax, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexBias, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexRaster, kGx2ZTexRange, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexZ, kGx2ZTexWrapInv, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexWrapRange, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 1},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexRangeInv, 0},
+};
+
+static constexpr Gx2ZTextureOp kGx2Z16ReplaceOps[] = {
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexA, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexR, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexByteScale, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexBias, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexZ, kGx2ZTexWrapInv, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexWrapRange, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 1},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexRangeInv, 0},
+};
+
+static constexpr Gx2ZTextureOp kGx2Z16AddOps[] = {
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexA, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexR, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexByteScale, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexBias, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexRaster, kGx2ZTexRange, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexZ, kGx2ZTexWrapInv, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexWrapRange, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 1},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexRangeInv, 0},
+};
+
+static constexpr Gx2ZTextureOp kGx2Z24ReplaceOps[] = {
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexR, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexG, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexByteScale, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexB, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexByteScale, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexBias, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexZ, kGx2ZTexWrapInv, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexWrapRange, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 1},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexRangeInv, 0},
+};
+
+static constexpr Gx2ZTextureOp kGx2Z24AddOps[] = {
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexR, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexG, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexByteScale, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexB, kGx2ZTexByteMax, 0},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexByteScale, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexBias, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexRaster, kGx2ZTexRange, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexZ, kGx2ZTexWrapInv, 0},
+    {kGx2ZFloor, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexQ, 0},
+    {kGx2ZMul, kGx2ZTexQ, kGx2ZTexQ, kGx2ZTexWrapRange, 0},
+    {kGx2ZAdd, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexQ, 1},
+    {kGx2ZMul, kGx2ZTexZ, kGx2ZTexZ, kGx2ZTexRangeInv, 0},
+};
+
+inline Gx2ZTextureOpTable gx2ZTextureOpTable(uint32_t format, bool add) {
+    switch (format & 3) {
+    case 0: return {add ? kGx2Z8AddOps : kGx2Z8ReplaceOps,
+                    add ? uint32_t(sizeof(kGx2Z8AddOps) / sizeof(kGx2Z8AddOps[0]))
+                        : uint32_t(sizeof(kGx2Z8ReplaceOps) / sizeof(kGx2Z8ReplaceOps[0]))};
+    case 1: return {add ? kGx2Z16AddOps : kGx2Z16ReplaceOps,
+                    add ? uint32_t(sizeof(kGx2Z16AddOps) / sizeof(kGx2Z16AddOps[0]))
+                        : uint32_t(sizeof(kGx2Z16ReplaceOps) / sizeof(kGx2Z16ReplaceOps[0]))};
+    default: return {add ? kGx2Z24AddOps : kGx2Z24ReplaceOps,
+                     add ? uint32_t(sizeof(kGx2Z24AddOps) / sizeof(kGx2Z24AddOps[0]))
+                         : uint32_t(sizeof(kGx2Z24ReplaceOps) / sizeof(kGx2Z24ReplaceOps[0]))};
+    }
+}
+
 // GX expands a Z8/Z16/Z24X8 texel into the low bits of a 24-bit integer.
 // GX2 samples the decoded texture as normalized RGBA8, so these helpers are
 // the host-side reference for the generated Latte ALU sequence in
