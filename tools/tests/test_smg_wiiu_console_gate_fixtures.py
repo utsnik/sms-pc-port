@@ -42,6 +42,8 @@ class ConsoleGateFixtures(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("stage=EggStarGalaxy (Good Egg) reached", result.stdout)
             evidence = json.loads(record.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["result"], "PASS")
+            self.assertEqual(evidence["errors"], [])
             self.assertEqual(evidence["run_interval"]["start_line"], 1)
             self.assertEqual(evidence["run_interval"]["main_start_count"], 1)
             self.assertEqual(len(evidence["framesplit"]), 2)
@@ -50,6 +52,32 @@ class ConsoleGateFixtures(unittest.TestCase):
                 ["FileSelect", "EggStarGalaxy"],
             )
             self.assertEqual(evidence["stage_path"], ["FileSelect", "EggStarGalaxy"])
+
+    def test_failed_run_is_recorded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            record = Path(directory) / "run.json"
+            result = self.run_gate(
+                "--udp-log", str(FIXTURES / "heavens_only.log"),
+                "--require-good-egg", "--record-run", str(record),
+            )
+            self.assertNotEqual(result.returncode, 0)
+            evidence = json.loads(record.read_text(encoding="utf-8"))
+            self.assertEqual(evidence["result"], "FAIL")
+            self.assertTrue(evidence["errors"])
+
+    def test_bounded_window_excludes_appended_rescue_run(self) -> None:
+        fixture = FIXTURES / "no_rescue_then_rescue.log"
+        passing = self.run_gate(
+            "--udp-log", str(fixture), "--from-line", "0", "--to-line", "4",
+            "--require-good-egg",
+        )
+        self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
+
+        failing = self.run_gate(
+            "--udp-log", str(fixture), "--require-good-egg",
+        )
+        self.assertNotEqual(failing.returncode, 0)
+        self.assertIn("EggStarGalaxy", failing.stdout)
 
     def test_task6_rescue_and_report_pass(self) -> None:
         result = self.run_gate(

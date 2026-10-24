@@ -181,14 +181,17 @@ def nonnegative_int(value: str) -> int:
     return result
 
 
-def record_run(path: Path, log_path: Path, lines: list[str], start: int,
-               frames: list[dict[str, Any]], stages: list[str], milestones: list[str]) -> str | None:
-    run_lines = lines[start:]
+def record_run(path: Path, log_path: Path, lines: list[str], start: int, end: int,
+               frames: list[dict[str, Any]], stages: list[str], milestones: list[str],
+               result: str, errors: list[str]) -> str | None:
+    run_lines = lines[start:end]
     evidence: dict[str, Any] = {
+        "result": result,
+        "errors": errors,
         "udp_log": str(log_path),
         "run_interval": {
             "start_line": start + 1,
-            "end_line": len(lines),
+            "end_line": end,
             "main_start_count": sum(MAIN_MARKER in line for line in run_lines),
             "timestamps": {
                 "start": timestamp(run_lines[0]) if run_lines else None,
@@ -218,6 +221,8 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--record-run", type=Path)
     result.add_argument("--from-line", type=nonnegative_int, metavar="N",
                         help="use log lines after the N lines present before launch")
+    result.add_argument("--to-line", type=nonnegative_int, metavar="M",
+                        help="use no lines after inclusive 1-based log line M")
     result.add_argument("--require-log", action="append", default=[])
     result.add_argument("--require-stage-path")
     result.add_argument("--require-stage2-pass", action="store_true")
@@ -276,15 +281,20 @@ def main(argv: list[str] | None = None) -> int:
         errors.append(f"cannot read UDP log {log_path}: {exc}")
         text = ""
     lines = text.splitlines()
+    if args.to_line is not None and args.from_line is not None and args.to_line < args.from_line:
+        errors.append("--to-line must be greater than or equal to --from-line")
+    if args.to_line is not None and args.to_line > len(lines):
+        errors.append(f"--to-line exceeds log length ({len(lines)} lines)")
+    end = args.to_line if args.to_line is not None else len(lines)
     all_starts = [index for index, line in enumerate(lines) if MAIN_MARKER in line]
     if args.from_line is not None:
         start = args.from_line
-        run_lines = lines[start:]
-        starts = [index for index in all_starts if index >= start]
+        run_lines = lines[start:end]
+        starts = [index for index in all_starts if start <= index < end]
     else:
         start = all_starts[-1] if all_starts else len(lines)
-        run_lines = lines[start:]
-        starts = [index for index in all_starts if index >= start]
+        run_lines = lines[start:end]
+        starts = [index for index in all_starts if start <= index < end]
     run_number = len(starts)
     frames, frame_errors = parse_frames((index + 1, line) for index, line in enumerate(run_lines, start))
     errors.extend(frame_errors)
@@ -336,7 +346,7 @@ def main(argv: list[str] | None = None) -> int:
                 for bucket in BUCKETS:
                     if f"{bucket}_p50" not in row or f"{bucket}_p90" not in row:
                         errors.append(f"frame row {row['line']} is missing p50/p90 for {bucket}")
-    evidence_text = "\n".join(run_lines) if args.from_line is not None else text
+    evidence_text = "\n".join(run_lines) if args.from_line is not None else "\n".join(lines[:end])
     if args.require_rescue_disabled_run and not re.search(
         r"no[- ]rescue|rescue thread disabled.*SMG", evidence_text, re.I
     ):
@@ -383,11 +393,14 @@ def main(argv: list[str] | None = None) -> int:
         if not all(re.search(rf"\b{re.escape(control)}\b", report_text, re.I) for control in controls):
             errors.append("report lacks evidence for the required basic controls")
 
-    if args.record_run and not errors:
+    if args.record_run:
         milestones = list(args.require_log)
         if args.require_main_start:
             milestones.append(MAIN_MARKER)
-        record_error = record_run(args.record_run, log_path, lines, start, frames, stages, milestones)
+        record_error = record_run(
+            args.record_run, log_path, lines, start, end, frames, stages, milestones,
+            "FAIL" if errors else "PASS", list(errors),
+        )
         if record_error:
             errors.append(record_error)
 
