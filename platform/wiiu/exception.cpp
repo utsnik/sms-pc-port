@@ -57,6 +57,30 @@ char s_message[512];
 volatile int s_crashed;
 char s_trace[2048];
 
+#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+enum { kRescueStackBytes = 0x200 };
+
+struct RescueCapture {
+	uint32_t gpr[32];
+	uint32_t srr0;
+	uint32_t srr1;
+	uint32_t dar;
+	uint32_t dsisr;
+	uint32_t lr;
+	uint32_t stack_address;
+	uint32_t stack_size;
+	const char* type;
+	void* faulting_thread;
+	uint8_t stack[kRescueStackBytes];
+};
+
+RescueCapture s_rescue_capture;
+volatile bool s_rescue_started;
+void* s_rescue_owner_thread;
+
+BOOL fatal_no_rescue(const char* type, OSContext* context);
+#endif
+
 /* The faulting PC is often inside a system RPL (outside .text at 0x02000000),
  * so name every address and walk the stack back to the game's own frames. */
 void append_symbol(const char* tag, uint32_t addr)
@@ -126,8 +150,65 @@ void trace(OSContext* context)
 	}
 }
 
+#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+void capture_stack(RescueCapture* capture, uint32_t sp)
+{
+	capture->stack_address = sp;
+	capture->stack_size = 0;
+	if (sp < 0x10000000u || sp >= 0x50000000u || (sp & 3u) ||
+	    sp > 0x50000000u - kRescueStackBytes)
+		return;
+	volatile const uint8_t* source = reinterpret_cast<volatile const uint8_t*>(sp);
+	for (uint32_t i = 0; i < kRescueStackBytes; ++i)
+		capture->stack[i] = source[i];
+	capture->stack_size = kRescueStackBytes;
+}
+
+BOOL rescue_fatal(const char* type, OSContext* context)
+{
+	if (!s_rescue_started)
+		return fatal_no_rescue(type, context);
+
+	RescueCapture* capture = &s_rescue_capture;
+	capture->type = type;
+	capture->faulting_thread = context;
+	if (!context) {
+		capture->stack_address = 0;
+		capture->stack_size = 0;
+		__sync_synchronize();
+		sms_wiiu_crash_pending = 1;
+		sms_wiiu_crash_stage = 1;
+		return FALSE;
+	}
+	for (int i = 0; i < 32; ++i)
+		capture->gpr[i] = context->gpr[i];
+	capture->srr0 = context->srr0;
+	capture->srr1 = context->srr1;
+	capture->dar = context->dar;
+	capture->dsisr = context->dsisr;
+	capture->lr = context->lr;
+	capture_stack(capture, capture->gpr[1]);
+
+	/* A resumed faulting thread does not continue at its original PC. */
+	context->srr0 = (uint32_t)&park_forever;
+	context->lr = 0;
+	context->gpr[1] &= ~0xFu;
+	context->gpr[1] -= 0x100;
+
+	/* The callback does no formatting, symbol lookup, memory walking, or
+	 * logging. Publish the complete snapshot before the rescue thread sees it. */
+	__sync_synchronize();
+	sms_wiiu_crash_pending = 1;
+	sms_wiiu_crash_stage = context == s_rescue_owner_thread ? 1 : 10;
+	return TRUE;
+}
+#endif
+
 BOOL fatal(const char* type, OSContext* context)
 {
+#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+	return rescue_fatal(type, context);
+#else
 	if (!context) {
 		std::snprintf(s_message, sizeof(s_message), "SMS Wii U %s exception (no context)\n", type);
 	} else {
@@ -182,7 +263,32 @@ BOOL fatal(const char* type, OSContext* context)
 	}
 	return TRUE;
 #endif
+#endif
 }
+
+#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+BOOL fatal_no_rescue(const char* type, OSContext* context)
+{
+	if (!context) {
+		std::snprintf(s_message, sizeof(s_message), "SMS Wii U %s exception (no context)\n", type);
+	} else {
+		std::snprintf(s_message, sizeof(s_message),
+		              "SMS Wii U %s exception core=%u\nSRR0=%08X SRR1=%08X\nDAR=%08X DSISR=%08X\n"
+		              "LR=%08X R1=%08X R3=%08X R4=%08X\n",
+		              type, (unsigned)OSGetCoreId(), (unsigned)context->srr0, (unsigned)context->srr1,
+		              (unsigned)context->dar, (unsigned)context->dsisr, (unsigned)context->lr,
+		              (unsigned)context->gpr[1], (unsigned)context->gpr[3], (unsigned)context->gpr[4]);
+	}
+	WHBLogPrint(s_message);
+	if (context) {
+		trace(context);
+		WHBLogPrint(s_trace);
+		dump(context);
+	}
+	OSFatal(s_message);
+	return FALSE;
+}
+#endif
 
 BOOL on_dsi(OSContext* c) { return fatal("DSI", c); }
 BOOL on_isi(OSContext* c) { return fatal("ISI", c); }
@@ -192,6 +298,80 @@ BOOL on_program(OSContext* c) { return fatal("PROGRAM", c); }
 
 namespace {
 #if !defined(PORT_GAME_SMG) || SMG_WIIU_ENABLE_RESCUE
+#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+uint32_t captured_word(const RescueCapture& capture, uint32_t address)
+{
+	if (!capture.stack_size || address < capture.stack_address ||
+	    address > capture.stack_address + capture.stack_size - sizeof(uint32_t))
+		return 0;
+	uint32_t value;
+	std::memcpy(&value, capture.stack + (address - capture.stack_address), sizeof(value));
+	return value;
+}
+
+void trace_capture(const RescueCapture& capture)
+{
+	uint32_t sp = capture.gpr[1];
+	s_trace[0] = '\0';
+	append_symbol("PC", capture.srr0);
+	append_symbol("LR", capture.lr);
+	for (int i = 0; i < 16; ++i) {
+		if (!capture.stack_size || sp < capture.stack_address ||
+		    sp > capture.stack_address + capture.stack_size - 8)
+			break;
+		uint32_t next = captured_word(capture, sp);
+		if (next <= sp || next >= 0x50000000u || next > capture.stack_address + capture.stack_size - 8)
+			break;
+		append_symbol("BT", captured_word(capture, next + 4));
+		sp = next;
+	}
+}
+
+void dump_capture(const RescueCapture& capture)
+{
+	s_dump[0] = '\0';
+	for (int i = 0; i < 32; i += 8)
+		dump_line("[crash] r%-2d %08X %08X %08X %08X %08X %08X %08X %08X\n", i,
+		          (unsigned)capture.gpr[i], (unsigned)capture.gpr[i + 1], (unsigned)capture.gpr[i + 2],
+		          (unsigned)capture.gpr[i + 3], (unsigned)capture.gpr[i + 4], (unsigned)capture.gpr[i + 5],
+		          (unsigned)capture.gpr[i + 6], (unsigned)capture.gpr[i + 7]);
+	for (uint32_t address = capture.stack_address;
+	     capture.stack_size && address < capture.stack_address + capture.stack_size; address += 32) {
+		dump_line("[crash] %08X: %08X %08X %08X %08X %08X %08X %08X %08X\n", (unsigned)address,
+		          (unsigned)captured_word(capture, address), (unsigned)captured_word(capture, address + 4),
+		          (unsigned)captured_word(capture, address + 8), (unsigned)captured_word(capture, address + 12),
+		          (unsigned)captured_word(capture, address + 16), (unsigned)captured_word(capture, address + 20),
+		          (unsigned)captured_word(capture, address + 24), (unsigned)captured_word(capture, address + 28));
+	}
+	WHBLogPrint(s_dump);
+}
+
+bool report_capture(const RescueCapture& capture)
+{
+	if (!capture.faulting_thread) {
+		std::snprintf(s_message, sizeof(s_message), "SMS Wii U %s exception (no context)\n", capture.type);
+		WHBLogPrint(s_message);
+		OSFatal(s_message);
+		return false;
+	}
+	std::snprintf(s_message, sizeof(s_message),
+	              "SMS Wii U %s exception\nSRR0=%08X SRR1=%08X\nDAR=%08X DSISR=%08X\n"
+	              "LR=%08X R1=%08X R3=%08X R4=%08X\n",
+	              capture.type, (unsigned)capture.srr0, (unsigned)capture.srr1,
+	              (unsigned)capture.dar, (unsigned)capture.dsisr, (unsigned)capture.lr,
+	              (unsigned)capture.gpr[1], (unsigned)capture.gpr[3], (unsigned)capture.gpr[4]);
+	WHBLogPrint(s_message);
+	trace_capture(capture);
+	WHBLogPrint(s_trace);
+	dump_capture(capture);
+	std::snprintf(s_message, sizeof(s_message), "[crash] %s thread faulted: context=%p owner=%p",
+	              capture.faulting_thread == s_rescue_owner_thread ? "main" : "other",
+	              capture.faulting_thread, s_rescue_owner_thread);
+	WHBLogPrint(s_message);
+	return true;
+}
+#endif
+
 /* Waits on core 1 (ProcUI's core) at the top priority for a main-thread fault,
  * then takes the main thread's place: Menu, ProcUI, exit. */
 OSThread s_rescue;
@@ -199,11 +379,29 @@ alignas(16) uint8_t s_rescue_stack[16 * 1024];
 
 int rescue(int, const char**)
 {
+#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+	for (;;) {
+		while (sms_wiiu_crash_stage != 1 && sms_wiiu_crash_stage != 10)
+			OSSleepTicks(OSMillisecondsToTicks(100));
+		__sync_synchronize();
+		RescueCapture capture = s_rescue_capture;
+		if (!report_capture(capture))
+			return 0;
+		if (capture.faulting_thread == s_rescue_owner_thread) {
+			WHBLogPrint("[crash] rescue thread takes over");
+			sms_wiiu_crash_stage = 1;
+			sms_wiiu_crash_return_to_menu();
+			return 0;
+		}
+		sms_wiiu_crash_stage = 11;
+	}
+#else
 	while (sms_wiiu_crash_stage != 1)
 		OSSleepTicks(OSMillisecondsToTicks(100));
 	WHBLogPrint("[crash] rescue thread takes over");
 	sms_wiiu_crash_return_to_menu();
 	return 0;
+#endif
 }
 #endif
 } // namespace
@@ -213,6 +411,9 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 	/* Priority 0 was refused (2026-10-20); the parked main thread no longer
 	 * competes, so any priority above the game's (16) will do. */
 #if !defined(PORT_GAME_SMG) || SMG_WIIU_ENABLE_RESCUE
+	#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+	s_rescue_owner_thread = sms_wiiu_vi_owner_thread();
+	#endif
 	static const int kPriorities[] = {1, 8, 15};
 	bool started = false;
 	for (int prio : kPriorities) {
@@ -224,6 +425,9 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 			break;
 		}
 	}
+	#if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
+	s_rescue_started = started;
+	#endif
 	if (!started)
 		WHBLogPrint("[crash] could not start the rescue thread");
 #else

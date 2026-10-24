@@ -14,6 +14,24 @@ def fail(message: str) -> int:
     return 1
 
 
+def function_body(source: str, signature: str) -> str | None:
+    start = source.find(signature)
+    if start < 0:
+        return None
+    opening = source.find("{", start)
+    if opening < 0:
+        return None
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[opening:index + 1]
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cmake", type=Path, required=True)
@@ -50,6 +68,13 @@ def main() -> int:
         return fail("SMG crash-test switch is not configured")
     if "SMG_WIIU_ENABLE_RESCUE=$<BOOL:${SMG_WIIU_ENABLE_RESCUE}>" not in cmake:
         return fail("SMG rescue option is not passed to the target")
+    smg_compile_definitions = re.search(
+        r"target_compile_definitions\(smg PRIVATE(.*?)\n\s*\)", cmake, re.DOTALL
+    )
+    if smg_compile_definitions is None:
+        return fail("SMG executable target compile definitions are missing")
+    if "SMG_WIIU_CRASH_TEST=$<BOOL:${SMG_WIIU_CRASH_TEST}>" not in smg_compile_definitions.group(1):
+        return fail("SMG crash-test switch is not passed to the executable target")
 
     if "SMG Wii U: main entered" not in main_source:
         return fail("stage-neutral SMG main diagnostic is missing")
@@ -71,10 +96,49 @@ def main() -> int:
     if "sms_wiiu_vi_owner_thread()" not in exception:
         return fail("rescue path lost the main-thread owner check")
 
-    rescue_guard = re.search(
-        r"#if !defined\(PORT_GAME_SMG\) \|\| SMG_WIIU_ENABLE_RESCUE(.*?)#else",
-        exception,
-        re.DOTALL,
+    capture_guard = next(
+        (
+            match
+            for match in re.finditer(
+                r"#if defined\(PORT_GAME_SMG\) && SMG_WIIU_ENABLE_RESCUE(.*?)#endif",
+                exception,
+                re.DOTALL,
+            )
+            if "BOOL rescue_fatal(" in match.group(1)
+        ),
+        None,
+    )
+    if capture_guard is None:
+        return fail("SMG rescue capture guard is missing")
+    rescue_capture = function_body(capture_guard.group(1), "BOOL rescue_fatal(")
+    if rescue_capture is None:
+        return fail("SMG rescue callback is not isolated in rescue_fatal")
+    forbidden = (
+        "snprintf", "vsnprintf", "WHBLog", "OSGetSymbolName", "trace(",
+        "dump(", "strlen(", "vsprintf", "vfprintf",
+    )
+    if any(token in rescue_capture for token in forbidden):
+        return fail("SMG rescue callback performs formatting, symbol lookup, dumping, or logging")
+    if "__sync_synchronize()" not in rescue_capture:
+        return fail("SMG rescue callback does not publish through a memory barrier")
+    if "faulting_thread" not in rescue_capture or "stack" not in rescue_capture:
+        return fail("SMG rescue callback does not capture thread and stack state")
+    if "if (!s_rescue_started)" not in capture_guard.group(1):
+        return fail("SMG rescue callback does not fall back when the rescue thread is unavailable")
+    if "could not start the rescue thread" not in exception:
+        return fail("SMG rescue installation does not log thread-start failure")
+
+    rescue_guard = next(
+        (
+            match
+            for match in re.finditer(
+                r"#if !defined\(PORT_GAME_SMG\) \|\| SMG_WIIU_ENABLE_RESCUE(.*?)#else",
+                exception,
+                re.DOTALL,
+            )
+            if "cafe_OSCreateThread(&s_rescue" in match.group(1)
+        ),
+        None,
     )
     if args.require_no_unconditional_rescue and (
         rescue_guard is None or "cafe_OSCreateThread(&s_rescue" not in rescue_guard.group(1)
