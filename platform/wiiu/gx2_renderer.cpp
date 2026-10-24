@@ -104,6 +104,12 @@ static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
 static bool initTevVertex();
+#if defined(PORT_GAME_SMG)
+static constexpr uint32_t kZtexConstReg = 42;
+static constexpr uint32_t kZtexRangeInvChan = _y;
+static constexpr uint32_t kZtexRangeChan = _z;
+static constexpr uint32_t kZtexBiasChan = _w;
+#endif
 #if SMS_GX2_DEBUG_PIXEL_TRACE
 static void debugPixelTrace(uint32_t draw);
 #endif
@@ -2882,25 +2888,25 @@ static bool initTevPixel(TevShader& shader) {
             g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(z, _z)));
             flush();
         }
-        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevC(42, _w)));
+        g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevC(kZtexConstReg, kZtexBiasChan)));
         flush();
         if (ztexAdd) {
-            g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.pos, _z), tevC(42, _z)));
+            g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.pos, _z), tevC(kZtexConstReg, kZtexRangeChan)));
             flush();
             g.push_back(tevOp1(kOpFloor, ra.t[1], _x, tevG(ra.t[1], _x)));
             flush();
             g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevG(ra.t[1], _x)));
             flush();
         }
-        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(41, _y)));
+        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(kZtexConstReg, kZtexRangeChan)));
         flush();
         g.push_back(tevOp1(kOpFloor, ra.t[1], _x, tevG(z, _x)));
         flush();
-        g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.t[1], _x), tevC(41, _x)));
+        g.push_back(tevOp(kOpMul, ra.t[1], _x, tevG(ra.t[1], _x), tevC(kZtexConstReg, kZtexRangeInvChan)));
         flush();
         g.push_back(tevOp(kOpAdd, z, _x, tevG(z, _x), tevNeg(tevG(ra.t[1], _x))));
         flush();
-        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(42, _y)));
+        g.push_back(tevOp(kOpMul, z, _x, tevG(z, _x), tevC(kZtexConstReg, kZtexRangeInvChan)));
         flush();
     }
 #endif
@@ -3119,9 +3125,9 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
                                         8388608.0f, 1.0f / 8, 8, 0};
     memcpy(&params[156], kIndConst, sizeof(kIndConst));
 #if defined(PORT_GAME_SMG)
-    params[169] = 1.0f / 16777215.0f;  // C42.y: GX's 24-bit depth range
-    params[170] = 16777215.0f;          // C42.z: rasterized 24-bit Z scale
-    params[171] = float(in.ztexBias);   // C42.w: unsigned 24-bit bias
+    params[4 * kZtexConstReg + kZtexRangeInvChan] = 1.0f / 16777215.0f;
+    params[4 * kZtexConstReg + kZtexRangeChan] = 16777215.0f;
+    params[4 * kZtexConstReg + kZtexBiasChan] = float(in.ztexBias);
 #endif
     // C43-C46: the TEV registers' low 8 bits (the A/B/C view of a register no
     // stage has written yet).

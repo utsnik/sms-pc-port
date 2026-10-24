@@ -54,6 +54,32 @@ int main() {
     if "shader.key.ztexBias" in source or "16777215.0f" not in source:
         print("ztex: FAIL: z-texture bias/24-bit shader uniform wiring missing")
         return 10
+    zpath_start = source.index("if (ztexExport) {")
+    zpath_end = source.index("const size_t compareCount", zpath_start)
+    zpath = source[zpath_start:zpath_end]
+    required_emits = {
+        "bias": "tevC(kZtexConstReg, kZtexBiasChan)",
+        "raster range": "tevC(kZtexConstReg, kZtexRangeChan)",
+        "normalisation range": "tevC(kZtexConstReg, kZtexRangeInvChan)",
+    }
+    for name, emit in required_emits.items():
+        if emit not in zpath:
+            print(f"ztex: FAIL: generated z path does not read named {name} constant")
+            return 11
+    if "tevC(41, _y)" in zpath or "tevC(41, _x)" in zpath or "tevC(42, _y)" in zpath:
+        print("ztex: FAIL: generated z path still reads the old C41/C42 channels")
+        return 12
+    if "kZtexConstReg = 42" not in source or "kZtexRangeInvChan = _y" not in source:
+        print("ztex: FAIL: z constant register/channel names are not pinned")
+        return 13
+    upload = source[source.index("params[156]"):source.index("// C43-C46", source.index("params[156]"))]
+    for name in ("kZtexRangeInvChan", "kZtexRangeChan", "kZtexBiasChan"):
+        if f"4 * kZtexConstReg + {name}" not in upload:
+            print(f"ztex: FAIL: upload does not fill named {name} slot")
+            return 14
+    if "const bool ztexReplace" not in source or "if (ztexAdd)" not in zpath:
+        print("ztex: FAIL: REPLACE/ADD z paths are not both covered")
+        return 15
     print("ztex: PASS: ADD, 24-bit wrap/normalisation, stage coordinates, shader key")
     return 0
 
