@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import statistics
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -43,6 +44,9 @@ FRAME_RE = re.compile(
 )
 
 BUCKETS = ("logic_cpu", "gx_translate", "gpu_wait", "audio", "total")
+FRAME_TABLE_HEADER = "| Bucket | Rows | Samples | p50 ms | p90 ms | max ms |"
+CONTROL_TABLE_HEADER = "| Control | Action | Observed |"
+CONTROLS = ("left stick", "A", "Y/X", "L", "ZL", "ZR")
 SOURCE_PATTERNS = {
     "main start": ("games/smg/platform/wiiu/main.cpp", "SMG Wii U: main entered"),
     "input diagnostics": ("games/smg/platform/wiiu/input.cpp", "[smg-input]"),
@@ -154,21 +158,94 @@ def scene_start_stages(lines: Iterable[str]) -> list[str]:
     return stages
 
 
-def report_has_buckets(report: str, buckets: list[str], percentiles: list[str]) -> list[str]:
+def frame_rows_from_json(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [], [f"cannot read run JSON {path}: {exc}"]
+    rows = evidence.get("framesplit")
+    if not isinstance(rows, list):
+        return [], [f"run JSON has no framesplit list: {path}"]
+    return [row for row in rows if row.get("stage") == "EggStarGalaxy"], []
+
+
+def frame_table(rows: list[dict[str, Any]]) -> str:
+    lines = [FRAME_TABLE_HEADER, "|---|---:|---:|---:|---:|---:|"]
+    for bucket in BUCKETS:
+        p50s = [float(row[f"{bucket}_p50"]) / 1000 for row in rows]
+        p90s = [float(row[f"{bucket}_p90"]) / 1000 for row in rows]
+        maxes = [float(row[f"{bucket}_max"]) / 1000 for row in rows] if bucket != "total" else []
+        samples = sum(int(row["samples"]) for row in rows)
+        p50 = f"{statistics.median(p50s):.2f}" if p50s else "-"
+        p90 = f"{statistics.median(p90s):.2f}" if p90s else "-"
+        maximum = f"{max(maxes):.2f}" if maxes else "-"
+        lines.append(f"| {bucket} | {len(rows)} | {samples} | {p50} | {p90} | {maximum} |")
+    total_p90 = statistics.median([float(row["total_p90"]) / 1000 for row in rows]) if rows else 0
+    within_target = "yes" if total_p90 <= 16.7 else "no"
+    lines.append("")
+    lines.append(
+        "Frame table aggregation: rows attributed to EggStarGalaxy; target 16.7 ms; "
+        f"total p90 within target: {within_target}"
+    )
+    return "\n".join(lines)
+
+
+def markdown_table(report: str, header: str) -> dict[str, tuple[str, ...]]:
+    lines = report.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().lower() != header.lower():
+            continue
+        result: dict[str, tuple[str, ...]] = {}
+        for row in lines[index + 2:]:
+            if not row.strip().startswith("|"):
+                break
+            cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+            if len(cells) == 6 and cells[0].lower() in BUCKETS:
+                result[cells[0].lower()] = tuple(cells[1:])
+        return result
+    return {}
+
+
+def report_has_buckets(report: str, buckets: list[str], percentiles: list[str],
+                       expected_table: str | None = None) -> list[str]:
     errors: list[str] = []
-    lowered = report.lower()
+    table = markdown_table(report, FRAME_TABLE_HEADER)
+    if not table:
+        return ["report is missing the structured frame table"]
+    expected_rows = {}
+    if expected_table is not None:
+        expected_rows = markdown_table(expected_table, FRAME_TABLE_HEADER)
     for bucket in buckets:
-        if not re.search(rf"\b{re.escape(bucket)}\b", lowered):
+        cells = table.get(bucket)
+        if cells is None:
             errors.append(f"report is missing frame bucket {bucket}")
-        for percentile in percentiles:
-            if not re.search(rf"\b{re.escape(bucket)}\b[^\n]*\b{re.escape(percentile)}\b", lowered):
-                errors.append(f"report is missing {percentile} for frame bucket {bucket}")
-        if bucket != "total" and not re.search(
-            rf"\b{re.escape(bucket)}\b[^\n]*(?:count|samples)[^\n]*(?:p50|p90)[^\n]*max",
-            lowered,
-        ):
-            errors.append(f"report is missing count/p50/p90/max row for {bucket}")
+            continue
+        numeric_cells = cells[:4] if bucket == "total" else cells[:5]
+        if any(not re.fullmatch(r"\d+(?:\.\d+)?", cell) for cell in numeric_cells):
+            errors.append(f"report has non-numeric cells for frame bucket {bucket}")
+        if "p50" in percentiles and cells[2] == "-":
+            errors.append(f"report is missing p50 for frame bucket {bucket}")
+        if "p90" in percentiles and cells[3] == "-":
+            errors.append(f"report is missing p90 for frame bucket {bucket}")
+        if expected_rows and expected_rows.get(bucket) != cells:
+            errors.append(f"report frame table does not match fresh JSON for {bucket}")
     return errors
+
+
+def report_controls(report: str) -> dict[str, str]:
+    lines = report.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().lower() != CONTROL_TABLE_HEADER.lower():
+            continue
+        result: dict[str, str] = {}
+        for row in lines[index + 2:]:
+            if not row.strip().startswith("|"):
+                break
+            cells = [cell.strip() for cell in row.strip().strip("|").split("|")]
+            if len(cells) == 3:
+                result[cells[0].casefold()] = cells[2].casefold()
+        return result
+    return {}
 
 
 def nonnegative_int(value: str) -> int:
@@ -240,12 +317,23 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--require-frame-percentiles")
     result.add_argument("--require-target-ms")
     result.add_argument("--require-control-evidence", action="store_true")
+    result.add_argument("--emit-frame-table", type=Path, metavar="RUN_JSON")
+    result.add_argument("--run-json", type=Path, metavar="RUN_JSON")
     return result
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     errors: list[str] = []
+    if args.emit_frame_table is not None:
+        frame_rows, frame_errors = frame_rows_from_json(args.emit_frame_table)
+        errors.extend(frame_errors)
+        if not errors:
+            print(frame_table(frame_rows))
+            return 0
+        for error in errors:
+            fail(error)
+        return 1
     if args.self_check:
         errors.extend(source_self_check(args.source_root))
         if not errors:
@@ -261,7 +349,8 @@ def main(argv: list[str] | None = None) -> int:
     ) or bool(args.require_log or args.require_stage_path or args.record_run)
     if needs_log and args.udp_log is None:
         errors.append("--udp-log is required for log checks")
-    if args.udp_log is None:
+    report_only = args.report is not None or args.run_json is not None or args.require_control_evidence
+    if args.udp_log is None and not report_only:
         if errors:
             for error in errors:
                 fail(error)
@@ -273,33 +362,47 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     log_path = args.udp_log
+    if log_path is None:
+        lines = []
+        start = end = 0
+        run_lines = []
+        starts = []
+        run_number = 0
+        frames = []
+        frame_errors = []
+        stages = []
+        started_stages = []
+    else:
+        log_path = args.udp_log
     if "cemu" in str(log_path).lower():
         errors.append("Cemu log paths are forbidden; use the UDP Sunshine log")
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        errors.append(f"cannot read UDP log {log_path}: {exc}")
-        text = ""
-    lines = text.splitlines()
-    if args.to_line is not None and args.from_line is not None and args.to_line < args.from_line:
+    if log_path is not None:
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            errors.append(f"cannot read UDP log {log_path}: {exc}")
+            text = ""
+        lines = text.splitlines()
+    if log_path is not None and args.to_line is not None and args.from_line is not None and args.to_line < args.from_line:
         errors.append("--to-line must be greater than or equal to --from-line")
-    if args.to_line is not None and args.to_line > len(lines):
+    if log_path is not None and args.to_line is not None and args.to_line > len(lines):
         errors.append(f"--to-line exceeds log length ({len(lines)} lines)")
-    end = args.to_line if args.to_line is not None else len(lines)
-    all_starts = [index for index, line in enumerate(lines) if MAIN_MARKER in line]
-    if args.from_line is not None:
-        start = args.from_line
-        run_lines = lines[start:end]
-        starts = [index for index in all_starts if start <= index < end]
-    else:
-        start = all_starts[-1] if all_starts else len(lines)
-        run_lines = lines[start:end]
-        starts = [index for index in all_starts if start <= index < end]
-    run_number = len(starts)
-    frames, frame_errors = parse_frames((index + 1, line) for index, line in enumerate(run_lines, start))
-    errors.extend(frame_errors)
-    stages = scene_stages(run_lines)
-    started_stages = scene_start_stages(run_lines)
+    if log_path is not None:
+        end = args.to_line if args.to_line is not None else len(lines)
+        all_starts = [index for index, line in enumerate(lines) if MAIN_MARKER in line]
+        if args.from_line is not None:
+            start = args.from_line
+            run_lines = lines[start:end]
+            starts = [index for index in all_starts if start <= index < end]
+        else:
+            start = all_starts[-1] if all_starts else len(lines)
+            run_lines = lines[start:end]
+            starts = [index for index in all_starts if start <= index < end]
+        run_number = len(starts)
+        frames, frame_errors = parse_frames((index + 1, line) for index, line in enumerate(run_lines, start))
+        errors.extend(frame_errors)
+        stages = scene_stages(run_lines)
+        started_stages = scene_start_stages(run_lines)
 
     if args.require_stage2_pass:
         report, report_errors = read_report(args.stage2_report)
@@ -362,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
                 errors.append(f"selected rescue run is missing {marker}")
 
     report_text = ""
-    if args.report is not None or args.require_no_rescue_release or args.require_frame_buckets:
+    if args.report is not None or args.require_no_rescue_release or args.require_frame_buckets or args.require_control_evidence:
         if args.report is None:
             errors.append("--report is required for report checks")
         else:
@@ -381,17 +484,35 @@ def main(argv: list[str] | None = None) -> int:
         buckets_to_check = [b for b in required_buckets if b in BUCKETS]
         if "total" not in buckets_to_check:
             buckets_to_check.append("total")
-        errors.extend(report_has_buckets(report_text, buckets_to_check, required_percentiles))
+        expected_table = None
+        if args.run_json is not None:
+            json_rows, json_errors = frame_rows_from_json(args.run_json)
+            errors.extend(json_errors)
+            if not json_errors:
+                expected_table = frame_table(json_rows)
+        errors.extend(report_has_buckets(report_text, buckets_to_check, required_percentiles, expected_table))
     if args.require_target_ms and not re.search(
-        rf"target-ms\s*[=:]?\s*{re.escape(args.require_target_ms)}|{re.escape(args.require_target_ms)}\s*ms",
+        rf"Frame table aggregation:\s*[^\n]*target\s+{re.escape(args.require_target_ms)}\s+ms;\s*[^\n]*total p90 within target:\s+(?:yes|no)",
         report_text,
         re.I,
     ):
-        errors.append(f"report does not record target-ms={args.require_target_ms}")
+        errors.append(f"report caption does not record target {args.require_target_ms} ms")
     if args.require_control_evidence:
-        controls = ("left stick", "A", "Y", "X", "L", "ZL", "ZR")
-        if not all(re.search(rf"\b{re.escape(control)}\b", report_text, re.I) for control in controls):
-            errors.append("report lacks evidence for the required basic controls")
+        controls = report_controls(report_text)
+        missing = [control for control in CONTROLS if control.casefold() not in controls]
+        invalid = [control for control in CONTROLS if control.casefold() in controls
+                   and controls[control.casefold()] not in ("yes", "no", "n/a")]
+        if missing:
+            errors.append(f"report control table is missing: {', '.join(missing)}")
+        if invalid:
+            errors.append(f"report control table has invalid Observed values: {', '.join(invalid)}")
+        for control in CONTROLS:
+            observed = controls.get(control.casefold())
+            if observed in ("no", "n/a"):
+                print(f"console-gate: NOTE: {control} observed={observed}")
+        for control in ("left stick", "A", "Y/X"):
+            if controls.get(control.casefold()) != "yes":
+                errors.append(f"report requires {control}=yes")
 
     if args.record_run:
         milestones = list(args.require_log)

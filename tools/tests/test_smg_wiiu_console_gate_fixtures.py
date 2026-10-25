@@ -144,6 +144,51 @@ class ConsoleGateFixtures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("source log format self-check", result.stdout)
 
+    def test_round3_generated_table_controls_and_bypass_fixtures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_json = Path(directory) / "run.json"
+            record = self.run_gate(
+                "--udp-log", str(FIXTURES / "rescue_pass.log"),
+                "--from-line", "4", "--record-run", str(run_json),
+            )
+            self.assertEqual(record.returncode, 0, record.stdout + record.stderr)
+            emitted = self.run_gate("--emit-frame-table", str(run_json))
+            self.assertEqual(emitted.returncode, 0, emitted.stdout + emitted.stderr)
+            controls = """\
+| Control | Action | Observed |
+|---|---|---|
+| left stick | movement | yes |
+| A | jump | yes |
+| Y/X | spin | yes |
+| L | camera | yes |
+| ZL | crouch | yes |
+| ZR | star-bit shooting | yes |
+"""
+            report = Path(directory) / "generated.md"
+            report.write_text(emitted.stdout + "\n" + controls, encoding="utf-8")
+            passing = self.run_gate(
+                "--report", str(report), "--run-json", str(run_json),
+                "--require-frame-buckets", "logic_cpu,gx_translate,gpu_wait,audio",
+                "--require-frame-percentiles", "p50,p90", "--require-target-ms", "16.7",
+                "--require-control-evidence",
+            )
+            self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
+
+            for fixture, options in (
+                ("bare_controls_report.md", ("--require-control-evidence",)),
+                ("header_only_buckets_report.md", (
+                    "--require-frame-buckets", "logic_cpu,gx_translate,gpu_wait,audio",
+                    "--require-frame-percentiles", "p50,p90",
+                )),
+                ("microseconds_report.md", (
+                    "--run-json", str(run_json), "--require-frame-buckets", "logic_cpu,gx_translate,gpu_wait,audio",
+                    "--require-frame-percentiles", "p50,p90",
+                )),
+            ):
+                with self.subTest(fixture=fixture):
+                    result = self.run_gate("--report", str(FIXTURES / fixture), *options)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
