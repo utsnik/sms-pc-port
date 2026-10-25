@@ -1524,7 +1524,12 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         s_dlElem[i] = 0;
     }
     e.checkedClock = writeClock();
-    e.checkedFrame = g_displayFrames;
+    // Stagger the first periodic recheck per list: lists recorded together at
+    // a level load otherwise all rehash on the same frame every 30 (Wii U
+    // Plaza: ~20 ms once a second, one missed vsync a second when paced).
+    // The offset only brings a check earlier.
+    e.checkedFrame = g_displayFrames -
+        ((uint32_t(reinterpret_cast<uintptr_t>(data) >> 5) * 2654435761u) >> 16) % kDlRecheckFrames;
     s_dlRec = &e;
     s_dlRecFail = false;
     uint32_t need = 0;
