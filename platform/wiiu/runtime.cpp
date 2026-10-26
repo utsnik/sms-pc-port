@@ -203,6 +203,37 @@ void port_log(const char* fmt, ...)
 	}
 }
 
+/* TEMPORARY probe (decomp-patches/zzzz-wiiu-92-probe-dabr.patch): arm the
+ * data-address breakpoint on writes to the doubleword holding `addr` when the
+ * SD marker file `dabr` reads "<tag> <stage>".  A hit is a DSI that the crash
+ * handler reports with the writer's PC and backtrace. */
+BOOL OSSetDABR(BOOL allCores, uint32_t address, BOOL matchReads, BOOL matchWrites);
+
+void port_dabr_watch(const void* addr, const char* tag, int stage)
+{
+	static int s_read = 0;
+	static char s_tag[32];
+	static int s_stage = -1;
+	if (!s_read) {
+		s_read = 1;
+		char path[160];
+		std::snprintf(path, sizeof(path), "%sdabr", sms_wiiu_app_root());
+		if (FILE* f = std::fopen(path, "rb")) {
+			if (std::fscanf(f, "%31s %d", s_tag, &s_stage) != 2)
+				s_stage = -1;
+			std::fclose(f);
+		}
+		port_log("[dabr] marker %s: tag=%s stage=%d\n", path, s_stage >= 0 ? s_tag : "-", s_stage);
+	}
+	uint32_t a = (uint32_t)(uintptr_t)addr & ~7u;
+	if (s_stage < 0 || stage != s_stage || std::strcmp(tag, s_tag) != 0) {
+		port_log("[dabr] skip %s stage=%d addr=%08X\n", tag, stage, (unsigned)a);
+		return;
+	}
+	BOOL ok = OSSetDABR(TRUE, a, FALSE, TRUE);
+	port_log("[dabr] ARMED %s stage=%d addr=%08X ret=%d\n", tag, stage, (unsigned)a, (int)ok);
+}
+
 void sms_wiiu_runtime_init(void)
 {
 	if (s_initialized)

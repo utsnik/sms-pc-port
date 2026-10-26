@@ -1,0 +1,63 @@
+Reason: TEMPORARY probe (remove after diagnosis): arm a write data breakpoint (SD marker file dabr = "<splash|water> <stage>") on the splash quad / water manager that the Sirena and Gelato load crashes find overwritten, and log GD display-list overflows.
+--- a/src/Player/SplashManager.cpp	2026-10-26 19:37:50.124012961 +0000
++++ b/src/Player/SplashManager.cpp	2026-10-26 19:37:50.224014923 +0000
+@@ -13,6 +13,8 @@
+ 
+ TSplashManager* gpSplashManager;
+ 
++extern "C" void port_dabr_watch(const void* addr, const char* tag, int stage);
++
+ void TSplashManager::load(JSUMemoryInputStream& stream)
+ {
+ 	JDrama::TViewObj::load(stream);
+@@ -40,6 +42,10 @@
+ 	unk644 = 3000.0f;
+ 	unk648 = 16;
+ 
++	// Watch the quad's DL/position buffer pointers (stable after createBuffer).
++	port_dabr_watch((const void*)(((uintptr_t)unk640 + 0x10) & ~(uintptr_t)7), "splash",
++	                gpApplication.mCurrArea.getStage());
++
+ 	gpSplashManager = this;
+ }
+ 
+--- a/src/Player/ModelWaterManager.cpp	2026-10-26 19:37:50.125012980 +0000
++++ b/src/Player/ModelWaterManager.cpp	2026-10-26 19:37:50.229015021 +0000
+@@ -1,4 +1,7 @@
+ #include <Player/ModelWaterManager.hpp>
++#include <System/Application.hpp>
++
++extern "C" void port_dabr_watch(const void* addr, const char* tag, int stage);
+ #include <Player/MarioAccess.hpp>
+ #include <Player/SplashManager.hpp>
+ #include <Strategic/LiveActor.hpp>
+@@ -214,6 +217,10 @@
+ 	unk5E48 = 20;
+ 	unk5E49 = 40;
+ 
++	// Watch the vtable/name doubleword (written only by the constructor).
++	port_dabr_watch((const void*)(((uintptr_t)this + 4) & ~(uintptr_t)7), "water",
++	                gpApplication.mCurrArea.getStage());
++
+ 	gpModelWaterManager = this;
+ }
+ 
+--- a/libs/dolphin/src/gd/GDBase.c	2026-10-26 19:37:50.131013098 +0000
++++ b/libs/dolphin/src/gd/GDBase.c	2026-10-26 19:37:50.230015041 +0000
+@@ -29,8 +29,16 @@
+ 	}
+ }
+ 
++void port_log(const char* fmt, ...);
++
+ void GDOverflowed(void)
+ {
++	static u8* lastStart;
++	if (__GDCurrentDL->start != lastStart) {
++		lastStart = __GDCurrentDL->start;
++		port_log("[gd] overflow caller=%p start=%p top=%p ptr=%p cb=%p\n", __builtin_return_address(0),
++		         (void*)__GDCurrentDL->start, (void*)__GDCurrentDL->top, (void*)__GDCurrentDL->ptr, (void*)overflowcb);
++	}
+ 	if (overflowcb != NULL) {
+ 		(*overflowcb)();
+ 	}

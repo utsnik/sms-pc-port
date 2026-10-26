@@ -113,6 +113,9 @@ extern "C" void port_log(const char* fmt, ...)
 	std::fflush(stderr);
 }
 
+// TEMPORARY probe hook (zzzz-wiiu-92-probe-dabr.patch); the data breakpoint exists only on the Wii U.
+extern "C" void port_dabr_watch(const void*, const char*, int) { }
+
 static port_stub_rec* s_stub_list;
 static unsigned s_stub_distinct;
 extern "C" void port_stub_hit(port_stub_rec* rec)
