@@ -654,6 +654,7 @@ GXBool __GXinBegin;  // read by GXEnd when GXGeometry.h is built with DEBUG
 
 void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
     __GXinBegin = GX_TRUE;
+    if (g_perfStages) vsrcBeginNote(__builtin_return_address(0), nverts);
     traceNoteBegin();
 #ifdef __WIIU__
     if (hostState()) ++g_producerDraws;

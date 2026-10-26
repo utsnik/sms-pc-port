@@ -244,6 +244,7 @@ extern bool g_perfStages;     // Wii U: SD marker perfdiag times the per-draw st
 // being recorded, 2 list run uncached, 3 cache replay decoded, 4 arena fallback.
 void vsrcNote(int kind, uint32_t verts, uint32_t fmt);
 void vsrcReport(uint32_t frames);
+void vsrcBeginNote(const void* caller, uint32_t verts);  // perfdiag: GXBegin callers by vertices
 bool arenaEnabled();
 uint32_t arenaGeneration();
 bool arenaUpload(const uint8_t* verts, uint32_t count, uint32_t stride, const uint32_t* idx, uint32_t nidx, ArenaRef& out);

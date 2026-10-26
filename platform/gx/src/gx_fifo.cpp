@@ -693,7 +693,34 @@ void vsrcNote(int kind, uint32_t verts, uint32_t fmt) {
     // Replace the smallest: lists heavy over the window still surface.
     if (!low->verts || verts > low->verts / 4) *low = {list, uint32_t(kind), fmt, verts, 1};
 }
+struct VsrcCaller { const void* lr; uint32_t verts, calls; };
+static VsrcCaller s_vsrcCallers[24];
+void vsrcBeginNote(const void* caller, uint32_t verts) {
+    VsrcCaller* low = &s_vsrcCallers[0];
+    for (VsrcCaller& c : s_vsrcCallers) {
+        if (c.verts && c.lr == caller) {
+            c.verts += verts;
+            ++c.calls;
+            return;
+        }
+        if (c.verts < low->verts) low = &c;
+    }
+    if (!low->verts || verts > low->verts / 4) *low = {caller, verts, 1};
+}
 void vsrcReport(uint32_t frames) {
+    // GXBegin callers (immediate draws; lists only when built): map lr with
+    // addr2line after subtracting this function's runtime address from its ELF one.
+    VSRC_LOG("[vsrc] vsrcReport at %p; GXBegin callers by verts/frame:\n", reinterpret_cast<void*>(&vsrcReport));
+    for (int r = 0; r < 12; ++r) {
+        VsrcCaller* best = nullptr;
+        for (VsrcCaller& c : s_vsrcCallers)
+            if (c.verts && (!best || c.verts > best->verts)) best = &c;
+        if (!best) break;
+        VSRC_LOG("[vsrc] begin %d lr=%p verts/frame=%u calls/frame=%u\n", r, best->lr,
+                 (unsigned)(best->verts / frames), (unsigned)(best->calls / frames));
+        best->verts = 0;
+    }
+    memset(s_vsrcCallers, 0, sizeof s_vsrcCallers);
     VSRC_LOG("[vsrc] per-frame verts imm=%u rec=%u dl=%u replay=%u arenaDec=%u\n", s_vsrcCount[0] / frames,
            s_vsrcCount[1] / frames, s_vsrcCount[2] / frames, s_vsrcCount[3] / frames, s_vsrcCount[4] / frames);
     for (int r = 0; r < 10; ++r) {
