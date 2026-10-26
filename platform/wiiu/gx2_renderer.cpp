@@ -267,6 +267,7 @@ static bool s_ready;
 static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
+static uint32_t s_dlArenaLimit = 32u << 20;  // SD marker "dlarenasmall": 8 MiB, so Plaza wraps (test)
 // This is separate from the vertex/index arena above.  The GX2 command-list
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
@@ -4820,6 +4821,7 @@ void rendererInit(float) {
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
+    if (sdMarkerPresent("dlarenasmall")) s_dlArenaLimit = 8u << 20;
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
@@ -4967,6 +4969,32 @@ static uint32_t s_perfDlDraws, s_perfDlUploads, s_perfDlDecoded;
 // arenaUpload's arguments, for the store appendArena makes right after it.
 static struct { const uint8_t* verts; const uint32_t* idx; } s_dlStash;
 static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; } s_dlPending;
+// gx2prod arena wrap, deferred to core 1: the worker sets pending; the frame
+// end that follows takes its fence; the next frame begin waits for it and
+// starts the arena over.
+static volatile bool s_dlWrapPending;
+static bool s_dlWrapFenced;
+static OSTime s_dlWrapStamp;
+
+static void dlArenaFrameEnd(OSTime stamp) {
+    if (s_dlWrapPending && !s_dlWrapFenced) {
+        s_dlWrapStamp = stamp;
+        s_dlWrapFenced = true;
+    }
+}
+
+static void dlArenaFrameBegin() {
+    if (!s_dlWrapFenced) return;
+    const OSTime t0 = OSGetTime();
+    GX2WaitTimeStamp(s_dlWrapStamp);
+    GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
+    s_dlArenaUsed = 0;
+    s_dlWrapFenced = false;
+    __sync_synchronize();
+    s_dlWrapPending = false;
+    WHBLogPrintf("SMS Wii U: [dlarena] restart frame=%u waitUs=%u", (unsigned)g_displayFrames,
+                 (unsigned)OSTicksToMicroseconds(OSGetTime() - t0));
+}
 
 static void matrixDefaults(uint8_t out[9]) {
     const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
@@ -4992,14 +5020,26 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
         if (!s_dlArena) return false;
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
     }
-    if (s_dlArenaUsed + total > kDlArenaBytes) {
+    const bool wrapPending = s_dlWrapPending;
+    __sync_synchronize();  // pairs with dlArenaFrameBegin: see its s_dlArenaUsed once pending is clear
+    if (wrapPending) return false;
+    if (s_dlArenaUsed + total > s_dlArenaLimit) {
         WHBLogPrintf("SMS Wii U: [dlarena] wrap frame=%u gen=%u used=%u", (unsigned)g_displayFrames,
                      (unsigned)s_dlArenaGen, (unsigned)s_dlArenaUsed);
+        if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
+        if (s_gx2ProdEnabled) {
+            // The worker only records lists, so it cannot drain the GPU, and
+            // this frame's earlier draws still read the old runs once core 1
+            // calls their lists.  Retire the generation now and leave the
+            // memory alone: later runs decode until core 1 has seen this
+            // frame retire (dlArenaFrameBegin).
+            s_dlWrapPending = true;
+            return false;
+        }
         // Every stored run goes: let the GPU finish reading them first.
-        if (!s_gx2ProdEnabled) GX2DrawDone();
+        GX2DrawDone();
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
         s_dlArenaUsed = 0;
-        if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
     }
     uint8_t* base = s_dlArena + s_dlArenaUsed;
     for (uint32_t off = 0; off < ioff; off += 32)
@@ -6459,6 +6499,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     if (s_gx2ProdEnabled) s_prodFrontendStart = OSGetTime();
     s_frameBeginTime = OSGetTime();
     beginVertexArena();
+    dlArenaFrameBegin();
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     // The generated vertex programs use up to R60; the default split gives
     // vertex shaders 48 GPRs and asking for more hangs the GPU on hardware
@@ -6529,6 +6570,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     flushBatch();
     GX2Flush();
     endVertexArena();
+    dlArenaFrameEnd(s_vertexArenaFence[s_vertexArenaIndex]);
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
     const OSTime perfNow = OSGetTime();
