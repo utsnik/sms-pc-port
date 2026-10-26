@@ -73,6 +73,17 @@ static void note_fallback(size_t n)
 		s_logging = false;
 	}
 }
+/* A game allocation the JKR heaps could not satisfy returns null, and the
+ * heap's own ":::cannot alloc memory" warning is dropped without a console, so
+ * log the first few with their caller. */
+static uint32_t s_gameNulls;
+static void note_game_null(size_t n, void* caller)
+{
+	++s_gameNulls;
+	if (s_gameNulls <= 16)
+		port_log("[heap] game allocation of %u bytes returned null (#%u, caller %p)\n",
+		         unsigned(n), unsigned(s_gameNulls), caller);
+}
 extern "C" uint32_t sms_port_heap_fallbacks(void) { return s_fallbacks; }
 extern "C" uint32_t sms_port_heap_fallback_bytes(void) { return s_fallbackBytes; }
 
@@ -92,7 +103,9 @@ void* __wrap__Znwj(size_t n)
 	void* p = scoped ? port_alloc(n, 8) : nullptr;
 	if (!p && scoped)
 		note_fallback(n);
-	return p ? p : __real__Znwj(n);
+	if (!p && !(p = __real__Znwj(n)))
+		note_game_null(n, __builtin_return_address(0));
+	return p;
 }
 void* __wrap__Znaj(size_t n)
 {
@@ -100,7 +113,9 @@ void* __wrap__Znaj(size_t n)
 	void* p = scoped ? port_alloc(n, 8) : nullptr;
 	if (!p && scoped)
 		note_fallback(n);
-	return p ? p : __real__Znaj(n);
+	if (!p && !(p = __real__Znaj(n)))
+		note_game_null(n, __builtin_return_address(0));
+	return p;
 }
 void __wrap__ZdlPv(void* p) { if (!port_free(p)) __real__ZdlPv(p); }
 void __wrap__ZdaPv(void* p) { if (!port_free(p)) __real__ZdaPv(p); }
