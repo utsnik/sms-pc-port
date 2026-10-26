@@ -840,6 +840,9 @@ static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
 static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the [gpu] report
+static bool s_rectClear;  // SD marker "rectclear", see rectClearColour
+extern "C" void sms_wiiu_gpuframe_stamp(int kind);
+static bool s_frameClearPending = false;
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
     if (!s_gpuDiag) return;
     if (!s_gpuStamps[arena]) {
@@ -4162,7 +4165,10 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
         return;
     }
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
-    GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f); invalidateVertexUniforms();
+    // rectclear: the game's own frame clear in renderer_begin covers the whole buffer.
+    if (!(s_rectClear && s_frameClearPending && s_ready && ProcUIInForeground())) {
+        GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f); invalidateVertexUniforms();
+    }
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
@@ -4834,6 +4840,8 @@ void rendererInit(float) {
     }
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    s_rectClear = sdMarkerPresent("rectclear") && !runningUnderCemu();
+    WHBLogPrintf("SMS Wii U: copy clears %s (SD marker rectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
@@ -5113,7 +5121,6 @@ static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, 
 static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
 static bool s_gx2DlRecording;
 
-extern "C" void sms_wiiu_gpuframe_stamp(int kind);
 static void gx2ProdCallList(void* list, uint32_t bytes) {
     if (OSGetCoreId() != 1)
         WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());
@@ -5712,7 +5719,6 @@ void flushBatch() {
 // is presented from the TV target, so its clear is deferred until next frame
 // start rather than being applied to the image that is about to be presented.
 static float s_frameClear[4];
-static bool s_frameClearPending = false;
 static void rebindTvTarget(bool invalidateCaches) {
     GX2SetContextState(WHBGfxGetTVContextState());
     if (invalidateCaches) invalidateVertexUniforms();
@@ -5722,6 +5728,7 @@ static void rebindTvTarget(bool invalidateCaches) {
 
 struct ProducerCopyRequest {
     ProducerResolvedCopy copy;
+    GX2Rect clearRect;  // the copy's source rectangle in the render target
     float clearColour[4];
     float clearDepth;
     bool display;
@@ -5731,6 +5738,58 @@ struct ProducerCopyRequest {
     bool clearDepthEnabled;
 };
 static ProducerCopyRequest s_producerCopies[64];
+
+// SD marker "rectclear": a copy's clear covers only its source rectangle, as on
+// GX, instead of the whole 1080p colour buffer.  Bianco makes seven copies a
+// frame and each full clear cost ~1.2 ms of GPU.  GX2 has no rectangle clear,
+// so a scratch colour buffer the rectangle's size is cleared (only when the
+// colour changes) and copied into place.  Depth still clears the whole buffer.
+// Off under Cemu, whose GX2CopySurfaceEx handles only full-surface copies.
+struct RectClearScratch { GX2ColorBuffer cb; float colour[4]; bool cleared; };
+static RectClearScratch s_rectScratch[8];
+static uint32_t s_rectScratchCount, s_rectClears, s_rectFallbacks, s_copyClearColour, s_copyClearDepth, s_copyClearTotal;
+
+static bool rectClearColour(const GX2Rect& rect, const float colour[4]) {
+    GX2ColorBuffer* target = renderColour();
+    const uint32_t w = uint32_t(rect.right - rect.left), h = uint32_t(rect.bottom - rect.top);
+    if (!target || !w || !h) return false;
+    RectClearScratch* sc = nullptr;
+    for (uint32_t i = 0; i < s_rectScratchCount; ++i)
+        if (s_rectScratch[i].cb.surface.width == w && s_rectScratch[i].cb.surface.height == h) { sc = &s_rectScratch[i]; break; }
+    if (!sc) {
+        if (s_rectScratchCount == sizeof(s_rectScratch) / sizeof(s_rectScratch[0])) return false;
+        RectClearScratch& n = s_rectScratch[s_rectScratchCount];
+        memset(&n, 0, sizeof(n));
+        GX2Surface& surf = n.cb.surface;
+        surf.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        surf.width = w; surf.height = h; surf.depth = 1; surf.mipLevels = 1;
+        surf.format = target->surface.format;
+        surf.aa = GX2_AA_MODE1X;
+        surf.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+        surf.tileMode = GX2_TILE_MODE_DEFAULT;
+        n.cb.viewNumSlices = 1;
+        GX2CalcSurfaceSizeAndAlignment(&surf);
+        surf.image = alignedZero(surf.alignment, surf.imageSize);
+        if (!surf.image) return false;
+        DCFlushRange(surf.image, surf.imageSize);
+        GX2InitColorBufferRegs(&n.cb);
+        sc = &n;
+        ++s_rectScratchCount;
+        WHBLogPrintf("SMS Wii U: [rectclear] scratch %ux%u bytes=%u", unsigned(w), unsigned(h), unsigned(surf.imageSize));
+    }
+    if (!sc->cleared || memcmp(sc->colour, colour, sizeof(sc->colour))) {
+        GX2ClearColor(&sc->cb, colour[0], colour[1], colour[2], colour[3]);
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, sc->cb.surface.image, sc->cb.surface.imageSize);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, sc->cb.surface.image, sc->cb.surface.imageSize);
+        memcpy(sc->colour, colour, sizeof(sc->colour));
+        sc->cleared = true;
+    }
+    GX2Rect source = {0, 0, int32_t(w), int32_t(h)};
+    GX2Point destination = {rect.left, rect.top};
+    GX2CopySurfaceEx(&sc->cb.surface, 0, 0, &target->surface, 0, 0, 1, &source, &destination);
+    ++s_rectClears;
+    return true;
+}
 static uint32_t s_producerCopyWrite;
 // gx_fifo owns the draw-sync job ring.  The ring fix can provide this hook so
 // the renderer's already-established present drain resets its frame storage.
@@ -5756,15 +5815,30 @@ static void producerCopyService(void* opaque) {
                       r.copy.destination.imageSize);
         GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.copy.destination.image,
                       r.copy.destination.imageSize);
+        sms_wiiu_gpuframe_stamp(7);
     }
     rebindTvTarget(false);
     if (!r.clear) return;
-    if (r.clearColourEnabled)
-        GX2ClearColor(renderColour(), r.clearColour[0], r.clearColour[1],
-                      r.clearColour[2], r.clearColour[3]);
-    if (r.clearDepthEnabled)
+    ++s_copyClearTotal;
+    if (r.clearColourEnabled) {
+        ++s_copyClearColour;
+        if (!s_rectClear || !rectClearColour(r.clearRect, r.clearColour)) {
+            if (s_rectClear) ++s_rectFallbacks;
+            GX2ClearColor(renderColour(), r.clearColour[0], r.clearColour[1],
+                          r.clearColour[2], r.clearColour[3]);
+        }
+        sms_wiiu_gpuframe_stamp(8);
+    }
+    if (r.clearDepthEnabled) {
+        ++s_copyClearDepth;
         GX2ClearDepthStencilEx(renderDepth(), r.clearDepth, 0, GX2_CLEAR_FLAGS_DEPTH);
+        sms_wiiu_gpuframe_stamp(9);
+    }
     rebindTvTarget(false);
+    if (s_copyClearTotal % 600 == 0)
+        WHBLogPrintf("SMS Wii U: [efb] copy clears=%u colour=%u depth=%u rect=%u fallback=%u (rectclear %s)",
+                     unsigned(s_copyClearTotal), unsigned(s_copyClearColour), unsigned(s_copyClearDepth),
+                     unsigned(s_rectClears), unsigned(s_rectFallbacks), s_rectClear ? "on" : "off");
 }
 
 void executeCopy(uint32_t ctrl) {
@@ -5795,6 +5869,14 @@ void executeCopy(uint32_t ctrl) {
         r.clearColour[2] = float(gb & 255) / 255.0f;
         r.clearColour[3] = (pe & 7) == 1 ? float((ar >> 8) & 255) / 255.0f : 1.0f;
         r.clearDepth = float(g.bp[BP_CLEAR_Z] & 0xffffff) / 16777215.0f;
+        if (GX2ColorBuffer* cb = renderColour()) {
+            const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
+            uint32_t tw = uint32_t(float(w) * s_gameScale), th = uint32_t(float(h) * s_gameScale);
+            if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
+            if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
+            if (ty + th > cb->surface.height) th = cb->surface.height - ty;
+            r.clearRect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
+        }
         debugCopy(r.display, x, y, w, h, g.copyDest, ctrl);
         if (!r.display) {
             r.active = s_frameActive && ProcUIInForeground();
@@ -6523,6 +6605,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
         GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
         GX2SetDepthBuffer(renderDepth());
     }
+    sms_wiiu_gpuframe_stamp(10);
     s_debugDrawNo = 0;
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     GX2SetScissor(0, 0, uint32_t(s_tvW), uint32_t(s_tvH));

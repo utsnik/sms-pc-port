@@ -577,8 +577,9 @@ bool s_gf;
 uint64_t* s_gfStamp;
 /* Stamp kinds: 0 top of pipe; bottom after 1 a list, 2 a copy or clear,
  * 3 a retile, 4 another callback, 5 the frame's draws (before the present),
- * 6 the present (before the swap). */
-constexpr uint32_t kGfKinds = 7, kGfSegs = 160;
+ * 6 the present (before the swap), 7 a copy's copy, 8 its colour clear,
+ * 9 its depth clear, 10 the frame-start clears. */
+constexpr uint32_t kGfKinds = 11, kGfSegs = 160;
 uint8_t s_gfKind[kGfFrames][kGfStamps];
 uint64_t s_gfKindCost[kGfKinds], s_gfSegCost[kGfSegs];
 uint8_t s_gfSegKind[kGfSegs];
@@ -679,9 +680,12 @@ void gf_end_frame()
 		         unsigned(s_gfSpanMax / 2700), unsigned(s_gfStamps / s_gfFrames), unsigned(s_gfFrames),
 		         unsigned(s_gfNotReady), unsigned(s_gfOverflow));
 		const uint64_t d = uint64_t(s_gfFrames) * 270;  // x0.01 ms per frame
-		port_log("SMS Wii U: [gpuframe] busy by kind x0.01ms: lists=%u copyClear=%u retile=%u callback=%u preDraws=%u present=%u\n",
+		port_log("SMS Wii U: [gpuframe] busy by kind x0.01ms: lists=%u copyClear=%u retile=%u callback=%u preDraws=%u present=%u "
+		         "copy=%u copyColourClear=%u copyDepthClear=%u frameClears=%u\n",
 		         unsigned(s_gfKindCost[1] / d), unsigned(s_gfKindCost[2] / d), unsigned(s_gfKindCost[3] / d),
-		         unsigned(s_gfKindCost[4] / d), unsigned(s_gfKindCost[5] / d), unsigned(s_gfKindCost[6] / d));
+		         unsigned(s_gfKindCost[4] / d), unsigned(s_gfKindCost[5] / d), unsigned(s_gfKindCost[6] / d),
+		         unsigned(s_gfKindCost[7] / d), unsigned(s_gfKindCost[8] / d), unsigned(s_gfKindCost[9] / d),
+		         unsigned(s_gfKindCost[10] / d));
 		/* The costliest stamp positions: frames run the same sequence, so a
 		 * position names the same list or copy from frame to frame. */
 		char buf[256];
