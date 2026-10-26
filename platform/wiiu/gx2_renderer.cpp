@@ -540,6 +540,7 @@ struct TextureEntry {
     uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0, levels = 1;
     bool arbitraryMips = false;
     bool autoMips = false;  // automip: levels past the game's one were generated here
+    bool forceLogged = false;
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
@@ -1099,7 +1100,7 @@ static float s_lodScale = 1.5f;
 // textures are used the same way.  At 1080p the 256x256 Bianco grass without
 // mips thrashed the texture cache: 2.5 ms of GPU per frame at 545 MHz.
 // Clamped textures (UI, lookup ramps) keep the game's own sampling.
-static bool s_autoMip;
+static bool s_autoMip, s_autoMipPack;  // automipnopack: not for HD pack textures
 static bool autoMipWrap(uint32_t mode0) { return (mode0 & 3) && ((mode0 >> 2) & 3); }
 static void boxDownsample(const uint8_t* s, uint32_t sw, uint32_t sh, uint8_t* d, uint32_t dw, uint32_t dh) {
     for (uint32_t y = 0; y < dh; ++y) {
@@ -3787,8 +3788,17 @@ static TextureEntry* getTexture(int map) {
             }
             // The sampler state belongs to the texmap, not the image: the same
             // texture may be bound with other wrap or filter modes.
-            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips,
-                        s_autoMip && e.levels == 1);
+            const bool force = s_autoMip && e.levels == 1 && (e.packState != 3 || s_autoMipPack);
+            if (force && e.packState == 3 && !e.forceLogged && autoMipWrap(mode0) && e.texture.surface.mipLevels > 1) {
+                e.forceLogged = true;
+                static uint32_t s_forceLogs;
+                if (s_forceLogs++ < 60)
+                    WHBLogPrintf("SMS Wii U: [automip] pack texture %ux%u fmt=%u -> %ux%u levels=%u mode0=%08x src=%p",
+                                 unsigned(e.width), unsigned(e.height), unsigned(e.fmt),
+                                 unsigned(e.texture.surface.width), unsigned(e.texture.surface.height),
+                                 unsigned(e.texture.surface.mipLevels), unsigned(mode0), static_cast<const void*>(e.source));
+            }
+            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips, force);
             return &e;
         }
     }
@@ -4892,6 +4902,7 @@ void rendererInit(float) {
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_rectClear = sdMarkerPresent("rectclear") && !runningUnderCemu();
     s_autoMip = sdMarkerPresent("automip");
+    s_autoMipPack = !sdMarkerPresent("automipnopack");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker automip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker rectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
