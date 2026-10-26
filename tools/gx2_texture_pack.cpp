@@ -311,9 +311,17 @@ static bool makeEntry(const SourceGroup& group, const TexturePackConversionOptio
     levels.push_back(std::move(base));
     sourceBc.push_back(!downscaled && baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[0] : std::vector<uint8_t>());
     const uint32_t chain = [&] { uint32_t n = 1, longest = std::max(levels[0].width, levels[0].height); while (longest > 1) { longest >>= 1; ++n; } return n; }();
+    // A game texture without mips is drawn from level 0 only (Dolphin uses the
+    // game's sampler, LOD 0 to 0), so a pack's stored levels for it were never
+    // seen and can be different art (Bianco's palm trunks).  automip on the
+    // Wii U samples these levels, so build them from level 0.
+    const bool ownMips = group.key.mipmapped != 0;
     for (uint32_t i = 1; i < chain; ++i) {
-        auto explicitMip = group.files.find(int(i));
-        if (explicitMip != group.files.end()) {
+        auto explicitMip = ownMips ? group.files.find(int(i)) : group.files.end();
+        if (!ownMips) {
+            sourceBc.emplace_back();
+            levels.push_back(nextMip(levels.back()));
+        } else if (explicitMip != group.files.end()) {
             DecodedSource suppliedSource;
             if (!decodeSource(explicitMip->second.path, &suppliedSource, error)) return false;
             Image supplied = suppliedSource.levels[0];
