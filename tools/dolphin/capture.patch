@@ -76,7 +76,7 @@ index 000883e..6cef20c 100644
 +        wiimote_states[i].buttons.a = true;
 +        next_call[i] = WiimoteDevice::NextUpdateInputCall::Activate;
 +      }
-+      if (i == 0 && capture_frame >= 1902 && capture_frame <= 20000 &&
++      if (i == 0 && capture_frame >= 13902 && capture_frame <= 20000 &&
 +          next_call[i] == WiimoteDevice::NextUpdateInputCall::None)
 +      {
 +        m_wiimotes[i]->Activate(true);
@@ -102,7 +102,7 @@ index 000883e..6cef20c 100644
 +      {
 +        wiimote_states[i].buttons.a = true;
 +      }
-+      if (i == 0 && capture_frame >= 1902 && capture_frame <= 20000)
++      if (i == 0 && capture_frame >= 13902 && capture_frame <= 20000)
 +      {
 +        wiimote_states[i].buttons.a = true;
 +        wiimote_states[i].buttons.b = true;
