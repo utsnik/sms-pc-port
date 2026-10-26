@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 
+extern "C" void port_watch_check(const void* dst, uint32_t len, const char* what, const char* detail, uint32_t extra);
+
 namespace {
 
 const uint32_t kMaxEntries = 512;
@@ -218,6 +220,7 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		std::fclose(file);
 		return DVD_RESULT_FATAL_ERROR;
 	}
+	port_watch_check(address, static_cast<uint32_t>(length), "dvd", entry.path, static_cast<uint32_t>(offset));
 	size_t got = std::fread(address, 1, want, file);
 	/* A GameCube DVD read is a DMA; callers may invalidate the buffer after it,
 	 * which on the Wii U would drop this CPU copy. Write it back to memory. */

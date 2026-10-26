@@ -209,21 +209,39 @@ void port_log(const char* fmt, ...)
  * handler reports with the writer's PC and backtrace. */
 BOOL OSSetDABR(BOOL allCores, uint32_t address, BOOL matchReads, BOOL matchWrites);
 
+static uint32_t s_watch_addr; /* armed doubleword, 0 when none */
+
+/* Software half of the probe: DMA-like copies (DVD reads, ARAM->MRAM) may not
+ * trip the DABR, so their destinations are checked against the watch here. */
+void port_watch_check(const void* dst, uint32_t len, const char* what, const char* detail, uint32_t extra)
+{
+	static unsigned s_hits;
+	uint32_t d = (uint32_t)(uintptr_t)dst;
+	if (!s_watch_addr || s_watch_addr + 8 <= d || d + len <= s_watch_addr)
+		return;
+	if (s_hits++ < 32)
+		port_log("[dabr] COPY HITS WATCH %08X: %s dst=%08X len=0x%x %s extra=0x%x caller=%p\n", (unsigned)s_watch_addr,
+		         what, (unsigned)d, (unsigned)len, detail ? detail : "", (unsigned)extra, __builtin_return_address(0));
+}
+
 void port_dabr_watch(const void* addr, const char* tag, int stage)
 {
 	static int s_read = 0;
 	static char s_tag[32];
+	static char s_mode[16];
 	static int s_stage = -1;
 	if (!s_read) {
 		s_read = 1;
 		char path[160];
 		std::snprintf(path, sizeof(path), "%sdabr", sms_wiiu_app_root());
 		if (FILE* f = std::fopen(path, "rb")) {
-			if (std::fscanf(f, "%31s %d", s_tag, &s_stage) != 2)
+			int n = std::fscanf(f, "%31s %d %15s", s_tag, &s_stage, s_mode);
+			if (n < 2)
 				s_stage = -1;
 			std::fclose(f);
 		}
-		port_log("[dabr] marker %s: tag=%s stage=%d\n", path, s_stage >= 0 ? s_tag : "-", s_stage);
+		port_log("[dabr] marker %s: tag=%s stage=%d mode=%s\n", path, s_stage >= 0 ? s_tag : "-", s_stage,
+		         s_mode[0] ? s_mode : "-");
 	}
 	uint32_t a = (uint32_t)(uintptr_t)addr & ~7u;
 	if (s_stage < 0 || stage != s_stage || std::strcmp(tag, s_tag) != 0) {
@@ -231,7 +249,15 @@ void port_dabr_watch(const void* addr, const char* tag, int stage)
 		return;
 	}
 	BOOL ok = OSSetDABR(TRUE, a, FALSE, TRUE);
+	s_watch_addr = a;
 	port_log("[dabr] ARMED %s stage=%d addr=%08X ret=%d\n", tag, stage, (unsigned)a, (int)ok);
+	if (std::strcmp(s_mode, "test") == 0) {
+		/* Positive control: this store must raise a DSI naming port_dabr_watch. */
+		port_log("[dabr] control store to %08X\n", (unsigned)a);
+		volatile uint32_t* w = (volatile uint32_t*)(uintptr_t)a;
+		*w = *w;
+		port_log("[dabr] control store NOT caught\n");
+	}
 }
 
 void sms_wiiu_runtime_init(void)
