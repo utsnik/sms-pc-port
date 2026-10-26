@@ -39,6 +39,7 @@ extern "C" void sms_wiiu_gx2_target_present(void);
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <coreinit/core.h>
 
 namespace {
 
@@ -113,6 +114,7 @@ void log_words(const char* tag, const void* image, uint32_t bytes)
  * link-wrapped to change its buffering mode; WHBGfx then allocates the larger
  * buffer in its foreground heap and frees it on release as before. */
 bool s_tribuf;
+void gf_init();
 
 GX2BufferingMode scan_buffering()
 {
@@ -497,6 +499,7 @@ extern "C" void sms_wiiu_gfx_init(void)
 		return;
 	s_tribuf = sms_wiiu_sd_marker("tribuf") != 0;
 	port_log("SMS Wii U: scan buffers %s (SD marker tribuf)\n", s_tribuf ? "triple" : "double");
+	gf_init();
 	s_gfx_initialized = WHBGfxInit() != FALSE;
 	if (!s_gfx_initialized)
 		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
@@ -559,6 +562,119 @@ extern "C" int64_t wut_OSGetTime_stub(void) __asm__("OSGetTime");
 static int64_t s_presentFinish, s_presentBegin;
 static uint32_t s_presentFrames;
 
+/* SD marker "gpuframe": the GPU's own cost per frame under gx2prod, where
+ * perfdiag's per-draw stamps miss the worker's lists, copies, clears and the
+ * present.  Core 1 stamps the top of pipe at frame start and before each list,
+ * and the bottom of pipe after each list or serviced callback and before the
+ * swap.  A top stamp later than every earlier bottom stamp is time the GPU sat
+ * drained, waiting for commands.  Frames are read four frames later, when the
+ * GPU has long written them. */
+extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
+extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
+namespace {
+constexpr uint32_t kGfFrames = 4, kGfStamps = 512;
+bool s_gf;
+uint64_t* s_gfStamp;
+uint8_t s_gfBottom[kGfFrames][kGfStamps];
+uint32_t s_gfCount[kGfFrames], s_gfFrame;
+uint64_t s_gfPrevEnd;
+uint64_t s_gfSpan, s_gfSpanMax, s_gfIdle, s_gfStartGap;
+uint32_t s_gfStamps, s_gfFrames, s_gfNotReady, s_gfOverflow;
+
+void gf_init()
+{
+	s_gf = sms_wiiu_sd_marker("gpuframe") != 0;
+	if (s_gf) {
+		s_gfStamp = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGfFrames * kGfStamps * 8, 64));
+		if (s_gfStamp) {
+			memset(s_gfStamp, 0, kGfFrames * kGfStamps * 8);
+			DCFlushRange(s_gfStamp, kGfFrames * kGfStamps * 8);
+		} else {
+			s_gf = false;
+		}
+	}
+	port_log("SMS Wii U: GPU frame stamps %s (SD marker gpuframe)\n", s_gf ? "on" : "off");
+}
+
+void gf_stamp(bool bottom, bool end = false)
+{
+	const uint32_t f = s_gfFrame % kGfFrames;
+	uint32_t& n = s_gfCount[f];
+	if (n >= kGfStamps - (end ? 0 : 1)) {
+		++s_gfOverflow;
+		return;
+	}
+	uint64_t* slot = s_gfStamp + f * kGfStamps + n;
+	s_gfBottom[f][n++] = bottom;
+	if (bottom) GX2SampleBottomGPUCycle(slot);
+	else GX2SampleTopGPUCycle(slot);
+}
+
+/* Reads the frame about to reuse its slot, then clears the slot for it. */
+void gf_collect(uint32_t f)
+{
+	const uint32_t n = s_gfCount[f];
+	s_gfCount[f] = 0;
+	if (!n) return;
+	uint64_t* st = s_gfStamp + f * kGfStamps;
+	DCInvalidateRange(st, n * 8);
+	bool ready = true;
+	for (uint32_t i = 0; i < n; ++i)
+		if (!st[i]) ready = false;
+	if (ready && s_gfBottom[f][n - 1]) {
+		const uint64_t end = st[n - 1];
+		uint64_t busyUntil = s_gfPrevEnd;
+		uint64_t idle = 0;
+		for (uint32_t i = 0; i < n; ++i) {
+			if (s_gfBottom[f][i]) {
+				if (st[i] > busyUntil) busyUntil = st[i];
+			} else if (busyUntil && st[i] > busyUntil) {
+				if (i == 0) s_gfStartGap += st[i] - busyUntil;
+				idle += st[i] - busyUntil;
+				busyUntil = st[i];
+			}
+		}
+		if (s_gfPrevEnd && end > s_gfPrevEnd) {
+			const uint64_t span = end - s_gfPrevEnd;
+			s_gfSpan += span;
+			s_gfIdle += idle;
+			if (span > s_gfSpanMax) s_gfSpanMax = span;
+			s_gfStamps += n;
+			++s_gfFrames;
+		}
+		s_gfPrevEnd = end;
+	} else {
+		++s_gfNotReady;
+		s_gfPrevEnd = 0;
+	}
+	memset(st, 0, n * 8);
+	DCFlushRange(st, n * 8);
+}
+
+/* GPU timer: 27 MHz, so 2700 cycles per 0.1 ms. */
+void gf_end_frame()
+{
+	gf_stamp(true, true);
+	++s_gfFrame;
+	gf_collect(s_gfFrame % kGfFrames);
+	if (s_gfFrames >= 30) {
+		port_log("SMS Wii U: [gpuframe] per-frame x0.1ms span=%u busy=%u idle=%u startGap=%u maxSpan=%u stamps=%u /window: frames=%u notReady=%u overflow=%u\n",
+		         unsigned(s_gfSpan / s_gfFrames / 2700),
+		         unsigned((s_gfSpan - (s_gfIdle < s_gfSpan ? s_gfIdle : s_gfSpan)) / s_gfFrames / 2700),
+		         unsigned(s_gfIdle / s_gfFrames / 2700), unsigned(s_gfStartGap / s_gfFrames / 2700),
+		         unsigned(s_gfSpanMax / 2700), unsigned(s_gfStamps / s_gfFrames), unsigned(s_gfFrames),
+		         unsigned(s_gfNotReady), unsigned(s_gfOverflow));
+		s_gfSpan = s_gfSpanMax = s_gfIdle = s_gfStartGap = 0;
+		s_gfStamps = s_gfFrames = s_gfNotReady = s_gfOverflow = 0;
+	}
+}
+} // namespace
+
+extern "C" void sms_wiiu_gpuframe_stamp(int bottom)
+{
+	if (s_gf && OSGetCoreId() == 1) gf_stamp(bottom != 0);
+}
+
 /* Pipelined present: WHBGfxFinishRender ends in GX2DrawDone and
  * WHBGfxBeginRender waits for the previous flip, so the CPU never built a frame
  * while the GPU drew one.  Here the swap is queued without draining, and the
@@ -567,6 +683,7 @@ static uint32_t s_presentFrames;
  * safe. */
 static void present_finish_pipelined(void)
 {
+	if (s_gf) gf_end_frame();
 	GX2SwapScanBuffers();
 	GX2Flush();
 	static bool s_enabled;
@@ -602,6 +719,7 @@ static void present_begin_pipelined(void)
 	}
 	const int64_t t1 = wut_OSGetTime_stub();
 	GX2SetContextState(WHBGfxGetTVContextState());
+	if (s_gf) gf_stamp(false);
 	const int64_t t2 = wut_OSGetTime_stub();
 	s_beginSwapWait += t1 - t0;
 	s_beginContext += t2 - t1;
