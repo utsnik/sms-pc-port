@@ -188,12 +188,14 @@ static void drainWorker() {
     }
 }
 
+extern "C" void sms_wiiu_profiler_worker_start(void);
 static int workerMain(int, const char**) {
     // Everything this thread allocates (the worker pipe, decoded batches, the
     // display-list cache) is port data: keep it out of the game's JKR heaps,
     // which the game frees and reuses at every scene change while the port
     // still holds the pointers (Sirena/Gelato/Pianta load crashes).
     sms_port_heap_enter();
+    sms_wiiu_profiler_worker_start();  // SD markers cpuprof + workerprof: sample this core
     for (;;) {
         WutMessage message = {nullptr, {0, 0, 0}};
         const OSTime blockedStart = OSGetTime();

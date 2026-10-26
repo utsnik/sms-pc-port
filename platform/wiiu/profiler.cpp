@@ -69,6 +69,10 @@ struct Table {
 
 alignas(64) uint8_t s_alarm[0x80];
 Table s_tables[2];
+// SD marker "workerprof": a second sampler armed from the GX2 producer worker,
+// so it fires on that thread's core (0); reported with the main thread's.
+alignas(64) uint8_t s_walarm[0x80];
+Table s_wtables[2];
 // PCs known to be inside a leaf function, learned by report(); 0 = empty.
 uint32_t s_leafPc[kLeafSlots];
 
@@ -151,12 +155,15 @@ volatile uint32_t s_frameTicks;  // frame boundaries seen, for the hang check
 bool s_running;
 WutTime s_lastReport;
 
-void on_alarm(void*, void* context)
+void* s_workerThread;
+volatile uint32_t s_wactive;
+bool s_wrunning;
+
+void sample(Table& t, void* mainThread, void* context)
 {
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
-	Table& t = s_tables[s_active & 1];
 	++t.samples;
-	if (context == s_mainThread) {
+	if (context == mainThread) {
 		++t.main;
 		count_inclusive(t, static_cast<const uint8_t*>(context));
 	}
@@ -173,6 +180,9 @@ void on_alarm(void*, void* context)
 	}
 	++t.dropped;
 }
+
+void on_alarm(void*, void* context) { sample(s_tables[s_active & 1], s_mainThread, context); }
+void on_walarm(void*, void* context) { sample(s_wtables[s_wactive & 1], s_workerThread, context); }
 
 // Leaves whose samples are worth charging to their callers.
 bool leaf_name(const char* name)
@@ -216,7 +226,7 @@ struct Func {
 	uint32_t count;
 };
 
-void report(Table& t)
+void report(Table& t, const char* tag, void* mainThread)
 {
 	static Func funcs[512];
 	uint32_t nfuncs = 0, other = 0;
@@ -238,19 +248,19 @@ void report(Table& t)
 	/* No '%' in these lines' output: the console log handler formats the
 	 * finished line again, so "0.6% safe|..." became a %s with a junk
 	 * pointer and faulted in OSConsoleWrite. */
-	port_log("[prof] samples=%u dropped=%u functions=%u main-thread=%u call-dropped=%u\n", (unsigned)t.samples,
+	port_log("%s samples=%u dropped=%u functions=%u main-thread=%u call-dropped=%u\n", tag, (unsigned)t.samples,
 	         (unsigned)t.dropped, (unsigned)nfuncs, (unsigned)t.main, (unsigned)t.callDropped);
 	for (uint32_t i = 0; i < kThreads && t.thread[i]; ++i) {
 		const char* tn = thread_name(t.thread[i]);
 		char label[40];
 		std::snprintf(label, sizeof(label), "%.31s", tn ? tn : "?");
-		port_log("[prof] thr %08x %5.1f pct %s%s\n", (unsigned)reinterpret_cast<uint32_t>(t.thread[i]),
+		port_log("%s thr %08x %5.1f pct %s%s\n", tag, (unsigned)reinterpret_cast<uint32_t>(t.thread[i]),
 		         t.samples ? 100.0f * t.threadCount[i] / t.samples : 0.0f, label,
-		         t.thread[i] == s_mainThread ? " (main)" : "");
+		         t.thread[i] == mainThread ? " (main)" : "");
 	}
 	// Each other thread with a real share: its own top functions.
 	for (uint32_t th = 0; th < kThreads && t.thread[th]; ++th) {
-		if (t.thread[th] == s_mainThread || t.threadCount[th] * 50 < t.samples) continue;
+		if (t.thread[th] == mainThread || t.threadCount[th] * 50 < t.samples) continue;
 		static Func tf[64];
 		uint32_t ntf = 0;
 		for (uint32_t i = 0; i < kSlots; ++i) {
@@ -272,7 +282,7 @@ void report(Table& t)
 			for (uint32_t f = 0; f < ntf; ++f)
 				if (tf[f].count && (best == ntf || tf[f].count > tf[best].count)) best = f;
 			if (best == ntf) break;
-			port_log("[prof] thr %08x %5.1f pct %s\n", (unsigned)reinterpret_cast<uint32_t>(t.thread[th]),
+			port_log("%s thr %08x %5.1f pct %s\n", tag, (unsigned)reinterpret_cast<uint32_t>(t.thread[th]),
 			         100.0f * tf[best].count / t.samples, tf[best].name);
 			tf[best].count = 0;
 		}
@@ -287,7 +297,7 @@ void report(Table& t)
 		wut_OSGetSymbolName(t.callPc[best], leaf, sizeof(leaf));
 		if (code_addr(t.callLr[best])) wut_OSGetSymbolName(t.callLr[best], caller, sizeof(caller));
 		if (t.callUp[best]) wut_OSGetSymbolName(t.callUp[best], up, sizeof(up));
-		port_log("[prof] via %5.1f pct %s <- %s <- %s\n", t.samples ? 100.0f * t.callCount[best] / t.samples : 0.0f,
+		port_log("%s via %5.1f pct %s <- %s <- %s\n", tag, t.samples ? 100.0f * t.callCount[best] / t.samples : 0.0f,
 		         short_name(leaf), short_name(caller), t.callUp[best] ? short_name(up) : "?");
 		t.callCount[best] = 0;
 	}
@@ -309,13 +319,13 @@ void report(Table& t)
 			}
 			inc[f].count += t.incCount[i];
 		}
-		port_log("[prof] inclusive (of %u main-thread samples, dropped %u):\n", (unsigned)t.main, (unsigned)t.incDropped);
+		port_log("%s inclusive (of %u main-thread samples, dropped %u):\n", tag, (unsigned)t.main, (unsigned)t.incDropped);
 		for (int rank = 0; rank < 45; ++rank) {
 			uint32_t best = ninc;
 			for (uint32_t f = 0; f < ninc; ++f)
 				if (inc[f].count && (best == ninc || inc[f].count > inc[best].count)) best = f;
 			if (best == ninc) break;
-			port_log("[prof] inc %5.1f pct %s\n", t.main ? 100.0f * inc[best].count / t.main : 0.0f, inc[best].name);
+			port_log("%s inc %5.1f pct %s\n", tag, t.main ? 100.0f * inc[best].count / t.main : 0.0f, inc[best].name);
 			inc[best].count = 0;
 		}
 	}
@@ -324,7 +334,7 @@ void report(Table& t)
 		for (uint32_t f = 0; f < nfuncs; ++f)
 			if (funcs[f].count && (best == nfuncs || funcs[f].count > funcs[best].count)) best = f;
 		if (best == nfuncs) break;
-		port_log("[prof] %2d %5.1f%% %5u %s\n", rank, t.samples ? 100.0f * funcs[best].count / t.samples : 0.0f,
+		port_log("%s %2d %5.1f%% %5u %s\n", tag, rank, t.samples ? 100.0f * funcs[best].count / t.samples : 0.0f,
 		         (unsigned)funcs[best].count, funcs[best].name);
 		funcs[best].count = 0;
 	}
@@ -365,7 +375,24 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	s_lastReport = now;
 	const uint32_t done = s_active & 1;
 	s_active = done ^ 1;
-	report(s_tables[done]);
+	report(s_tables[done], "[prof]", s_mainThread);
+	if (s_wrunning) {
+		const uint32_t wdone = s_wactive & 1;
+		s_wactive = wdone ^ 1;
+		report(s_wtables[wdone], "[wprof]", s_workerThread);
+	}
+}
+
+/* From the GX2 producer worker's thread at its start: with the SD marker
+ * "workerprof", sample its core too (an alarm fires on the core that set it). */
+extern "C" void sms_wiiu_profiler_worker_start(void)
+{
+	if (s_wrunning || !sms_wiiu_sd_marker("workerprof")) return;
+	std::memset(s_wtables, 0, sizeof(s_wtables));
+	s_workerThread = wut_OSGetCurrentThread();
+	wut_OSCreateAlarm(s_walarm);
+	s_wrunning = wut_OSSetPeriodicAlarm(s_walarm, wut_OSGetTime() + kPeriod, kPeriod, on_walarm) != 0;
+	port_log("[wprof] worker sampler %s on thread %p\n", s_wrunning ? "on" : "failed", s_workerThread);
 }
 
 /* Hang report, from another thread (the audio pacer's 10 s stats): when the
@@ -412,6 +439,10 @@ extern "C" void sms_wiiu_hang_check(void)
 /* Every exit path cancels the alarm, or it fires into an unmapped process. */
 extern "C" void sms_wiiu_profiler_stop(void)
 {
+	if (s_wrunning) {
+		wut_OSCancelAlarm(s_walarm);
+		s_wrunning = false;
+	}
 	if (!s_running) return;
 	wut_OSCancelAlarm(s_alarm);
 	s_running = false;
