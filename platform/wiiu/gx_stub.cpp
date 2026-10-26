@@ -107,6 +107,18 @@ void log_words(const char* tag, const void* image, uint32_t bytes)
 	         unsigned(v[4]), unsigned(v[5]), unsigned(v[6]), unsigned(v[7]));
 }
 
+/* SD marker "tribuf": triple-buffered TV and DRC scan buffers, so two swaps may
+ * be outstanding before the next frame starts.  WHBGfxInit sizes, allocates
+ * and registers the TV buffer itself, so GX2CalcTVSize and GX2SetTVBuffer are
+ * link-wrapped to change its buffering mode; WHBGfx then allocates the larger
+ * buffer in its foreground heap and frees it on release as before. */
+bool s_tribuf;
+
+GX2BufferingMode scan_buffering()
+{
+	return s_tribuf ? GX2_BUFFERING_MODE_TRIPLE : GX2_BUFFERING_MODE_DOUBLE;
+}
+
 /* WHBGfxInit sizes and registers the DRC scan buffer with GX2GetSystemDRCMode(),
  * which returned 0 (DISABLED) on hardware: a 512-byte buffer in a disabled
  * mode, so the GamePad kept the system launch screen.  The LUS and DKR ports
@@ -127,7 +139,7 @@ void drc_register_scan_buffer()
 	if (mode == GX2_DRC_RENDER_MODE_DISABLED)
 		mode = GX2_DRC_RENDER_MODE_SINGLE;
 	uint32_t bytes = 0, unk = 0;
-	GX2CalcDRCSize(mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE, &bytes, &unk);
+	GX2CalcDRCSize(mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, scan_buffering(), &bytes, &unk);
 	uint32_t fga = 0, fgs = 0;
 	OSGetForegroundBucket(&fga, &fgs);
 	GX2Texture last;
@@ -170,7 +182,7 @@ void drc_register_scan_buffer()
 		return;
 	}
 	GX2Invalidate(GX2_INVALIDATE_MODE_CPU, s_drc_scan, bytes);
-	GX2SetDRCBuffer(s_drc_scan, bytes, mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE);
+	GX2SetDRCBuffer(s_drc_scan, bytes, mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, scan_buffering());
 	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
 	GX2SetDRCScale(tv->surface.width, tv->surface.height);
 	GX2SetDRCEnable(TRUE);
@@ -456,6 +468,26 @@ void present_diagnostics()
 
 } // namespace
 
+/* Linked with -Wl,--wrap for each; see s_tribuf. */
+extern "C" {
+void __real_GX2CalcTVSize(GX2TVRenderMode, GX2SurfaceFormat, GX2BufferingMode, uint32_t*, uint32_t*);
+void __real_GX2SetTVBuffer(void*, uint32_t, GX2TVRenderMode, GX2SurfaceFormat, GX2BufferingMode);
+void __wrap_GX2CalcTVSize(GX2TVRenderMode mode, GX2SurfaceFormat format, GX2BufferingMode buffering,
+                          uint32_t* size, uint32_t* unk)
+{
+	__real_GX2CalcTVSize(mode, format, s_tribuf ? GX2_BUFFERING_MODE_TRIPLE : buffering, size, unk);
+}
+void __wrap_GX2SetTVBuffer(void* buffer, uint32_t size, GX2TVRenderMode mode, GX2SurfaceFormat format,
+                           GX2BufferingMode buffering)
+{
+	if (s_tribuf)
+		buffering = GX2_BUFFERING_MODE_TRIPLE;
+	port_log("[present] TV scan buffer %p+%u mode=%d buffering=%d\n", buffer, unsigned(size), int(mode),
+	         int(buffering));
+	__real_GX2SetTVBuffer(buffer, size, mode, format, buffering);
+}
+}
+
 /* 1 forces the renderer's full-surface EFB copy (the Cemu path) on hardware. */
 extern "C" const int sms_wiiu_efb_full_copy = 0;
 
@@ -463,6 +495,8 @@ extern "C" void sms_wiiu_gfx_init(void)
 {
 	if (s_gfx_initialized)
 		return;
+	s_tribuf = sms_wiiu_sd_marker("tribuf") != 0;
+	port_log("SMS Wii U: scan buffers %s (SD marker tribuf)\n", s_tribuf ? "triple" : "double");
 	s_gfx_initialized = WHBGfxInit() != FALSE;
 	if (!s_gfx_initialized)
 		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
@@ -528,7 +562,7 @@ static uint32_t s_presentFrames;
 /* Pipelined present: WHBGfxFinishRender ends in GX2DrawDone and
  * WHBGfxBeginRender waits for the previous flip, so the CPU never built a frame
  * while the GPU drew one.  Here the swap is queued without draining, and the
- * next frame starts once at most one swap is still outstanding.  The vertex
+ * next frame starts once at most one swap (two with tribuf) is still outstanding.  The vertex
  * arenas are fenced and GXPeekARGB is asynchronous, so one frame in flight is
  * safe. */
 static void present_finish_pipelined(void)
@@ -548,7 +582,7 @@ static void present_begin_pipelined(void)
 		uint32_t swaps = 0, flips = 0;
 		OSTime lastFlip = 0, lastVsync = 0;
 		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
-		if (flips + 1 >= swaps)
+		if (flips + (s_tribuf ? 2 : 1) >= swaps)
 			break;
 		if (wait >= 10) {
 			port_log("[present] wait for swap timed out (swaps=%u flips=%u)\n", unsigned(swaps), unsigned(flips));
