@@ -576,21 +576,37 @@ static void present_finish_pipelined(void)
 		s_enabled = true;
 	}
 }
+/* Where beginRender's time goes, per 30 frames: the swap wait (and how many
+ * vsyncs it took), the context-state switch, and swaps still pending on entry. */
+static int64_t s_beginSwapWait, s_beginContext, s_beginMax;
+static uint32_t s_beginVsyncs, s_beginPending, s_beginWaited;
 static void present_begin_pipelined(void)
 {
+	const int64_t t0 = wut_OSGetTime_stub();
 	for (uint32_t wait = 0;; ++wait) {
 		uint32_t swaps = 0, flips = 0;
 		OSTime lastFlip = 0, lastVsync = 0;
 		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+		if (!wait)
+			s_beginPending += swaps - flips;
 		if (flips + (s_tribuf ? 2 : 1) >= swaps)
 			break;
+		if (!wait)
+			++s_beginWaited;
 		if (wait >= 10) {
 			port_log("[present] wait for swap timed out (swaps=%u flips=%u)\n", unsigned(swaps), unsigned(flips));
 			break;
 		}
 		GX2WaitForVsync();
+		++s_beginVsyncs;
 	}
+	const int64_t t1 = wut_OSGetTime_stub();
 	GX2SetContextState(WHBGfxGetTVContextState());
+	const int64_t t2 = wut_OSGetTime_stub();
+	s_beginSwapWait += t1 - t0;
+	s_beginContext += t2 - t1;
+	if (t2 - t0 > s_beginMax)
+		s_beginMax = t2 - t0;
 }
 
 /* Real vsyncs, counted by GX2's vsync event. The VI emulation advances its
@@ -691,9 +707,15 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	}
 	if (++s_presentFrames == 30) {
 		const int64_t tick100us = (248625000 / 4) / 10000;
-		port_log("SMS Wii U: [present] per-frame x0.1ms finish(GPU drain)=%u beginRender(vsync)=%u\n",
-		         unsigned(s_presentFinish / 30 / tick100us), unsigned(s_presentBegin / 30 / tick100us));
+		port_log("SMS Wii U: [present] per-frame x0.1ms finish(GPU drain)=%u beginRender(vsync)=%u "
+		         "swapWait=%u context=%u maxBegin=%u /30: waited=%u vsyncs=%u pendingAtEntry=%u\n",
+		         unsigned(s_presentFinish / 30 / tick100us), unsigned(s_presentBegin / 30 / tick100us),
+		         unsigned(s_beginSwapWait / 30 / tick100us), unsigned(s_beginContext / 30 / tick100us),
+		         unsigned(s_beginMax / tick100us), unsigned(s_beginWaited), unsigned(s_beginVsyncs),
+		         unsigned(s_beginPending));
 		s_presentFinish = s_presentBegin = 0;
+		s_beginSwapWait = s_beginContext = s_beginMax = 0;
+		s_beginWaited = s_beginVsyncs = s_beginPending = 0;
 		s_presentFrames = 0;
 	}
 	sms_wiiu_gx2_texture_pack_pump();
