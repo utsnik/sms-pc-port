@@ -842,7 +842,7 @@ static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
 static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the [gpu] report
-static bool s_rectClear;  // SD marker "rectclear", see rectClearColour
+static bool s_rectClear;  // see rectClearColour (SD marker norectclear)
 extern "C" void sms_wiiu_gpuframe_stamp(int kind);
 static bool s_frameClearPending = false;
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
@@ -1094,7 +1094,7 @@ static GX2TexClampMode clampMode(uint32_t value) {
 // are an effect sample the GameCube's level of detail: the bias makes up for
 // the TV target's scale over the 640x480 EFB.
 static float s_lodScale = 1.5f;
-// SD marker "automip": a game texture with no mip levels of its own, sampled
+// automip (default; SD marker noautomip turns it off): a game texture with no mip levels of its own, sampled
 // with wrapping on both axes (tiled ground, walls), gets a generated box-filter
 // chain and samples it with linear mip filtering; HD pack levels for such
 // textures are used the same way.  At 1080p the 256x256 Bianco grass without
@@ -4900,11 +4900,13 @@ void rendererInit(float) {
     }
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
-    s_rectClear = sdMarkerPresent("rectclear") && !runningUnderCemu();
-    s_autoMip = sdMarkerPresent("automip");
+    // Both default on since 2026-10-26 (Bianco at 545 MHz: 269 -> 5 of ~1400
+    // frames over 42 ms); the markers turn them off for A/B runs.
+    s_rectClear = !sdMarkerPresent("norectclear") && !runningUnderCemu();
+    s_autoMip = !sdMarkerPresent("noautomip");
     s_autoMipPack = !sdMarkerPresent("automipnopack");
-    WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker automip)", s_autoMip ? "on" : "off");
-    WHBLogPrintf("SMS Wii U: copy clears %s (SD marker rectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
+    WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
@@ -5833,7 +5835,7 @@ struct ProducerCopyRequest {
 };
 static ProducerCopyRequest s_producerCopies[64];
 
-// SD marker "rectclear": a copy's clear covers only its source rectangle, as on
+// rectclear (default; SD marker norectclear turns it off): a copy's clear covers only its source rectangle, as on
 // GX, instead of the whole 1080p colour buffer.  Bianco makes seven copies a
 // frame and each full clear cost ~1.2 ms of GPU.  GX2 has no rectangle clear,
 // so a scratch colour buffer the rectangle's size is cleared (only when the
