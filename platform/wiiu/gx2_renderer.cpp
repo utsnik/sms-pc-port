@@ -5481,6 +5481,37 @@ void flushBatch() {
             ++s_perfDraws; ++s_perfGpuDraws; ++s_perfDlDraws;
             s_perfVerts += pend.nidx; s_perfGpuVerts += pend.nidx;
             const uint32_t debugDrawNo = s_debugDrawNo++;
+            // Autoplay SMS_PROBE_VERTS=<n>: log the first draws of that index
+            // count (texture, sampler, state); SMS_PROBE_SKIP=1 also drops them.
+            static int s_probeVerts = -1, s_probeSkip;
+            static uint32_t s_probeLogged;
+            if (s_probeVerts < 0) {
+                const char* v = std::getenv("SMS_PROBE_VERTS");
+                s_probeVerts = v ? std::atoi(v) : 0;
+                const char* k = std::getenv("SMS_PROBE_SKIP");
+                s_probeSkip = k && *k == '1';
+                if (s_probeVerts)
+                    WHBLogPrintf("SMS Wii U: [probe] draws of %d indices: log%s", s_probeVerts, s_probeSkip ? " and skip" : "");
+            }
+            if (s_probeVerts && pend.nidx == uint32_t(s_probeVerts)) {
+                if (s_probeLogged < 12 && g_displayFrames > 2000) {
+                    ++s_probeLogged;
+                    const TextureEntry* t = nullptr;
+                    for (int m = 0; m < 8 && !t; ++m) t = tevTextures[m];
+                    WHBLogPrintf("SMS Wii U: [probe] frame=%u draw#%u stages=%u texmask=%02x cm0=%08x z=%02x genmode=%08x vp=%d,%d,%d,%d "
+                                 "tex=%ux%u fmt=%u levels=%u mips=%u tile=%u packStaging=%d sampler=%08x,%08x,%08x src=%p",
+                                 unsigned(g_displayFrames), unsigned(debugDrawNo), unsigned(tevKey.stages),
+                                 unsigned(tevTextureMask(tevKey)), unsigned(g.bp[BP_CMODE0]), unsigned(g.bp[BP_ZMODE] & 0xff),
+                                 unsigned(g.bp[BP_GENMODE]), int(g.viewport[0]), int(g.viewport[1]), int(g.viewport[2]),
+                                 int(g.viewport[3]), t ? unsigned(t->width) : 0u, t ? unsigned(t->height) : 0u,
+                                 t ? unsigned(t->fmt) : 0u, t ? unsigned(t->levels) : 0u,
+                                 t ? unsigned(t->texture.surface.mipLevels) : 0u, t ? unsigned(t->texture.surface.tileMode) : 0u,
+                                 t ? int(t->packLinear.surface.image != nullptr) : -1,
+                                 t ? unsigned(t->sampler.regs[0]) : 0u, t ? unsigned(t->sampler.regs[1]) : 0u,
+                                 t ? unsigned(t->sampler.regs[2]) : 0u, t ? static_cast<const void*>(t->source) : nullptr);
+                }
+                if (s_probeSkip) return;
+            }
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
