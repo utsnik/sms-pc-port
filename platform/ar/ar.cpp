@@ -10,10 +10,6 @@
 // DMA into main memory: cached GX decodes of it are checked again (weak:
 // absent without platform/gx).
 extern "C" __attribute__((weak)) void GXPC_MemoryWritten(const void* p, u32 n);
-// TEMPORARY probe (platform/wiiu/runtime.cpp; absent on the host).
-extern "C" __attribute__((weak)) void port_watch_check(const void* dst, u32 len, const char* what, const char* detail,
-                                                       u32 extra);
-extern "C" __attribute__((weak)) void port_watch_verify(const char* where, const char* name);
 
 namespace {
 const u32 kAramSize = 16u << 20;
@@ -30,11 +26,7 @@ void copy(u32 type, u32 src, u32 dst, u32 len)
 			port_log("[ar] write out of range 0x%x+0x%x\n", dst, len);
 	} else {
 		if (src + len <= kAramSize) {
-			if (port_watch_check)
-				port_watch_check((void*)(uintptr_t)dst, len, "aram", "", src);
 			memcpy((void*)(uintptr_t)dst, g_aram + src, len);
-			if (port_watch_verify)
-				port_watch_verify("aram-copy", "");
 			// The game invalidates the destination after this "DMA"
 			// (JKRAramPiece::doneDMA); on real hardware (Wii U) that drops the
 			// dirty lines this CPU copy left in the cache. Write them back first.

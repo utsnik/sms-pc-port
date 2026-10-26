@@ -114,14 +114,6 @@ set(SMS_WIIU_GD_SOURCES
   ${SMS_DECOMP}/libs/dolphin/src/gd/GDPixel.c
   ${SMS_DECOMP}/libs/dolphin/src/gd/GDTev.c
   ${SMS_DECOMP}/libs/dolphin/src/gd/GDTransform.c)
-# This list is not one patches.cmake rewrites: use a patched copy when a
-# decomp-patches/*.patch touches the file.
-foreach(f GDBase GDGeometry GDLight GDPixel GDTev GDTransform)
-  if(EXISTS ${SMS_PATCH_ROOT}/libs/dolphin/src/gd/${f}.c)
-    list(TRANSFORM SMS_WIIU_GD_SOURCES REPLACE "^${SMS_DECOMP}/libs/dolphin/src/gd/${f}\\.c$"
-         "${SMS_PATCH_ROOT}/libs/dolphin/src/gd/${f}.c")
-  endif()
-endforeach()
 set_source_files_properties(${SMS_WIIU_GD_SOURCES} PROPERTIES
   COMPILE_OPTIONS "-include;${CMAKE_CURRENT_SOURCE_DIR}/gd_wiiu_prefix.h;-w;-fcommon")
 
