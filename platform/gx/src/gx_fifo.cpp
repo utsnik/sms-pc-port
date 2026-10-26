@@ -1241,6 +1241,9 @@ struct DlEntry {
     uint32_t skip = 0;    // calls left to run without the cache
     uint32_t checkedClock = 0, checkedFrame = 0;  // when its source bytes were last compared
     bool hashAlways = false;  // its bytes once changed with no write reported: compared on every call
+    DlEntry* alt = nullptr;   // the same list recorded under other state (kDlVariants)
+    uint32_t usedFrame = 0;   // last hit or recording, to pick the variant to replace
+    uint32_t hits = 0;        // hits since recorded
 };
 // The entries (stable addresses) and an open-addressing index of them by
 // list address (a thousand lookups a frame).
@@ -1294,6 +1297,24 @@ FILE* traceFile();
 
 // Lists are compared by hash at least this often (texture data: kRecheckFrames).
 enum { kDlRecheckFrames = 30 };
+// Recordings kept per list address, one per state it is drawn under.
+enum { kDlVariants = 4 };
+
+static uint32_t s_dlVarNew, s_dlVarEvict, s_dlVarRerecords, s_dlVarHits, s_dlVarReportFrame;
+#ifdef __WIIU__
+extern "C" int sms_gx_whb_log(const char* fmt, ...) __asm__("WHBLogPrintf");
+#endif
+// [dlvar] every 300 display frames: variants added and replaced, other
+// re-recordings, and hits on a variant other than the first.
+static void dlVariantReport() {
+    if (g_displayFrames - s_dlVarReportFrame < 300) return;
+    s_dlVarReportFrame = g_displayFrames;
+#ifdef __WIIU__
+    sms_gx_whb_log("SMS Wii U: [dlvar] frame=%u new=%u evict=%u rerec=%u varHits=%u", (unsigned)g_displayFrames,
+                   (unsigned)s_dlVarNew, (unsigned)s_dlVarEvict, (unsigned)s_dlVarRerecords, (unsigned)s_dlVarHits);
+#endif
+    s_dlVarNew = s_dlVarEvict = s_dlVarRerecords = s_dlVarHits = 0;
+}
 
 static bool dlCacheEnabled() {
     static int on = -1;
@@ -1340,7 +1361,8 @@ static void dlRecordPrimitive(uint8_t opcode, const uint8_t* p, uint32_t count, 
     }
 }
 
-static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
+// The state a recording depends on besides the list's bytes.
+static bool dlStateMatches(const DlEntry& e, uint32_t size) {
     if (!e.valid || e.size != size) return false;
     if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return false;
     for (int v = 0; v < 8; v++)
@@ -1350,6 +1372,11 @@ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
     for (const DlArray& a : e.arrays)
         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
             return false;
+    return true;
+}
+
+static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
+    if (!dlStateMatches(e, size)) return false;
     bool unwritten = trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
@@ -1464,30 +1491,37 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         runCommands(data, size);
         return;
     }
-    DlEntry& e = dlLookup(data);
-    if (e.skip) {
-        e.skip--;
+    DlEntry& head = dlLookup(data);
+    if (head.skip) {
+        head.skip--;
         runCommands(data, size);
         return;
     }
-    if (dlReusable(e, data, size)) {
+    dlVariantReport();
+    DlEntry* hit = &head;
+    while (hit && !dlReusable(*hit, data, size)) hit = hit->alt;
+    if (hit) {
+        DlEntry& e = *hit;
+        e.usedFrame = g_displayFrames;
+        if (&e != &head) s_dlVarHits++;
         if (e.stateOnly) {
             dlReplayState(e);
-            e.misses = 0;
+            head.misses = 0;
             return;
         }
         const bool arena = arenaEnabled() && !traceFile();  // traces list the batch's own vertices
-        g_dlCurList = data; g_dlCurSize = size; g_dlCurMisses = e.misses;
-        // Store a run only for a list that hit without misses: a list drawn
-        // with several states per frame is re-recorded on each mismatch, and
-        // storing each fresh copy leaked ~32 KB of arena a frame until the
-        // pool wrapped and every run in the scene was stored again (a ~90 ms
-        // Plaza frame every ~620).  Such lists are decoded instead.
+        g_dlCurList = data; g_dlCurSize = size; g_dlCurMisses = head.misses;
+        // Store a run only for a recording hit at least once before, with no
+        // miss since: a list re-recorded on every call would store a fresh
+        // copy each time (~32 KB of arena a frame for Plaza 0x11659340 before
+        // it had variants, so the pool wrapped and every run in the scene was
+        // stored again: a ~90 ms frame every ~620).  Such lists are decoded.
+        const bool store = head.misses == 0 && e.hits > 0;
         for (DlRun& r : e.runs) {
             const uint32_t nidx = uint32_t(r.idx.size());
             if (arena && nidx &&
                 (r.arena.gen == arenaGeneration() ||
-                 (e.misses == 0 && arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena))))
+                 (store && arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena))))
                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());
             else
                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
@@ -1495,19 +1529,71 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         s_vertsLoaded += e.verts;
         for (const DlRun& r : e.runs) g_dlReplayIdx += uint32_t(r.idx.size());
         g_traceLastVat = e.lastVat;
-        e.misses = 0;
+        e.hits++;
+        head.misses = 0;
         return;
     }
-    // (re)record; a list that keeps changing is left alone for a while
-    if (e.valid || e.size) e.misses++;
+    // (Re)record.  A list drawn under another state than its recording gets
+    // a variant per state (up to kDlVariants, then the least recently used is
+    // replaced); one whose bytes changed is recorded again in place.  Only a
+    // replacement counts as a miss: a list that keeps changing is left alone
+    // for a while.
+    DlEntry* target = &head;
+    uint32_t variant = 0;
+    bool fresh = false;
+    if (head.valid && head.size == size && !dlStateMatches(head, size)) {
+        DlEntry* lru = &head;
+        uint32_t n = 0, lruIndex = 0;
+        target = nullptr;
+        for (DlEntry* v = &head; v; v = v->alt, n++) {
+            if (dlStateMatches(*v, size)) {
+                target = v;
+                variant = n;
+                break;
+            }
+            if (int32_t(v->usedFrame - lru->usedFrame) < 0) {
+                lru = v;
+                lruIndex = n;
+            }
+        }
+        if (!target && n < kDlVariants) {
+            s_dlEntries->emplace_back();  // a deque: entries keep their addresses
+            target = &s_dlEntries->back();
+            DlEntry* last = &head;
+            while (last->alt) last = last->alt;
+            last->alt = target;
+            variant = n;
+            fresh = true;
+            s_dlVarNew++;
+        } else if (!target) {
+            target = lru;
+            variant = lruIndex;
+            s_dlVarEvict++;
+        }
+    } else if (head.size != size) {
+        // another list now at this address: its variants are stale
+        if (head.alt && batchUsesArena()) flushBatch();
+        for (DlEntry* v = head.alt; v; v = v->alt) {
+            s_dlCacheBytes -= v->bytes;
+            DlEntry* next = v->alt;
+            *v = DlEntry();
+            v->alt = next;
+        }
+    }
+    if (!fresh && (head.valid || head.size)) head.misses++;
+    if (!fresh) s_dlVarRerecords++;
     if (batchUsesArena()) flushBatch();  // the batch may still read the runs about to be dropped
+    DlEntry& e = *target;
     s_dlCacheBytes -= e.bytes;
-    uint32_t misses = e.misses;
+    uint32_t misses = head.misses;
     bool hashAlways = e.hashAlways;
+    DlEntry* alt = e.alt;
     e = DlEntry();
-    e.misses = misses;
+    e.alt = alt;
     e.hashAlways = hashAlways;
-    if (misses >= 3) e.skip = 4u << (misses - 3 < 8 ? misses - 3 : 8);
+    e.usedFrame = g_displayFrames;
+    head.misses = misses;
+    if (misses >= 3) head.skip = 4u << (misses - 3 < 8 ? misses - 3 : 8);
     if (s_dlCacheBytes > (size_t(96) << 20)) {  // keep the cache bounded: start over
         dlClear();
         runCommands(data, size);
@@ -1529,7 +1615,7 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
     // Plaza: ~20 ms once a second, one missed vsync a second when paced).
     // The offset only brings a check earlier.
     e.checkedFrame = g_displayFrames -
-        ((uint32_t(reinterpret_cast<uintptr_t>(data) >> 5) * 2654435761u) >> 16) % kDlRecheckFrames;
+        ((uint32_t((reinterpret_cast<uintptr_t>(data) >> 5) + variant) * 2654435761u) >> 16) % kDlRecheckFrames;
     s_dlRec = &e;
     s_dlRecFail = false;
     uint32_t need = 0;
@@ -1544,7 +1630,7 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         if (used < size || !dlCompileState(e, data, size)) {
             e.ops.clear();
             e.words.clear();
-            e.skip = ~0u;
+            head.skip = ~0u;
             return;
         }
         e.stateOnly = true;
