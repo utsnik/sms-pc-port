@@ -1,49 +1,47 @@
-Reason: TEMPORARY probe (remove after diagnosis): arm a write data breakpoint (SD marker file dabr = "<splash|water> <stage>") on the splash quad / water manager that the Sirena and Gelato load crashes find overwritten, and log GD display-list overflows.
+Reason: TEMPORARY probe (remove after diagnosis): snapshot the splash quad / water manager that the Sirena and Gelato load crashes find overwritten (SD marker file dabr = "<splash|water> <stage>") and verify it at every object load and perform-list entry to bracket the writer; log GD display-list overflows.
 --- a/src/Player/SplashManager.cpp	2026-10-26 19:37:50.124012961 +0000
-+++ b/src/Player/SplashManager.cpp	2026-10-26 19:37:50.224014923 +0000
++++ b/src/Player/SplashManager.cpp	2026-10-26 20:03:06.532572876 +0000
 @@ -13,6 +13,8 @@
  
  TSplashManager* gpSplashManager;
  
-+extern "C" void port_dabr_watch(const void* addr, const char* tag, int stage);
++extern "C" void port_dabr_watch(const void* base, unsigned len, const char* tag, int stage);
 +
  void TSplashManager::load(JSUMemoryInputStream& stream)
  {
  	JDrama::TViewObj::load(stream);
-@@ -40,6 +42,10 @@
+@@ -40,6 +42,9 @@
  	unk644 = 3000.0f;
  	unk648 = 16;
  
-+	// Watch the quad's DL/position buffer pointers (stable after createBuffer).
-+	port_dabr_watch((const void*)(((uintptr_t)unk640 + 0x10) & ~(uintptr_t)7), "splash",
-+	                gpApplication.mCurrArea.getStage());
++	// Watch the quad's vtable, counters and DL buffer pointers (set by createBuffer).
++	port_dabr_watch(unk640, 0x14, "splash", gpApplication.mCurrArea.getStage());
 +
  	gpSplashManager = this;
  }
  
 --- a/src/Player/ModelWaterManager.cpp	2026-10-26 19:37:50.125012980 +0000
-+++ b/src/Player/ModelWaterManager.cpp	2026-10-26 19:37:50.229015021 +0000
++++ b/src/Player/ModelWaterManager.cpp	2026-10-26 20:03:06.537572978 +0000
 @@ -1,4 +1,7 @@
  #include <Player/ModelWaterManager.hpp>
 +#include <System/Application.hpp>
 +
-+extern "C" void port_dabr_watch(const void* addr, const char* tag, int stage);
++extern "C" void port_dabr_watch(const void* base, unsigned len, const char* tag, int stage);
  #include <Player/MarioAccess.hpp>
  #include <Player/SplashManager.hpp>
  #include <Strategic/LiveActor.hpp>
-@@ -214,6 +217,10 @@
+@@ -214,6 +217,9 @@
  	unk5E48 = 20;
  	unk5E49 = 40;
  
-+	// Watch the vtable/name doubleword (written only by the constructor).
-+	port_dabr_watch((const void*)(((uintptr_t)this + 4) & ~(uintptr_t)7), "water",
-+	                gpApplication.mCurrArea.getStage());
++	// Watch the vtable, name and keycode (written by the constructor and TNameRef::load).
++	port_dabr_watch(this, 0xC, "water", gpApplication.mCurrArea.getStage());
 +
  	gpModelWaterManager = this;
  }
  
 --- a/libs/dolphin/src/gd/GDBase.c	2026-10-26 19:37:50.131013098 +0000
-+++ b/libs/dolphin/src/gd/GDBase.c	2026-10-26 19:37:50.230015041 +0000
++++ b/libs/dolphin/src/gd/GDBase.c	2026-10-26 20:03:06.538572998 +0000
 @@ -29,8 +29,16 @@
  	}
  }
@@ -61,3 +59,35 @@ Reason: TEMPORARY probe (remove after diagnosis): arm a write data breakpoint (S
  	if (overflowcb != NULL) {
  		(*overflowcb)();
  	}
+--- a/libs/JSystem/src/JDrama/JDRNameRef.cpp	2026-10-26 20:03:06.440571003 +0000
++++ b/libs/JSystem/src/JDrama/JDRNameRef.cpp	2026-10-26 20:03:06.539573019 +0000
+@@ -48,8 +48,11 @@
+ 
+ int TNameRef::getType() const { return 0; }
+ 
++extern "C" void port_watch_verify(const char* where, const char* name);
++
+ void TNameRef::load(JSUMemoryInputStream& stream)
+ {
++	port_watch_verify("load", getName());
+ 	mKeyCode = stream.readU16();
+ 	mName    = stream.readString();
+ }
+--- a/src/System/PerformList.cpp	2026-10-26 20:02:46.772170522 +0000
++++ b/src/System/PerformList.cpp	2026-10-26 20:03:06.540573039 +0000
+@@ -2,6 +2,7 @@
+ #include <JSystem/JDrama/JDRNameRefGen.hpp>
+ 
+ extern "C" void port_log(const char* fmt, ...);
++extern "C" void port_watch_verify(const char* where, const char* name);
+ 
+ void TPerformList::forEachPerform(
+     JGadget::TSingleLinkList<TPerformLink, 0>::iterator b,
+@@ -10,6 +11,7 @@
+ {
+ 	for (JGadget::TSingleLinkList<TPerformLink, 0>::iterator it = b; it != e;
+ 	     it++) {
++		port_watch_verify("perform", it->mPerformer ? it->mPerformer->getName() : "-");
+ 		it->perform(cue, graphics);
+ 	}
+ }
