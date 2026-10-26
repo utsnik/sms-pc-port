@@ -539,6 +539,7 @@ struct TextureEntry {
     const uint8_t* source = nullptr;
     uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0, levels = 1;
     bool arbitraryMips = false;
+    bool autoMips = false;  // automip: levels past the game's one were generated here
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
@@ -1092,7 +1093,32 @@ static GX2TexClampMode clampMode(uint32_t value) {
 // are an effect sample the GameCube's level of detail: the bias makes up for
 // the TV target's scale over the 640x480 EFB.
 static float s_lodScale = 1.5f;
-static void initSampler(GX2Sampler* sampler, uint32_t mode0, uint32_t mode1, uint32_t levels, bool arbitraryMips) {
+// SD marker "automip": a game texture with no mip levels of its own, sampled
+// with wrapping on both axes (tiled ground, walls), gets a generated box-filter
+// chain and samples it with linear mip filtering; HD pack levels for such
+// textures are used the same way.  At 1080p the 256x256 Bianco grass without
+// mips thrashed the texture cache: 2.5 ms of GPU per frame at 545 MHz.
+// Clamped textures (UI, lookup ramps) keep the game's own sampling.
+static bool s_autoMip;
+static bool autoMipWrap(uint32_t mode0) { return (mode0 & 3) && ((mode0 >> 2) & 3); }
+static void boxDownsample(const uint8_t* s, uint32_t sw, uint32_t sh, uint8_t* d, uint32_t dw, uint32_t dh) {
+    for (uint32_t y = 0; y < dh; ++y) {
+        const uint8_t* r0 = s + size_t(std::min(2 * y, sh - 1)) * sw * 4;
+        const uint8_t* r1 = s + size_t(std::min(2 * y + 1, sh - 1)) * sw * 4;
+        for (uint32_t x = 0; x < dw; ++x) {
+            const uint32_t x0 = std::min(2 * x, sw - 1) * 4, x1 = std::min(2 * x + 1, sw - 1) * 4;
+            for (uint32_t c = 0; c < 4; ++c)
+                d[(size_t(y) * dw + x) * 4 + c] = uint8_t((r0[x0 + c] + r0[x1 + c] + r1[x0 + c] + r1[x1 + c] + 2) >> 2);
+        }
+    }
+}
+
+static void initSampler(GX2Sampler* sampler, uint32_t mode0, uint32_t mode1, uint32_t levels, bool arbitraryMips,
+                        bool forceMips = false) {
+    if (forceMips && levels > 1 && autoMipWrap(mode0)) {
+        mode0 = (mode0 & ~(3u << 5)) | (2u << 5);                  // linear between levels
+        mode1 = (mode1 & ~0xffffu) | (((levels - 1) * 16) << 8);   // LOD 0 .. last level
+    }
     GX2InitSampler(sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
     GX2InitSamplerClamping(sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
                            GX2_TEX_CLAMP_MODE_WRAP);
@@ -3761,7 +3787,8 @@ static TextureEntry* getTexture(int map) {
             }
             // The sampler state belongs to the texmap, not the image: the same
             // texture may be bound with other wrap or filter modes.
-            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips);
+            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips,
+                        s_autoMip && e.levels == 1);
             return &e;
         }
     }
@@ -3784,6 +3811,14 @@ static TextureEntry* getTexture(int map) {
     e.texture.surface.height = h;
     e.texture.surface.depth = 1;
     e.texture.surface.mipLevels = levels;
+    // automip: levels from genFrom on are box-filtered here, not decoded.
+    uint32_t genFrom = 0;
+    if (s_autoMip && levels == 1 && autoMipWrap(mode0) && w >= 32 && h >= 32 && !(w & (w - 1)) && !(h & (h - 1))) {
+        uint32_t n = 1;
+        while ((std::min(w, h) >> n) >= 4 && n < 12) ++n;
+        e.texture.surface.mipLevels = n;
+        genFrom = 1;
+    }
     e.texture.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.texture.surface.aa = GX2_AA_MODE1X;
     e.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
@@ -3837,8 +3872,10 @@ static TextureEntry* getTexture(int map) {
     // Decode through explicitly checked buffers: a failed allocation returns
     // null here (no exceptions), and the decoder then wrote megabytes from
     // address 0 and corrupted newlib's heap.
+    if (surf.mipLevels <= 1) genFrom = 0;
+    e.autoMips = genFrom != 0;
     uint32_t srcBytes = 0;
-    for (uint32_t l = 0; l < surf.mipLevels; ++l)
+    for (uint32_t l = 0; l < (genFrom ? genFrom : surf.mipLevels); ++l)
         srcBytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
     // A texture address that did not survive the 30-bit GX physical address
     // (outside the main heap) must not be read: in Cemu that kills the title.
@@ -3871,15 +3908,17 @@ static TextureEntry* getTexture(int map) {
                                    static_cast<uint32_t>(s_textures.size()));
         for (uint32_t l = 0; l < surf.mipLevels; ++l) {
             const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
-            gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
+            const bool generated = genFrom && l >= genFrom;
+            if (generated) boxDownsample(prev, pw, ph, rgba, lw, lh);
+            else gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
             uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
                                   : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
             for (uint32_t y = 0; y < lh; ++y)
                 memcpy(dst + size_t(y) * mipPitch[l] * 4, rgba + size_t(y) * lw * 4, size_t(lw) * 4);
-            if (l > 0) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
+            if (l > 0 && !generated) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
             if (prev) std::swap(prev, rgba);
             pw = lw; ph = lh;
-            src += texLevelBytes(fmt, lw, lh);
+            if (!generated) src += texLevelBytes(fmt, lw, lh);
         }
         decodeTiming.finish();
         e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
@@ -3892,7 +3931,7 @@ static TextureEntry* getTexture(int map) {
                                static_cast<uint32_t>(s_textures.size()));
     retileTexture(e.texture);
     retileTiming.finish();
-    initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
+    initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips, s_autoMip && e.levels == 1);
     e.valid = true;
     if (texturePackEnabled()) {
         TexturePackRequest request = {};
@@ -4044,7 +4083,18 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
                 result.request.retry = result.retry; result.request.writeClock = writeClock();
                 e->packState = texturePackEnqueue(result.request) ? 1 : 2;
             } else e->packState = 2;
-        } else if (!result.found) { e->packState = 2; ++s_packFallback; }
+        } else if (!result.found) {
+            e->packState = 2; ++s_packFallback;
+            // Textures the pack has no replacement for, named as Dolphin names them.
+            static uint32_t s_packMissLogs;
+            if (s_packMissLogs < 160) {
+                ++s_packMissLogs;
+                WHBLogPrintf("SMS Wii U: [texpack] miss tex1_%ux%u%s_%016llx_%u tlut=%016llx",
+                             unsigned(result.key.width), unsigned(result.key.height), result.key.mipmapped ? "_m" : "",
+                             (unsigned long long)result.key.dataHash, unsigned(result.key.format),
+                             (unsigned long long)result.key.tlutHash);
+            }
+        }
         else if (!packStart(*e, result.entry)) { e->packState = 2; ++s_packFallback; }
     }
     TexturePackUploadBudget budget(512u << 10);
@@ -4841,6 +4891,8 @@ void rendererInit(float) {
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_rectClear = sdMarkerPresent("rectclear") && !runningUnderCemu();
+    s_autoMip = sdMarkerPresent("automip");
+    WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker automip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker rectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
