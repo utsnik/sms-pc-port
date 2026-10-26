@@ -893,10 +893,12 @@ static void gpuCollect(uint32_t arena) {
         const uint64_t cost = st[i] - st[i - 1];
         const uint64_t idle = top[i] > st[i - 1] ? std::min(top[i] - st[i - 1], cost) : 0;
         s_gpuIdle += idle;
+        // Ranked by busy time: a draw that mostly waited (starved, zero pixels)
+        // has large cycles but costs the GPU nothing.
         int slot = -1;
         for (int k = 0; k < 8; ++k)
-            if (slot < 0 || s_gpuTop[k].cost < s_gpuTop[slot].cost) slot = k;
-        if (cost > s_gpuTop[slot].cost) s_gpuTop[slot] = {cost, idle, s_gpuInfo[arena][i]};
+            if (slot < 0 || s_gpuTop[k].cost - s_gpuTop[k].idle < s_gpuTop[slot].cost - s_gpuTop[slot].idle) slot = k;
+        if (cost - idle > s_gpuTop[slot].cost - s_gpuTop[slot].idle) s_gpuTop[slot] = {cost, idle, s_gpuInfo[arena][i]};
     }
 }
 
@@ -911,7 +913,7 @@ static void gpuReport() {
     for (int r = 0; r < 8; ++r) {
         int best = -1;
         for (int k = 0; k < 8; ++k)
-            if (s_gpuTop[k].cost && (best < 0 || s_gpuTop[k].cost > s_gpuTop[best].cost)) best = k;
+            if (s_gpuTop[k].cost && (best < 0 || s_gpuTop[k].cost - s_gpuTop[k].idle > s_gpuTop[best].cost - s_gpuTop[best].idle)) best = k;
         if (best < 0) break;
         const GpuDrawInfo& d = s_gpuTop[best].info;
         WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u idle=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u",
