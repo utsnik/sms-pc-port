@@ -26,6 +26,7 @@ BOOL cafe_OSCreateThread(OSThread*, OSThreadEntryPointFn, int32_t, char*, void*,
                          OSThreadAttributes) __asm__("OSCreateThread");
 int32_t cafe_OSResumeThread(OSThread*) __asm__("OSResumeThread");
 OSThread* cafe_OSGetCurrentThread(void) __asm__("OSGetCurrentThread");
+const char* cafe_OSGetThreadName(OSThread*) __asm__("OSGetThreadName");
 }
 
 extern "C" void* sms_wiiu_vi_owner_thread(void);
@@ -52,6 +53,10 @@ void park_forever(void)
 char s_message[512];
 volatile int s_crashed;
 char s_trace[2048];
+/* The first fault's report, kept for the rescue thread to send again: the
+ * handler's own burst of UDP lines lost the backtrace (Gelato, 2026-10-26). */
+char s_first[2560];
+OSThread s_rescue;
 
 /* The faulting PC is often inside a system RPL (outside .text at 0x02000000),
  * so name every address and walk the stack back to the game's own frames. */
@@ -124,13 +129,16 @@ void trace(OSContext* context)
 
 BOOL fatal(const char* type, OSContext* context)
 {
+	OSThread* thread = cafe_OSGetCurrentThread();
+	const char* name = thread ? cafe_OSGetThreadName(thread) : nullptr;
 	if (!context) {
 		std::snprintf(s_message, sizeof(s_message), "SMS Wii U %s exception (no context)\n", type);
 	} else {
 		std::snprintf(s_message, sizeof(s_message),
-		              "SMS Wii U %s exception core=%u\nSRR0=%08X SRR1=%08X\nDAR=%08X DSISR=%08X\n"
+		              "SMS Wii U %s exception core=%u thread=%p (%s) fault=%d\nSRR0=%08X SRR1=%08X\nDAR=%08X DSISR=%08X\n"
 		              "LR=%08X R1=%08X R3=%08X R4=%08X\n",
-		              type, (unsigned)OSGetCoreId(), (unsigned)context->srr0, (unsigned)context->srr1,
+		              type, (unsigned)OSGetCoreId(), (void*)thread, name ? name : "unnamed", s_crashed + 1,
+		              (unsigned)context->srr0, (unsigned)context->srr1,
 		              (unsigned)context->dar, (unsigned)context->dsisr, (unsigned)context->lr,
 		              (unsigned)context->gpr[1], (unsigned)context->gpr[3], (unsigned)context->gpr[4]);
 	}
@@ -138,13 +146,34 @@ BOOL fatal(const char* type, OSContext* context)
 	if (context) {
 		trace(context);
 		WHBLogPrint(s_trace);
+		if (!s_crashed)
+			std::snprintf(s_first, sizeof(s_first), "%s%s", s_message, s_trace);
 		dump(context);
 	}
-	/* A second fault (or none of the recovery paths apply): the old behaviour,
-	 * an error screen that needs a reboot. */
-	if (!context || s_crashed++) {
+	/* No context, a fault in the rescue thread itself, or a runaway string of
+	 * faults: the old behaviour, an error screen that needs a reboot. */
+	if (!context || thread == &s_rescue || s_crashed >= 8) {
 		OSFatal(s_message);
 		return FALSE;
+	}
+	/* A later fault while the rescue runs (another game or port thread hitting
+	 * what the first fault or the teardown left behind) is parked like any
+	 * non-main thread. OSFatal here wedged the console with FTP down
+	 * (Gelato 2026-10-26: a core-0 DSI in a system library 0.1 s into the
+	 * rescue). */
+	if (s_crashed++) {
+		context->srr0 = (uint32_t)&park_forever;
+		context->lr = 0;
+		context->gpr[1] &= ~0xFu;
+		context->gpr[1] -= 0x100;
+		std::snprintf(s_message, sizeof(s_message), "[crash] fault #%d during the rescue (stage %d): thread %s parked",
+		              s_crashed, sms_wiiu_crash_stage, name ? name : "unnamed");
+		WHBLogPrint(s_message);
+		/* The main thread was still due to leave for a parked other thread:
+		 * now the rescue thread has to. */
+		if ((void*)context == sms_wiiu_vi_owner_thread() && sms_wiiu_crash_stage >= 10)
+			sms_wiiu_crash_stage = 1;
+		return TRUE;
 	}
 	/* Crash safety: resume the faulting thread in a recovery function instead
 	 * of OSFatal. The main thread (which owns ProcUI and GX2) goes straight to
@@ -182,7 +211,6 @@ BOOL on_program(OSContext* c) { return fatal("PROGRAM", c); }
 namespace {
 /* Waits on core 1 (ProcUI's core) at the top priority for a main-thread fault,
  * then takes the main thread's place: Menu, ProcUI, exit. */
-OSThread s_rescue;
 alignas(16) uint8_t s_rescue_stack[16 * 1024];
 
 int rescue(int, const char**)
@@ -190,6 +218,15 @@ int rescue(int, const char**)
 	while (sms_wiiu_crash_stage != 1)
 		OSSleepTicks(OSMillisecondsToTicks(100));
 	WHBLogPrint("[crash] rescue thread takes over");
+	/* The first report again, line by line and paced, after the handler's burst. */
+	OSSleepTicks(OSMillisecondsToTicks(200));
+	for (char* line = s_first; line && *line;) {
+		char* end = std::strchr(line, '\n');
+		if (end) *end = '\0';
+		WHBLogPrintf("[crash] first fault: %s", line);
+		OSSleepTicks(OSMillisecondsToTicks(20));
+		line = end ? end + 1 : nullptr;
+	}
 	sms_wiiu_crash_return_to_menu();
 	return 0;
 }
