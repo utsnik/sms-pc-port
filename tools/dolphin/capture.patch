@@ -1,4 +1,9 @@
 # Capture-only input aid; this never changes Dolphin's reference rendering.
+# The dumped boot sequence shows the strap screen from capture frames 60 through
+# 1200 (the latter is its dismissal/connection tail), so the DTM supplies only A in that
+# bounded interval and releases every button afterward. The Bluetooth changes
+# remain necessary because nogui playback otherwise reaches the Wii safety
+# screen before IOS completes the emulated remote link/channel handshake.
 diff --git a/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp b/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp
 index 000883e..6cef20c 100644
 --- a/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp
@@ -41,7 +46,7 @@ index 000883e..6cef20c 100644
    return true;
  }
  
-@@ -345,12 +355,26 @@ void BluetoothEmuDevice::Update()
+@@ -345,12 +355,34 @@ void BluetoothEmuDevice::Update()
      g_controller_interface.SetCurrentInputChannel(ciface::InputChannel::Bluetooth);
      g_controller_interface.UpdateInput();
  
@@ -52,15 +57,23 @@ index 000883e..6cef20c 100644
  
      for (size_t i = 0; i < m_wiimotes.size(); ++i)
 +    {
++      if (i == 0 && !m_wiimotes[i]->IsSourceValid())
++      {
++        m_wiimotes[i]->SetSource(
++            static_cast<WiimoteEmu::Wiimote*>(Wiimote::GetConfig()->GetController(i)));
++      }
        next_call[i] = m_wiimotes[i]->PrepareInput(&wiimote_states[i]);
  
 +      // The capture DTM is intentionally unattended. Dolphin normally waits
 +      // for a real button edge before starting the emulated Wii Remote link,
 +      // which leaves the Wii safety screen waiting forever in nogui mode.
-+      if (i == 0 && next_call[i] == WiimoteDevice::NextUpdateInputCall::None &&
-+          m_wiimotes[i]->IsSourceValid())
++      if (i == 0 && capture_frame >= 60 && capture_frame <= 1200 &&
++          next_call[i] == WiimoteDevice::NextUpdateInputCall::None)
 +      {
-+        wiimote_states[i].buttons.hex |= WiimoteCommon::ButtonData::BUTTON_MASK;
++        // The DTM owns the bounded A press; this activation edge must not
++        // synthesize HOME, B, 1/2, or a d-pad direction.
++        m_wiimotes[i]->Activate(true);
++        wiimote_states[i].buttons.a = true;
 +        next_call[i] = WiimoteDevice::NextUpdateInputCall::Activate;
 +      }
 +    }
@@ -68,18 +81,18 @@ index 000883e..6cef20c 100644
      if (NetPlay::IsNetPlayRunning())
      {
        std::array<WiimoteEmu::SerializedWiimoteState, MAX_BBMOTES> serialized;
-@@ -388,6 +412,11 @@ void BluetoothEmuDevice::Update()
+@@ -388,4 +388,11 @@ void BluetoothEmuDevice::Update()
  
        movie.PlayWiimote(i, &wiimote_states[i]);
        movie.CheckWiimoteStatus(i, wiimote_states[i]);
 +
-+      // Temporary unattended RMGP01 capture aid: keep all primary Wiimote
-+      // buttons asserted while the boot safety screen is active.
-+      if (i == 0 && capture_frame >= 120 && ((capture_frame / 100) % 2 == 0))
-+        wiimote_states[i].buttons.hex |= WiimoteCommon::ButtonData::BUTTON_MASK;
++      // Apply the bounded A press after movie playback so an empty DTM
++      // activation record cannot erase the connection edge.
++      if (i == 0 && capture_frame >= 60 && capture_frame <= 1200)
++      {
++        wiimote_states[i].buttons.a = true;
++      }
      }
- 
-     for (size_t i = 0; i < m_wiimotes.size(); ++i)
 diff --git a/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp b/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp
 index 8b556da..7234514 100644
 --- a/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp
@@ -120,21 +133,4 @@ index 8b556da..7234514 100644
 +  }
    return NextUpdateInputCall::None;
  }
-
-diff --git a/Source/Core/Core/Movie.cpp b/Source/Core/Core/Movie.cpp
-index aee5e47..267e1ab 100644
---- a/Source/Core/Core/Movie.cpp
-+++ b/Source/Core/Core/Movie.cpp
-@@ -1299,6 +1299,12 @@ bool MovieManager::PlayWiimote(int wiimote, DesiredWiimoteState* desired_state)
-     return false;
-   }
- 
-+  // Temporary unattended boot aid for the RMGP01 capture route. The Wii
-+  // strap screen can appear before the game starts polling the movie input;
-+  // keep the emulated A button down through the first 10000 VI frames.
-+  if (m_current_frame >= 240 && m_current_frame < 360)
-+    desired_state->buttons.a = true;
-+
-   m_current_byte += serialized.length;
-   ++m_current_input_count;
  
