@@ -341,17 +341,14 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	const WutTime now = wut_OSGetTime();
 	++s_frameTicks;
 	/* The sampler costs CPU every millisecond: only with the SD marker
-	 * "perfdiag" (the frame count above still feeds the hang check). */
+	 * "perfdiag", or "cpuprof" for the sampler alone (perfdiag also turns
+	 * gx2prod's renderer paths off; cpuprof keeps them, for core 1 as shipped).
+	 * The frame count above still feeds the hang check. */
 	static int s_enabled = -1;
 	if (s_enabled < 0) {
 		s_mainThread = wut_OSGetCurrentThread(); // the hang check needs it either way
-		char path[256];
-		std::snprintf(path, sizeof(path), "%sperfdiag", sms_wiiu_app_root());
-		FILE* f = std::fopen(path, "rb");
-		s_enabled = f != nullptr;
-		if (f)
-			std::fclose(f);
-		port_log("[prof] sampler %s (SD marker perfdiag)\n", s_enabled ? "on" : "off");
+		s_enabled = sms_wiiu_sd_marker("perfdiag") || sms_wiiu_sd_marker("cpuprof");
+		port_log("[prof] sampler %s (SD marker perfdiag or cpuprof)\n", s_enabled ? "on" : "off");
 	}
 	if (!s_enabled)
 		return;
