@@ -46,7 +46,7 @@ index 000883e..6cef20c 100644
    return true;
  }
  
-@@ -345,12 +355,34 @@ void BluetoothEmuDevice::Update()
+@@ -345,12 +355,42 @@ void BluetoothEmuDevice::Update()
      g_controller_interface.SetCurrentInputChannel(ciface::InputChannel::Bluetooth);
      g_controller_interface.UpdateInput();
  
@@ -76,21 +76,36 @@ index 000883e..6cef20c 100644
 +        wiimote_states[i].buttons.a = true;
 +        next_call[i] = WiimoteDevice::NextUpdateInputCall::Activate;
 +      }
++      if (i == 0 && capture_frame >= 1532 && capture_frame <= 20000 &&
++          next_call[i] == WiimoteDevice::NextUpdateInputCall::None)
++      {
++        m_wiimotes[i]->Activate(true);
++        wiimote_states[i].buttons.a = true;
++        wiimote_states[i].buttons.b = true;
++        next_call[i] = WiimoteDevice::NextUpdateInputCall::Activate;
++      }
 +    }
 +
      if (NetPlay::IsNetPlayRunning())
      {
        std::array<WiimoteEmu::SerializedWiimoteState, MAX_BBMOTES> serialized;
-@@ -388,4 +388,11 @@ void BluetoothEmuDevice::Update()
+@@ -388,4 +388,18 @@ void BluetoothEmuDevice::Update()
  
        movie.PlayWiimote(i, &wiimote_states[i]);
        movie.CheckWiimoteStatus(i, wiimote_states[i]);
 +
 +      // Apply the bounded A press after movie playback so an empty DTM
-+      // activation record cannot erase the connection edge.
++      // activation record cannot erase the connection edge. Once the title
++      // milestone is complete, Galaxy accepts A+B from the title screen and
++      // opens file select without a pointer event.
 +      if (i == 0 && capture_frame >= 60 && capture_frame <= 1200)
 +      {
 +        wiimote_states[i].buttons.a = true;
++      }
++      if (i == 0 && capture_frame >= 1532 && capture_frame <= 20000)
++      {
++        wiimote_states[i].buttons.a = true;
++        wiimote_states[i].buttons.b = true;
 +      }
      }
 diff --git a/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp b/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp
