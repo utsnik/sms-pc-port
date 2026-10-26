@@ -1,0 +1,140 @@
+# Capture-only input aid; this never changes Dolphin's reference rendering.
+diff --git a/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp b/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp
+index 000883e..6cef20c 100644
+--- a/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp
++++ b/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp
+@@ -18,6 +18,7 @@
+ #include "Core/HW/SystemTimers.h"
+ #include "Core/HW/Wiimote.h"
+ #include "Core/HW/WiimoteEmu/DesiredWiimoteState.h"
++#include "Core/HW/WiimoteEmu/WiimoteEmu.h"
+ #include "Core/IOS/Device.h"
+ #include "Core/IOS/IOS.h"
+ #include "Core/Movie.h"
+@@ -26,6 +27,7 @@
+ #include "Core/SysConf.h"
+ #include "Core/System.h"
+ #include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "InputCommon/InputConfig.h"
+ 
+ namespace IOS::HLE
+ {
+@@ -64,6 +66,8 @@ BluetoothEmuDevice::BluetoothEmuDevice(EmulationKernel& ios, const std::string&
+     const unsigned int hid_source_number =
+         NetPlay::IsNetPlayRunning() ? NetPlay::NetPlay_GetLocalWiimoteForSlot(i) : i;
+     m_wiimotes[i] = std::make_unique<WiimoteDevice>(this, tmp_bd, hid_source_number);
++    m_wiimotes[i]->SetSource(
++        static_cast<WiimoteEmu::Wiimote*>(Wiimote::GetConfig()->GetController(i)));
+   }
+ 
+   bt_dinf.num_registered = MAX_BBMOTES;
+@@ -111,6 +115,12 @@ bool BluetoothEmuDevice::RemoteConnect(WiimoteDevice& wiimote)
+     return false;
+ 
+   SendEventRequestConnection(wiimote);
++  // Let the Wii IOS finish bringing up Bluetooth before completing the
++  // unattended page. Completing it on the first update races that startup and
++  // can make the game dereference an uninitialized channel table.
++  static unsigned int capture_connection_attempts = 0;
++  if (++capture_connection_attempts > 1000 && wiimote.EventConnectionAccept())
++    SendEventConnectionComplete(wiimote.GetBD(), 0x00);
+   return true;
+ }
+ 
+@@ -345,12 +355,26 @@ void BluetoothEmuDevice::Update()
+     g_controller_interface.SetCurrentInputChannel(ciface::InputChannel::Bluetooth);
+     g_controller_interface.UpdateInput();
+ 
++    static u64 capture_frame = 0;
++    ++capture_frame;
+     std::array<WiimoteEmu::DesiredWiimoteState, MAX_BBMOTES> wiimote_states;
+     std::array<WiimoteDevice::NextUpdateInputCall, MAX_BBMOTES> next_call;
+ 
+     for (size_t i = 0; i < m_wiimotes.size(); ++i)
++    {
+       next_call[i] = m_wiimotes[i]->PrepareInput(&wiimote_states[i]);
+ 
++      // The capture DTM is intentionally unattended. Dolphin normally waits
++      // for a real button edge before starting the emulated Wii Remote link,
++      // which leaves the Wii safety screen waiting forever in nogui mode.
++      if (i == 0 && next_call[i] == WiimoteDevice::NextUpdateInputCall::None &&
++          m_wiimotes[i]->IsSourceValid())
++      {
++        wiimote_states[i].buttons.hex |= WiimoteCommon::ButtonData::BUTTON_MASK;
++        next_call[i] = WiimoteDevice::NextUpdateInputCall::Activate;
++      }
++    }
++
+     if (NetPlay::IsNetPlayRunning())
+     {
+       std::array<WiimoteEmu::SerializedWiimoteState, MAX_BBMOTES> serialized;
+@@ -388,6 +412,11 @@ void BluetoothEmuDevice::Update()
+ 
+       movie.PlayWiimote(i, &wiimote_states[i]);
+       movie.CheckWiimoteStatus(i, wiimote_states[i]);
++
++      // Temporary unattended RMGP01 capture aid: keep all primary Wiimote
++      // buttons asserted while the boot safety screen is active.
++      if (i == 0 && capture_frame >= 120 && ((capture_frame / 100) % 2 == 0))
++        wiimote_states[i].buttons.hex |= WiimoteCommon::ButtonData::BUTTON_MASK;
+     }
+ 
+     for (size_t i = 0; i < m_wiimotes.size(); ++i)
+diff --git a/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp b/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp
+index 8b556da..7234514 100644
+--- a/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp
++++ b/Source/Core/Core/IOS/USB/Bluetooth/WiimoteDevice.cpp
+@@ -311,8 +311,10 @@ void WiimoteDevice::Update()
+   {
+     if (m_host->RemoteConnect(*this))
+     {
+-      // After a connection request is visible to the controller switch to inactive.
+-      SetBasebandState(BasebandState::Inactive);
++      // After a connection request is visible to the controller switch to
++      // inactive unless the unattended route completed it above.
++      if (!IsConnected())
++        SetBasebandState(BasebandState::Inactive);
+     }
+   }
+ 
+@@ -364,7 +366,10 @@ WiimoteDevice::PrepareInput(WiimoteEmu::DesiredWiimoteState* wiimote_state)
+     return NextUpdateInputCall::None;
+   }
+ 
+-  // Verify interrupt channel is connected and configured.
++  // Verify interrupt channel is connected and configured. The headless
++  // capture route may reach the safety screen before IOS has completed its
++  // first HID channel handshake, so still feed the emulated remote's report
++  // state once the baseband link is complete.
+   const auto* channel = FindChannelWithPSM(L2CAP_PSM_HID_INTR);
+   if (channel && channel->IsComplete())
+   {
+@@ -375,6 +380,11 @@ WiimoteDevice::PrepareInput(WiimoteEmu::DesiredWiimoteState* wiimote_state)
+                                    WiimoteCommon::HIDWiimote::SensorBarState::Disabled);
+     return NextUpdateInputCall::Update;
+   }
++  if (IsConnected())
++  {
++    m_hid_source->PrepareInput(wiimote_state, WiimoteCommon::HIDWiimote::SensorBarState::Disabled);
++    return NextUpdateInputCall::Update;
++  }
+   return NextUpdateInputCall::None;
+ }
+
+diff --git a/Source/Core/Core/Movie.cpp b/Source/Core/Core/Movie.cpp
+index aee5e47..267e1ab 100644
+--- a/Source/Core/Core/Movie.cpp
++++ b/Source/Core/Core/Movie.cpp
+@@ -1299,6 +1299,12 @@ bool MovieManager::PlayWiimote(int wiimote, DesiredWiimoteState* desired_state)
+     return false;
+   }
+ 
++  // Temporary unattended boot aid for the RMGP01 capture route. The Wii
++  // strap screen can appear before the game starts polling the movie input;
++  // keep the emulated A button down through the first 10000 VI frames.
++  if (m_current_frame >= 240 && m_current_frame < 360)
++    desired_state->buttons.a = true;
++
+   m_current_byte += serialized.length;
+   ++m_current_input_count;
+ 
