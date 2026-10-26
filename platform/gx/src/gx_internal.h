@@ -123,6 +123,9 @@ uint32_t writeClock();
 // value). Caches still compare by hash every kRecheckFrames frames, for
 // writes nothing reported, and always with trustWriteStamps() false.
 bool unwrittenSince(const void* p, size_t n, uint32_t since);
+// True when [p, p + n) lies inside the write-stamp window, so unwrittenSince
+// answers for it (outside it, unwrittenSince always says written).
+bool writeStampTracked(const void* p, size_t n);
 bool trustWriteStamps();
 enum { kRecheckFrames = 8 };
 extern uint32_t g_displayFrames;  // display copies so far

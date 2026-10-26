@@ -225,6 +225,12 @@ bool unwrittenSince(const void* p, size_t n, uint32_t since) {
     return true;
 }
 
+bool writeStampTracked(const void* p, size_t n) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_stampBase);
+    const uintptr_t span = uintptr_t(kStampPages) << kStampShift;
+    return a < span && a + n <= span;
+}
+
 // ------------------------------------------------------------------ big-endian ranges
 // Memory holding data in its on-disc byte order (resource files loaded in
 // place).  Vertex arrays that start inside such a range are read big-endian.

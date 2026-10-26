@@ -541,6 +541,10 @@ struct TextureEntry {
     bool arbitraryMips = false;
     bool autoMips = false;  // automip: levels past the game's one were generated here
     bool forceLogged = false;
+    // Stale-data check (see retireStaleTexture): the GX source bytes hashed at
+    // decode, and the write clock / frame of the last check.
+    uint32_t srcBytes = 0, checkedClock = 0, checkedFrame = 0;
+    uint64_t dataHash = 0;
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
@@ -3374,6 +3378,31 @@ static void textureUvTransform(const TextureEntry* texture, float out[4]) {
     out[2] = float(e->sourceW) / s_tvW;
     out[3] = float(e->sourceH) / s_tvH;
 }
+// The cache matched an entry by address, format and size only, and GX
+// texture-cache invalidates are a no-op here, so new data loaded at an old
+// texture's address (a level change) reused the old image: Bianco's palm
+// trunks showed a Plaza atlas on some runs.  As on the PC renderer, a hit
+// whose source pages were written since the last check is hashed again (at
+// most once a frame) and a changed entry is retired, so a fresh one decodes
+// and asks the HD pack for the new data.  SD marker notexrecheck turns it off.
+static bool s_texRecheck = true;
+static uint32_t s_texRetired;
+static void retireStaleTexture(TextureEntry& e) {
+    e.valid = false;
+    ++s_texRetired;
+    if (s_texRetired <= 24 || s_texRetired % 100 == 0)
+        WHBLogPrintf("SMS Wii U: [tex] stale texture retired %ux%u fmt=%u src=%p packState=%u (#%u)",
+                     unsigned(e.width), unsigned(e.height), unsigned(e.fmt), static_cast<const void*>(e.source),
+                     unsigned(e.packState), unsigned(s_texRetired));
+    // A pending or resident pack texture is the pack pump's (core 1) to free.
+    if (e.packState == 0 || e.packState == 2) {
+        deferFree(e.texture.surface.image);
+        deferFree(e.texture.surface.mipmaps);
+        e.texture.surface.image = nullptr;
+        e.texture.surface.mipmaps = nullptr;
+    }
+}
+
 static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     const CopyEntry* e = copyEntryForTexture(texture);
     if (!e || !e->sourceW || !e->sourceH) return;
@@ -3789,6 +3818,15 @@ static TextureEntry* getTexture(int map) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.fmt == fmt && e.width == w && e.height == h &&
             e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
+            if (e.srcBytes && e.checkedFrame != g_displayFrames &&
+                !unwrittenSince(e.source, e.srcBytes, e.checkedClock)) {
+                e.checkedFrame = g_displayFrames;
+                e.checkedClock = writeClock();
+                if (xxh64(e.source, e.srcBytes, 0) != e.dataHash) {
+                    retireStaleTexture(e);
+                    continue;
+                }
+            }
             if (e.packState == 3 && e.packTouchedFrame != g_displayFrames) {
                 e.packTouchedFrame = g_displayFrames;
                 e.packLruHint = s_packLru.touchHint(e.packRequestId, g_displayFrames, e.packLruHint);
@@ -3901,6 +3939,12 @@ static TextureEntry* getTexture(int map) {
     const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
     const bool readable = source && srcBytes && a1 > a0 &&
         ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
+    if (readable && s_texRecheck && writeStampTracked(source, srcBytes)) {
+        e.srcBytes = srcBytes;
+        e.checkedClock = writeClock();
+        e.checkedFrame = g_displayFrames;
+        e.dataHash = xxh64(source, srcBytes, 0);
+    }
     uint8_t* rgba = readable ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     uint8_t* prev = (readable && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
@@ -4913,6 +4957,7 @@ void rendererInit(float) {
     s_autoMip = !sdMarkerPresent("noautomip");
     s_autoMipPack = !sdMarkerPresent("automipnopack");
     s_depthSkip = !sdMarkerPresent("nodepthskip");
+    s_texRecheck = !sdMarkerPresent("notexrecheck");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
