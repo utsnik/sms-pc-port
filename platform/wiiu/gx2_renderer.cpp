@@ -5139,7 +5139,10 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     const uint32_t vbytes = (n + 1) * kRawVertexStride;  // + a zeroed slot for out-of-range indices
     const uint32_t ioff = (vbytes + 255) & ~255u;
     const uint32_t total = (ioff + nidx * 4 + 255) & ~255u;  // 256-aligned: no GPU cache line spans two runs
-    if (total > kDlArenaBytes / 8) return false;
+    // A quarter of the arena: Pianta's and Pinna's map lists are one ~31k-vertex
+    // run (~4.4 MB) each, and an eighth refused them, so they were decoded on
+    // every frame (~41 and ~28 ms).  Arena peaks there are ~15 MB of 32.
+    if (total > kDlArenaBytes / 4) return false;
     if (!s_dlArena) {
         const uint32_t freeBefore = sms_wiiu_heap_free();
         s_dlArena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
