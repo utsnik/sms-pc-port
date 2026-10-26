@@ -575,7 +575,13 @@ namespace {
 constexpr uint32_t kGfFrames = 4, kGfStamps = 512;
 bool s_gf;
 uint64_t* s_gfStamp;
-uint8_t s_gfBottom[kGfFrames][kGfStamps];
+/* Stamp kinds: 0 top of pipe; bottom after 1 a list, 2 a copy or clear,
+ * 3 a retile, 4 another callback, 5 the frame's draws (before the present),
+ * 6 the present (before the swap). */
+constexpr uint32_t kGfKinds = 7, kGfSegs = 160;
+uint8_t s_gfKind[kGfFrames][kGfStamps];
+uint64_t s_gfKindCost[kGfKinds], s_gfSegCost[kGfSegs];
+uint8_t s_gfSegKind[kGfSegs];
 uint32_t s_gfCount[kGfFrames], s_gfFrame;
 uint64_t s_gfPrevEnd;
 uint64_t s_gfSpan, s_gfSpanMax, s_gfIdle, s_gfStartGap;
@@ -596,7 +602,7 @@ void gf_init()
 	port_log("SMS Wii U: GPU frame stamps %s (SD marker gpuframe)\n", s_gf ? "on" : "off");
 }
 
-void gf_stamp(bool bottom, bool end = false)
+void gf_stamp(uint32_t kind, bool end = false)
 {
 	const uint32_t f = s_gfFrame % kGfFrames;
 	uint32_t& n = s_gfCount[f];
@@ -605,8 +611,8 @@ void gf_stamp(bool bottom, bool end = false)
 		return;
 	}
 	uint64_t* slot = s_gfStamp + f * kGfStamps + n;
-	s_gfBottom[f][n++] = bottom;
-	if (bottom) GX2SampleBottomGPUCycle(slot);
+	s_gfKind[f][n++] = uint8_t(kind);
+	if (kind) GX2SampleBottomGPUCycle(slot);
 	else GX2SampleTopGPUCycle(slot);
 }
 
@@ -621,13 +627,21 @@ void gf_collect(uint32_t f)
 	bool ready = true;
 	for (uint32_t i = 0; i < n; ++i)
 		if (!st[i]) ready = false;
-	if (ready && s_gfBottom[f][n - 1]) {
+	if (ready && s_gfKind[f][n - 1]) {
 		const uint64_t end = st[n - 1];
 		uint64_t busyUntil = s_gfPrevEnd;
 		uint64_t idle = 0;
+		const bool count = s_gfPrevEnd && end > s_gfPrevEnd;
 		for (uint32_t i = 0; i < n; ++i) {
-			if (s_gfBottom[f][i]) {
-				if (st[i] > busyUntil) busyUntil = st[i];
+			if (const uint32_t kind = s_gfKind[f][i]) {
+				/* Busy time since the GPU last caught up goes to this stamp's kind. */
+				if (st[i] > busyUntil) {
+					if (count && busyUntil) {
+						s_gfKindCost[kind < kGfKinds ? kind : 0] += st[i] - busyUntil;
+						if (i < kGfSegs) { s_gfSegCost[i] += st[i] - busyUntil; s_gfSegKind[i] = uint8_t(kind); }
+					}
+					busyUntil = st[i];
+				}
 			} else if (busyUntil && st[i] > busyUntil) {
 				if (i == 0) s_gfStartGap += st[i] - busyUntil;
 				idle += st[i] - busyUntil;
@@ -654,7 +668,7 @@ void gf_collect(uint32_t f)
 /* GPU timer: 27 MHz, so 2700 cycles per 0.1 ms. */
 void gf_end_frame()
 {
-	gf_stamp(true, true);
+	gf_stamp(6, true);
 	++s_gfFrame;
 	gf_collect(s_gfFrame % kGfFrames);
 	if (s_gfFrames >= 30) {
@@ -664,15 +678,35 @@ void gf_end_frame()
 		         unsigned(s_gfIdle / s_gfFrames / 2700), unsigned(s_gfStartGap / s_gfFrames / 2700),
 		         unsigned(s_gfSpanMax / 2700), unsigned(s_gfStamps / s_gfFrames), unsigned(s_gfFrames),
 		         unsigned(s_gfNotReady), unsigned(s_gfOverflow));
+		const uint64_t d = uint64_t(s_gfFrames) * 270;  // x0.01 ms per frame
+		port_log("SMS Wii U: [gpuframe] busy by kind x0.01ms: lists=%u copyClear=%u retile=%u callback=%u preDraws=%u present=%u\n",
+		         unsigned(s_gfKindCost[1] / d), unsigned(s_gfKindCost[2] / d), unsigned(s_gfKindCost[3] / d),
+		         unsigned(s_gfKindCost[4] / d), unsigned(s_gfKindCost[5] / d), unsigned(s_gfKindCost[6] / d));
+		/* The costliest stamp positions: frames run the same sequence, so a
+		 * position names the same list or copy from frame to frame. */
+		char buf[256];
+		int len = 0;
+		for (int r = 0; r < 8; ++r) {
+			uint32_t best = 0;
+			for (uint32_t i = 1; i < kGfSegs; ++i)
+				if (s_gfSegCost[i] > s_gfSegCost[best]) best = i;
+			if (!s_gfSegCost[best]) break;
+			len += std::snprintf(buf + len, sizeof(buf) - len, " #%u(k%u)=%u", unsigned(best),
+			                     unsigned(s_gfSegKind[best]), unsigned(s_gfSegCost[best] / d));
+			s_gfSegCost[best] = 0;
+		}
+		port_log("SMS Wii U: [gpuframe] top positions x0.01ms:%s\n", buf);
+		memset(s_gfKindCost, 0, sizeof(s_gfKindCost));
+		memset(s_gfSegCost, 0, sizeof(s_gfSegCost));
 		s_gfSpan = s_gfSpanMax = s_gfIdle = s_gfStartGap = 0;
 		s_gfStamps = s_gfFrames = s_gfNotReady = s_gfOverflow = 0;
 	}
 }
 } // namespace
 
-extern "C" void sms_wiiu_gpuframe_stamp(int bottom)
+extern "C" void sms_wiiu_gpuframe_stamp(int kind)
 {
-	if (s_gf && OSGetCoreId() == 1) gf_stamp(bottom != 0);
+	if (s_gf && OSGetCoreId() == 1) gf_stamp(uint32_t(kind));
 }
 
 /* Pipelined present: WHBGfxFinishRender ends in GX2DrawDone and
@@ -719,7 +753,7 @@ static void present_begin_pipelined(void)
 	}
 	const int64_t t1 = wut_OSGetTime_stub();
 	GX2SetContextState(WHBGfxGetTVContextState());
-	if (s_gf) gf_stamp(false);
+	if (s_gf) gf_stamp(0);
 	const int64_t t2 = wut_OSGetTime_stub();
 	s_beginSwapWait += t1 - t0;
 	s_beginContext += t2 - t1;
@@ -806,6 +840,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		return;
 	sms_wiiu_gx2_renderer_end();
 	const int64_t t0 = wut_OSGetTime_stub();
+	if (s_gf) gf_stamp(5);
 	sms_wiiu_gx2_target_present();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
 	else WHBGfxFinishRender();

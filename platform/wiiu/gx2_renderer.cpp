@@ -5113,7 +5113,7 @@ static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, 
 static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
 static bool s_gx2DlRecording;
 
-extern "C" void sms_wiiu_gpuframe_stamp(int bottom);
+extern "C" void sms_wiiu_gpuframe_stamp(int kind);
 static void gx2ProdCallList(void* list, uint32_t bytes) {
     if (OSGetCoreId() != 1)
         WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());

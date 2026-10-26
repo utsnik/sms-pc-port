@@ -7,7 +7,7 @@
 
 #include <cstring>
 
-extern "C" void sms_wiiu_gpuframe_stamp(int bottom);
+extern "C" void sms_wiiu_gpuframe_stamp(int kind);
 
 namespace gx2prod {
 namespace {
@@ -479,7 +479,8 @@ static void serviceImpl(bool allowNested) {
         } else if (record.type == SERVICE_CALLBACK) {
             const OSTime serviceStart = OSGetTime();
             record.fn(record.arg);
-            sms_wiiu_gpuframe_stamp(1);
+            sms_wiiu_gpuframe_stamp(record.counterKind == SERVICE_COUNTER_COPY_CLEAR ? 2
+                                    : record.counterKind == SERVICE_COUNTER_RETILE ? 3 : 4);
             const uint32_t micros = microsSince(serviceStart);
             switch (record.counterKind) {
             case SERVICE_COUNTER_COPY_CLEAR: add(&s_totals.core1CopyClearMicros, micros); break;
