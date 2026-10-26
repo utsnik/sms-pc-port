@@ -845,6 +845,13 @@ static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the
 static bool s_rectClear;  // see rectClearColour (SD marker norectclear)
 extern "C" void sms_wiiu_gpuframe_stamp(int kind);
 static bool s_frameClearPending = false;
+// Copy depth clears (worker order): a copy's depth clear is skipped when no
+// draw with depth update has run since a clear to the same value.  Bianco's
+// blur passes between its copies leave depth alone, and each full-buffer
+// depth clear cost ~0.5 ms.  SD marker nodepthskip turns it off.
+static bool s_depthSkip, s_depthWritten = true, s_depthClearKnown;
+static float s_lastDepthClear;
+static uint32_t s_depthClearsSkipped;
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
     if (!s_gpuDiag) return;
     if (!s_gpuStamps[arena]) {
@@ -4905,6 +4912,7 @@ void rendererInit(float) {
     s_rectClear = !sdMarkerPresent("norectclear") && !runningUnderCemu();
     s_autoMip = !sdMarkerPresent("noautomip");
     s_autoMipPack = !sdMarkerPresent("automipnopack");
+    s_depthSkip = !sdMarkerPresent("nodepthskip");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
@@ -5467,6 +5475,7 @@ void flushBatch() {
         s_dlPending = {};
         return;
     }
+    if (g.bp[BP_ZMODE] & 0x10) s_depthWritten = true;
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
     disablePerDrawCaches();
@@ -5932,9 +5941,10 @@ static void producerCopyService(void* opaque) {
     }
     rebindTvTarget(false);
     if (s_copyClearTotal % 600 == 0)
-        WHBLogPrintf("SMS Wii U: [efb] copy clears=%u colour=%u depth=%u rect=%u fallback=%u (rectclear %s)",
+        WHBLogPrintf("SMS Wii U: [efb] copy clears=%u colour=%u depth=%u depthSkipped=%u rect=%u fallback=%u (rectclear %s)",
                      unsigned(s_copyClearTotal), unsigned(s_copyClearColour), unsigned(s_copyClearDepth),
-                     unsigned(s_rectClears), unsigned(s_rectFallbacks), s_rectClear ? "on" : "off");
+                     unsigned(s_depthClearsSkipped), unsigned(s_rectClears), unsigned(s_rectFallbacks),
+                     s_rectClear ? "on" : "off");
 }
 
 void executeCopy(uint32_t ctrl) {
@@ -5974,6 +5984,7 @@ void executeCopy(uint32_t ctrl) {
             r.clearRect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
         }
         debugCopy(r.display, x, y, w, h, g.copyDest, ctrl);
+        if (r.display) s_depthClearKnown = false;  // the next frame starts from its own clear
         if (!r.display) {
             r.active = s_frameActive && ProcUIInForeground();
             if (r.active) {
@@ -5981,6 +5992,16 @@ void executeCopy(uint32_t ctrl) {
                                              (ctrl >> 9) & 1,
                                              ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7), pe);
                 if (r.clear && r.clearColourEnabled) ++s_perfClears;
+                if (r.clear && r.clearDepthEnabled && s_depthSkip) {
+                    if (!s_depthWritten && s_depthClearKnown && s_lastDepthClear == r.clearDepth) {
+                        r.clearDepthEnabled = false;
+                        ++s_depthClearsSkipped;
+                    } else {
+                        s_depthWritten = false;
+                        s_depthClearKnown = true;
+                        s_lastDepthClear = r.clearDepth;
+                    }
+                }
                 // copy/rebind/clear all clobber the same worker-owned shadows.
                 // Invalidate now so the next recorded list restores them.
                 invalidateVertexUniforms();
