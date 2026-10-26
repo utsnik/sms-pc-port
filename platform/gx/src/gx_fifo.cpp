@@ -668,6 +668,47 @@ uint64_t g_dlTicks = 0;
 const uint8_t* g_dlCurList = nullptr;  // list being replayed, for the Wii U [dlstore] diagnostic
 uint32_t g_dlCurSize = 0, g_dlCurMisses = 0;
 bool g_perfStages = false;
+// perfdiag: which lists and draws feed the vertex decode (see vsrcNote).
+#ifdef __WIIU__
+#define VSRC_LOG(...) port_log("SMS Wii U: " __VA_ARGS__)
+#else
+#define VSRC_LOG(...) logmsg(__VA_ARGS__)
+#endif
+static const uint8_t* s_vsrcList;  // display list being run, null outside one
+static uint32_t s_vsrcCount[5];
+struct VsrcTop { const uint8_t* list; uint32_t kind, fmt, verts, calls; };
+static VsrcTop s_vsrcTop[16];
+void vsrcNote(int kind, uint32_t verts, uint32_t fmt) {
+    s_vsrcCount[kind] += verts;
+    const uint8_t* list = kind ? s_vsrcList : nullptr;
+    VsrcTop* low = &s_vsrcTop[0];
+    for (VsrcTop& t : s_vsrcTop) {
+        if (t.verts && t.list == list && t.kind == uint32_t(kind) && t.fmt == fmt) {
+            t.verts += verts;
+            ++t.calls;
+            return;
+        }
+        if (t.verts < low->verts) low = &t;
+    }
+    // Replace the smallest: lists heavy over the window still surface.
+    if (!low->verts || verts > low->verts / 4) *low = {list, uint32_t(kind), fmt, verts, 1};
+}
+void vsrcReport(uint32_t frames) {
+    VSRC_LOG("[vsrc] per-frame verts imm=%u rec=%u dl=%u replay=%u arenaDec=%u\n", s_vsrcCount[0] / frames,
+           s_vsrcCount[1] / frames, s_vsrcCount[2] / frames, s_vsrcCount[3] / frames, s_vsrcCount[4] / frames);
+    for (int r = 0; r < 10; ++r) {
+        VsrcTop* best = nullptr;
+        for (VsrcTop& t : s_vsrcTop)
+            if (t.verts && (!best || t.verts > best->verts)) best = &t;
+        if (!best) break;
+        VSRC_LOG("[vsrc] %d list=%08x kind=%u fmt=%08x verts/frame=%u calls/frame=%u\n", r,
+               (unsigned)reinterpret_cast<uintptr_t>(best->list), (unsigned)best->kind, (unsigned)best->fmt,
+               (unsigned)(best->verts / frames), (unsigned)(best->calls / frames));
+        best->verts = 0;
+    }
+    memset(s_vsrcCount, 0, sizeof s_vsrcCount);
+    memset(s_vsrcTop, 0, sizeof s_vsrcTop);
+}
 double g_decodeSeconds = 0;  // detailed timers: time in the vertex loader
 extern double g_flushSeconds;
 
@@ -1044,6 +1085,7 @@ static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t 
     for (int k = 0; k < nops; k++) ops[k].fn(ops[k], p, L.size, out, stride, count);
     primitiveEnd(opcode, count);
     if (s_dlRec) dlRecordPrimitive(opcode, p, count, vat, S, out);
+    if (g_perfStages) vsrcNote(s_dlRec ? 1 : s_vsrcList ? 2 : 0, count, S.fmt);
     return p + size_t(count) * L.size;
 }
 
@@ -1493,6 +1535,11 @@ void callDisplayList(const uint8_t* data, uint32_t size) {
 }
 
 static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
+    struct VsrcScope {
+        const uint8_t* prev;
+        explicit VsrcScope(const uint8_t* d) : prev(s_vsrcList) { s_vsrcList = d; }
+        ~VsrcScope() { s_vsrcList = prev; }
+    } vsrcScope(data);
     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
         runCommands(data, size);
         return;
@@ -1529,8 +1576,10 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
                 (r.arena.gen == arenaGeneration() ||
                  (store && arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena))))
                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());
-            else
+            else {
+                if (g_perfStages) vsrcNote(3, r.nverts, r.fmt);
                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
+            }
         }
         s_vertsLoaded += e.verts;
         for (const DlRun& r : e.runs) g_dlReplayIdx += uint32_t(r.idx.size());

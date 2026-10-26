@@ -5220,6 +5220,7 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& c
                                                      : dlArenaStore(ref, fmt, stride, n, verts, idx, nidx));
     if (!usable) {
         ++s_perfDlDecoded;
+        if (g_perfStages) vsrcNote(4, n, fmt);
         appendDecoded(cls, fmt, stride, verts, n, idx, nidx);
         return;
     }
@@ -6927,6 +6928,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                          ms(s_perfFlush > staged ? s_perfFlush - staged : 0), ms(OSTime(g_dlTicks)));
             s_stKey = s_stVkey = s_stState = s_stShader = s_stXfu = 0;
             g_dlTicks = 0;
+            vsrcReport(30);
         }
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
         static uint32_t s_gpuReportEvery;
