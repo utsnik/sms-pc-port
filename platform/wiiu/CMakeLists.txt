@@ -185,7 +185,7 @@ set_target_properties(sms PROPERTIES
 target_link_options(sms PRIVATE
   "-Wl,-Map,${SMS_WIIU_BUILD_DIR}/sms.map"
   -Wl,--gc-sections
-  -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvj
+  -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_Znwji -Wl,--wrap=_Znaji -Wl,--wrap=_ZnwjP7JKRHeapi -Wl,--wrap=_ZnajP7JKRHeapi -Wl,--wrap=_ZN7JKRHeap5allocEmiPS_ -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv -Wl,--wrap=_ZdlPvj
   -Wl,--wrap=DCFlushRange -Wl,--wrap=DCStoreRange -Wl,--wrap=DCFlushRangeNoSync -Wl,--wrap=DCStoreRangeNoSync
   -Wl,--wrap=memset -Wl,--wrap=GX2CalcTVSize -Wl,--wrap=GX2SetTVBuffer)
 # Audio output (audio.cpp): wut's SDL2 port, audio subsystem only.

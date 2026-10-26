@@ -117,6 +117,55 @@ void* __wrap__Znaj(size_t n)
 		note_game_null(n, __builtin_return_address(0));
 	return p;
 }
+/* The game's own heap-directed allocations (operator new with a JKRHeap or an
+ * alignment, and the static JKRHeap::alloc) return null just as silently: log
+ * those too, with the heap asked.  Levels past Ricco crashed at their first
+ * perform with objects missing (2026-10-26). */
+struct JKRHeap;
+void* __real__Znwji(size_t, int);
+void* __real__Znaji(size_t, int);
+void* __real__ZnwjP7JKRHeapi(size_t, JKRHeap*, int);
+void* __real__ZnajP7JKRHeapi(size_t, JKRHeap*, int);
+void* __real__ZN7JKRHeap5allocEmiPS_(unsigned long, int, JKRHeap*);
+static uint32_t s_heapNulls;
+static void note_heap_null(const char* what, size_t n, int align, const void* heap, void* caller)
+{
+	++s_heapNulls;
+	if (s_heapNulls <= 32 || s_heapNulls % 100 == 0)
+		port_log("[heap] %s of %u bytes (align %d, heap %p) returned null (#%u, caller %p)\n", what,
+		         unsigned(n), align, heap, unsigned(s_heapNulls), caller);
+}
+void* __wrap__Znwji(size_t n, int a)
+{
+	void* p = __real__Znwji(n, a);
+	if (!p) note_heap_null("new(align)", n, a, nullptr, __builtin_return_address(0));
+	return p;
+}
+void* __wrap__Znaji(size_t n, int a)
+{
+	void* p = __real__Znaji(n, a);
+	if (!p) note_heap_null("new[](align)", n, a, nullptr, __builtin_return_address(0));
+	return p;
+}
+void* __wrap__ZnwjP7JKRHeapi(size_t n, JKRHeap* h, int a)
+{
+	void* p = __real__ZnwjP7JKRHeapi(n, h, a);
+	if (!p) note_heap_null("new(heap)", n, a, h, __builtin_return_address(0));
+	return p;
+}
+void* __wrap__ZnajP7JKRHeapi(size_t n, JKRHeap* h, int a)
+{
+	void* p = __real__ZnajP7JKRHeapi(n, h, a);
+	if (!p) note_heap_null("new[](heap)", n, a, h, __builtin_return_address(0));
+	return p;
+}
+void* __wrap__ZN7JKRHeap5allocEmiPS_(unsigned long n, int a, JKRHeap* h)
+{
+	void* p = __real__ZN7JKRHeap5allocEmiPS_(n, a, h);
+	if (!p) note_heap_null("JKRHeap::alloc", n, a, h, __builtin_return_address(0));
+	return p;
+}
+
 void __wrap__ZdlPv(void* p) { if (!port_free(p)) __real__ZdlPv(p); }
 void __wrap__ZdaPv(void* p) { if (!port_free(p)) __real__ZdaPv(p); }
 void __wrap__ZdlPvj(void* p, size_t n) { if (!port_free(p)) __real__ZdlPvj(p, n); }
