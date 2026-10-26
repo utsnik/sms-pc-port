@@ -1706,6 +1706,10 @@ bool producerMode() { return s_producerMode; }
 static void pipeGrow(uint32_t need);
 static void producerFlushPending() {
     if (!s_pipeLen) return;
+    // Runs on the game thread from GX calls: without the scope the flush
+    // vector grew inside the current JKR (scene) heap, and after a scene
+    // change its GX bytes overwrote the new scene's objects.
+    SMS_PORT_HEAP_SCOPE();
     ::gx2prod::record_flush_hook();
     const uint32_t bytes = s_pipeLen;
     // append() may pump a draw-sync callback which re-enters GX and this hook.
@@ -1721,6 +1725,7 @@ static void producerFlushPending() {
 }
 
 void setProducerMode(bool enabled) {
+    SMS_PORT_HEAP_SCOPE();
     s_producerMode = enabled;
     if (enabled) {
         // Any bytes already in the legacy pipe are consumed before the worker

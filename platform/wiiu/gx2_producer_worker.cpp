@@ -1,6 +1,7 @@
 #include "gx2_producer_worker.h"
 
 #include "runtime.h"
+#include "port_heap.h"
 
 #include <coreinit/core.h>
 #include <coreinit/time.h>
@@ -188,6 +189,11 @@ static void drainWorker() {
 }
 
 static int workerMain(int, const char**) {
+    // Everything this thread allocates (the worker pipe, decoded batches, the
+    // display-list cache) is port data: keep it out of the game's JKR heaps,
+    // which the game frees and reuses at every scene change while the port
+    // still holds the pointers (Sirena/Gelato/Pianta load crashes).
+    sms_port_heap_enter();
     for (;;) {
         WutMessage message = {nullptr, {0, 0, 0}};
         const OSTime blockedStart = OSGetTime();
