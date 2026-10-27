@@ -181,7 +181,14 @@ void sample(Table& t, void* mainThread, void* context)
 	++t.dropped;
 }
 
-void on_alarm(void*, void* context) { sample(s_tables[s_active & 1], s_mainThread, context); }
+// Set while report() runs on the main thread: its symbol lookups took 19-23
+// pct of core-1 samples and showed up as frame-boundary time.
+volatile bool s_reporting;
+void on_alarm(void*, void* context)
+{
+	if (s_reporting && context == s_mainThread) return;
+	sample(s_tables[s_active & 1], s_mainThread, context);
+}
 void on_walarm(void*, void* context) { sample(s_wtables[s_wactive & 1], s_workerThread, context); }
 
 // Leaves whose samples are worth charging to their callers.
@@ -375,12 +382,14 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	s_lastReport = now;
 	const uint32_t done = s_active & 1;
 	s_active = done ^ 1;
+	s_reporting = true;
 	report(s_tables[done], "[prof]", s_mainThread);
 	if (s_wrunning) {
 		const uint32_t wdone = s_wactive & 1;
 		s_wactive = wdone ^ 1;
 		report(s_wtables[wdone], "[wprof]", s_workerThread);
 	}
+	s_reporting = false;
 }
 
 /* From the GX2 producer worker's thread at its start: with the SD marker
