@@ -167,6 +167,8 @@ enum ProducerHostKind : uint8_t {
     kHostViewport, kHostScissor, kHostCull, kHostLineWidth, kHostPointSize,
     kHostTcManual, kHostCopyDest, kHostTexImage, kHostCallDlPtr, kHostCallDlSize,
     kHostTlutPtr, kHostTlutOffset, kHostTlutLoad,
+    kHostWidescreen, kHostStretch2D, kHostWide2D, kHostHud,
+    kHostHudPaneX1, kHostHudPaneX2, kHostHudPaneEnd,
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
 // Draws the game issued this frame (GXBegin / GXCallDisplayList) in producer

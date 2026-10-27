@@ -1946,6 +1946,8 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     pipePut(cmd, sizeof cmd);
 }
 
+extern "C" void sms_wiiu_gx2_apply_host_state(uint8_t kind, uint8_t slot, uint32_t value);
+
 // The worker side of producerHostState: what the same-thread API would have
 // written into g directly, applied at the same point in the command order.
 static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
@@ -2000,6 +2002,15 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         onStateChange();
         if (s_tlutPtr && s_tlutOffset + value <= sizeof g.tlutMem) memcpy(g.tlutMem + s_tlutOffset, s_tlutPtr, value);
         s_tlutPtr = nullptr;
+        break;
+    case kHostWidescreen:
+    case kHostStretch2D:
+    case kHostWide2D:
+    case kHostHud:
+    case kHostHudPaneX1:
+    case kHostHudPaneX2:
+    case kHostHudPaneEnd:
+        sms_wiiu_gx2_apply_host_state(kind, slot, value);
         break;
     default:
         logmsg("gx2prod: unknown host-state kind %u", unsigned(kind));

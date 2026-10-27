@@ -3368,7 +3368,40 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     }
 }
 
+// Widescreen keeps the game's 640-wide coordinate system and maps each draw
+// into a widened EFB, just like the PC backend.  The target itself remains
+// the selected TV/scene size; s_gameX is therefore recomputed whenever that
+// size changes so applySceneRenderSize continues to work in both modes.
+static float s_wide = 1.0f, s_efbW = 640.0f, s_ox = 0.0f;
+struct XMap {
+    float a = 1.0f, b = 0.0f, clip = 1.0f;
+};
+static XMap s_xmap;
+static bool s_stretch2D, s_wide2D, s_hudEdges, s_hud;
+struct HudPane { float x1, x2; };
+static std::vector<HudPane> s_hudPanes;
+static float s_hudAnchor = -1.0f;
+static float s_hudPendingX1;
+static constexpr float kCamAspect = 660.0f * 0.91346145f / 448.0f;
 static float s_tvW = 1280.0f, s_tvH = 720.0f, s_gameScale = 1.5f, s_gameX = 160.0f;
+
+static float hudOffset(float at) {
+    if (at < 640.0f / 3.0f) return 0.0f;
+    if (at > 640.0f * 2.0f / 3.0f) return 2.0f * s_ox;
+    return s_ox;
+}
+
+static float centredOffset(float at) {
+    if (!s_hud) return s_ox;
+    return hudOffset(s_hudAnchor >= 0.0f ? s_hudAnchor : at);
+}
+
+static void updateWideTarget() {
+    const int width = s_wide > 1.0f ? (int(640.0f * s_wide + 1.0f) & ~1) : 640;
+    s_efbW = float(width);
+    s_ox = (s_efbW - 640.0f) * 0.5f;
+    s_gameX = (s_tvW - s_efbW * s_gameScale) * 0.5f;
+}
 
 // EFB copies to textures (GXCopyTex): the game renders a pass, copies the
 // frame into a texture and draws it back (water, heat haze, shadows). The
@@ -3544,6 +3577,47 @@ static bool runningUnderCemu() {
     return result != 0;
 }
 static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
+
+struct MappedCopyRect {
+    float x, y, w, h;
+};
+
+static MappedCopyRect mapCopyRect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
+    MappedCopyRect rect = {float(x), float(y), float(w), float(h)};
+    if (s_wide <= 1.0f) return rect;
+    if (x <= 0 && x + w >= 640) {
+        rect.x = 0.0f;
+        rect.w = s_efbW;
+    } else if (s_stretch2D) {
+        rect.x *= s_wide;
+        rect.w *= s_wide;
+    } else {
+        rect.x += s_ox;
+    }
+    return rect;
+}
+
+static void mappedCopyPixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t* tx, uint32_t* ty, uint32_t* tw, uint32_t* th) {
+    const MappedCopyRect mapped = mapCopyRect(x, y, w, h);
+    const int left = int(lroundf(s_gameX + mapped.x * s_gameScale));
+    const int top = int(lroundf(mapped.y * s_gameScale));
+    const int right = int(lroundf(s_gameX + (mapped.x + mapped.w) * s_gameScale));
+    const int bottom = int(lroundf((mapped.y + mapped.h) * s_gameScale));
+    const int clippedLeft = std::max(0, left), clippedTop = std::max(0, top);
+    const int clippedRight = std::min(int(s_tvW), right), clippedBottom = std::min(int(s_tvH), bottom);
+    *tx = uint32_t(clippedLeft);
+    *ty = uint32_t(clippedTop);
+    *tw = clippedRight > clippedLeft ? uint32_t(clippedRight - clippedLeft) : 0;
+    *th = clippedBottom > clippedTop ? uint32_t(clippedBottom - clippedTop) : 0;
+}
+
+static uint32_t mappedPeekX(int x) {
+    const float gameX = (float(x) + 0.5f) * (s_wide > 1.0f ? s_wide : 1.0f);
+    const int pixel = int(lroundf(s_gameX + gameX * s_gameScale));
+    return pixel < 0 ? 0 : uint32_t(pixel);
+}
+
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     const WorkerTextureInfo info = {static_cast<uint32_t>(reinterpret_cast<uintptr_t>(dest)), fmt, w, h, 1, 0};
     WorkerOpTimer timing(kWorkerCopyToTexture, info, textureCacheEntryCount());
@@ -3551,8 +3625,15 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     ++s_copyGeneration;
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return;
-    const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
-    uint32_t tw = uint32_t(float(w) * s_gameScale), th = uint32_t(float(h) * s_gameScale);
+    uint32_t tx, ty, tw, th;
+    if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+    else {
+        tx = uint32_t(s_gameX + float(x) * s_gameScale);
+        ty = uint32_t(float(y) * s_gameScale);
+        tw = uint32_t(float(w) * s_gameScale);
+        th = uint32_t(float(h) * s_gameScale);
+    }
+    if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
     if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
     if (ty + th > cb->surface.height) th = cb->surface.height - ty;
     if (!tw || !th) return;
@@ -3685,10 +3766,15 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     ++s_copyGeneration;
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return result;
-    const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale);
-    const uint32_t ty = uint32_t(float(y) * s_gameScale);
-    uint32_t tw = uint32_t(float(w) * s_gameScale);
-    uint32_t th = uint32_t(float(h) * s_gameScale);
+    uint32_t tx, ty, tw, th;
+    if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+    else {
+        tx = uint32_t(s_gameX + float(x) * s_gameScale);
+        ty = uint32_t(float(y) * s_gameScale);
+        tw = uint32_t(float(w) * s_gameScale);
+        th = uint32_t(float(h) * s_gameScale);
+    }
+    if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
     if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
     if (ty + th > cb->surface.height) th = cb->surface.height - ty;
     if (!tw || !th) return result;
@@ -4475,12 +4561,15 @@ static void updateTarget() {
     }
     s_gameScale = s_tvH / 480.0f;
     s_lodScale = s_gameScale;
-    s_gameX = (s_tvW - 640.0f * s_gameScale) * 0.5f;
+    updateWideTarget();
 }
 
 static void applyState() {
     // Same inputs as the last draw: GX2 already holds this state.
-    struct StateInputs { uint32_t zmode, xf5, cm0, cm1, pe, genmode, scissor[4]; float scale, x, w, h; };
+    struct StateInputs {
+        uint32_t zmode, xf5, cm0, cm1, pe, genmode, scissor[4];
+        float scale, x, w, h, mapA, mapB, mapClip;
+    };
     StateInputs in;
     memset(&in, 0, sizeof(in));
     in.zmode = g.bp[BP_ZMODE]; in.xf5 = g.xfReg[0x05];
@@ -4488,6 +4577,7 @@ static void applyState() {
     in.pe = g.bp[BP_PE_CONTROL]; in.genmode = g.bp[BP_GENMODE];
     memcpy(in.scissor, g.scissor, sizeof(in.scissor));
     in.scale = s_gameScale; in.x = s_gameX; in.w = s_tvW; in.h = s_tvH;
+    in.mapA = s_xmap.a; in.mapB = s_xmap.b; in.mapClip = s_xmap.clip;
     static StateInputs s_last;
     if (s_stateValid && !memcmp(&in, &s_last, sizeof(in))) return;
     s_last = in;
@@ -4550,19 +4640,33 @@ static void applyState() {
     const uint32_t cull = (g.bp[BP_GENMODE] >> 14) & 3;
     GX2SetPolygonControl(GX2_FRONT_FACE_CW, cull == 2 || cull == 3, cull == 1 || cull == 3, FALSE,
                          GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
-    const float scaleX = s_gameScale, scaleY = s_gameScale;
-    const int vx = int(s_gameX + g.viewport[0] * scaleX);
-    const int vy = int(g.viewport[1] * scaleY);
-    const int vw = int(g.viewport[2] * scaleX);
-    const int vh = int(g.viewport[3] * scaleY);
     // transform() already applies the GX viewport (into the TV target),
     // so GX2's own viewport must be the identity mapping.
-    (void)vx; (void)vy; (void)vw; (void)vh;
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
-    const int sx = int(s_gameX + g.scissor[0] * scaleX);
-    const int sy = int(g.scissor[1] * scaleY);
-    const int sw = int(g.scissor[2] * scaleX);
-    const int sh = int(g.scissor[3] * scaleY);
+    float scissorX = float(g.scissor[0]), scissorW = float(g.scissor[2]);
+    int sx, sy, sw, sh;
+    if (s_wide <= 1.0f) {
+        sx = int(s_gameX + scissorX * s_gameScale);
+        sy = int(g.scissor[1] * s_gameScale);
+        sw = int(scissorW * s_gameScale);
+        sh = int(float(g.scissor[3]) * s_gameScale);
+    } else {
+        if (scissorX <= 0.0f && scissorX + scissorW >= 640.0f) {
+            scissorX = 0.0f;
+            scissorW = s_efbW;
+        } else {
+            const float left = std::floor(scissorX * s_xmap.a + s_xmap.b);
+            const float right = std::ceil((scissorX + scissorW) * s_xmap.a + s_xmap.b);
+            scissorX = left;
+            scissorW = right - left;
+        }
+        sx = int(std::lround(s_gameX + scissorX * s_gameScale));
+        const int right = int(std::lround(s_gameX + (scissorX + scissorW) * s_gameScale));
+        sy = int(std::lround(g.scissor[1] * s_gameScale));
+        sw = right - sx;
+        const int bottom = int(std::lround((g.scissor[1] + float(g.scissor[3])) * s_gameScale));
+        sh = bottom - sy;
+    }
     GX2SetScissor(sx, sy, sw, sh);
     // Color update is independent of blending in CMODE0.  The title's
     // blend-off cloud and light-ray passes still have cupd set, so use that
@@ -4792,11 +4896,13 @@ static void transformPosition(const HostVertex& in, float* out) {
         cw = -z;
     }
     if (fabsf(cw) < 0.00001f) cw = 0.00001f;
-    // Match the PC renderer's XF viewport conversion, then map the original
-    // 640x480 game rectangle into the TV target (4:3 letterboxed).
-    const float halfW = g.viewport[2] * 0.5f * s_gameScale;
+    // Match the PC renderer's XF viewport conversion, then apply the current
+    // draw XMap before mapping the original game rectangle into the TV target.
+    const float viewportCenter = g.viewport[0] + g.viewport[2] * 0.5f;
+    const float mappedCenter = (viewportCenter - 320.0f) * s_xmap.a + 320.0f + s_xmap.b;
+    const float halfW = g.viewport[2] * 0.5f * s_xmap.a * s_xmap.clip * s_gameScale;
     const float halfH = g.viewport[3] * 0.5f * s_gameScale;
-    const float centerX = s_gameX + g.viewport[0] * s_gameScale + halfW;
+    const float centerX = s_gameX + mappedCenter * s_gameScale;
     const float centerY = g.viewport[1] * s_gameScale + halfH;
     out[0] = ((centerX * cw + halfW * cx) * (2.0f / s_tvW)) - cw;
     // GX screen y grows downwards; GX2 clip-space y grows upwards.
@@ -4852,7 +4958,15 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
     const float* xfViewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
     memcpy(&s_vtxLive[0], proj, 6 * sizeof(float));
     s_vtxLive[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
-    memcpy(&s_vtxLive[8], g.viewport, 4 * sizeof(float));
+    // C186 is left/top/width/height in game coordinates.  Map its horizontal
+    // centre and half-width exactly as transformPosition does so the GPU
+    // vertex-program path lands on the same pixels as the CPU path.
+    const float viewportCenter = g.viewport[0] + g.viewport[2] * 0.5f;
+    const float mappedCenter = (viewportCenter - 320.0f) * s_xmap.a + 320.0f + s_xmap.b;
+    s_vtxLive[8] = mappedCenter - g.viewport[2] * 0.5f * s_xmap.a * s_xmap.clip;
+    s_vtxLive[9] = g.viewport[1];
+    s_vtxLive[10] = g.viewport[2] * s_xmap.a * s_xmap.clip;
+    s_vtxLive[11] = g.viewport[3];
     // C187 is the viewport mapping block consumed by the generated vertex
     // program: game scale/X followed by the target dimensions.  Do not leave
     // the XF viewport's depth pair in front of it; that made the generated
@@ -5115,6 +5229,9 @@ void rendererInit(float) {
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
+    if (const char* hud = std::getenv("SMS_WIDESCREEN_HUD"))
+        s_hudEdges = s_wide > 1.0f && std::strcmp(hud, "edges") == 0;
+    updateWideTarget();
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     if (sdMarkerPresent("dlarenasmall")) s_dlArenaLimit = 8u << 20;
     // Read the Stage 1 switch exactly once.  No frame or present path probes
@@ -5185,6 +5302,140 @@ void rendererInit(float) {
             WHBLogPrintf("SMS Wii U: [gx2prod] worker start failed; marker path disabled");
         }
     }
+}
+
+static void hudReanchor() {
+    float now = -1.0f;
+    for (const HudPane& pane : s_hudPanes) {
+        if (pane.x2 - pane.x1 < 640.0f * 3.0f / 4.0f) {
+            now = (pane.x1 + pane.x2) * 0.5f;
+            break;
+        }
+    }
+    if (now == s_hudAnchor) return;
+    if (now < 0.0f || s_hudAnchor < 0.0f || hudOffset(now) != hudOffset(s_hudAnchor)) {
+        if (s_ready && s_frameActive) flushBatch();
+    }
+    s_hudAnchor = now;
+}
+
+static void applyStretch2D(bool value) {
+    if (s_wide <= 1.0f || s_stretch2D == value) return;
+    if (s_ready && s_frameActive) flushBatch();
+    s_stretch2D = value;
+}
+
+static void applyWide2D(bool value) {
+    if (s_wide <= 1.0f || s_wide2D == value) return;
+    if (s_ready && s_frameActive) flushBatch();
+    s_wide2D = value;
+}
+
+static void applyHud(bool value) {
+    if (!s_hudEdges || s_hud == value) return;
+    if (s_ready && s_frameActive) flushBatch();
+    s_hud = value;
+    s_hudPanes.clear();
+    s_hudAnchor = -1.0f;
+}
+
+static void applyHudPaneBegin(float x1, float x2) {
+    if (!s_hud) return;
+    s_hudPanes.push_back({std::min(x1, x2), std::max(x1, x2)});
+    hudReanchor();
+}
+
+static void applyHudPaneEnd() {
+    if (!s_hud || s_hudPanes.empty()) return;
+    s_hudPanes.pop_back();
+    hudReanchor();
+}
+
+static uint32_t floatBits(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof bits);
+    return bits;
+}
+
+static bool streamWideHostState(uint8_t kind, uint8_t slot, uint32_t value) {
+#ifdef __WIIU__
+    if (producerMode()) {
+        producerHostState(kind, slot, value);
+        return true;
+    }
+#else
+    (void)kind; (void)slot; (void)value;
+#endif
+    return false;
+}
+
+// GXPC's per-draw hooks are called by the game thread.  In gx2prod mode they
+// become ordered host commands so the worker applies them before the next
+// draw, rather than racing a global flag that the worker may read later.
+extern "C" void sms_wiiu_gx2_apply_host_state(uint8_t kind, uint8_t slot, uint32_t value) {
+    switch (kind) {
+    case kHostWidescreen: {
+        if (s_ready) break;
+        float width;
+        memcpy(&width, &value, sizeof width);
+        s_wide = width > 1.0f ? width : 1.0f;
+        updateWideTarget();
+        break;
+    }
+    case kHostStretch2D: applyStretch2D(value != 0); break;
+    case kHostWide2D: applyWide2D(value != 0); break;
+    case kHostHud: applyHud(value != 0); break;
+    case kHostHudPaneX1: memcpy(&s_hudPendingX1, &value, sizeof value); break;
+    case kHostHudPaneX2: {
+        float x2;
+        memcpy(&x2, &value, sizeof x2);
+        applyHudPaneBegin(s_hudPendingX1, x2);
+        break;
+    }
+    case kHostHudPaneEnd: applyHudPaneEnd(); break;
+    default: break;
+    }
+    (void)slot;
+}
+
+extern "C" void sms_wiiu_gx2_set_widescreen(float widthOver43) {
+    if (streamWideHostState(kHostWidescreen, 0, floatBits(widthOver43))) return;
+    if (s_ready) return;
+    s_wide = widthOver43 > 1.0f ? widthOver43 : 1.0f;
+    updateWideTarget();
+}
+
+extern "C" void sms_wiiu_gx2_set_stretch_2d(int on) {
+    if (s_wide <= 1.0f) return;
+    if (streamWideHostState(kHostStretch2D, 0, on != 0)) return;
+    applyStretch2D(on != 0);
+}
+
+extern "C" void sms_wiiu_gx2_set_wide_2d(int on) {
+    if (s_wide <= 1.0f) return;
+    if (streamWideHostState(kHostWide2D, 0, on != 0)) return;
+    applyWide2D(on != 0);
+}
+
+extern "C" void sms_wiiu_gx2_set_hud(int on) {
+    if (!s_hudEdges) return;
+    if (streamWideHostState(kHostHud, 0, on != 0)) return;
+    applyHud(on != 0);
+}
+
+extern "C" void sms_wiiu_gx2_hud_pane_begin(float x1, float x2) {
+    if (!s_hudEdges) return;
+    if (streamWideHostState(kHostHudPaneX1, 0, floatBits(x1))) {
+        streamWideHostState(kHostHudPaneX2, 0, floatBits(x2));
+        return;
+    }
+    applyHudPaneBegin(x1, x2);
+}
+
+extern "C" void sms_wiiu_gx2_hud_pane_end(void) {
+    if (!s_hudEdges) return;
+    if (streamWideHostState(kHostHudPaneEnd, 0, 0)) return;
+    applyHudPaneEnd();
 }
 
 float efbScale() { return 1.0f; }
@@ -5413,6 +5664,110 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& c
 }
 
 bool batchUsesArena() { return false; }  // stored runs are drawn at once, never left in the batch
+
+// A batch's horizontal extent in the game's 640-wide coordinate space.  It
+// is used for the PC renderer's full-width 2D/artwork and HUD decisions; the
+// selected XMap is applied by the CPU and GPU vertex paths below.
+static void screenExtent(float sx, float cx, float* outLo, float* outHi) {
+    const uint32_t defIdx = g.xfReg[XFR_MATIDX_A] & 63;
+    const bool ortho = (g.xfReg[XFR_PROJ + 6] & 1) != 0;
+    const float* projection = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
+    const float p0 = projection[0], p1 = projection[1];
+    const uint8_t* vertices = s_batch.vertices.empty() ? s_dlPending.verts : s_batch.vertices.data();
+    const uint32_t count = s_batch.vertices.empty() ? s_dlPending.n : s_batch.count;
+    const uint32_t stride = s_batch.stride;
+    float lo = 1e30f, hi = -1e30f;
+    if (!vertices || !stride) {
+        *outLo = lo;
+        *outHi = hi;
+        return;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t* source = vertices + size_t(i) * stride;
+        HostVertex vertex;
+        uint8_t defaults[9];
+        matrixDefaults(defaults);
+        unpackVertex(s_batch.fmt, source, defaults, vertex);
+        const uint32_t matrix = (s_batch.fmt & VF_MTX) ? vertex.mtx[0] & 63 : defIdx;
+        const float* m = reinterpret_cast<const float*>(&g.xfMem[matrix * 4]);
+        const float x = m[0] * vertex.pos[0] + m[1] * vertex.pos[1] + m[2] * vertex.pos[2] + m[3];
+        float screenX;
+        if (ortho) {
+            screenX = cx + sx * (p0 * x + p1);
+        } else {
+            const float z = m[8] * vertex.pos[0] + m[9] * vertex.pos[1] + m[10] * vertex.pos[2] + m[11];
+            if (z > -1e-6f) continue;
+            screenX = cx + sx * (p0 * x + p1 * z) / -z;
+        }
+        lo = std::min(lo, screenX);
+        hi = std::max(hi, screenX);
+    }
+    *outLo = lo;
+    *outHi = hi;
+}
+
+static XMap drawXMap() {
+    XMap map;
+    if (s_efbW == 640.0f) return map;
+    const bool ortho = (g.xfReg[XFR_PROJ + 6] & 1) != 0;
+    if (s_stretch2D && ortho) {
+        map.a = s_wide;
+        return map;
+    }
+    if (s_wide2D && ortho) {
+        map.b = s_ox;
+        return map;
+    }
+    // XF stores half-width and centre; GXSetViewport's public shadow stores
+    // left/top/width/height, so recover the same quantities as the PC path.
+    const float sx = g.viewport[2] * 0.5f;
+    const float cx = g.viewport[0] + sx;
+    const bool fullWidth = std::fabs(sx * 2.0f - 640.0f) < 2.0f &&
+                           std::fabs(cx - 320.0f) < 2.0f;
+    if (!fullWidth) {
+        map.b = centredOffset(cx);
+        return map;
+    }
+    if (!ortho) {
+        if (s_hud) {
+            float lo, hi;
+            screenExtent(sx, cx, &lo, &hi);
+            if (lo <= hi) map.b = centredOffset((lo + hi) * 0.5f);
+            return map;
+        }
+        map.a = s_wide;
+        const float p00 = g.xfReg[XFR_PROJ];
+        const float p11 = g.xfReg[XFR_PROJ + 2];
+        const float aspect = p00 != 0.0f ? std::fabs(p11 / p00) : 0.0f;
+        if (aspect < kCamAspect * std::sqrt(s_wide)) map.clip = 1.0f / s_wide;
+        return map;
+    }
+
+    // Textured artwork (menus, movies and screen copies) remains centred;
+    // untextured/utility passes that cover the frame are stretched.
+    bool artwork = false;
+    const bool colour = (g.bp[BP_CMODE0] >> 3) & 1;
+    const uint32_t stages = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
+    for (uint32_t stage = 0; colour && stage < stages && !artwork; ++stage) {
+        const uint32_t order = (g.bp[BP_TREF + (stage >> 1)] >> ((stage & 1) * 12)) & 0x3ff;
+        if (!((order >> 6) & 1)) continue;
+        const int mapIndex = int(order & 7);
+        const uint8_t* source = g.texImage[mapIndex];
+        const uint32_t image = g.bp[bpTexReg(BP_TX_IMAGE0, mapIndex)];
+        const uint32_t width = (image & 0x3ff) + 1, height = ((image >> 10) & 0x3ff) + 1;
+        if (source && width >= 32 && height >= 32 && !copyTexture(source)) artwork = true;
+    }
+    float lo, hi;
+    screenExtent(sx, cx, &lo, &hi);
+    if (lo > hi) {
+        map.b = s_ox;
+        return map;
+    }
+    const bool spans = lo <= 2.0f && hi >= 638.0f;
+    if (spans && !artwork) map.a = s_wide;
+    else map.b = spans ? s_ox : centredOffset((lo + hi) * 0.5f);
+    return map;
+}
 
 static uint32_t s_drawsThisFrame;
 static uint32_t s_debugDrawNo;
@@ -5705,6 +6060,7 @@ void flushBatch() {
         s_dlPending = {};
         return;
     }
+    s_xmap = drawXMap();
     if (g.bp[BP_ZMODE] & 0x10) s_depthWritten = true;
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
@@ -6179,6 +6535,10 @@ static void producerCopyService(void* opaque) {
     rebindTvTarget(false);
     if (!r.clear) return;
     ++s_copyClearTotal;
+    if (s_wide > 1.0f && r.clearRect.right > r.clearRect.left && r.clearRect.bottom > r.clearRect.top)
+        GX2SetScissor(r.clearRect.left, r.clearRect.top,
+                      r.clearRect.right - r.clearRect.left,
+                      r.clearRect.bottom - r.clearRect.top);
     if (r.clearColourEnabled) {
         ++s_copyClearColour;
         if (!s_rectClear || !rectClearColour(r.clearRect, r.clearColour)) {
@@ -6230,8 +6590,14 @@ void executeCopy(uint32_t ctrl) {
         r.clearColour[3] = (pe & 7) == 1 ? float((ar >> 8) & 255) / 255.0f : 1.0f;
         r.clearDepth = float(g.bp[BP_CLEAR_Z] & 0xffffff) / 16777215.0f;
         if (GX2ColorBuffer* cb = renderColour()) {
-            const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
-            uint32_t tw = uint32_t(float(w) * s_gameScale), th = uint32_t(float(h) * s_gameScale);
+            uint32_t tx, ty, tw, th;
+            if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+            else {
+                tx = uint32_t(s_gameX + float(x) * s_gameScale);
+                ty = uint32_t(float(y) * s_gameScale);
+                tw = uint32_t(float(w) * s_gameScale);
+                th = uint32_t(float(h) * s_gameScale);
+            }
             if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
             if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
             if (ty + th > cb->surface.height) th = cb->surface.height - ty;
@@ -6311,6 +6677,20 @@ void executeCopy(uint32_t ctrl) {
     }
     if (!clear) return;
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
+    uint32_t clearX = 0, clearY = 0, clearW = 0, clearH = 0;
+    if (GX2ColorBuffer* cb = renderColour()) {
+        if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &clearX, &clearY, &clearW, &clearH);
+        else {
+            clearX = uint32_t(s_gameX + float(x) * s_gameScale);
+            clearY = uint32_t(float(y) * s_gameScale);
+            clearW = uint32_t(float(w) * s_gameScale);
+            clearH = uint32_t(float(h) * s_gameScale);
+        }
+        if (clearX >= cb->surface.width || clearY >= cb->surface.height) clearW = clearH = 0;
+        if (clearX + clearW > cb->surface.width) clearW = cb->surface.width - clearX;
+        if (clearY + clearH > cb->surface.height) clearH = cb->surface.height - clearY;
+        if (s_wide > 1.0f && clearW && clearH) GX2SetScissor(clearX, clearY, clearW, clearH);
+    }
     if ((g.bp[BP_CMODE0] >> 3) & 1) {  // colour update enabled: GX clears colour only then
         ++s_perfClears;
         GX2ClearColor(renderColour(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
@@ -6401,7 +6781,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         if (have) {
             if (!prodTimestampReady(s_peekStamp)) return false;
             for (uint32_t i = 0; i < count; ++i) {
-                uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
+                uint32_t px = mappedPeekX(points[i][0]);
                 uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
                 if (px >= s_peekSurface.width) px = s_peekSurface.width - 1;
                 if (py >= s_peekSurface.height) py = s_peekSurface.height - 1;
@@ -6427,7 +6807,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     rebindTvTarget();
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
+        uint32_t px = mappedPeekX(points[i][0]);
         uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
         if (px >= linear.width) px = linear.width - 1;
         if (py >= linear.height) py = linear.height - 1;
@@ -6550,7 +6930,7 @@ static bool tokAllocate() {
 
 // Game coordinates to TV-target pixels, clamped to w x h.
 static void tokPixel(int x, int y, uint32_t w, uint32_t h, uint32_t* px, uint32_t* py) {
-    *px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
+    *px = mappedPeekX(x);
     *py = uint32_t((float(y) + 0.5f) * s_gameScale);
     if (*px >= w) *px = w - 1;
     if (*py >= h) *py = h - 1;
@@ -6861,7 +7241,7 @@ static uint32_t peekZProd6(int x, int y) {
         s_frame = g_displayFrames;
         if (!had) return 0xffffff;
     }
-    uint32_t px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
+    uint32_t px = mappedPeekX(x);
     uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScale);
     if (px >= s_linear.width) px = s_linear.width - 1;
     if (py >= s_linear.height) py = s_linear.height - 1;

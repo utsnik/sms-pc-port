@@ -58,6 +58,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
 extern "C" void sms_wiiu_gx2_texture_pack_pump(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
+extern "C" void sms_wiiu_gx2_set_widescreen(float widthOver43);
+extern "C" void sms_wiiu_gx2_set_stretch_2d(int on);
+extern "C" void sms_wiiu_gx2_set_wide_2d(int on);
+extern "C" void sms_wiiu_gx2_set_hud(int on);
+extern "C" void sms_wiiu_gx2_hud_pane_begin(float x1, float x2);
+extern "C" void sms_wiiu_gx2_hud_pane_end(void);
 
 void log_active_once()
 {
@@ -901,12 +907,12 @@ uint32_t GXPC_FrameCount(void) { return sms_wiiu_frame_count(); }
 void GXPC_SetWindowIcon(const uint8_t*, int, int) {}
 int GXPC_MouseCaptured(void) { return 0; }
 int GXPC_GameInputBlocked(void) { return 0; }
-void GXPC_SetWidescreen(float width) { s_widescreen = width; }
-void GXPC_SetStretch2D(int) {}
-void GXPC_SetWide2D(int) {}
-void GXPC_SetHud(int) {}
-void GXPC_HudPaneBegin(float, float) {}
-void GXPC_HudPaneEnd(void) {}
+void GXPC_SetWidescreen(float width) { s_widescreen = width; sms_wiiu_gx2_set_widescreen(width); }
+void GXPC_SetStretch2D(int on) { sms_wiiu_gx2_set_stretch_2d(on); }
+void GXPC_SetWide2D(int on) { sms_wiiu_gx2_set_wide_2d(on); }
+void GXPC_SetHud(int on) { sms_wiiu_gx2_set_hud(on); }
+void GXPC_HudPaneBegin(float x1, float x2) { sms_wiiu_gx2_hud_pane_begin(x1, x2); }
+void GXPC_HudPaneEnd(void) { sms_wiiu_gx2_hud_pane_end(); }
 float GXPC_GetWidescreen(void) { return s_widescreen; }
 void sms_gx_set_event_callback(void (*)(const union SDL_Event*)) {}
 void sms_gx_pump_events(void) {}

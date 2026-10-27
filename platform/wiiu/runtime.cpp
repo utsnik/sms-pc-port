@@ -275,6 +275,11 @@ void port_init(int, char**)
 	sms_wiiu_runtime_init();
 	if (!s_initialized)
 		return;
+	port_widescreen = sms_wiiu_sd_marker("widescreen") ? 4.0f / 3.0f : 1.0f;
+	GXPC_SetWidescreen(port_widescreen);
+	port_log("SMS Wii U: widescreen %s (marker %s)\n",
+	         port_widescreen > 1.0f ? "on" : "off",
+	         port_widescreen > 1.0f ? "widescreen" : "absent");
 	port_os_init();
 	port_os_threads_init();
 	s_heap_ready = true;
