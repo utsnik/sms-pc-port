@@ -106,6 +106,34 @@ static bool runOverflow() {
     return true;
 }
 
+static bool runGenerationAndHookSequence() {
+    GrassNearBlade blade = {10.0f, -4.0f, 33.0f, 2.0f};
+    GrassNearRecord record = nearRecord(blade, 9, kGrassCenter);
+    GrassNearDynamic first = {1.0f, -2.0f,
+                              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+                               0.0f, 0.0f, 0.0f, 7.0f, 0.0f}};
+    GrassNearDynamic second = first;
+    second.swing[9] = -11.0f;
+    const GrassNearVertex a = grassShaderNearVertex(record, first);
+    const GrassNearVertex b = grassShaderNearVertex(record, second);
+    if (bits(a.x) == bits(b.x) || a.color != 0) {
+        std::fprintf(stderr, "hook sequence did not carry changing near uniform/center color\n");
+        return false;
+    }
+    GrassFarBlade farBlade = {100, -100, 4, 8};
+    GrassFarRecord farRecordValue = farRecord(farBlade, 9, kGrassCenter);
+    GrassFarDynamic farFirst = {3, -5, {0, 0, 0, 0, 0, 0, 0, 0, 0, 120}};
+    GrassFarDynamic farSecond = farFirst;
+    farSecond.swing[9] = -120;
+    if (grassShaderFarVertex(farRecordValue, farFirst).x ==
+            grassShaderFarVertex(farRecordValue, farSecond).x ||
+        grassShaderFarVertex(farRecordValue, farFirst).color != 0) {
+        std::fprintf(stderr, "hook sequence did not carry changing far uniform\n");
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -127,7 +155,7 @@ int main() {
         std::fprintf(stderr, "grass color contract changed\n");
         return 1;
     }
-    if (!runSamples() || !runOverflow()) return 1;
+    if (!runSamples() || !runOverflow() || !runGenerationAndHookSequence()) return 1;
     std::puts("grass GPU math oracle: PASS");
     return 0;
 }
