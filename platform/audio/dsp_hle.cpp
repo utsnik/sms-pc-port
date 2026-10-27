@@ -128,10 +128,14 @@ BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t) __asm__("OSRec
 int sms_wiiu_OSCreateThread(OSThread*, void* (*)(void*), void*, void*, u32, s32, u16);
 long sms_wiiu_OSResumeThread(OSThread*);
 int sms_wiiu_OSJoinThread(OSThread*, void**);
+int sms_wiiu_sd_marker(const char* name);
 }
 
 #ifndef OS_THREAD_ATTRIB_AFFINITY_CPU0
 #define OS_THREAD_ATTRIB_AFFINITY_CPU0 (1u << 0)
+#endif
+#ifndef OS_THREAD_ATTRIB_AFFINITY_CPU2
+#define OS_THREAD_ATTRIB_AFFINITY_CPU2 (1u << 2)
 #endif
 
 const int32_t kWutMessageBlock = 1;
@@ -282,11 +286,15 @@ bool start_async()
 	s_async.replyStarted = true;
 	s_async.active = true;
 	sms_wiiu_OSResumeThread(&s_async.replyThread);
+	// SD marker "mixcore2": the mixer on core 2 (AX, texture-pack loader)
+	// instead of core 0, where at priority 2 it preempts the GX2 producer
+	// worker (15-22 pct of core 0 in Gelato and Pianta, 2026-10-27).
+	const bool mixCore2 = sms_wiiu_sd_marker("mixcore2") != 0;
 	if (!wut_OSCreateThread(&s_async.mixerThread, mixer_thread, 0,
 	                        reinterpret_cast<char*>(&s_async),
 	                        s_async.mixerStack + sizeof(s_async.mixerStack),
 	                        sizeof(s_async.mixerStack), kMixerPriority,
-	                        OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+	                        mixCore2 ? OS_THREAD_ATTRIB_AFFINITY_CPU2 : OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
 		s_async.active = false;
 		send_ptr(&s_async.replyQueue, nullptr);
 		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
@@ -296,7 +304,7 @@ bool start_async()
 	}
 	s_async.mixerStarted = true;
 	wut_OSResumeThread(&s_async.mixerThread);
-	port_log("[audio] DSP HLE mode: asynchronous (mixer core 0, replies core 1)\n");
+	port_log("[audio] DSP HLE mode: asynchronous (mixer core %d, replies core 1)\n", mixCore2 ? 2 : 0);
 	return true;
 }
 
