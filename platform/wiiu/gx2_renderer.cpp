@@ -4390,6 +4390,48 @@ static void initRenderTarget() {
     s_renderOwn = true;
 }
 
+// Per-scene render size: the Corona boss arena is fill-bound at 1080p (fire
+// particles, the bath's metaball drops and two full-screen copy passes: about
+// 40 ms of GPU time a frame at 625 MHz), so it renders at 810 lines and present
+// scales it like any other size.  Set when a scene archive opens (dvd.cpp),
+// applied at the next frame start, where the producer worker is idle.  SD
+// marker nosceneres keeps the setting's size everywhere; sceneres900 uses 900.
+static volatile uint32_t s_sceneRenderH;
+static bool s_sceneResOff, s_sceneRes900, s_sceneResRead;
+extern "C" void sms_wiiu_gx2_scene_archive(const char* name) {
+    if (!name || strchr(name, '/')) return;
+    const size_t n = strlen(name);
+    if (n < 4 || strcmp(name + n - 4, ".szs") != 0) return;
+    if (!s_sceneResRead) {
+        s_sceneResRead = true;
+        s_sceneResOff = sdMarkerPresent("nosceneres");
+        s_sceneRes900 = sdMarkerPresent("sceneres900");
+    }
+    s_sceneRenderH = !s_sceneResOff && strncmp(name, "coronaBoss", 10) == 0 ? (s_sceneRes900 ? 900u : 810u) : 0u;
+}
+static void applySceneRenderSize() {
+    if (!s_renderOwn) return;
+    uint32_t w = kRenderW, h = kRenderH;
+    const uint32_t want = s_sceneRenderH;
+    if (want && want < kRenderH) { h = want; w = (want * 16 / 9) & ~1u; }
+    GX2Surface& c = s_renderColour.surface;
+    if (c.width == w && c.height == h) return;
+    GX2DrawDone();  // the target's memory is about to be laid out again
+    void* ci = c.image;
+    GX2Surface& d = s_renderDepth.surface;
+    void* di = d.image;
+    c.width = w; c.height = h; c.image = nullptr; c.swizzle = 0;
+    GX2CalcSurfaceSizeAndAlignment(&c);
+    d.width = w; d.height = h; d.image = nullptr; d.swizzle = 0;
+    GX2CalcSurfaceSizeAndAlignment(&d);
+    c.image = ci;
+    d.image = di;
+    GX2InitColorBufferRegs(&s_renderColour);
+    GX2InitDepthBufferRegs(&s_renderDepth);
+    invalidateVertexUniforms();
+    WHBLogPrintf("SMS Wii U: render target %ux%u (scene size %u)", (unsigned)w, (unsigned)h, (unsigned)want);
+}
+
 static GX2ColorBuffer* renderColour() {
     initRenderTarget();
     return s_renderOwn ? &s_renderColour : WHBGfxGetTVColourBuffer();
@@ -4402,6 +4444,7 @@ static GX2DepthBuffer* renderDepth() {
 // Frame start (instead of WHBGfxBeginRenderTV + clear) and present.
 extern "C" void sms_wiiu_gx2_target_begin(void) {
     initRenderTarget();
+    applySceneRenderSize();
     if (!s_renderOwn) {
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);

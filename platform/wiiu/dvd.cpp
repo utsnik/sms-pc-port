@@ -8,6 +8,8 @@
 #include <cstdio>
 #include <cstring>
 
+extern "C" void sms_wiiu_gx2_scene_archive(const char* name);  // gx2_renderer.cpp: per-scene render size
+
 namespace {
 
 const uint32_t kMaxEntries = 512;
@@ -375,6 +377,7 @@ BOOL DVDOpen(char* name, DVDFileInfo* file)
 	}
 	port_log("[dvd] open path=%s entry=%d offset=0x%x bytes=%u\n", name, entry,
 	         file->startAddr, file->length);
+	sms_wiiu_gx2_scene_archive(name);
 	return TRUE;
 }
 
