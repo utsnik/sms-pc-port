@@ -842,6 +842,16 @@ static uint64_t s_gpuTotal, s_gpuIdle;
 static uint32_t s_gpuFrames;
 struct GpuTop { uint64_t cost, idle; GpuDrawInfo info; };
 static GpuTop s_gpuTop[8];
+// Busy time summed per draw signature over the window: a stage's cost spread
+// over many similar draws shows up here, not among the single top draws.
+// Copies and clears get their own stamps (stages 0xC0 copy, 0xC1 clear).
+struct GpuSig { uint64_t busy; uint32_t count; GpuDrawInfo info; };
+static GpuSig s_gpuSig[128];
+static uint32_t s_gpuSigDropped;
+static bool gpuSameSig(const GpuDrawInfo& a, const GpuDrawInfo& b) {
+    return a.verts == b.verts && a.stages == b.stages && a.texMask == b.texMask && a.blend == b.blend &&
+           a.zmode == b.zmode && a.texW == b.texW && a.texH == b.texH;
+}
 static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
@@ -899,6 +909,14 @@ static void gpuCollect(uint32_t arena) {
         for (int k = 0; k < 8; ++k)
             if (slot < 0 || s_gpuTop[k].cost - s_gpuTop[k].idle < s_gpuTop[slot].cost - s_gpuTop[slot].idle) slot = k;
         if (cost - idle > s_gpuTop[slot].cost - s_gpuTop[slot].idle) s_gpuTop[slot] = {cost, idle, s_gpuInfo[arena][i]};
+        const GpuDrawInfo& d = s_gpuInfo[arena][i];
+        uint32_t h = (d.verts * 31u + d.stages * 7u + d.texMask * 131u + d.blend * 17u + d.zmode * 3u + d.texW * 5u + d.texH) & 127u;
+        uint32_t probe = 0;
+        while (probe < 128 && s_gpuSig[h].count && !gpuSameSig(s_gpuSig[h].info, d)) { h = (h + 1) & 127u; ++probe; }
+        if (probe == 128) { ++s_gpuSigDropped; continue; }
+        if (!s_gpuSig[h].count) s_gpuSig[h].info = d;
+        s_gpuSig[h].busy += cost - idle;
+        ++s_gpuSig[h].count;
     }
 }
 
@@ -923,6 +941,22 @@ static void gpuReport() {
         s_gpuTop[best].cost = 0;
     }
     memset(s_gpuTop, 0, sizeof(s_gpuTop));
+    for (int r = 0; r < 16; ++r) {
+        int best = -1;
+        for (int k = 0; k < 128; ++k)
+            if (s_gpuSig[k].count && (best < 0 || s_gpuSig[k].busy > s_gpuSig[best].busy)) best = k;
+        if (best < 0) break;
+        const GpuSig& g2 = s_gpuSig[best];
+        const GpuDrawInfo& d = g2.info;
+        WHBLogPrintf("SMS Wii U: [gpusig] %d busy/frame=%u count/frame=%u.%u verts=%u stages=%02x texmask=%02x tex=%ux%u blend=%08x z=%02x",
+                     r, (unsigned)(g2.busy / s_gpuFrames), (unsigned)(g2.count / s_gpuFrames),
+                     (unsigned)(g2.count * 10 / s_gpuFrames % 10), (unsigned)d.verts, (unsigned)d.stages,
+                     (unsigned)d.texMask, (unsigned)d.texW, (unsigned)d.texH, (unsigned)d.blend, (unsigned)d.zmode);
+        s_gpuSig[best].count = 0;
+    }
+    if (s_gpuSigDropped) WHBLogPrintf("SMS Wii U: [gpusig] %u draws over the 128 signatures", (unsigned)s_gpuSigDropped);
+    memset(s_gpuSig, 0, sizeof(s_gpuSig));
+    s_gpuSigDropped = 0;
     s_gpuTotal = 0;
     s_gpuIdle = 0;
     s_gpuFrames = 0;
@@ -6216,6 +6250,9 @@ void executeCopy(uint32_t ctrl) {
         copyToTexture(g.copyDest, x, y, w, h, (ctrl >> 9) & 1,
                       ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7));
         rebindTvTarget();  // GX2CopySurface may leave its destination bound
+        GpuDrawInfo ci = {};
+        ci.stages = 0xC0; ci.texMask = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7); ci.texW = w; ci.texH = h;
+        gpuStamp(s_vertexArenaIndex, &ci);
     }
     if (!clear) return;
     const uint32_t ar = g.bp[BP_CLEAR_AR], gb = g.bp[BP_CLEAR_GB], z = g.bp[BP_CLEAR_Z];
@@ -6229,6 +6266,9 @@ void executeCopy(uint32_t ctrl) {
         GX2ClearDepthStencilEx(renderDepth(), float(z & 0xffffff) / 16777215.0f, 0,
                                GX2_CLEAR_FLAGS_DEPTH);
     rebindTvTarget();
+    GpuDrawInfo ci = {};
+    ci.stages = 0xC1; ci.texW = w; ci.texH = h; ci.zmode = (g.bp[BP_ZMODE] >> 4) & 1; ci.blend = (g.bp[BP_CMODE0] >> 3) & 1;
+    gpuStamp(s_vertexArenaIndex, &ci);
 }
 void markXfMemDirty() {
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
