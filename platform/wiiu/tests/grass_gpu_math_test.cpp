@@ -111,6 +111,22 @@ static bool runOverflow() {
 int main() {
     static_assert(sizeof(GrassNearRecord) == 32, "near record ABI changed");
     static_assert(sizeof(GrassFarRecord) == 16, "far record ABI changed");
+    static_assert(offsetof(GrassNearRecord, drawCoefficient) == 12,
+                  "near draw coefficient offset changed");
+    static_assert(offsetof(GrassNearRecord, swingCoefficient) == 16,
+                  "near swing coefficient offset changed");
+    static_assert(offsetof(GrassFarRecord, drawCoefficient) == 6,
+                  "far draw coefficient offset changed");
+    static_assert(kGrassUniformDrawOffset == 0 && kGrassUniformModeOffset == 8 &&
+                      kGrassUniformSwingOffset == 16,
+                  "grass dynamic uniform offsets changed");
+    if (kGrassUpperColor[0] != 0x3c || kGrassUpperColor[1] != 0xc8 ||
+        kGrassUpperColor[2] != 0x3c || kGrassUpperColor[3] != 0xff ||
+        kGrassLowerColor[0] != 0x28 || kGrassLowerColor[1] != 0x64 ||
+        kGrassLowerColor[2] != 0x28 || kGrassLowerColor[3] != 0xff) {
+        std::fprintf(stderr, "grass color contract changed\n");
+        return 1;
+    }
     if (!runSamples() || !runOverflow()) return 1;
     std::puts("grass GPU math oracle: PASS");
     return 0;

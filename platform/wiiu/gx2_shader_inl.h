@@ -229,4 +229,28 @@
 #define VALID_PIX | to_QWORD(0, to_LE(1 << 22))
 #define END_OF_PROGRAM | to_QWORD(0, to_LE(1 << 21))
 
+/* Grass uses the same constant-register file as the generated vertex path.
+ * Keep this small ABI here so host tests and the hand-written program cannot
+ * silently disagree about the dynamic block.  The swing array is accessed as
+ * ten scalar lanes in three vectors; no scale or fractional position is read.
+ */
+#define SMS_GRASS_UNIFORM_DRAW_REG 213
+#define SMS_GRASS_UNIFORM_SWING_REG 214
+#define SMS_GRASS_UNIFORM_REGS 4
+#define SMS_GRASS_UNIFORM_DRAW_X 0
+#define SMS_GRASS_UNIFORM_DRAW_Z 1
+#define SMS_GRASS_UNIFORM_MODE 2
+
+static inline bool smsGrassShaderEncodingAssertion() {
+    const uint64_t mova = ALU_MOVA_INT(__, _x, _R(1), _y);
+    const uint64_t swing0 = ALU_MOV_REL_CONST(__, _x, _GX2_C(SMS_GRASS_UNIFORM_SWING_REG), _x);
+    const uint64_t swing1 = ALU_MOV_REL_CONST(__, _x, _GX2_C(SMS_GRASS_UNIFORM_SWING_REG + 1), _x);
+    const uint32_t movaWord1 = __builtin_bswap32(uint32_t(mova));
+    const uint32_t swingWord0 = __builtin_bswap32(uint32_t(swing0 >> 32));
+    const uint32_t swingNextWord0 = __builtin_bswap32(uint32_t(swing1 >> 32));
+    return ((movaWord1 >> 7) & 0xff) == ALU_OP2_INST_MOVA_INT &&
+           (swingWord0 & (1u << 9)) != 0 &&
+           (swingWord0 & 0x1ff) != (swingNextWord0 & 0x1ff);
+}
+
 #endif

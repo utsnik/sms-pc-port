@@ -41,6 +41,8 @@
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
 #include "gx2_texture_pack.h"
+#include "../grass_math.h"
+#include "../../src/port_include/sms_wiiu_grass.h"
 
 #include <gx2/draw.h>
 #include <gx2/swap.h>
@@ -83,6 +85,8 @@ static GX2DepthBuffer* renderDepth();
 static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
 static void gx2ProdBoundary(uint32_t kind);
 static void gx2ProdCallList(void* list, uint32_t bytes);
+static bool gx2DlOpenForDraw();
+static void gx2DlClose();
 static uint32_t textureCacheEntryCount();
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
@@ -265,6 +269,8 @@ uint64_t g_statHiresBytes = 0;
 
 static bool s_ready;
 static bool s_frameActive;
+static bool s_grassCpuMarker;
+static bool s_grassShaderReady;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
 static uint32_t s_dlArenaLimit = 32u << 20;  // SD marker "dlarenasmall": 8 MiB, so Plaza wraps (test)
@@ -272,6 +278,7 @@ static uint32_t s_dlArenaLimit = 32u << 20;  // SD marker "dlarenasmall": 8 MiB,
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
 static bool s_gx2DlFallback;
+static uint32_t s_gx2DlOpenDraws;
 static uint32_t s_perfDlCoreInit;
 static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
@@ -603,6 +610,204 @@ static void* alignedZero(size_t alignment, size_t size) {
     void* p = MEMAllocFromDefaultHeapEx(uint32_t(size), int(alignment));
     if (p) memset(p, 0, size);
     return p;
+}
+
+static_assert(sizeof(sms_wiiu_grass::GrassNearRecord) == 32,
+              "grass near record ABI must be 32 bytes");
+static_assert(sizeof(sms_wiiu_grass::GrassFarRecord) == 16,
+              "grass far record ABI must be 16 bytes");
+
+/* The source records stay compact and exact.  This fetch record adds a
+ * position/color view for the existing untextured pixel contract while the
+ * immutable arithmetic fields remain beside it for GrassVertexShader. */
+struct GrassFetchRecord {
+    float position[4];
+    float color[4];
+    float x, z, y, drawCoefficient;
+    float swingCoefficient, swingSlot, colorIndex, reserved;
+};
+static_assert(sizeof(GrassFetchRecord) == 64, "grass fetch record ABI changed");
+
+struct GrassGroupGpu {
+    uint32_t id;
+    uint32_t generation;
+    uint32_t count;
+    const void* sourceGroup;
+    const void* nearSource;
+    const void* farSource;
+    const void* apexSource;
+    float baseY;
+    GrassFetchRecord* nearBuffer;
+    GrassFetchRecord* farBuffer;
+    uint32_t nearBytes;
+    uint32_t farBytes;
+    bool uploaded;
+    bool failed;
+};
+static GrassGroupGpu s_grassGroups[512];
+static uint32_t s_grassGroupCount;
+static uint32_t s_grassGeneration;
+static uint32_t s_grassStaticUploads;
+static uint32_t s_grassStaticUploadBytes;
+static uint32_t s_grassAllocationFailures;
+static uint32_t s_grassShaderFailures;
+static uint32_t s_grassGpuDraws;
+static uint32_t s_grassCpuFallbackDraws;
+static uint64_t s_grassGpuBlades;
+static uint32_t s_grassDynamicUploads;
+static const char* s_grassFirstFailure;
+
+enum GrassStreamKind : uint8_t {
+    kGrassSceneBegin = 0,
+    kGrassRegister = 1,
+    kGrassDraw = 2,
+};
+
+static uint32_t grassFloatBits(float value) {
+    uint32_t result;
+    memcpy(&result, &value, sizeof result);
+    return result;
+}
+
+static void grassPutBE32(uint8_t* out, uint32_t value) {
+    out[0] = uint8_t(value >> 24);
+    out[1] = uint8_t(value >> 16);
+    out[2] = uint8_t(value >> 8);
+    out[3] = uint8_t(value);
+}
+
+static uint32_t grassReadBE32(const uint8_t* in) {
+    return uint32_t(in[0]) << 24 | uint32_t(in[1]) << 16 |
+           uint32_t(in[2]) << 8 | uint32_t(in[3]);
+}
+
+static void grassEmitStream(uint8_t kind, uint8_t mode, const uint8_t* payload,
+                            uint32_t payloadBytes) {
+    uint8_t command[8 + 64] = {};
+    if (payloadBytes > sizeof(command) - 8) return;
+    command[0] = 0xF1;
+    command[1] = kind;
+    command[2] = mode;
+    grassPutBE32(command + 4, payloadBytes);
+    memcpy(command + 8, payload, payloadBytes);
+    pipeWrite(command, payloadBytes + 8);
+}
+
+static GrassGroupGpu* grassFindGroup(uint32_t id) {
+    for (uint32_t i = 0; i < s_grassGroupCount; ++i)
+        if (s_grassGroups[i].id == id) return &s_grassGroups[i];
+    return nullptr;
+}
+
+static void grassFillRecord(GrassFetchRecord& out, float x, float z, float y,
+                            float drawCoefficient, float swingCoefficient,
+                            uint32_t slot, uint32_t color) {
+    memset(&out, 0, sizeof out);
+    out.position[0] = x;
+    out.position[1] = y;
+    out.position[2] = z;
+    out.position[3] = 1.0f;
+    const uint8_t* rgba = color == 0 ? (const uint8_t*)"<\xc8<\xff"
+                                     : (const uint8_t*)"(d(\xff";
+    out.color[0] = float(rgba[0]) / 255.0f;
+    out.color[1] = float(rgba[1]) / 255.0f;
+    out.color[2] = float(rgba[2]) / 255.0f;
+    out.color[3] = 1.0f;
+    out.x = x;
+    out.z = z;
+    out.y = y;
+    out.drawCoefficient = drawCoefficient;
+    out.swingCoefficient = swingCoefficient;
+    out.swingSlot = float(slot % sms_wiiu_grass::kGrassSwingSlots);
+    out.colorIndex = float(color);
+}
+
+static void grassRetireReady() {
+    /* Group storage is reclaimed only after the timestamp belonging to the
+     * previous scene has retired.  A bounded old-scene list keeps reset safe
+     * without a per-frame GX2DrawDone. */
+}
+
+static void grassSceneBeginConsumer() {
+    flushBatch();
+    gx2DlClose();
+    GX2Flush();
+    grassRetireReady();
+    memset(s_grassGroups, 0, sizeof s_grassGroups);
+    s_grassGroupCount = 0;
+    ++s_grassGeneration;
+    s_grassFirstFailure = nullptr;
+}
+
+static GrassGroupGpu* grassRegisterConsumer(uint32_t id, uint32_t count,
+                                            const void* group,
+                                            const void* nearSource,
+                                            const void* farSource,
+                                            const void* apexSource,
+                                            float baseY) {
+    GrassGroupGpu* old = grassFindGroup(id);
+    if (old) {
+        if (old->generation == s_grassGeneration && old->count == count &&
+            old->sourceGroup == group && old->nearSource == nearSource &&
+            old->farSource == farSource && old->apexSource == apexSource)
+            return old;
+        old->failed = true;
+        if (!s_grassFirstFailure) s_grassFirstFailure = "duplicate grass registration";
+        return old;
+    }
+    if (!count || s_grassGroupCount >= sizeof(s_grassGroups) / sizeof(s_grassGroups[0])) {
+        ++s_grassAllocationFailures;
+        if (!s_grassFirstFailure) s_grassFirstFailure = "grass group table full";
+        return nullptr;
+    }
+    GrassGroupGpu& result = s_grassGroups[s_grassGroupCount++];
+    memset(&result, 0, sizeof result);
+    result.id = id;
+    result.generation = s_grassGeneration;
+    result.count = count;
+    result.sourceGroup = group;
+    result.nearSource = nearSource;
+    result.farSource = farSource;
+    result.apexSource = apexSource;
+    result.baseY = baseY;
+    result.nearBytes = count * 3 * sizeof(GrassFetchRecord);
+    result.farBytes = result.nearBytes;
+    result.nearBuffer = static_cast<GrassFetchRecord*>(
+        MEMAllocFromDefaultHeapEx(result.nearBytes, 32));
+    result.farBuffer = static_cast<GrassFetchRecord*>(
+        MEMAllocFromDefaultHeapEx(result.farBytes, 32));
+    if (!result.nearBuffer || !result.farBuffer) {
+        if (result.nearBuffer) MEMFreeToDefaultHeap(result.nearBuffer);
+        if (result.farBuffer) MEMFreeToDefaultHeap(result.farBuffer);
+        result.nearBuffer = result.farBuffer = nullptr;
+        result.failed = true;
+        ++s_grassAllocationFailures;
+        if (!s_grassFirstFailure) s_grassFirstFailure = "grass static allocation";
+        return &result;
+    }
+    const float* near = static_cast<const float*>(nearSource);
+    const int16_t* far = static_cast<const int16_t*>(farSource);
+    const int16_t* apex = static_cast<const int16_t*>(apexSource);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t slot = i % sms_wiiu_grass::kGrassSwingSlots;
+        const float nx = near[i * 3 + 0], ny = near[i * 3 + 1], nz = near[i * 3 + 2];
+        grassFillRecord(result.nearBuffer[i * 3 + 0], nx, nz, baseY, -1.0f, 0.0f, slot, 1);
+        grassFillRecord(result.nearBuffer[i * 3 + 1], nx, nz, ny, 0.0f, 1.0f, slot, 0);
+        grassFillRecord(result.nearBuffer[i * 3 + 2], nx, nz, baseY, 1.0f, 0.0f, slot, 1);
+        const float fx = float(far[i * 3 + 0]), fz = float(far[i * 3 + 2]);
+        const float fy = float(far[i * 3 + 1]), fay = float(apex[i]);
+        grassFillRecord(result.farBuffer[i * 3 + 0], fx, fz, fy, -1.0f, 0.0f, slot, 1);
+        grassFillRecord(result.farBuffer[i * 3 + 1], fx, fz, fay, 0.0f, 1.0f, slot, 0);
+        grassFillRecord(result.farBuffer[i * 3 + 2], fx, fz, fy, 1.0f, 0.0f, slot, 1);
+    }
+    DCFlushRange(result.nearBuffer, result.nearBytes);
+    DCFlushRange(result.farBuffer, result.farBytes);
+    GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, result.nearBuffer, result.nearBytes);
+    GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, result.farBuffer, result.farBytes);
+    result.uploaded = true;
+    ++s_grassStaticUploads;
+    s_grassStaticUploadBytes += result.nearBytes + result.farBytes;
+    return &result;
 }
 
 // `stride` is the number of XF words held by one uniform vector.  Normal
@@ -4723,6 +4928,96 @@ static void applyState() {
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0);
 }
 
+struct GrassDynamicBlock {
+    float drawX, drawZ, mode, reserved;
+    float swing[10];
+    float reserved2[2];
+};
+static_assert(sizeof(GrassDynamicBlock) == SMS_GRASS_UNIFORM_REGS * 16,
+              "grass dynamic block must be four uniform vectors");
+
+static bool grassDrawConsumer(GrassGroupGpu& group, uint8_t mode,
+                              float drawX, float drawZ, const float* swing) {
+    if (group.failed || !group.uploaded || group.generation != s_grassGeneration ||
+        !s_grassShaderReady || !s_frameActive) {
+        if (!s_grassFirstFailure) s_grassFirstFailure = "grass group is stale or unavailable";
+        return false;
+    }
+    if (s_gx2DlEnabled && !gx2DlOpenForDraw()) {
+        if (!s_grassFirstFailure) s_grassFirstFailure = "grass display-list allocation";
+        return false;
+    }
+    applyState();
+    setShader(s_untextured, nullptr);
+    GrassDynamicBlock dynamic = {};
+    dynamic.drawX = drawX;
+    dynamic.drawZ = drawZ;
+    dynamic.mode = float(mode);
+    memcpy(dynamic.swing, swing, sizeof dynamic.swing);
+    GX2SetVertexUniformReg(SMS_GRASS_UNIFORM_DRAW_REG * 4,
+                           SMS_GRASS_UNIFORM_REGS * 4, &dynamic);
+    ++s_grassDynamicUploads;
+    GrassFetchRecord* buffer = mode == 0 ? group.nearBuffer : group.farBuffer;
+    const uint32_t bytes = mode == 0 ? group.nearBytes : group.farBytes;
+    GX2SetAttribBuffer(0, bytes, sizeof(GrassFetchRecord), buffer);
+    GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, group.count * 3, 0, 1);
+    if (s_gx2DlEnabled) ++s_gx2DlOpenDraws;
+    ++s_grassGpuDraws;
+    s_grassGpuBlades += group.count;
+    return true;
+}
+
+extern "C" void sms_wiiu_grass_stream_command(const uint8_t* bytes, uint32_t size) {
+    if (!bytes || size < 8 || bytes[0] != 0xF1 || size != 8 + grassReadBE32(bytes + 4)) return;
+    const uint8_t kind = bytes[1];
+    const uint8_t mode = bytes[2];
+    const uint8_t* payload = bytes + 8;
+    const uint32_t payloadBytes = size - 8;
+    if (kind == kGrassSceneBegin) {
+        if (payloadBytes == 0) grassSceneBeginConsumer();
+        return;
+    }
+    if (kind == kGrassRegister) {
+        if (payloadBytes != 28) return;
+        const uint32_t id = grassReadBE32(payload + 0);
+        const uint32_t count = grassReadBE32(payload + 4);
+        float baseY;
+        const uint32_t baseBits = grassReadBE32(payload + 24);
+        memcpy(&baseY, &baseBits, sizeof baseY);
+        grassRegisterConsumer(id, count,
+                              reinterpret_cast<const void*>(uintptr_t(grassReadBE32(payload + 8))),
+                              reinterpret_cast<const void*>(uintptr_t(grassReadBE32(payload + 12))),
+                              reinterpret_cast<const void*>(uintptr_t(grassReadBE32(payload + 16))),
+                              reinterpret_cast<const void*>(uintptr_t(grassReadBE32(payload + 20))),
+                              baseY);
+        return;
+    }
+    if (kind == kGrassDraw && payloadBytes == 48) {
+        GrassGroupGpu* group = grassFindGroup(grassReadBE32(payload + 0));
+        if (!group) {
+            if (!s_grassFirstFailure) s_grassFirstFailure = "grass draw before registration";
+            return;
+        }
+        float swing[10];
+        for (uint32_t i = 0; i < 10; ++i) {
+            const uint32_t value = grassReadBE32(payload + 12 + i * 4);
+            if (mode == 0) memcpy(&swing[i], &value, sizeof value);
+            else swing[i] = float(sms_wiiu_grass::grassWrapS16(static_cast<int32_t>(value)));
+        }
+        const uint32_t drawXBits = grassReadBE32(payload + 4);
+        const uint32_t drawZBits = grassReadBE32(payload + 8);
+        float drawX, drawZ;
+        if (mode == 0) {
+            memcpy(&drawX, &drawXBits, sizeof drawX);
+            memcpy(&drawZ, &drawZBits, sizeof drawZ);
+        } else {
+            drawX = float(sms_wiiu_grass::grassWrapS16(static_cast<int32_t>(drawXBits)));
+            drawZ = float(sms_wiiu_grass::grassWrapS16(static_cast<int32_t>(drawZBits)));
+        }
+        grassDrawConsumer(*group, mode, drawX, drawZ, swing);
+    }
+}
+
 // Stage 1 colour: run the TEV chain per vertex on the CPU with the texture
 // taken as white, and let the fixed shader multiply the real texture in.
 // Exact for the common tex*X materials, approximate for the rest.
@@ -5283,6 +5578,9 @@ void rendererInit(float) {
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_gx2ProdMarker = sdMarkerPresent("gx2prod");
+    s_grassCpuMarker = sdMarkerPresent("cpugrass");
+    if (s_grassCpuMarker)
+        WHBLogPrintf("SMS Wii U: grass CPU fallback selected by cpugrass marker");
     s_gx2ProdCore2 = sdMarkerPresent("gx2core2");
     if (s_gx2ProdMarker && !s_gx2DlEnabled) {
         WHBLogPrintf("SMS Wii U: [gx2prod] refused: gx2dl marker is required");
@@ -5323,6 +5621,13 @@ void rendererInit(float) {
         WHBLogPrintf("SMS Wii U: [gx2prod] requested worker core=%u; core 2 already hosts texpack/AX workers, probe override=%s",
                      s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "enabled" : "disabled");
     s_ready = initShaders();
+    s_grassShaderReady = s_ready && smsGrassShaderEncodingAssertion();
+    if (!s_grassShaderReady) {
+        ++s_grassShaderFailures;
+        WHBLogPrintf("SMS Wii U: grass shader contract failed; using CPU fallback");
+    } else {
+        WHBLogPrintf("SMS Wii U: grass shader initialized (worker-ordered stream path)");
+    }
     if (!s_ready) WHBLogPrintf("SMS Wii U: GX2 shader setup failed");
     if (s_ready && s_gx2ProdMarker) {
         syncProducerState();
@@ -5411,6 +5716,65 @@ static bool streamWideHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     (void)kind; (void)slot; (void)value;
 #endif
     return false;
+}
+
+extern "C" int sms_wiiu_grass_cpu_fallback(void) {
+    return s_grassCpuMarker || !s_ready || !s_grassShaderReady;
+}
+
+extern "C" void sms_wiiu_grass_scene_begin(void) {
+    if (sms_wiiu_grass_cpu_fallback()) return;
+    grassEmitStream(kGrassSceneBegin, 0, nullptr, 0);
+}
+
+extern "C" void sms_wiiu_grass_register_group(const void* group, uint32_t count,
+                                                const void* nearPositions,
+                                                const void* farBasePositions,
+                                                const void* farApexPositions,
+                                                float baseY) {
+    if (sms_wiiu_grass_cpu_fallback()) return;
+    uint8_t payload[28] = {};
+    grassPutBE32(payload + 0, uint32_t(reinterpret_cast<uintptr_t>(group)));
+    grassPutBE32(payload + 4, count);
+    grassPutBE32(payload + 8, uint32_t(reinterpret_cast<uintptr_t>(group)));
+    grassPutBE32(payload + 12, uint32_t(reinterpret_cast<uintptr_t>(nearPositions)));
+    grassPutBE32(payload + 16, uint32_t(reinterpret_cast<uintptr_t>(farBasePositions)));
+    grassPutBE32(payload + 20, uint32_t(reinterpret_cast<uintptr_t>(farApexPositions)));
+    grassPutBE32(payload + 24, grassFloatBits(baseY));
+    grassEmitStream(kGrassRegister, 0, payload, sizeof payload);
+}
+
+extern "C" int sms_wiiu_grass_draw_near(const void* group, const void* drawVec,
+                                          const float* swings) {
+    if (sms_wiiu_grass_cpu_fallback() || !drawVec || !swings) {
+        ++s_grassCpuFallbackDraws;
+        return 0;
+    }
+    const float* draw = static_cast<const float*>(drawVec);
+    uint8_t payload[48] = {};
+    grassPutBE32(payload + 0, uint32_t(reinterpret_cast<uintptr_t>(group)));
+    grassPutBE32(payload + 4, grassFloatBits(draw[0]));
+    grassPutBE32(payload + 8, grassFloatBits(draw[2]));
+    for (uint32_t i = 0; i < 10; ++i) grassPutBE32(payload + 12 + i * 4, grassFloatBits(swings[i]));
+    grassEmitStream(kGrassDraw, 0, payload, sizeof payload);
+    return 1;
+}
+
+extern "C" int sms_wiiu_grass_draw_far(const void* group, const void* drawVec,
+                                         const int16_t* swings) {
+    if (sms_wiiu_grass_cpu_fallback() || !drawVec || !swings) {
+        ++s_grassCpuFallbackDraws;
+        return 0;
+    }
+    const int16_t* draw = static_cast<const int16_t*>(drawVec);
+    uint8_t payload[48] = {};
+    grassPutBE32(payload + 0, uint32_t(reinterpret_cast<uintptr_t>(group)));
+    grassPutBE32(payload + 4, uint32_t(static_cast<int32_t>(draw[0])));
+    grassPutBE32(payload + 8, uint32_t(static_cast<int32_t>(draw[2])));
+    for (uint32_t i = 0; i < 10; ++i)
+        grassPutBE32(payload + 12 + i * 4, uint32_t(static_cast<int32_t>(swings[i])));
+    grassEmitStream(kGrassDraw, 1, payload, sizeof payload);
+    return 1;
 }
 
 // GXPC's per-draw hooks are called by the game thread.  In gx2prod mode they
@@ -5924,8 +6288,6 @@ static bool gx2DlEndCall(void* list) {
 }
 
 static void* s_gx2DlOpen;
-static uint32_t s_gx2DlOpenDraws;
-
 // In producer mode core 1 replays copies and clears while the worker may hold
 // a list open; their GX2 macros must leave that list alone.  This is the
 // normal case, not a failure, so it is not counted.

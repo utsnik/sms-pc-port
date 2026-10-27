@@ -1139,6 +1139,7 @@ static bool s_dlRecFail = false;  // the list being recorded does more than draw
 // tail holds an incomplete command, *need receives its total length.
 #ifdef __WIIU__
 static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value);
+extern "C" void sms_wiiu_grass_stream_command(const uint8_t* bytes, uint32_t size);
 // Set only while the worker parses the producer stream itself: a game display
 // list never carries the private 0xF0 command.
 static bool s_hostOps = false;
@@ -1207,6 +1208,14 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
             len = 8;
             if (avail < len) break;
             applyHostState(p[1], p[2], be32(p + 4));
+#ifdef __WIIU__
+        } else if (op == 0xF1) {
+            len = 8;
+            if (avail < len) break;
+            len += be32(p + 4);
+            if (avail < len) break;
+            sms_wiiu_grass_stream_command(p, len);
+#endif
 #endif
         } else if (op >= 0x80 && op < 0xC0) {
             if (avail < 3) { len = 3; break; }
@@ -1243,6 +1252,7 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
         else if (op == 0x61) len = 5;
 #ifdef __WIIU__
         else if (op == 0xF0 && s_hostOps) len = 8;
+        else if (op == 0xF1) len = avail < 8 ? 8 : 8 + be32(p + 4);
 #endif
         else if (op >= 0x80 && op < 0xC0) {
             if (avail < 3) len = 3;

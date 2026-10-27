@@ -7,6 +7,11 @@
 namespace sms_wiiu_grass {
 
 static const uint32_t kGrassSwingSlots = 10;
+static const uint32_t kGrassUniformDrawOffset = 0;
+static const uint32_t kGrassUniformModeOffset = 8;
+static const uint32_t kGrassUniformSwingOffset = 16;
+static const uint8_t kGrassUpperColor[4] = {0x3c, 0xc8, 0x3c, 0xff};
+static const uint8_t kGrassLowerColor[4] = {0x28, 0x64, 0x28, 0xff};
 
 enum GrassCorner : uint8_t {
     kGrassLeft = 0,
