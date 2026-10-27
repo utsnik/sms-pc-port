@@ -4356,7 +4356,11 @@ static void initRenderTarget() {
     if (s_renderTried) return;
     s_renderTried = true;
     if (!kNativeRender) return;
-    if (sdMarkerPresent("res1080")) { kRenderW = 1920; kRenderH = 1080; }
+    // res900 / res810 (1600x900, 1440x810) are measurement sizes for
+    // fill-bound scenes and win over res1080.
+    if (sdMarkerPresent("res900")) { kRenderW = 1600; kRenderH = 900; }
+    else if (sdMarkerPresent("res810")) { kRenderW = 1440; kRenderH = 810; }
+    else if (sdMarkerPresent("res1080")) { kRenderW = 1920; kRenderH = 1080; }
     else if (sdMarkerPresent("res720")) { kRenderW = 1280; kRenderH = 720; }
     GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
     GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
