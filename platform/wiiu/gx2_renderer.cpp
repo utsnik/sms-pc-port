@@ -2209,6 +2209,93 @@ static bool initVertexProgram(VertexProgram& shader) {
     return true;
 }
 
+// SD marker "compactvx": a decoded batch goes to the GPU in its packed form
+// (gx_fifo's VtxFmtLayout: only the attributes its format carries) instead of
+// one 132-byte HostVertex per vertex.  The fetch shader follows the format: an
+// absent attribute reads its default through the component selects, and the
+// matrix indices of a format without VF_MTX come from one 32-byte element of
+// the batch's defaults (stride 0, attribute buffer 1).  Pianta's far grass
+// alone is 17.5k such vertices a frame at ~0.4 us each in unpackVertex
+// (2026-10-27).  The vertex programs read the same 13 locations either way.
+static bool s_compactVx;
+struct CompactFetch {
+    uint32_t fmt;
+    bool ok;
+    GX2FetchShader fetch;
+    GX2AttribStream attrs[RAW_ATTR_COUNT];
+};
+static CompactFetch s_compactFetch[64];
+static uint32_t s_compactFetchCount;
+
+static GX2FetchShader* compactFetchFor(uint32_t fmt) {
+    for (uint32_t i = 0; i < s_compactFetchCount; ++i)
+        if (s_compactFetch[i].fmt == fmt) return s_compactFetch[i].ok ? &s_compactFetch[i].fetch : nullptr;
+    if (s_compactFetchCount == sizeof(s_compactFetch) / sizeof(s_compactFetch[0])) return nullptr;
+    CompactFetch& c = s_compactFetch[s_compactFetchCount++];
+    c.fmt = fmt;
+    c.ok = false;
+    const VtxFmtLayout& l = vtxFmtLayout(fmt);
+    const GX2AttribFormat f3 = GX2_ATTRIB_FORMAT_FLOAT_32_32_32, f2 = GX2_ATTRIB_FORMAT_FLOAT_32_32,
+                          f4 = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, u8x4 = GX2_ATTRIB_FORMAT_UNORM_8_8_8_8,
+                          idx = GX2AttribFormat(GX2_ATTRIB_FLAG_SCALED | GX2_ATTRIB_TYPE_8_8_8_8);
+    const uint32_t xyzw = GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W);
+    const uint32_t zero = GX2_COMP_MAP(GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_0);
+    auto set = [&](uint32_t i, uint32_t buffer, uint32_t offset, GX2AttribFormat format, uint32_t mask) {
+        GX2AttribStream& a = c.attrs[i];
+        a.location = i;
+        a.buffer = buffer;
+        a.offset = offset;
+        a.format = format;
+        a.type = GX2_ATTRIB_INDEX_PER_VERTEX;
+        a.aluDivisor = 0;
+        a.mask = mask;
+        a.endianSwap = GX2_ENDIAN_SWAP_DEFAULT;
+    };
+    // As the raw layout: positions read w = 1, normals 0 (a missing
+    // component's SEL_W reads 0); an absent normal is (0, 0, 1).
+    set(RAW_ATTR_POS, 0, 0, f3, GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_1));
+    if (fmt & VF_NRM) set(RAW_ATTR_NRM, 0, l.nrm, f3, xyzw);
+    else set(RAW_ATTR_NRM, 0, 0, f3, GX2_COMP_MAP(GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_1, GX2_SQ_SEL_0));
+    const bool nbt = (fmt & VF_NRM) && (fmt & VF_NBT);
+    set(RAW_ATTR_BIN, 0, nbt ? l.nrm + 12 : 0, f3, nbt ? xyzw : zero);
+    set(RAW_ATTR_TAN, 0, nbt ? l.nrm + 24 : 0, f3, nbt ? xyzw : zero);
+    for (uint32_t ch = 0; ch < 2; ++ch) {
+        if (fmt & (VF_CLR0 << ch)) set(RAW_ATTR_CLR0 + ch, 0, l.clr[ch], u8x4, xyzw);
+        else set(RAW_ATTR_CLR0 + ch, 0, 0, u8x4, GX2_COMP_MAP(GX2_SQ_SEL_1, GX2_SQ_SEL_1, GX2_SQ_SEL_1, GX2_SQ_SEL_1));
+    }
+    for (uint32_t pair = 0; pair < 4; ++pair) {
+        const uint32_t t0 = pair * 2, t1 = t0 + 1;
+        const bool h0 = fmt & (VF_TEX0 << t0), h1 = fmt & (VF_TEX0 << t1);
+        const uint32_t at = RAW_ATTR_TEX01 + pair;
+        if (h0 && h1) {
+            if (l.tex[t1] != l.tex[t0] + 8) return nullptr;  // not adjacent: keep the raw path
+            set(at, 0, l.tex[t0], f4, xyzw);
+        } else if (h0) {
+            set(at, 0, l.tex[t0], f2, GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_0));
+        } else if (h1) {
+            set(at, 0, l.tex[t1], f2, GX2_COMP_MAP(GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_X, GX2_SQ_SEL_Y));
+        } else {
+            set(at, 0, 0, f2, zero);
+        }
+    }
+    for (uint32_t group = 0; group < 3; ++group) {
+        if (fmt & VF_MTX) set(RAW_ATTR_MTX0 + group, 0, l.mtx + group * 4, idx, xyzw);
+        else set(RAW_ATTR_MTX0 + group, 1, group * 4, idx, xyzw);
+    }
+    c.fetch.size = GX2CalcFetchShaderSizeEx(RAW_ATTR_COUNT, GX2_FETCH_SHADER_TESSELLATION_NONE,
+                                            GX2_TESSELLATION_MODE_DISCRETE);
+    void* program = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, c.fetch.size);
+    if (!program) return nullptr;
+    c.fetch.program = program;
+    GX2InitFetchShaderEx(&c.fetch, static_cast<uint8_t*>(program), RAW_ATTR_COUNT, c.attrs,
+                         GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, program, c.fetch.size);
+    c.ok = true;
+    WHBLogPrintf("SMS Wii U: [compactvx] fetch shader for fmt %08x stride %u (%u formats)", (unsigned)fmt,
+                 (unsigned)l.stride, (unsigned)s_compactFetchCount);
+    return &c.fetch;
+}
+
 static ShaderKeyIndex<VertexProgram> s_vertexProgramIndex;
 
 static VertexProgram* vertexShaderForKey(const VertexKey& key) {
@@ -4953,6 +5040,8 @@ void rendererInit(float) {
     }
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    s_compactVx = sdMarkerPresent("compactvx");
+    if (s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches on (SD marker compactvx)");
     // Both default on since 2026-10-26 (Bianco at 545 MHz: 269 -> 5 of ~1400
     // frames over 42 ms); the markers turn them off for A/B runs.
     s_rectClear = !sdMarkerPresent("norectclear") && !runningUnderCemu();
@@ -5677,11 +5766,16 @@ void flushBatch() {
     // vertices, one zeroed slot for out-of-range indices and the index list
     // share ONE arena block: an overflow between two allocations would recycle
     // the vertices before their draw is submitted.
+    GX2FetchShader* compact = s_compactVx && gpuPath && !s_vertexSelfCheck && !SMS_GX2_VX_ORACLE && s_batch.stride
+                                  ? compactFetchFor(s_batch.fmt) : nullptr;
     const size_t vertexFloats = gpuPath ? kRawVertexFloats : (tevPath ? 28 : (useTex ? 10 : 8));
-    const uint32_t vertexStride = gpuPath ? kRawVertexStride : uint32_t(vertexFloats * sizeof(float));
+    const uint32_t vertexStride = compact ? s_batch.stride :
+                                  gpuPath ? kRawVertexStride : uint32_t(vertexFloats * sizeof(float));
     const size_t vertexCount = s_batch.stride ? s_batch.vertices.size() / s_batch.stride : 0;
     const uint32_t indexCount = uint32_t(s_batch.indices.size());
-    const uint32_t vboBytes = uint32_t((vertexCount + 1) * vertexStride);
+    // compactvx: the packed vertices, the zeroed slot, then the default matrix indices.
+    const uint32_t compactDefOff = compact ? (uint32_t((vertexCount + 1) * vertexStride) + 31) & ~31u : 0;
+    const uint32_t vboBytes = compact ? compactDefOff + 32 : uint32_t((vertexCount + 1) * vertexStride);
     const uint32_t iboOffset = (vboBytes + 255) & ~255u;
     const uint32_t blockBytes = iboOffset + indexCount * uint32_t(sizeof(uint32_t));
     uint8_t* block = reinterpret_cast<uint8_t*>(allocVertices(blockBytes));
@@ -5691,7 +5785,9 @@ void flushBatch() {
     }
     float* vbo = reinterpret_cast<float*>(block);
     uint32_t* ibo = reinterpret_cast<uint32_t*>(block + iboOffset);
-    if (gpuPath) {
+    if (compact) {
+        // Written whole below.
+    } else if (gpuPath) {
         // Zero the vertex lines in cache without reading MEM2: the decoder
         // writes every vertex here, and cold write-allocate fills were the
         // top CPU cost.  Covers the sentinel slot too.  block is 256-aligned.
@@ -5711,46 +5807,58 @@ void flushBatch() {
     const uint8_t defaults[9] = {uint8_t(ma & 63), uint8_t((ma >> 6) & 63), uint8_t((ma >> 12) & 63),
                                  uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
                                  uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
-    for (uint32_t i = 0; i < indexCount; ++i) {
-        const uint32_t index = s_batch.indices[i];
-        if (index >= vertexCount) {
-            ibo[i] = uint32_t(vertexCount);
-            continue;
+    if (compact) {
+        memcpy(block, s_batch.vertices.data(), vertexCount * vertexStride);
+        memset(block + vertexCount * vertexStride, 0, vertexStride);
+        memset(block + compactDefOff, 0, 32);
+        memcpy(block + compactDefOff, defaults, sizeof(defaults));
+        for (uint32_t i = 0; i < indexCount; ++i) {
+            const uint32_t index = s_batch.indices[i];
+            ibo[i] = index < vertexCount ? index : uint32_t(vertexCount);
         }
-        ibo[i] = index;
-        if (!s_uniqueDone[index]) {
-            HostVertex hv;
-            const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
-            float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
-            HostVertex& dec = gpuPath ? *reinterpret_cast<HostVertex*>(out) : hv;
-            unpackVertex(s_batch.fmt, packed, defaults, dec, gpuPath);
-            if (gpuPath && s_vertexSelfCheck)
-                vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
-                                    dec, s_debugDrawNo);
-            if (gpuPath) {
-                // dec already sits in the arena in the fetch layout.
-#if SMS_GX2_VX_ORACLE
-                const HostVertex orig = dec;
-                float reference[28] = {};
-                if (tevPath) transformTev(orig, reference, tevKey, tevTextures);
-                else transform(orig, reference, coord, useTex, texture);
-                if (SMS_GX2_VX_ORACLE != 8)
-                memcpy(reinterpret_cast<RawVertex*>(out)->tex[6],
-                       reference + (SMS_GX2_VX_ORACLE == 2 ? 4 : SMS_GX2_VX_ORACLE == 6 ? 24 : 0), 4 * sizeof(float));
-                if (SMS_GX2_VX_ORACLE == 6)
-                    memcpy(reinterpret_cast<RawVertex*>(out)->tex[4], reference + 20, 4 * sizeof(float));
-#endif
-            } else if (tevPath) {
-                transformTev(hv, out, tevKey, tevTextures);
-            } else {
-                transform(hv, out, coord, useTex, texture);
+        s_perfUnique += uint32_t(vertexCount);
+    } else {
+        for (uint32_t i = 0; i < indexCount; ++i) {
+            const uint32_t index = s_batch.indices[i];
+            if (index >= vertexCount) {
+                ibo[i] = uint32_t(vertexCount);
+                continue;
             }
-            s_uniqueDone[index] = 1;
-            ++s_perfUnique;
-            if (!haveFirst) {
-                firstHv = dec;
-                if (!gpuPath) memcpy(firstOut, out, vertexFloats * sizeof(float));
-                haveFirst = true;
+            ibo[i] = index;
+            if (!s_uniqueDone[index]) {
+                HostVertex hv;
+                const uint8_t* packed = s_batch.vertices.data() + size_t(index) * s_batch.stride;
+                float* out = reinterpret_cast<float*>(block + size_t(index) * vertexStride);
+                HostVertex& dec = gpuPath ? *reinterpret_cast<HostVertex*>(out) : hv;
+                unpackVertex(s_batch.fmt, packed, defaults, dec, gpuPath);
+                if (gpuPath && s_vertexSelfCheck)
+                    vertexSelfCheckDraw(vertexKey, tevKey, tevPath, coord, useTex, texture, tevTextures,
+                                        dec, s_debugDrawNo);
+                if (gpuPath) {
+                    // dec already sits in the arena in the fetch layout.
+    #if SMS_GX2_VX_ORACLE
+                    const HostVertex orig = dec;
+                    float reference[28] = {};
+                    if (tevPath) transformTev(orig, reference, tevKey, tevTextures);
+                    else transform(orig, reference, coord, useTex, texture);
+                    if (SMS_GX2_VX_ORACLE != 8)
+                    memcpy(reinterpret_cast<RawVertex*>(out)->tex[6],
+                           reference + (SMS_GX2_VX_ORACLE == 2 ? 4 : SMS_GX2_VX_ORACLE == 6 ? 24 : 0), 4 * sizeof(float));
+                    if (SMS_GX2_VX_ORACLE == 6)
+                        memcpy(reinterpret_cast<RawVertex*>(out)->tex[4], reference + 20, 4 * sizeof(float));
+    #endif
+                } else if (tevPath) {
+                    transformTev(hv, out, tevKey, tevTextures);
+                } else {
+                    transform(hv, out, coord, useTex, texture);
+                }
+                s_uniqueDone[index] = 1;
+                ++s_perfUnique;
+                if (!haveFirst) {
+                    firstHv = dec;
+                    if (!gpuPath) memcpy(firstOut, out, vertexFloats * sizeof(float));
+                    haveFirst = true;
+                }
             }
         }
     }
@@ -5806,7 +5914,12 @@ void flushBatch() {
     } else if (listReady) {
         prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
     }
-    GX2SetAttribBuffer(0, vboBytes, gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
+    if (compact) {
+        GX2SetFetchShader(compact);
+        s_boundFetch = compact;
+        GX2SetAttribBuffer(1, 32, 0, block + compactDefOff);
+    }
+    GX2SetAttribBuffer(0, vboBytes, compact ? vertexStride : gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
     const bool bracket = SMS_GX2_VX_BRACKET && gpuPath && !vertex->bracketed;
