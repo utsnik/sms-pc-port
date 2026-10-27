@@ -124,6 +124,8 @@
 #define ALU_OP2_INST_MULLO_INT 0x73
 #define ALU_OP2_INST_LSHL_INT 0x72
 #define ALU_OP2_INST_ADD_INT 0x34
+#define ALU_OP2_INST_AND_INT 0x30
+#define ALU_OP2_INST_SETGE_INT 0x3c
 #define ALU_OP2_INST_LSHR_INT 0x71
 #define ALU_OP2_INST_INT_TO_FLT 0x6c
 #define ALU_OP2_INST_FLT_TO_INT 0x6b
@@ -152,6 +154,16 @@
     ALU_OP2(ALU_OP2_INST_INT_TO_FLT, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
 #define ALU_ADD_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
     ALU_OP2(ALU_OP2_INST_ADD_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_MULLO_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_MULLO_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_LSHL_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_LSHL_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_LSHR_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_LSHR_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_AND_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_AND_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
+#define ALU_SETGE_INT(dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan) \
+    ALU_OP2(ALU_OP2_INST_SETGE_INT, dstGpr, dstChan, src0Sel, src0Chan, src1Sel, src1Chan, ALU_OMOD_OFF)
 #define ALU_RECIP_IEEE(dstGpr, dstChan, src0Sel, src0Chan) \
     ALU_OP2(ALU_OP2_INST_RECIP_IEEE, dstGpr, dstChan, src0Sel, src0Chan, ALU_SRC_0, 0, ALU_OMOD_OFF)
 #define ALU_RECIPSQRT_IEEE(dstGpr, dstChan, src0Sel, src0Chan) \
@@ -242,13 +254,16 @@
 #define SMS_GRASS_UNIFORM_MODE 2
 
 static inline bool smsGrassShaderEncodingAssertion() {
+    const uint64_t psToPv = ALU_MOV(__, _x, ALU_SRC_PS, _x);
     const uint64_t mova = ALU_MOVA_INT(__, _x, _R(1), _y);
     const uint64_t swing0 = ALU_MOV_REL_CONST(__, _x, _GX2_C(SMS_GRASS_UNIFORM_SWING_REG), _x);
     const uint64_t swing1 = ALU_MOV_REL_CONST(__, _x, _GX2_C(SMS_GRASS_UNIFORM_SWING_REG + 1), _x);
     const uint32_t movaWord1 = __builtin_bswap32(uint32_t(mova));
+    const uint32_t psToPvWord0 = __builtin_bswap32(uint32_t(psToPv >> 32));
     const uint32_t swingWord0 = __builtin_bswap32(uint32_t(swing0 >> 32));
     const uint32_t swingNextWord0 = __builtin_bswap32(uint32_t(swing1 >> 32));
-    return ((movaWord1 >> 7) & 0xff) == ALU_OP2_INST_MOVA_INT &&
+    return (psToPvWord0 & 0x1ff) == (ALU_SRC_PS & 0x1ff) &&
+           ((movaWord1 >> 7) & 0xff) == ALU_OP2_INST_MOVA_INT &&
            (swingWord0 & (1u << 9)) != 0 &&
            (swingWord0 & 0x1ff) != (swingNextWord0 & 0x1ff);
 }

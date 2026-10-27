@@ -1,4 +1,5 @@
 #include "../grass_math.h"
+#include "../gx2_shader_inl.h"
 
 #include <cmath>
 #include <cstdio>
@@ -40,28 +41,44 @@ static bool equalFar(const GrassFarVertex& a, const GrassFarVertex& b,
 
 static GrassNearRecord nearRecord(const GrassNearBlade& b, uint32_t slot,
                                   GrassCorner corner) {
-    GrassNearRecord r = {};
-    r.x = b.x;
-    r.z = b.z;
-    r.y = corner == kGrassCenter ? b.apexY : b.baseY;
-    r.drawCoefficient = corner == kGrassLeft ? -1.0f : corner == kGrassRight ? 1.0f : 0.0f;
-    r.swingCoefficient = corner == kGrassCenter ? 1.0f : 0.0f;
-    r.swingSlot = static_cast<uint8_t>(slot % kGrassSwingSlots);
-    r.color = corner == kGrassCenter ? 0 : 1;
-    return r;
+    return grassMakeRecord(b.x, b.z, corner == kGrassCenter ? b.apexY : b.baseY,
+                           corner == kGrassLeft ? -1 : corner == kGrassRight ? 1 : 0,
+                           corner == kGrassCenter ? 1 : 0, slot,
+                           corner == kGrassCenter ? 0 : 1);
 }
 
 static GrassFarRecord farRecord(const GrassFarBlade& b, uint32_t slot,
                                 GrassCorner corner) {
-    GrassFarRecord r = {};
-    r.x = b.x;
-    r.z = b.z;
-    r.y = corner == kGrassCenter ? b.apexY : b.baseY;
-    r.drawCoefficient = corner == kGrassLeft ? -1 : corner == kGrassRight ? 1 : 0;
-    r.swingCoefficient = corner == kGrassCenter ? 1 : 0;
-    r.swingSlot = static_cast<uint8_t>(slot % kGrassSwingSlots);
-    r.color = corner == kGrassCenter ? 0 : 1;
-    return r;
+    return grassMakeRecord(float(b.x), float(b.z),
+                           float(corner == kGrassCenter ? b.apexY : b.baseY),
+                           corner == kGrassLeft ? -1 : corner == kGrassRight ? 1 : 0,
+                           corner == kGrassCenter ? 1 : 0, slot,
+                           corner == kGrassCenter ? 0 : 1);
+}
+
+static bool runWireRoundTrip() {
+    GrassDrawWirePayload source = {0x12345678u, 0x80000001u, 0x7fffffffu,
+                                   {0x00000000u, 0xffffffffu, 0x3f800000u,
+                                    0x80000000u, 0x01020304u, 0xa5a5a5a5u,
+                                    0x7fc00001u, 0xdeadbeefu, 0x11223344u,
+                                    0x55667788u}};
+    uint8_t bytes[kGrassDrawPayloadBytes] = {};
+    grassEncodeDrawPayload(bytes, source);
+    const GrassDrawWirePayload decoded = grassDecodeDrawPayload(bytes);
+    if (std::memcmp(&source, &decoded, sizeof source) != 0) {
+        std::fprintf(stderr, "grass escape payload round-trip lost one of 10 swings\n");
+        return false;
+    }
+    return true;
+}
+
+static bool runArEncodingCheck() {
+    const uint64_t toPv = ALU_MOV(__, _x, ALU_SRC_PS, _x);
+    const uint64_t mova = ALU_MOVA_INT(__, _x, ALU_SRC_PV, _x);
+    const uint32_t toPvWord = __builtin_bswap32(uint32_t(toPv >> 32));
+    const uint32_t movaWord = __builtin_bswap32(uint32_t(mova));
+    return (toPvWord & 0x1ffu) == (ALU_SRC_PS & 0x1ffu) &&
+           ((movaWord >> 7) & 0xffu) == ALU_OP2_INST_MOVA_INT;
 }
 
 static bool runSamples() {
@@ -137,14 +154,16 @@ static bool runGenerationAndHookSequence() {
 } // namespace
 
 int main() {
-    static_assert(sizeof(GrassNearRecord) == 32, "near record ABI changed");
+    static_assert(sizeof(GrassNearRecord) == 16, "near record ABI changed");
     static_assert(sizeof(GrassFarRecord) == 16, "far record ABI changed");
     static_assert(offsetof(GrassNearRecord, drawCoefficient) == 12,
-                  "near draw coefficient offset changed");
-    static_assert(offsetof(GrassNearRecord, swingCoefficient) == 16,
+                  "near packed metadata offset changed");
+    static_assert(offsetof(GrassNearRecord, swingCoefficient) == 13,
                   "near swing coefficient offset changed");
-    static_assert(offsetof(GrassFarRecord, drawCoefficient) == 6,
-                  "far draw coefficient offset changed");
+    static_assert(offsetof(GrassFarRecord, swingSlot) == 14,
+                  "far swing slot offset changed");
+    static_assert(kGrassDrawPayloadBytes == 52,
+                  "escape payload must carry 12 + 10*4 bytes");
     static_assert(kGrassUniformDrawOffset == 0 && kGrassUniformModeOffset == 8 &&
                       kGrassUniformSwingOffset == 16,
                   "grass dynamic uniform offsets changed");
@@ -155,7 +174,8 @@ int main() {
         std::fprintf(stderr, "grass color contract changed\n");
         return 1;
     }
-    if (!runSamples() || !runOverflow() || !runGenerationAndHookSequence()) return 1;
+    if (!runSamples() || !runOverflow() || !runGenerationAndHookSequence() ||
+        !runWireRoundTrip() || !runArEncodingCheck()) return 1;
     std::puts("grass GPU math oracle: PASS");
     return 0;
 }
