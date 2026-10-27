@@ -5780,8 +5780,12 @@ static XMap drawXMap() {
             return map;
         }
         map.a = s_wide;
-        const float p00 = g.xfReg[XFR_PROJ];
-        const float p11 = g.xfReg[XFR_PROJ + 2];
+        // XF registers hold float bits (PC: xff); a numeric uint32 -> float
+        // conversion made this ratio ~1, so every full-width camera counted as
+        // unwidened and was widened twice (3D squeezed to 3/4 width).
+        const float* proj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
+        const float p00 = proj[0];
+        const float p11 = proj[2];
         const float aspect = p00 != 0.0f ? std::fabs(p11 / p00) : 0.0f;
         if (aspect < kCamAspect * std::sqrt(s_wide)) map.clip = 1.0f / s_wide;
         return map;
