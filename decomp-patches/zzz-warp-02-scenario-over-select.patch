@@ -1,0 +1,30 @@
+Reason: port: SMS_WARP=stage,scenario keeps its scenario through the episode select (the warp set mNextArea, then the select menu's cursor overwrote it, so every warp loaded episode 0)
+--- a/src/GC2D/SelectDir.cpp
++++ b/src/GC2D/SelectDir.cpp
+@@ -1,4 +1,8 @@
+ #include <System/SelectDir.hpp>
++#ifdef TARGET_PC
++#include <stdio.h>
++#include <stdlib.h>
++#endif
+ 
+ #include <dolphin/os.h>
+ #include <JSystem/JKernel/JKRFileLoader.hpp>
+@@ -341,6 +345,17 @@
+ #endif
+ 			SMSGetApplication()->mNextArea.unk1 = getSelectMenu()->mSelectedShine;
+ 			TFlagManager::smInstance->setFlag(0x40003, getSelectMenu()->mSelectedShine);
++#ifdef TARGET_PC
++			// port: SMS_WARP=stage,scenario keeps its scenario through the
++			// episode select, whose cursor starts on the newest unlocked one.
++			if (const char* warp = getenv("SMS_WARP")) {
++				int stage = -1, scenario = -1;
++				if (sscanf(warp, "%d,%d", &stage, &scenario) == 2 && scenario >= 0) {
++					SMSGetApplication()->mNextArea.unk1 = (u8)scenario;
++					TFlagManager::smInstance->setFlag(0x40003, scenario);
++				}
++			}
++#endif
+ 			SMSGetApplication()->getFader()->startWipe(0xf, 1.0f, 0.0f);
+ #ifdef TARGET_PC
+ 			// Eclipse (character_select.cpp): the `li r0, 0xff` word at
