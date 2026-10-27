@@ -1,0 +1,56 @@
+diff --git a/src/MoveBG/MapObjGrass.cpp b/src/MoveBG/MapObjGrass.cpp
+--- a/src/MoveBG/MapObjGrass.cpp
++++ b/src/MoveBG/MapObjGrass.cpp
+@@ -5,6 +5,10 @@
+ #include <dolphin/gx.h>
+ #include <stdlib.h>
+ 
++#if defined(TARGET_WIIU)
++#include "sms_wiiu_grass.h"
++#endif
++
+ // rogue includes needed for matching sinit & bss
+ #include <MSound/MSSetSound.hpp>
+ #include <MSound/MSoundBGM.hpp>
+@@ -31,6 +35,11 @@ void TMapObjGrassGroup::drawNear() const
+ void TMapObjGrassGroup::drawNear() const
+ {
+ 	if (!shouldDrawNear())
+ 		return;
++#if defined(TARGET_WIIU)
++	if (sms_wiiu_grass_draw_near(this, &TMapObjGrassManager::mDrawVec,
++	                             gpMapObjGrassManager->unk20))
++		return;
++#endif
+ 
+ 	GXBegin(GX_TRIANGLES, GX_VTXFMT0, unk68 * 3);
+@@ -57,6 +65,11 @@ void TMapObjGrassGroup::drawFar() const
+ void TMapObjGrassGroup::drawFar() const
+ {
+ 	if (!shouldDrawFar())
+ 		return;
++#if defined(TARGET_WIIU)
++	if (sms_wiiu_grass_draw_far(this, &TMapObjGrassManager::mDrawVecS16,
++                            gpMapObjGrassManager->unk24))
++		return;
++#endif
+ 
+ 	GXBegin(GX_TRIANGLES, GX_VTXFMT0, unk68 * 3);
+@@ -122,5 +134,9 @@ void TMapObjGrassGroup::load(JSUMemoryInputStream& stream)
+ 		unk74[i] = mPosition.y + unk6C[i].y;
+ 	}
+ 
++#if defined(TARGET_WIIU)
++	sms_wiiu_grass_register_group(this, unk68, unk6C, unk70, unk74,
++	                              mPosition.y);
++#endif
+ 	gpMapObjGrassManager->entryGrassGroup(this, unk68);
+ }
+@@ -255,4 +271,7 @@ void TMapObjGrassManager::load(JSUMemoryInputStream& stream)
+ {
+ 	JDrama::TViewObj::load(stream);
++#if defined(TARGET_WIIU)
++	sms_wiiu_grass_scene_begin();
++#endif
+ 	unk14 = new TMapObjGrassGroup*[500];
+ 	unk20 = new f32[10];
