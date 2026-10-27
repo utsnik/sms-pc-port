@@ -412,8 +412,15 @@ void take_shots(uint32_t p)
 	}
 	const uint32_t n = s_base + s_shots_written++;
 	std::snprintf(path, sizeof(path), "%s/shot%02u-tv.bmp", dir, unsigned(n));
-	shot_surface(WHBGfxGetTVColourBuffer()->surface, path, 2);
+	/* The TV scan buffer, not WHBGfx's TV colour buffer: the render target
+	 * aliases that buffer's memory, so below 1080 lines (the per-scene size)
+	 * its 1920x1080 descriptor decodes a different tiling as noise. */
 	GX2Texture last;
+	std::memset(&last, 0, sizeof(last));
+	if (GX2GetLastFrame(GX2_SCAN_TARGET_TV, &last))
+		shot_surface(last.surface, path, 2);
+	else
+		shot_surface(WHBGfxGetTVColourBuffer()->surface, path, 2);
 	std::memset(&last, 0, sizeof(last));
 	if (GX2GetLastFrame(GX2_SCAN_TARGET_DRC, &last)) {
 		std::snprintf(path, sizeof(path), "%s/shot%02u-drc.bmp", dir, unsigned(n));
