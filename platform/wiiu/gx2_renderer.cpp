@@ -4457,6 +4457,9 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
     }
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
+// The colour buffer the game draws into (its own size and tiling), for the
+// self-screenshots.
+extern "C" const GX2Surface* sms_wiiu_gx2_render_surface(void) { return &renderColour()->surface; }
 extern "C" void sms_wiiu_gx2_target_present(void) {
     GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
     GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
