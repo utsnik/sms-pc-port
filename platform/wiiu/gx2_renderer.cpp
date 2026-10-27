@@ -6943,6 +6943,25 @@ extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
         WHBLogPrintf("SMS Wii U: [gx2prod] worker stopped");
     }
     texturePackShutdown();
+    // An exit with the target below the TV size (Corona boss at 810 lines)
+    // left the console unable to launch anything for about 10 minutes, twice
+    // (2026-10-27).  Hand WHBGfx back its own colour/depth layout, bound and
+    // drained, before it shuts down.
+    if (s_renderOwn && (s_renderColour.surface.width != WHBGfxGetTVColourBuffer()->surface.width ||
+                        s_renderColour.surface.height != WHBGfxGetTVColourBuffer()->surface.height)) {
+        WHBLogPrintf("SMS Wii U: exit: render target %ux%u back to the TV buffer's %ux%u",
+                     (unsigned)s_renderColour.surface.width, (unsigned)s_renderColour.surface.height,
+                     (unsigned)WHBGfxGetTVColourBuffer()->surface.width,
+                     (unsigned)WHBGfxGetTVColourBuffer()->surface.height);
+        GX2DrawDone();
+        s_renderColour = *WHBGfxGetTVColourBuffer();
+        s_renderDepth = *WHBGfxGetTVDepthBuffer();
+        GX2SetContextState(WHBGfxGetTVContextState());
+        GX2SetColorBuffer(&s_renderColour, GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(&s_renderDepth);
+        GX2Flush();
+        GX2DrawDone();
+    }
 }
 /* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
  * presenting thread, between frames, so one run shows the same game state
