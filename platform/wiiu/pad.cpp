@@ -104,31 +104,39 @@ void script_load(FILE* f)
 	char buf[2048];
 	size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
 	buf[n] = 0;
-	char* save = nullptr;
-	for (char* tok = strtok_r(buf, ",\r\n", &save); tok; tok = strtok_r(nullptr, ",\r\n", &save)) {
-		while (*tok == ' ' || *tok == '\t')
-			tok++;
-		if (char* eq = std::strchr(tok, '=')) {
+	// A NAME=value line sets an environment variable to the rest of the line
+	// (SMS_WARP=8,1,1 keeps its commas: split at them, every warp lost its
+	// scenario).  Other lines are comma-separated presses.
+	char* lineSave = nullptr;
+	for (char* line = strtok_r(buf, "\r\n", &lineSave); line; line = strtok_r(nullptr, "\r\n", &lineSave)) {
+		while (*line == ' ' || *line == '\t')
+			line++;
+		if (char* eq = std::strchr(line, '=')) {
 			*eq = 0;
-			setenv(tok, eq + 1, 1);
-			port_log("[pad] autoplay env %s=%s\n", tok, eq + 1);
+			setenv(line, eq + 1, 1);
+			port_log("[pad] autoplay env %s=%s\n", line, eq + 1);
 			continue;
 		}
-		char* at = std::strchr(tok, '@');
-		if (!at || s_script_count >= (int)(sizeof(s_script) / sizeof(s_script[0])))
-			continue;
-		*at = 0;
-		ScriptPress p{};
-		if (!script_control(tok, p)) {
-			port_log("[pad] autoplay: unknown control '%s'\n", tok);
-			continue;
+		char* save = nullptr;
+		for (char* tok = strtok_r(line, ",", &save); tok; tok = strtok_r(nullptr, ",", &save)) {
+			while (*tok == ' ' || *tok == '\t')
+				tok++;
+			char* at = std::strchr(tok, '@');
+			if (!at || s_script_count >= (int)(sizeof(s_script) / sizeof(s_script[0])))
+				continue;
+			*at = 0;
+			ScriptPress p{};
+			if (!script_control(tok, p)) {
+				port_log("[pad] autoplay: unknown control '%s'\n", tok);
+				continue;
+			}
+			uint32_t hold = 8;
+			if (const char* plus = std::strchr(at + 1, '+'))
+				hold = (uint32_t)atoi(plus + 1);
+			p.at = (uint32_t)atoi(at + 1);
+			p.until = p.at + hold;
+			s_script[s_script_count++] = p;
 		}
-		uint32_t hold = 8;
-		if (const char* plus = std::strchr(at + 1, '+'))
-			hold = (uint32_t)atoi(plus + 1);
-		p.at = (uint32_t)atoi(at + 1);
-		p.until = p.at + hold;
-		s_script[s_script_count++] = p;
 	}
 	port_log("[pad] autoplay: %d scripted presses\n", s_script_count);
 }
