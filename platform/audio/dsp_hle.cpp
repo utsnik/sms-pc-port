@@ -286,10 +286,11 @@ bool start_async()
 	s_async.replyStarted = true;
 	s_async.active = true;
 	sms_wiiu_OSResumeThread(&s_async.replyThread);
-	// SD marker "mixcore2": the mixer on core 2 (AX, texture-pack loader)
-	// instead of core 0, where at priority 2 it preempts the GX2 producer
-	// worker (15-22 pct of core 0 in Gelato and Pianta, 2026-10-27).
-	const bool mixCore2 = sms_wiiu_sd_marker("mixcore2") != 0;
+	// The mixer runs on core 2 (AX, texture-pack loader).  On core 0, at
+	// priority 2, it preempted the GX2 producer worker (15-22 pct of core 0 in
+	// Gelato and Pianta; Gelato 49.5 -> 33.9 ms, 2026-10-27).  SD marker
+	// "mixcore0" puts it back.
+	const bool mixCore2 = sms_wiiu_sd_marker("mixcore0") == 0;
 	if (!wut_OSCreateThread(&s_async.mixerThread, mixer_thread, 0,
 	                        reinterpret_cast<char*>(&s_async),
 	                        s_async.mixerStack + sizeof(s_async.mixerStack),

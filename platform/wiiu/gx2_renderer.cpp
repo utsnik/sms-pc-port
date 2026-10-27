@@ -2209,9 +2209,9 @@ static bool initVertexProgram(VertexProgram& shader) {
     return true;
 }
 
-// SD marker "compactvx": a decoded batch goes to the GPU in its packed form
-// (gx_fifo's VtxFmtLayout: only the attributes its format carries) instead of
-// one 132-byte HostVertex per vertex.  The fetch shader follows the format: an
+// Compact vertices (on unless SD marker "nocompactvx"): a decoded batch goes
+// to the GPU in its packed form (gx_fifo's VtxFmtLayout: only the attributes
+// its format carries) instead of one 132-byte HostVertex per vertex.  The fetch shader follows the format: an
 // absent attribute reads its default through the component selects, and the
 // matrix indices of a format without VF_MTX come from one 32-byte element of
 // the batch's defaults (stride 0, attribute buffer 1).  Pianta's far grass
@@ -5040,8 +5040,9 @@ void rendererInit(float) {
     }
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
-    s_compactVx = sdMarkerPresent("compactvx");
-    if (s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches on (SD marker compactvx)");
+    // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
+    s_compactVx = !sdMarkerPresent("nocompactvx");
+    if (!s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
     // Both default on since 2026-10-26 (Bianco at 545 MHz: 269 -> 5 of ~1400
     // frames over 42 ms); the markers turn them off for A/B runs.
     s_rectClear = !sdMarkerPresent("norectclear") && !runningUnderCemu();
