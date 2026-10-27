@@ -3411,6 +3411,11 @@ struct CopyEntry {
     const void* dest = nullptr;
     TextureEntry tex;
     uint32_t sourceX = 0, sourceY = 0, sourceW = 0, sourceH = 0;
+    // The copy texture may include an aligned border around the source rect:
+    // GX2CopySurfaceEx reads widescreen hardware rects in 8-pixel microtiles.
+    // These are the texels the copy shader should sample, in that texture.
+    uint32_t sampleX = 0, sampleY = 0, sampleW = 0, sampleH = 0;
+    uint32_t storageW = 0, storageH = 0;
 };
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
 static std::vector<CopyEntry>* s_copyObject;
@@ -3533,11 +3538,11 @@ static void debugCopy(bool disp, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
 static void textureUvTransform(const TextureEntry* texture, float out[4]) {
     out[0] = 0.0f; out[1] = 0.0f; out[2] = 1.0f; out[3] = 1.0f;
     const CopyEntry* e = copyEntryForTexture(texture);
-    if (!e || !e->sourceW || !e->sourceH) return;
-    out[0] = float(e->sourceX) / s_tvW;
-    out[1] = float(e->sourceY) / s_tvH;
-    out[2] = float(e->sourceW) / s_tvW;
-    out[3] = float(e->sourceH) / s_tvH;
+    if (!e || !e->sampleW || !e->sampleH || !e->storageW || !e->storageH) return;
+    out[0] = float(e->sampleX) / float(e->storageW);
+    out[1] = float(e->sampleY) / float(e->storageH);
+    out[2] = float(e->sampleW) / float(e->storageW);
+    out[3] = float(e->sampleH) / float(e->storageH);
 }
 // The cache matched an entry by address, format and size only, and GX
 // texture-cache invalidates are a no-op here, so new data loaded at an old
@@ -3566,9 +3571,9 @@ static void retireStaleTexture(TextureEntry& e) {
 
 static void adjustCopyUv(const TextureEntry* texture, float* u, float* v) {
     const CopyEntry* e = copyEntryForTexture(texture);
-    if (!e || !e->sourceW || !e->sourceH) return;
-    *u = (float(e->sourceX) + *u * float(e->sourceW)) / s_tvW;
-    *v = (float(e->sourceY) + *v * float(e->sourceH)) / s_tvH;
+    if (!e || !e->sampleW || !e->sampleH || !e->storageW || !e->storageH) return;
+    *u = (float(e->sampleX) + *u * float(e->sampleW)) / float(e->storageW);
+    *v = (float(e->sampleY) + *v * float(e->sampleH)) / float(e->storageH);
 }
 extern "C" const int sms_wiiu_efb_full_copy;  // gx_stub.cpp: 1 = full-surface copies on hardware too
 static bool runningUnderCemu() {
@@ -3581,6 +3586,25 @@ static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 struct MappedCopyRect {
     float x, y, w, h;
 };
+
+// GX2CopySurfaceEx on Cafe addresses colour data in 8-pixel microtiles.  A
+// widened copy often lands on fractional target pixels after the TV mapping;
+// submitting that unaligned source rect leaves a sparse vertical seam at its
+// left edge.  Keep the exact rectangle at 4:3, and expand only widescreen
+// hardware copies.  The CopyEntry UV rectangle selects the unexpanded part.
+static void copyStorageRect(uint32_t tx, uint32_t ty, uint32_t tw, uint32_t th,
+                            uint32_t surfaceW, uint32_t surfaceH, bool align,
+                            uint32_t* left, uint32_t* top, uint32_t* right, uint32_t* bottom) {
+    *left = tx;
+    *top = ty;
+    *right = tx + tw;
+    *bottom = ty + th;
+    if (!align) return;
+    *left &= ~7u;
+    *top &= ~7u;
+    *right = std::min(surfaceW, (*right + 7u) & ~7u);
+    *bottom = std::min(surfaceH, (*bottom + 7u) & ~7u);
+}
 
 static MappedCopyRect mapCopyRect(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     MappedCopyRect rect = {float(x), float(y), float(w), float(h)};
@@ -3641,13 +3665,17 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     for (CopyEntry& c : copyCache())
         if (c.dest == dest) { e = &c; break; }
     const bool cemu = runningUnderCemu();
+    uint32_t sourceLeft, sourceTop, sourceRight, sourceBottom;
+    copyStorageRect(tx, ty, tw, th, cb->surface.width, cb->surface.height,
+                    s_wide > 1.0f && !cemu, &sourceLeft, &sourceTop, &sourceRight, &sourceBottom);
     // Cemu's GX2CopySurfaceEx implementation only handles a full-surface
     // copy. Keep the compatibility path's backing texture the size of the
     // TV target, copy that surface in one operation, and apply the source
     // rectangle in the texture coordinates sent to the shader below.
     const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
     const uint32_t logicalW = half ? (w + 1) / 2 : w, logicalH = half ? (h + 1) / 2 : h;
-    const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
+    const uint32_t copyW = cemu ? fullW : sourceRight - sourceLeft;
+    const uint32_t copyH = cemu ? fullH : sourceBottom - sourceTop;
     if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         GX2DrawDone(); // earlier draws this frame may still sample it
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
@@ -3667,6 +3695,12 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     e->tex.height = logicalH;
     e->sourceX = cemu ? tx : 0; e->sourceY = cemu ? ty : 0;
     e->sourceW = cemu ? tw : 0; e->sourceH = cemu ? th : 0;
+    e->sampleX = cemu ? tx : tx - sourceLeft;
+    e->sampleY = cemu ? ty : ty - sourceTop;
+    e->sampleW = tw;
+    e->sampleH = th;
+    e->storageW = copyW;
+    e->storageH = copyH;
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
@@ -3730,7 +3764,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     if (cemu) {
         GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0); invalidateVertexUniforms();
     } else {
-        GX2Rect source = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
+        GX2Rect source = {int32_t(sourceLeft), int32_t(sourceTop), int32_t(sourceRight), int32_t(sourceBottom)};
         GX2Point destination = {0, 0};
         GX2CopySurfaceEx(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0, 1,
                         &source, &destination);
@@ -3783,10 +3817,14 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     for (CopyEntry& c : copyCache())
         if (c.dest == dest) { e = &c; break; }
     const bool cemu = runningUnderCemu();
+    uint32_t sourceLeft, sourceTop, sourceRight, sourceBottom;
+    copyStorageRect(tx, ty, tw, th, cb->surface.width, cb->surface.height,
+                    s_wide > 1.0f && !cemu, &sourceLeft, &sourceTop, &sourceRight, &sourceBottom);
     const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
     const uint32_t logicalW = half ? (w + 1) / 2 : w;
     const uint32_t logicalH = half ? (h + 1) / 2 : h;
-    const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
+    const uint32_t copyW = cemu ? fullW : sourceRight - sourceLeft;
+    const uint32_t copyH = cemu ? fullH : sourceBottom - sourceTop;
     if (e && (e->tex.texture.surface.width != copyW ||
               e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         result.retiredImage = e->tex.texture.surface.image;
@@ -3805,6 +3843,12 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     e->sourceY = cemu ? ty : 0;
     e->sourceW = cemu ? tw : 0;
     e->sourceH = cemu ? th : 0;
+    e->sampleX = cemu ? tx : tx - sourceLeft;
+    e->sampleY = cemu ? ty : ty - sourceTop;
+    e->sampleW = tw;
+    e->sampleH = th;
+    e->storageW = copyW;
+    e->storageH = copyH;
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
@@ -3862,7 +3906,7 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     result.source = cb->surface;
     result.destination = e->tex.texture.surface;
     result.fullSurface = cemu;
-    result.sourceRect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
+    result.sourceRect = {int32_t(sourceLeft), int32_t(sourceTop), int32_t(sourceRight), int32_t(sourceBottom)};
     result.destinationPoint = {0, 0};
     result.ready = true;
     return result;
@@ -4899,7 +4943,7 @@ static void transformPosition(const HostVertex& in, float* out) {
     // Match the PC renderer's XF viewport conversion, then apply the current
     // draw XMap before mapping the original game rectangle into the TV target.
     const float viewportCenter = g.viewport[0] + g.viewport[2] * 0.5f;
-    const float mappedCenter = (viewportCenter - 320.0f) * s_xmap.a + 320.0f + s_xmap.b;
+    const float mappedCenter = viewportCenter * s_xmap.a + s_xmap.b;
     const float halfW = g.viewport[2] * 0.5f * s_xmap.a * s_xmap.clip * s_gameScale;
     const float halfH = g.viewport[3] * 0.5f * s_gameScale;
     const float centerX = s_gameX + mappedCenter * s_gameScale;
@@ -4962,7 +5006,7 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
     // centre and half-width exactly as transformPosition does so the GPU
     // vertex-program path lands on the same pixels as the CPU path.
     const float viewportCenter = g.viewport[0] + g.viewport[2] * 0.5f;
-    const float mappedCenter = (viewportCenter - 320.0f) * s_xmap.a + 320.0f + s_xmap.b;
+    const float mappedCenter = viewportCenter * s_xmap.a + s_xmap.b;
     s_vtxLive[8] = mappedCenter - g.viewport[2] * 0.5f * s_xmap.a * s_xmap.clip;
     s_vtxLive[9] = g.viewport[1];
     s_vtxLive[10] = g.viewport[2] * s_xmap.a * s_xmap.clip;
@@ -5004,11 +5048,11 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
         copy[0] = copy[1] = 1.0f;
         copy[2] = copy[3] = 0.0f;
         const CopyEntry* entry = copyEntryForTexture(texture);
-        if (entry && entry->sourceW && entry->sourceH) {
-            copy[0] = float(entry->sourceW) / s_tvW;
-            copy[1] = float(entry->sourceH) / s_tvH;
-            copy[2] = float(entry->sourceX) / s_tvW;
-            copy[3] = float(entry->sourceY) / s_tvH;
+        if (entry && entry->sampleW && entry->sampleH && entry->storageW && entry->storageH) {
+            copy[0] = float(entry->sampleW) / float(entry->storageW);
+            copy[1] = float(entry->sampleH) / float(entry->storageH);
+            copy[2] = float(entry->sampleX) / float(entry->storageW);
+            copy[3] = float(entry->sampleY) / float(entry->storageH);
         }
     }
     static float s_vtxLiveShadow[sizeof(s_vtxLive) / sizeof(float)];
