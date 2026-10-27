@@ -24,6 +24,9 @@
 #include "Game/Util/SoundUtil.hpp"
 #include "Game/Util/StarPointerUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
+#if defined(PORT_GAME_SMG)
+extern "C" int sms_wiiu_sd_marker(const char* name);
+#endif
 
 namespace {
     static const s32 sTimingPlayingTicoSE = 180;
@@ -164,6 +167,40 @@ void GameSequenceProgress::requestGalaxyMove(const GalaxyMoveArgument& rMoveArg)
 
     GalaxyMoveArgument moveArg(rMoveArg);
     mStorySequenceExecutor->moveGalaxy(&moveArg, isNerve(GET_NERVE_ANON(GameSequenceProgressResetProcessing)) || mIsCancelScenarioSelect);
+
+#if defined(PORT_GAME_SMG)
+    /* Stage 4 picture routes are deliberately an SD-card switch, not a new
+     * scene path.  Keep the normal requestGalaxyMove path and replace only
+     * the destination after story bookkeeping has consumed the caller's
+     * argument.  Exactly one marker must be present so a stale route cannot
+     * win silently over the requested route. */
+    struct PictureRoute {
+        const char* marker;
+        const char* stage;
+    };
+    static const PictureRoute routes[] = {
+        {"smg-picture-route-gateway", "HeavensDoorGalaxy"},
+        {"smg-picture-route-observatory", "AstroGalaxy"},
+        {"smg-picture-route-good-egg", "EggStarGalaxy"},
+    };
+    const PictureRoute* selected = nullptr;
+    int selectedCount = 0;
+    for (const PictureRoute& route : routes) {
+        if (sms_wiiu_sd_marker(route.marker)) {
+            selected = &route;
+            ++selectedCount;
+        }
+    }
+    if (selectedCount == 1) {
+        moveArg.mStageName = selected->stage;
+        moveArg.mScenarioNo = 1;
+        moveArg._C = 1;
+        port_log("[smg-picture-route] marker=%s stage=%s scenario=1",
+                 selected->marker, selected->stage);
+    } else if (selectedCount > 1) {
+        port_log("[smg-picture-route] ignored: %d route markers are present", selectedCount);
+    }
+#endif
 
     mGalaxyCometScheduler->syncWithFlags();
 

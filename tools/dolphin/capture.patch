@@ -48,6 +48,8 @@ index 000883e..6cef20c 100644
  
 +    static u64 capture_update_counter = 0;
 +    static u64 strap_start = 60, strap_end = 900, pulse_start = 0, pulse_end = 0;
++    static u64 route_start = 0, route_end = 0;
++    static u16 route_x = 300, route_y = 480;
 +    static bool capture_config_loaded = false;
 +    if (!capture_config_loaded)
 +    {
@@ -68,6 +70,14 @@ index 000883e..6cef20c 100644
 +          pulse_start = value;
 +        else if (key == "pulse_end")
 +          pulse_end = value;
++        else if (key == "route_start")
++          route_start = value;
++        else if (key == "route_end")
++          route_end = value;
++        else if (key == "route_x")
++          route_x = static_cast<u16>(value);
++        else if (key == "route_y")
++          route_y = static_cast<u16>(value);
 +      }
 +      std::fprintf(stderr, "smg-capture: strap=%llu..%llu pulse=%llu..%llu\n",
 +                   static_cast<unsigned long long>(strap_start),
@@ -114,6 +124,13 @@ index 000883e..6cef20c 100644
 +        wiimote_states[i].buttons.b = true;
 +        next_call[i] = WiimoteDevice::NextUpdateInputCall::Activate;
 +      }
++      if (i == 0 && capture_update_counter >= route_start &&
++          capture_update_counter <= route_end)
++      {
++        wiimote_states[i].camera_points[0] = WiimoteEmu::CameraPoint(
++            {route_x, route_y}, 10);
++        wiimote_states[i].buttons.a = true;
++      }
 +    }
 +
      if (NetPlay::IsNetPlayRunning())
@@ -138,6 +155,13 @@ index 000883e..6cef20c 100644
 +      {
 +        wiimote_states[i].buttons.a = true;
 +        wiimote_states[i].buttons.b = true;
++      }
++      if (i == 0 && capture_update_counter >= route_start &&
++          capture_update_counter <= route_end)
++      {
++        wiimote_states[i].camera_points[0] = WiimoteEmu::CameraPoint(
++            {route_x, route_y}, 10);
++        wiimote_states[i].buttons.a = true;
 +      }
      }
 diff --git a/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp b/Source/Core/Core/IOS/USB/Bluetooth/BTEmu.cpp
