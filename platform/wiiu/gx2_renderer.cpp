@@ -7309,25 +7309,11 @@ extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
         WHBLogPrintf("SMS Wii U: [gx2prod] worker stopped");
     }
     texturePackShutdown();
-    // Hand WHBGfx back its own colour/depth layout, bound and drained, before
-    // it shuts down when the target is below the TV size.  A precaution only:
-    // the ~650 s launch hold seen after Corona boss runs (2026-10-27) is not
-    // this; it follows self-screenshots taken in that scene at any size.
-    if (s_renderOwn && (s_renderColour.surface.width != WHBGfxGetTVColourBuffer()->surface.width ||
-                        s_renderColour.surface.height != WHBGfxGetTVColourBuffer()->surface.height)) {
-        WHBLogPrintf("SMS Wii U: exit: render target %ux%u back to the TV buffer's %ux%u",
-                     (unsigned)s_renderColour.surface.width, (unsigned)s_renderColour.surface.height,
-                     (unsigned)WHBGfxGetTVColourBuffer()->surface.width,
-                     (unsigned)WHBGfxGetTVColourBuffer()->surface.height);
-        GX2DrawDone();
-        s_renderColour = *WHBGfxGetTVColourBuffer();
-        s_renderDepth = *WHBGfxGetTVDepthBuffer();
-        GX2SetContextState(WHBGfxGetTVContextState());
-        GX2SetColorBuffer(&s_renderColour, GX2_RENDER_TARGET_0);
-        GX2SetDepthBuffer(&s_renderDepth);
-        GX2Flush();
-        GX2DrawDone();
-    }
+    // No GX2 work here: sms_wiiu_exit runs after ProcUI released the
+    // foreground, and handing WHBGfx back its TV-sized layout (a precaution
+    // once used only below the TV size) faulted in GX2DrawDone ->
+    // GX2GetMainCoreId (DAR 0) on 1 of 7 exits once every scene rendered at
+    // 1792x1008 (2026-10-28). WHBGfx frees its own descriptors, not ours.
 }
 /* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
  * presenting thread, between frames, so one run shows the same game state
