@@ -353,6 +353,11 @@ void sms_wiiu_input_poll(void)
 				out.substickX = kpad0.substickX;
 				out.substickY = kpad0.substickY;
 			}
+			/* Let a Nunchuk move when the GamePad stick is in its deadzone. */
+			if (out.stickX >= -15 && out.stickX <= 15 && out.stickY >= -15 && out.stickY <= 15) {
+				out.stickX = kpad0.stickX;
+				out.stickY = kpad0.stickY;
+			}
 		}
 		out.err = PAD_ERR_NONE;
 		if (!s_first_success) {
