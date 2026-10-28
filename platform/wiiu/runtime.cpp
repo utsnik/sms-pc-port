@@ -286,6 +286,11 @@ void port_init(int, char**)
 	GXPC_SetWidescreen(port_widescreen);
 	port_log("SMS Wii U: %s (SD marker 4x3 %s)\n", four_by_three ? "4:3" : "widescreen 16:9",
 	         four_by_three ? "present" : "absent");
+	/* Experiment (SD marker invflush): DCInvalidateRange writes dirty lines
+	 * back instead of discarding them, for the Airstrip water A/B. */
+	sms_wiiu_invflush = sms_wiiu_sd_marker("invflush") != 0;
+	if (sms_wiiu_invflush)
+		port_log("SMS Wii U: SD marker invflush: DCInvalidateRange writes back (DCFlushRange)\n");
 	port_os_init();
 	port_os_threads_init();
 	s_heap_ready = true;

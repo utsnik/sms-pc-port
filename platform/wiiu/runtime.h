@@ -23,6 +23,7 @@ extern u32 sms_wiiu_mem2_size;
 const char* sms_wiiu_app_root(void);
 /* 1 when the file <app root>/<name> exists (read-only SD switches). */
 int sms_wiiu_sd_marker(const char* name);
+extern volatile int sms_wiiu_invflush; // SD marker invflush (os_core.cpp)
 uint32_t sms_wiiu_heap_free(void);
 u32 sms_wiiu_frame_count(void);
 const char* sms_wiiu_stage_path(void);

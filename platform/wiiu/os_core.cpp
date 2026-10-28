@@ -342,6 +342,21 @@ void __wrap_DCFlushRange(void* p, uint32_t n) { __real_DCFlushRange(p, n); GXPC_
 void __wrap_DCStoreRange(void* p, uint32_t n) { __real_DCStoreRange(p, n); GXPC_MemoryWritten(p, n); }
 void __wrap_DCFlushRangeNoSync(void* p, uint32_t n) { __real_DCFlushRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
 void __wrap_DCStoreRangeNoSync(void* p, uint32_t n) { __real_DCStoreRangeNoSync(p, n); GXPC_MemoryWritten(p, n); }
+
+/* The game invalidates memory a GameCube DMA engine (DSP, ARAM, GX copy) wrote
+ * behind the CPU. In this port those writers are CPU threads, so a real
+ * invalidate discards their dirty lines. SD marker invflush (read once in
+ * runtime start) makes every invalidate a write-back instead; off by default. */
+volatile int sms_wiiu_invflush;
+void __real_DCInvalidateRange(void*, uint32_t);
+void __wrap_DCInvalidateRange(void* p, uint32_t n)
+{
+	if (sms_wiiu_invflush) {
+		__real_DCFlushRange(p, n);
+		GXPC_MemoryWritten(p, n);
+	} else
+		__real_DCInvalidateRange(p, n);
+}
 }
 
 /* Large zero fills by dcbz (-Wl,--wrap=memset). newlib's memset stores words,
