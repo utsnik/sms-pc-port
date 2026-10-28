@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "remote_pad_mapping.h"
 
 #include <dolphin/pad.h>
 #include <padscore/kpad.h>
@@ -213,13 +214,41 @@ u16 map_classic_buttons(uint32_t b)
 	return result;
 }
 
-/* Wii Remote, with or without a Nunchuk. With a Nunchuk there is no R/L, so
+void map_sideways_remote(uint32_t b, PADStatus& out)
+{
+	sms_wiiu_remote::Input input = {
+		bool(b & WPAD_BUTTON_UP), bool(b & WPAD_BUTTON_RIGHT),
+		bool(b & WPAD_BUTTON_DOWN), bool(b & WPAD_BUTTON_LEFT),
+		0,
+	};
+	if (b & WPAD_BUTTON_A) input.buttons |= sms_wiiu_remote::kButtonA;
+	if (b & WPAD_BUTTON_B) input.buttons |= sms_wiiu_remote::kButtonB;
+	if (b & WPAD_BUTTON_1) input.buttons |= sms_wiiu_remote::kButton1;
+	if (b & WPAD_BUTTON_2) input.buttons |= sms_wiiu_remote::kButton2;
+	if (b & WPAD_BUTTON_MINUS) input.buttons |= sms_wiiu_remote::kButtonMinus;
+	if (b & WPAD_BUTTON_PLUS) input.buttons |= sms_wiiu_remote::kButtonPlus;
+	const sms_wiiu_remote::Output mapped = sms_wiiu_remote::mapSideways(input);
+	out.stickX = mapped.stick_x;
+	out.stickY = mapped.stick_y;
+	if (mapped.buttons & sms_wiiu_remote::kGameA) out.button |= PAD_BUTTON_A;
+	if (mapped.buttons & sms_wiiu_remote::kGameB) out.button |= PAD_BUTTON_B;
+	if (mapped.buttons & sms_wiiu_remote::kGameX) out.button |= PAD_BUTTON_X;
+	if (mapped.buttons & sms_wiiu_remote::kGameStart) out.button |= PAD_BUTTON_START;
+	set_triggers(out, mapped.buttons & sms_wiiu_remote::kGameL, false,
+	             mapped.buttons & sms_wiiu_remote::kGameR, false);
+}
+
+/* Wii Remote extensions. With a Nunchuk there is no R/L, so
  * B squirts (R), C is L and Minus takes over GameCube B; the D-pad also drives
  * the C-stick (camera) while still acting as a D-pad for menus. */
 void map_remote(const KPADStatus& kpad, PADStatus& out)
 {
 	uint32_t b = kpad.hold;
 	const bool nunchuk = kpad.extensionType == WPAD_EXT_NUNCHUK;
+	if (kpad.extensionType == WPAD_EXT_CORE) {
+		map_sideways_remote(b, out);
+		return;
+	}
 	if (nunchuk)
 		b |= kpad.nunchuk.hold;
 	out.button = map_face_dpad(b, WPAD_BUTTON_LEFT, WPAD_BUTTON_RIGHT, WPAD_BUTTON_DOWN, WPAD_BUTTON_UP,
@@ -353,7 +382,7 @@ void sms_wiiu_input_poll(void)
 				out.substickX = kpad0.substickX;
 				out.substickY = kpad0.substickY;
 			}
-			/* Let a Nunchuk move when the GamePad stick is in its deadzone. */
+			/* Let a Nunchuk or sideways Remote move when the GamePad stick is in its deadzone. */
 			if (out.stickX >= -15 && out.stickX <= 15 && out.stickY >= -15 && out.stickY <= 15) {
 				out.stickX = kpad0.stickX;
 				out.stickY = kpad0.stickY;

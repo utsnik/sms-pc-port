@@ -3,19 +3,21 @@ BUILD_DIR ?= /mnt/buildcache/wiiu-build/sms-gx2r/grass
 TEST := $(BUILD_DIR)/grass_gpu_math_test
 ORACLE := $(BUILD_DIR)/latte_vs_oracle_test
 SCISSOR := $(BUILD_DIR)/widescreen_scissor_test
+REMOTE := $(BUILD_DIR)/remote_pad_mapping_test
 # No FMA contraction: the oracle compares against unfused Latte arithmetic.
 CXXFLAGS ?= -std=c++11 -Wall -Wextra -Werror -O2 -ffp-contract=off
 
 .PHONY: check check-sanitize clean
 
-check: $(TEST) $(ORACLE) $(SCISSOR)
+check: $(TEST) $(ORACLE) $(SCISSOR) $(REMOTE)
 	$(TEST)
 	$(ORACLE)
 	$(SCISSOR)
+	$(REMOTE)
 
 check-sanitize:
 	$(MAKE) CXXFLAGS="$(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
-		TEST=$(BUILD_DIR)/grass_gpu_math_test-san ORACLE=$(BUILD_DIR)/latte_vs_oracle_test-san SCISSOR=$(BUILD_DIR)/widescreen_scissor_test-san check
+		TEST=$(BUILD_DIR)/grass_gpu_math_test-san ORACLE=$(BUILD_DIR)/latte_vs_oracle_test-san SCISSOR=$(BUILD_DIR)/widescreen_scissor_test-san REMOTE=$(BUILD_DIR)/remote_pad_mapping_test-san check
 
 $(TEST): grass_gpu_math_test.cpp ../grass_math.h ../gx2_vertex_program.h ../gx2_shader_inl.h
 	mkdir -p $(BUILD_DIR)
@@ -30,5 +32,9 @@ $(SCISSOR): widescreen_scissor_test.cpp ../widescreen_math.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -I.. $< -o $@
 
+$(REMOTE): remote_pad_mapping_test.cpp ../remote_pad_mapping.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I.. $< -o $@
+
 clean:
-	rm -f $(TEST) $(ORACLE) $(SCISSOR) $(BUILD_DIR)/grass_gpu_math_test-san $(BUILD_DIR)/latte_vs_oracle_test-san $(BUILD_DIR)/widescreen_scissor_test-san
+	rm -f $(TEST) $(ORACLE) $(SCISSOR) $(REMOTE) $(BUILD_DIR)/grass_gpu_math_test-san $(BUILD_DIR)/latte_vs_oracle_test-san $(BUILD_DIR)/widescreen_scissor_test-san $(BUILD_DIR)/remote_pad_mapping_test-san
