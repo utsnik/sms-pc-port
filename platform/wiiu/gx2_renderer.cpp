@@ -3113,8 +3113,10 @@ static float centredOffset(float at) {
 }
 
 static void updateWideTarget() {
-    const int width = s_wide > 1.0f ? (int(640.0f * s_wide + 1.0f) & ~1) : 640;
-    s_efbW = float(width);
+    // The exact widened width: vertex transforms and peeks use s_wide itself,
+    // so rounding it here put full-width scissors and copies a fraction of a
+    // pixel off the draws (796 vs 796.44 at 16:9; 854 vs 853.33 before).
+    s_efbW = s_wide > 1.0f ? 640.0f * s_wide : 640.0f;
     s_ox = (s_efbW - 640.0f) * 0.5f;
     s_gameX = (s_tvW - s_efbW * s_gameScale) * 0.5f;
 }
