@@ -377,6 +377,8 @@ void maybe_dump_aram()
 }
 
 #ifdef TARGET_WIIU
+extern "C" void __real_DCFlushRange(void*, uint32_t); // coreinit's, not the GX-stamping wrapper (os_core.cpp)
+
 /* SD marker pbdump: after 30 s of audio, snapshot 140 consecutive subframes
  * (voice blocks and FX blocks before the mixer runs, its two outputs after)
  * and write them with the setup tables to "<app root>pbdump.bin", then the
@@ -479,6 +481,20 @@ void render_subframe()
 		pbdump_after(pbOut, g.outA + g.sub * n, g.outB + g.sub * n, n);
 #endif
 	}
+#ifdef TARGET_WIIU
+	/* The game invalidates what the DSP wrote before reading it: JASDSPBuf
+	 * invalidates the frame buffer the AI plays and calls invalChannelAll on
+	 * the voice blocks, because on a GameCube the DSP writes them by DMA.
+	 * Here the mixer writes through the CPU cache, and the Wii U's real
+	 * DCInvalidateRange discards dirty lines: the AI then played stale RAM,
+	 * steps every 16 samples (one 32-byte line) and at every subframe seam,
+	 * and voices lost their write-back (the stutter and "metallic" sound,
+	 * pcmcap 2026-10-28). Write them back first, as the DSP's DMA would. */
+	__real_DCFlushRange(g.outA + g.sub * n, n * sizeof(int16_t));
+	__real_DCFlushRange(g.outB + g.sub * n, n * sizeof(int16_t));
+	if (s_pb.voices)
+		__real_DCFlushRange(const_cast<u8*>(s_pb.voices), s_pb.nvoices * 0x180);
+#endif
 	g.sub++;
 	g.subframesRendered++;
 #ifdef TARGET_WIIU
