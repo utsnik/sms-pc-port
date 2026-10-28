@@ -6712,6 +6712,9 @@ void markXfMemDirty() {
 // every peek, so it is not used there.
 static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
+// The async console path: a copy into s_peekSurface was queued and flushed.
+static uint64_t s_peekStamp;
+static bool s_peekQueued;
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
     ProdPeekScope prodPeek(s_gx2ProdEnabled);
     ++s_perfPeeks;
@@ -6720,6 +6723,12 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
     if (s_peekSurfaceReady && (s_peekSurface.width != cb->surface.width ||
                                s_peekSurface.height != cb->surface.height)) {
+        // The last queued copy may still be writing into the old surface, and
+        // its answer belongs to the old size: let it retire, then forget it.
+        // prodTimestampReady never blocks core 1 in producer mode, so this
+        // peek answers not-ready and a later one frees the surface.
+        if (s_peekQueued && !prodTimestampReady(s_peekStamp)) return false;
+        s_peekQueued = false;
         MEMFreeToDefaultHeap(s_peekSurface.image);
         if (s_peekSpecial.image) MEMFreeToDefaultHeap(s_peekSpecial.image);
         s_peekSpecial.image = nullptr;
@@ -6757,8 +6766,6 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         // frame old, finished long ago) and queue this frame's copy without
         // draining the GPU.  The synchronous version stalled the CPU on the
         // whole frame's GPU work twice per peek.
-        static uint64_t s_peekStamp;
-        static bool s_peekQueued;
         const bool have = s_peekQueued;
         if (s_gx2ProdEnabled && OSGetCoreId() == 1) {
             gx2prod::record_core1_readback(have, have && GX2GetRetiredTimeStamp() >= s_peekStamp,
@@ -6855,8 +6862,46 @@ static TokenStats s_tokStats;
 
 bool peekTokenNoWait() { return s_peekTokenMode == 1; }
 
+// The depth snapshots match the depth buffer, which changes size with the
+// per-scene render size (Corona). Rebuild them at the new size; without this
+// the copy is skipped and GXPeekZ keeps answering from the old scene.
+static void tokResizeDepth(const GX2DepthBuffer* db) {
+    if (db->surface.width == s_tok.depthTiled.width && db->surface.height == s_tok.depthTiled.height) return;
+    // Never block here: a copy still in flight retries the resize next time.
+    if (s_tok.depthQueued && GX2GetRetiredTimeStamp() < s_tok.depthStamp) return;
+    s_tok.depthQueued = false;
+    if (s_tok.depthTiled.image) MEMFreeToDefaultHeap(s_tok.depthTiled.image);
+    if (s_tok.depthLinear.image) MEMFreeToDefaultHeap(s_tok.depthLinear.image);
+    GX2Surface& t = s_tok.depthTiled;
+    t.image = nullptr;
+    t.width = db->surface.width;
+    t.height = db->surface.height;
+    t.tileMode = GX2_TILE_MODE_DEFAULT;
+    s_tok.depthLinear = t;
+    s_tok.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&t);
+    GX2CalcSurfaceSizeAndAlignment(&s_tok.depthLinear);
+    t.image = alignedZero(t.alignment, t.imageSize);
+    s_tok.depthLinear.image = t.image ? alignedZero(s_tok.depthLinear.alignment, s_tok.depthLinear.imageSize) : nullptr;
+    if (!s_tok.depthLinear.image) {
+        // Out of memory: keep the new size (no retry every frame) without
+        // images, so no depth copy is made and depth peeks stay not-ready.
+        if (t.image) MEMFreeToDefaultHeap(t.image);
+        t.image = nullptr;
+        WHBLogPrintf("SMS Wii U: [peektok] out of memory resizing depth snapshots to %ux%u",
+                     unsigned(db->surface.width), unsigned(db->surface.height));
+        return;
+    }
+    DCFlushRange(t.image, t.imageSize);
+    DCFlushRange(s_tok.depthLinear.image, s_tok.depthLinear.imageSize);
+    WHBLogPrintf("SMS Wii U: [peektok] depth snapshots resized to %ux%u", unsigned(t.width), unsigned(t.height));
+}
+
 static bool tokAllocate() {
-    if (s_tok.allocated) return true;
+    if (s_tok.allocated) {
+        if (GX2DepthBuffer* db = renderDepth()) tokResizeDepth(db);
+        return true;
+    }
     if (s_tok.failed) return false;
     GX2ColorBuffer* cb = renderColour();
     GX2DepthBuffer* db = renderDepth();
@@ -7010,7 +7055,8 @@ static void tokenSnapService(void* opaque) {
         slot.top = top;
         colour = true;
     }
-    if (wantDepth && db && db->surface.width == s_tok.depthTiled.width && db->surface.height == s_tok.depthTiled.height &&
+    if (wantDepth && db && s_tok.depthLinear.image && db->surface.width == s_tok.depthTiled.width &&
+        db->surface.height == s_tok.depthTiled.height &&
         db->surface.format == GX2_SURFACE_FORMAT_FLOAT_R32 && db->surface.aa == GX2_AA_MODE1X) {
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
         GX2ConvertDepthBufferToTextureSurface(db, &s_tok.depthTiled, 0, 0);
