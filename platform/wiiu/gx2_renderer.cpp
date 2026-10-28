@@ -6862,6 +6862,25 @@ static TokenStats s_tokStats;
 
 bool peekTokenNoWait() { return s_peekTokenMode == 1; }
 
+// Fresh descriptors for the token depth snapshots at w x h (no images).
+static void tokDepthDescriptors(uint32_t w, uint32_t h) {
+    GX2Surface& t = s_tok.depthTiled;
+    memset(&t, 0, sizeof(t));
+    t.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    t.width = w;
+    t.height = h;
+    t.depth = 1;
+    t.mipLevels = 1;
+    t.format = GX2_SURFACE_FORMAT_FLOAT_R32;
+    t.aa = GX2_AA_MODE1X;
+    t.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    t.tileMode = GX2_TILE_MODE_DEFAULT;
+    s_tok.depthLinear = t;
+    s_tok.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&t);
+    GX2CalcSurfaceSizeAndAlignment(&s_tok.depthLinear);
+}
+
 // The depth snapshots match the depth buffer, which changes size with the
 // per-scene render size (Corona). Rebuild them at the new size; without this
 // the copy is skipped and GXPeekZ keeps answering from the old scene.
@@ -6872,15 +6891,8 @@ static void tokResizeDepth(const GX2DepthBuffer* db) {
     s_tok.depthQueued = false;
     if (s_tok.depthTiled.image) MEMFreeToDefaultHeap(s_tok.depthTiled.image);
     if (s_tok.depthLinear.image) MEMFreeToDefaultHeap(s_tok.depthLinear.image);
+    tokDepthDescriptors(db->surface.width, db->surface.height);
     GX2Surface& t = s_tok.depthTiled;
-    t.image = nullptr;
-    t.width = db->surface.width;
-    t.height = db->surface.height;
-    t.tileMode = GX2_TILE_MODE_DEFAULT;
-    s_tok.depthLinear = t;
-    s_tok.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
-    GX2CalcSurfaceSizeAndAlignment(&t);
-    GX2CalcSurfaceSizeAndAlignment(&s_tok.depthLinear);
     t.image = alignedZero(t.alignment, t.imageSize);
     s_tok.depthLinear.image = t.image ? alignedZero(s_tok.depthLinear.alignment, s_tok.depthLinear.imageSize) : nullptr;
     if (!s_tok.depthLinear.image) {
@@ -6918,21 +6930,8 @@ static bool tokAllocate() {
     c.aa = GX2_AA_MODE1X;
     c.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&c);
+    tokDepthDescriptors(db->surface.width, db->surface.height);
     GX2Surface& t = s_tok.depthTiled;
-    memset(&t, 0, sizeof(t));
-    t.dim = GX2_SURFACE_DIM_TEXTURE_2D;
-    t.width = db->surface.width;
-    t.height = db->surface.height;
-    t.depth = 1;
-    t.mipLevels = 1;
-    t.format = GX2_SURFACE_FORMAT_FLOAT_R32;
-    t.aa = GX2_AA_MODE1X;
-    t.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
-    t.tileMode = GX2_TILE_MODE_DEFAULT;
-    s_tok.depthLinear = t;
-    s_tok.depthLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
-    GX2CalcSurfaceSizeAndAlignment(&t);
-    GX2CalcSurfaceSizeAndAlignment(&s_tok.depthLinear);
     bool ok = true;
     for (int i = 0; i < kTokRing; ++i) {
         s_tok.colour[i].surface = c;
