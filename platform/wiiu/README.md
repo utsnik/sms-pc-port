@@ -39,7 +39,6 @@ The controls below use the game's GameCube actions.
 | Wii Remote + Nunchuk | Nunchuk stick: move; A: jump; B trigger: full R/FLUDD; Minus: B/dive; C: L/camera reset; Z: Z; D-pad: camera and menu cursor; 1/2: X/Y; Plus: pause. |
 | Pro Controller | Same layout as the GamePad. |
 | Classic Controller | Same sticks and face-button layout; analog L/R are GameCube L/R; ZL/ZR are Z. |
-| GameCube adapter | Control stick: move; C-stick: camera; A: jump; B: dive-attack; X/Y: X/Y actions; L/R: L/R; Z: Z; D-pad: menus; Start: pause. |
 
 A Wii Remote without a Nunchuk has no movement-stick mapping; its D-pad, A,
 and Plus operate menus.
