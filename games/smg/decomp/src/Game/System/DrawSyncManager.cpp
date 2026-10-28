@@ -184,7 +184,7 @@ void DrawSyncManager::pushBreakPoint() {
     if ((mFlags & 3) == 0) {
         GXFlush();
         GXFifoObj fifoObj;
-        GXGetCPUFifo(&fifoObj);
+        GXGetCPUFifoOut(&fifoObj);
 
         void* pRead;
         void* pWrite;

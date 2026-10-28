@@ -29,8 +29,23 @@ typedef struct __GXFifoObj {
     GXBool bind_gp;
 } __GXFifoObj;
 
+#if defined(__WIIU__)
+/* SMG's RVL declaration is an out-parameter API, while the Wii U provider
+ * exposes Dolphin's return-pointer form under the same C symbol. */
+GXFifoObj* GXGetCPUFifo(void);
+GXFifoObj* GXGetGPFifo(void);
+static inline GXBool GXGetCPUFifoOut(GXFifoObj* fifo) {
+    *fifo = *GXGetCPUFifo();
+    return GX_TRUE;
+}
+static inline GXBool GXGetGPFifoOut(GXFifoObj* fifo) {
+    *fifo = *GXGetGPFifo();
+    return GX_TRUE;
+}
+#else
 GXBool GXGetCPUFifo(GXFifoObj*);
 GXBool GXGetGPFifo(GXFifoObj*);
+#endif
 
 void GXGetFifoPtrs(const GXFifoObj*, void**, void**);
 
