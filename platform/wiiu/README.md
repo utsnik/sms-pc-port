@@ -1,8 +1,27 @@
 # Super Mario Sunshine on Wii U
 
+## Easiest: Wii U Pack Helper (Windows)
+
+Download `WiiU-Pack-Helper.exe` from the release page and run it:
+
+1. Choose **Super Mario Sunshine**, then choose your SD card's top folder.
+2. Choose your own North American (GMSE01) disc image (`.iso`, `.gcm` or
+   `.ciso`; convert RVZ to ISO in Dolphin first). Pick 16:9 or 4:3.
+3. Optional: tick **HD textures** and choose `GMS_1080.zip` from the
+   [Super Mario Sunshine UHD Texture Pack 2.1.1](https://github.com/qashto/Super_Mario_Sunshine_UHD_Texture_Pack/releases/tag/2.1.1).
+   The helper converts it into the Wii U pack (about 900 MB); `GMS.7z` is the
+   full-size pack and is not used.
+4. Click **Start** and wait for **Done**.
+
+The helper writes the game data and the texture pack in the layout below.
+Copy `sms.wuhb` to `sd:/wiiu/apps/` yourself, or put it beside the helper
+and tick **Copy sms.wuhb**. Neither the game nor the texture pack is
+included in the release; you supply both.
+
 ## SD card setup
 
-The `.wuhb` contains the program and artwork only. Put it in:
+To set the card up by hand instead: the `.wuhb` contains the program and
+artwork only. Put it in:
 
 ```text
 sd:/wiiu/apps/sms.wuhb
