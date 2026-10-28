@@ -4312,15 +4312,16 @@ extern "C" void sms_wiiu_gx2_target_present(void) {
     GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
 }
 
-// TV target size (WHBGfx picks 720p or 1080p) and the 4:3 game rectangle in it:
-// the 640x480 EFB scaled to the target's height and centred.
+// TV target size (WHBGfx picks 720p or 1080p) and the game rectangle in it:
+// the 448 lines the game draws scaled to the target's height and centred.
+// Scaling 480 lines left the bottom 32 of them black on every frame.
 static void updateTarget() {
     const GX2ColorBuffer* cb = renderColour();
     if (cb && cb->surface.width && cb->surface.height) {
         s_tvW = float(cb->surface.width);
         s_tvH = float(cb->surface.height);
     }
-    s_gameScale = s_tvH / 480.0f;
+    s_gameScale = s_tvH / 448.0f;
     s_lodScale = s_gameScale;
     updateWideTarget();
 }

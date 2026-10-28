@@ -275,7 +275,11 @@ void port_init(int, char**)
 	sms_wiiu_runtime_init();
 	if (!s_initialized)
 		return;
-	port_widescreen = sms_wiiu_sd_marker("widescreen") ? 4.0f / 3.0f : 1.0f;
+	/* 16:9 from the 448 drawn lines (scaled to the full height, see
+	 * gx2_renderer.cpp updateTarget): 16/9 * 448 / 640 = 1.244 times the width,
+	 * which fills a 16:9 target exactly. 4/3 assumed 480 lines and ran 57 game
+	 * units past the target's sides. */
+	port_widescreen = sms_wiiu_sd_marker("widescreen") ? (16.0f * 448.0f) / (9.0f * 640.0f) : 1.0f;
 	GXPC_SetWidescreen(port_widescreen);
 	port_log("SMS Wii U: widescreen %s (marker %s)\n",
 	         port_widescreen > 1.0f ? "on" : "off",
