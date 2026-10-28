@@ -33,6 +33,8 @@
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <new>
@@ -374,6 +376,82 @@ void maybe_dump_aram()
 	}
 }
 
+#ifdef TARGET_WIIU
+/* SD marker pbdump: after 30 s of audio, snapshot 140 consecutive subframes
+ * (voice blocks and FX blocks before the mixer runs, its two outputs after)
+ * and write them with the setup tables to "<app root>pbdump.bin", then the
+ * 16 MiB ARAM image to "<app root>pbaram.bin", for an offline replay of the
+ * subframe-seam steps found in pcmcap (2026-10-28). Host (big-endian) order. */
+struct PbSetup {
+	u32 nvoices;
+	const u8* voices;
+	const u32* res;
+	const u32* adpcm;
+	const u8* fx;
+};
+PbSetup s_pb;
+const u32 kPbStart = 12000, kPbCount = 140;
+int s_pbState = -1; // -1 unchecked, 0 off/done, 1 armed
+u8* s_pbBuf;
+u32 s_pbRec, s_pbSize, s_pbDone;
+
+void pbdump_write()
+{
+	char path[256];
+	std::snprintf(path, sizeof path, "%spbdump.bin", sms_wiiu_app_root());
+	if (FILE* f = std::fopen(path, "wb")) {
+		const u32 hdr[6] = {0x50424431u /* PBD1 */, s_pb.nvoices, g.subSamples, s_pbDone, s_pbRec, 0};
+		std::fwrite(hdr, 4, 6, f);
+		std::fwrite(s_pb.res, 4, 320, f);
+		std::fwrite(s_pb.adpcm, 4, 16, f);
+		std::fwrite(s_pbBuf, s_pbRec, s_pbDone, f);
+		std::fclose(f);
+	}
+	std::snprintf(path, sizeof path, "%spbaram.bin", sms_wiiu_app_root());
+	if (FILE* f = std::fopen(path, "wb")) {
+		std::fwrite(port_aram_ptr(0), 1, 16u << 20, f);
+		std::fclose(f);
+	}
+	port_log("[audio] pbdump: wrote %u subframes (%u bytes each) and the ARAM image\n", (unsigned)s_pbDone,
+	         (unsigned)s_pbRec);
+}
+
+// Record layout: u16 master, u16 n, voices (nvoices * 0x180), FX (4 * 0x20), outA[n], outB[n].
+u8* pbdump_before(u32 n)
+{
+	if (s_pbState < 0) {
+		s_pbState = sms_wiiu_sd_marker("pbdump") != 0 && s_pb.voices;
+		if (s_pbState) {
+			s_pbRec  = 4 + s_pb.nvoices * 0x180 + 4 * 0x20 + 2 * n * 2;
+			s_pbBuf  = static_cast<u8*>(std::malloc(s_pbRec * kPbCount));
+			s_pbState = s_pbBuf != nullptr;
+			port_log("[audio] SD marker pbdump: %u subframes from subframe %u (%s)\n", (unsigned)kPbCount,
+			         (unsigned)kPbStart, s_pbBuf ? "armed" : "allocation failed");
+		}
+	}
+	if (s_pbState != 1 || g.subframesRendered < kPbStart || s_pbDone >= kPbCount)
+		return nullptr;
+	u8* r = s_pbBuf + s_pbDone * s_pbRec;
+	const u16 head[2] = {g.master, (u16)n};
+	std::memcpy(r, head, 4);
+	std::memcpy(r + 4, s_pb.voices, s_pb.nvoices * 0x180);
+	std::memcpy(r + 4 + s_pb.nvoices * 0x180, s_pb.fx, 4 * 0x20);
+	return r + 4 + s_pb.nvoices * 0x180 + 4 * 0x20;
+}
+
+void pbdump_after(u8* out, const int16_t* a, const int16_t* b, u32 n)
+{
+	if (!out)
+		return;
+	std::memcpy(out, a, n * 2);
+	std::memcpy(out + n * 2, b, n * 2);
+	if (++s_pbDone == kPbCount) {
+		pbdump_write();
+		s_pbState = 0;
+	}
+}
+#endif
+
 void render_subframe()
 {
 	maybe_dump_aram();
@@ -392,7 +470,15 @@ void render_subframe()
 		std::memset(g.outB + g.sub * n, 0, n * sizeof(int16_t));
 	} else
 #endif
-	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+	{
+#ifdef TARGET_WIIU
+		u8* pbOut = pbdump_before(n);
+#endif
+		port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+#ifdef TARGET_WIIU
+		pbdump_after(pbOut, g.outA + g.sub * n, g.outB + g.sub * n, n);
+#endif
+	}
 	g.sub++;
 	g.subframesRendered++;
 #ifdef TARGET_WIIU
@@ -457,6 +543,14 @@ void execute(bool fromWorker)
 	case 0x81: // DsetupTable(n, CH_BUF, DSPRES_FILTER, DSPADPCM_FILTER, FX_BUF)
 		if (w.size() >= 5) {
 			port_dspmix_set_aram(aram_lookup);
+#ifdef TARGET_WIIU
+			if (sms_wiiu_sd_marker("nofx")) {
+				setenv("SMS_AUDIO_FX", "0", 1);
+				port_log("[audio] SD marker nofx: FX lines off\n");
+			}
+			s_pb = {w[0] & 0xFFFF, (const u8*)(uintptr_t)w[1], (const u32*)(uintptr_t)w[2], (const u32*)(uintptr_t)w[3],
+			        (const u8*)(uintptr_t)w[4]};
+#endif
 			port_dspmix_setup(w[0] & 0xFFFF, (void*)(uintptr_t)w[1], (const uint32_t*)(uintptr_t)w[2],
 			                  (const uint32_t*)(uintptr_t)w[3], (void*)(uintptr_t)w[4]);
 #ifdef TARGET_WIIU

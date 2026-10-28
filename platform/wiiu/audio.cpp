@@ -32,6 +32,8 @@
 #include <dolphin/os.h>
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 extern "C" int port_audio_dsp_frame_pending(void);
@@ -94,6 +96,59 @@ struct Ai {
 };
 
 Ai g;
+
+/* SD marker pcmcap: keep the last 15 s of the stream the output gets and write
+ * it to "<app root>pcmcap.raw" (s16 big-endian stereo, 32 kHz) on exit, so the
+ * exact samples can be heard and analysed on a PC. */
+const u32 kCapFrames = kRate * 15;
+int16_t* s_cap;
+u32 s_capPos;
+bool s_capWrapped;
+int s_capOn = -1;
+
+void capture(const int16_t* mix, u32 frames)
+{
+	if (s_capOn < 0) {
+		s_capOn = sms_wiiu_sd_marker("pcmcap") != 0;
+		if (s_capOn) {
+			s_cap = static_cast<int16_t*>(std::malloc(kCapFrames * 4));
+			s_capOn = s_cap != nullptr;
+			port_log("[audio] SD marker pcmcap: keeping the last %u s of output (%s)\n", (unsigned)(kCapFrames / kRate),
+			         s_cap ? "ok" : "allocation failed");
+		}
+	}
+	if (!s_capOn)
+		return;
+	for (u32 i = 0; i < frames; i++) {
+		s_cap[s_capPos * 2]     = mix[i * 2];
+		s_cap[s_capPos * 2 + 1] = mix[i * 2 + 1];
+		if (++s_capPos == kCapFrames) {
+			s_capPos     = 0;
+			s_capWrapped = true;
+		}
+	}
+}
+
+void write_capture()
+{
+	if (s_capOn <= 0)
+		return;
+	char path[256];
+	std::snprintf(path, sizeof path, "%spcmcap.raw", sms_wiiu_app_root());
+	FILE* f = std::fopen(path, "wb");
+	if (!f) {
+		port_log("[audio] pcmcap: cannot open %s\n", path);
+		return;
+	}
+	u32 frames = s_capPos;
+	if (s_capWrapped) {
+		std::fwrite(s_cap + s_capPos * 2, 4, kCapFrames - s_capPos, f);
+		frames = kCapFrames;
+	}
+	std::fwrite(s_cap, 4, s_capPos, f);
+	std::fclose(f);
+	port_log("[audio] pcmcap: wrote %u frames to %s\n", (unsigned)frames, path);
+}
 OSThread s_pacer;
 u8 s_pacer_stack[0x10000] __attribute__((aligned(32)));
 int16_t s_mix[kBlockFrames * 2] __attribute__((aligned(32)));
@@ -122,6 +177,7 @@ void dma_block()
 				g.peak = a;
 		}
 		g.samples += frames * 2;
+		capture(s_mix, frames);
 		sms_wiiu_sdl_audio_queue(s_mix, frames * 4);
 		g.fed = true;
 	}
@@ -336,6 +392,8 @@ extern "C" void sms_wiiu_audio_shutdown(void)
 			sms_wiiu_sdl_audio_close();
 		}
 		port_log("[audio] shut down (pacer %s)\n", g.stopped ? "stopped, SDL closed" : "did not stop; SDL left open");
+		if (g.stopped)
+			write_capture();
 	}
 	port_audio_dsp_shutdown();
 }
