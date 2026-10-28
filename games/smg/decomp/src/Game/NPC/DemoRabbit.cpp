@@ -148,9 +148,12 @@ void DemoRabbit::updateStopVelocity() {
     MR::reboundVelocityFromCollision(this);
 
     TVec3f normal;
-    MR::getFirstPolyNormalOnLineToMap(&normal, mPosition, mGravity * 10.0f, nullptr, nullptr);
-    MR::vecKillElement(mVelocity, normal, &normal);
-    mVelocity.sub(normal);
+    // Port deviation: a missed query leaves normal uninitialized on GC too;
+    // only apply the kill when the port actually returned a polygon normal.
+    if (MR::getFirstPolyNormalOnLineToMap(&normal, mPosition, mGravity * 10.0f, nullptr, nullptr)) {
+        MR::vecKillElement(mVelocity, normal, &normal);
+        mVelocity.sub(normal);
+    }
 }
 
 void DemoRabbit::updateNormalVelocity() {
