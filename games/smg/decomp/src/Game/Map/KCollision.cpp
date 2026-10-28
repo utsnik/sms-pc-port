@@ -92,7 +92,7 @@ bool KCollisionServer::calcFarthestVertexDistance() {
 }
 
 bool KCollisionServer::isBinaryInitialized(const void* pData) NO_INLINE {
-    return reinterpret_cast< const s32* >(pData)[0] < 0;
+    return reinterpret_cast< const u32* >(pData)[0] >= static_cast< u32 >(reinterpret_cast< uintptr_t >(pData));
 }
 
 KC_PrismData* KCollisionServer::checkPoint(Fxyz* pPoint, f32 param, f32* pDist) {
