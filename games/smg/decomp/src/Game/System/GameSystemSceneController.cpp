@@ -1,6 +1,7 @@
 #include "Game/System/GameSystemSceneController.hpp"
 #ifdef TARGET_WIIU
 #include "port/port.h"
+extern "C" unsigned int sms_wiiu_frame_count();
 #endif
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/NameObj/NameObjHolder.hpp"
@@ -212,7 +213,8 @@ bool GameSystemSceneController::isFirstUpdateSceneNerveNormal() const {
 
 void GameSystemSceneController::startScene() {
 #ifdef TARGET_WIIU
-    port_log("[smg-scene] start scene=%s stage=%s", mCurrSceneControlInfo.mScene, mCurrSceneControlInfo.mStage);
+    port_log("[smg-scene] start scene=%s stage=%s frame=%u", mCurrSceneControlInfo.mScene,
+             mCurrSceneControlInfo.mStage, sms_wiiu_frame_count());
 #endif
     mScene->start();
     GameSystemFunction::restartControllerLeaveWatcher();

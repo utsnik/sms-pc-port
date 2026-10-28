@@ -1,0 +1,16 @@
+# Title: acknowledge the strap and accept the title prompt.
+a@50+2
+a@3480+8,b@3480+8
+# File 1: hold a valid IR position through Galaxy's five-frame hover gate.
+pointer@3600,-0.33,0.33+700
+a@3700+2
+# New-file confirmation.
+pointer@4200,0.34,0.67+700
+a@4300+2
+# Icon selection: Mario.
+pointer@4700,0.0,-0.38+700
+a@4800+2
+# Icon confirmation, then the newly-created file's Play This File action.
+pointer@5100,0.34,0.67+1800
+a@5200+2
+a@5700+2
