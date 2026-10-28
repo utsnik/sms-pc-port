@@ -1,4 +1,4 @@
 [submodule "decomp"]
 	path = decomp
-	url = https://github.com/chasem-dev/sms-english.git
-	branch = main
+	url = https://github.com/utsnik/sms-english.git
+	branch = wiiu-release

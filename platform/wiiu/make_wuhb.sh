@@ -4,7 +4,7 @@
 # (see runtime.cpp), so the .wuhb carries only the RPX and art.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-RPX="${1:-/mnt/buildcache/wiiu-build/sms/sms.rpx}"
+RPX="${1:-$HERE/../../build/wiiu/sms.rpx}"
 OUT="${2:-${RPX%.rpx}.wuhb}"
 STAGE="$(mktemp -d)"; trap 'rm -rf "$STAGE"' EXIT
 cp "$RPX" "$STAGE/root.rpx"; cp "$HERE"/wuhb/*.png "$STAGE/"

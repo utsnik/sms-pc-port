@@ -1,5 +1,5 @@
 CXX ?= c++
-BUILD_DIR ?= /mnt/buildcache/wiiu-build/sms-gx2r/grass
+BUILD_DIR ?= ../../../build/wiiu-tests
 TEST := $(BUILD_DIR)/grass_gpu_math_test
 ORACLE := $(BUILD_DIR)/latte_vs_oracle_test
 SCISSOR := $(BUILD_DIR)/widescreen_scissor_test

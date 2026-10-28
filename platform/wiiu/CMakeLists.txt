@@ -1,4 +1,4 @@
-set(SMS_WIIU_BUILD_DIR "/mnt/buildcache/wiiu-build/sms" CACHE PATH
+set(SMS_WIIU_BUILD_DIR "${PROJECT_SOURCE_DIR}/build/wiiu" CACHE PATH
     "Stage 1 Wii U output directory")
 option(SMS_WIIU_SKIP_INTRO "Skip opening movies in Wii U test builds" ON)
 
