@@ -4192,10 +4192,15 @@ static void setShader(FixedShader& shader, TextureEntry* texture, VertexProgram*
 // else draws into any more; present copies (and scales) the target to the TV
 // and GamePad scan buffers.
 static constexpr bool kNativeRender = true;
-// Render size is a setting: SD marker res1080 -> 1920x1080, res720 ->
-// 1280x720, otherwise 854x480.  The game's 4:3 picture is scaled to the
-// target height and centred.
-static uint32_t kRenderW = 854, kRenderH = 480;
+// Render size is a setting: 1080 lines by default (every timing since
+// 2026-10 ran there, through a res1080 marker left on the test SD); SD markers
+// res720 / res480 pick 1280x720 / 854x480.  The game draws 448 of the 480 GC
+// lines and they fill the TV height, so every size renders 448/480 of its
+// lines (1080 -> 1792x1008): the game picture keeps the pixel count it had
+// when 480 lines were mapped, and present scales the target up to the TV.
+static uint32_t kRenderW = 1920, kRenderH = 1080;
+static uint32_t drawnLines(uint32_t lines) { return (lines * 448u / 480u + 1u) & ~1u; }
+static uint32_t wideWidth(uint32_t lines) { return (lines * 16u / 9u) & ~1u; }
 static GX2ColorBuffer s_renderColour;
 static GX2DepthBuffer s_renderDepth;
 static bool s_renderOwn, s_renderTried;
@@ -4205,14 +4210,18 @@ static void initRenderTarget() {
     s_renderTried = true;
     if (!kNativeRender) return;
     // res900 / res810 (1600x900, 1440x810) are measurement sizes for
-    // fill-bound scenes and win over res1080.
+    // fill-bound scenes.
     if (sdMarkerPresent("res900")) { kRenderW = 1600; kRenderH = 900; }
     else if (sdMarkerPresent("res810")) { kRenderW = 1440; kRenderH = 810; }
-    else if (sdMarkerPresent("res1080")) { kRenderW = 1920; kRenderH = 1080; }
     else if (sdMarkerPresent("res720")) { kRenderW = 1280; kRenderH = 720; }
+    else if (sdMarkerPresent("res480")) { kRenderW = 854; kRenderH = 480; }
     GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
     GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
     if (!tv || !td || !tv->surface.image || !td->surface.image) return;
+    // A 720p (or 480p) TV mode gives WHBGfx a smaller TV buffer to alias.
+    if (kRenderH > tv->surface.height) kRenderH = tv->surface.height;
+    kRenderH = drawnLines(kRenderH);
+    kRenderW = wideWidth(kRenderH);
     s_renderColour = *tv;
     GX2Surface& c = s_renderColour.surface;
     c.width = kRenderW; c.height = kRenderH;
@@ -4260,8 +4269,8 @@ extern "C" void sms_wiiu_gx2_scene_archive(const char* name) {
 static void applySceneRenderSize() {
     if (!s_renderOwn) return;
     uint32_t w = kRenderW, h = kRenderH;
-    const uint32_t want = s_sceneRenderH;
-    if (want && want < kRenderH) { h = want; w = (want * 16 / 9) & ~1u; }
+    const uint32_t want = s_sceneRenderH ? drawnLines(s_sceneRenderH) : 0u;
+    if (want && want < kRenderH) { h = want; w = wideWidth(want); }
     GX2Surface& c = s_renderColour.surface;
     if (c.width == w && c.height == h) return;
     GX2DrawDone();  // the target's memory is about to be laid out again
