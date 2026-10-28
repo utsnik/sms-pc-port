@@ -40,6 +40,7 @@
 #include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
+#include "gx2_vertex_program.h"
 #include "gx2_texture_pack.h"
 #include "../grass_math.h"
 #include "../../src/port_include/sms_wiiu_grass.h"
@@ -358,53 +359,6 @@ struct TevShader {
     uint32_t textureMask;
 };
 
-struct VertexKey {
-    uint32_t layoutVersion;
-    uint32_t outputMode;       // 0: TEV (ten parameters), 1: fixed path
-    uint32_t fixedCoord;
-    uint32_t fixedTextured;
-    uint32_t numChans;
-    uint32_t colorCtrl[2];
-    uint32_t alphaCtrl[2];
-    uint32_t numTexGens;
-    uint32_t texgen[8];
-    uint32_t dualTex;
-    uint32_t postTex[8];
-    uint32_t projectionOrtho;
-};
-static constexpr uint32_t kVertexKeyLayoutVersion = 1;
-
-/*
- * GPU-transform ABI.  The raw stream deliberately uses only formats already
- * exercised by the Cafe/Cemu fetch path: three-component float vectors,
- * float4 colours, float2 texcoords, and float4 matrix-index groups.  Matrix
- * indices are exact integral float values; the vertex program converts them
- * to AR with FLT_TO_INT/MOVA_INT before relative constant-file reads.  Keeping
- * the index groups as float4 is a documented portability fallback for builds
- * whose GX2 headers do not expose an integer byte attribute format.
- *
- *   0: position       float3
- *   12: normal        float3
- *   24: binormal      float3
- *   36: tangent       float3
- *   48: colours       float4, float4 (normalised 0..1)
- *   80: texcoords     eight float2 pairs
- *   144: matrix index 0..11 as three float4 groups
- */
-// The raw GX2 fetch ABI is HostVertex itself: the decoder writes straight
-// into the vertex arena and the fetch unit converts colours (UNORM8) and
-// matrix indices (USCALED8), so no per-vertex CPU packing remains.
-using RawVertex = HostVertex;
-static_assert(sizeof(RawVertex) == 132, "the raw GX2 fetch ABI must stay compact and stable");
-static constexpr uint32_t kRawVertexStride = sizeof(RawVertex);
-static constexpr uint32_t kRawVertexFloats = sizeof(RawVertex) / sizeof(float);
-
-enum RawAttrib : uint32_t {
-    RAW_ATTR_POS = 0, RAW_ATTR_NRM, RAW_ATTR_BIN, RAW_ATTR_TAN,
-    RAW_ATTR_CLR0, RAW_ATTR_CLR1, RAW_ATTR_TEX01, RAW_ATTR_TEX23,
-    RAW_ATTR_TEX45, RAW_ATTR_TEX67, RAW_ATTR_MTX0, RAW_ATTR_MTX1, RAW_ATTR_MTX2,
-    RAW_ATTR_COUNT,
-};
 
 struct VertexProgram {
     VertexKey key;
@@ -423,10 +377,6 @@ struct VertexProgram {
 static const char* s_vertexRejectReason = "unknown";
 static uint32_t s_vertexRejected;
 
-static constexpr uint32_t kXfUniformRegs = 192;
-static constexpr uint32_t kXfUniformFloats = kXfUniformRegs * 4;
-static constexpr uint32_t kVtxLiveBase = kXfUniformRegs;
-static constexpr uint32_t kVtxLiveRegs = 21;
 static float s_xfUniform[kXfUniformFloats];
 static uint32_t s_xfShadow[XF_MEM_WORDS];
 static bool s_xfUniformValid;
@@ -899,7 +849,6 @@ static GrassCpuRegistration* grassBuildCpuRegistration(uint32_t id, uint32_t cou
 // matrices are 3x3 with three-word rows, so they are spread one row per
 // vector (w = 0) to keep a matrix index a plain register offset.
 struct XfUniformSegment { uint32_t source, destination, words, stride; };
-static constexpr uint32_t kXfNormalBase = 64, kXfPostTexBase = 96, kXfLightBase = 160;
 static constexpr XfUniformSegment kXfSegments[] = {
     {0x000,            0, 256, 4}, // raw position/texgen matrix words -> C0..C63
     {0x400, kXfNormalBase,  96, 3}, // normal matrix rows -> C64..C95
@@ -1866,667 +1815,81 @@ struct TevChannel {
     bool clamp;
 };
 
-static void vertexEmit(std::vector<uint64_t>& ops, std::initializer_list<uint64_t> group) {
-    for (uint64_t op : group) ops.push_back(op);
-    if (!ops.empty()) ops.back() |= to_QWORD(to_LE(1ull << 31), 0);
-}
-
-static void vertexEmitDot4(std::vector<uint64_t>& ops, uint32_t dst, uint32_t dstChan,
-                           uint32_t src0, uint32_t src1) {
-    // Keep the result in one component.  The generated shaders use this for
-    // matrix rows and lighting vectors; scalar multiply-adds avoid DOT4's
-    // reduction broadcast clobbering the other components under Cemu's
-    // legacy decompiler.
-    vertexEmit(ops, {ALU_MUL(_R(dst), dstChan, src0, _x, src1, _x)});
-    vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _y, src1, _y, _R(dst), dstChan)});
-    vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _z, src1, _z, _R(dst), dstChan)});
-    vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _w, src1, _w, _R(dst), dstChan)});
-}
-
-static uint32_t vertexInputForRow(uint32_t row) {
-    if (row == 0) return 1; // position
-    if (row == 1) return 2; // normal
-    if (row == 3) return 3; // binormal
-    if (row == 4) return 4; // tangent
-    if (row >= 5) return RAW_ATTR_TEX01 + (row - 5) / 2 + 1; // packed source texcoord pair
-    return 29; // raster colour 0, selected by the caller for row 2
-}
-
-static void vertexCopySource(std::vector<uint64_t>& ops, uint32_t source, uint32_t dst, bool colour) {
-    vertexEmit(ops, {ALU_MOV(_R(dst), _x, _R(source), _x)});
-    vertexEmit(ops, {ALU_MOV(_R(dst), _y, _R(source), _y)});
-    // Geometric rows keep z (texgen form ABC1); the caller forces z = 1 for
-    // form AB11.  w is 1 for every geometric source.
-    vertexEmit(ops, {ALU_MOV(_R(dst), _z, _R(source), _z)});
-    vertexEmit(ops, {ALU_MOV(_R(dst), _w, colour ? _R(source) : ALU_SRC_1, colour ? _w : _x)});
-}
-
-static void vertexCopyTexSource(std::vector<uint64_t>& ops, uint32_t coord, uint32_t dst) {
-    const uint32_t source = RAW_ATTR_TEX01 + coord / 2 + 1;
-    const uint32_t chan = (coord & 1) * 2;
-    vertexEmit(ops, {ALU_MOV(_R(dst), _x, _R(source), chan)});
-    vertexEmit(ops, {ALU_MOV(_R(dst), _y, _R(source), chan + 1)});
-    vertexEmit(ops, {ALU_MOV(_R(dst), _z, ALU_SRC_1, _x)});
-    vertexEmit(ops, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
-}
-
-static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, uint32_t base,
-                                     uint32_t rows = 4);
-
-static void vertexLoadRelativeMatrix(std::vector<uint64_t>& ops, uint32_t indexReg, uint32_t indexChan,
-                                     uint32_t dst, uint32_t base, uint32_t rows = 4) {
-    // Every XF matrix row occupies one uniform vector, so the GX matrix index
-    // is the register offset itself.  Keep the converted index in PV rather
-    // than a GPR: Cemu's legacy decompiler rejects a GPR-held MOVA source.
-    // FLT_TO_INT runs on the transcendental unit, so its no-GPR result is PS.
-    // PV/PS and AR do not survive a clause boundary, and clauses are cut
-    // every 128 slots, so pad with scratch moves to keep this run in one.
-    const size_t run = 3 + rows * 4;
-    while (ops.size() % 128 + run > 128)
-        vertexEmit(ops, {ALU_MOV(_R(57), _x, ALU_SRC_0, _x)});
-    vertexEmit(ops, {ALU_FLT_TO_INT(__, _x, _R(indexReg), indexChan)});
-    vertexEmit(ops, {ALU_MOV(__, _x, ALU_SRC_PS, _x)});
-    vertexEmit(ops, {ALU_MOVA_INT(__, _x, ALU_SRC_PV, _x)});
-    for (uint32_t row = 0; row < rows; ++row)
-        for (uint32_t ch = 0; ch < 4; ++ch)
-            vertexEmit(ops, {ALU_MOV_REL_CONST(_R(dst + row), ch, _GX2_C(base + row), ch)});
-}
-
-static void vertexLoadAbsoluteMatrix(std::vector<uint64_t>& ops, uint32_t dst, uint32_t base,
-                                     uint32_t rows) {
-    for (uint32_t row = 0; row < rows; ++row)
-        for (uint32_t ch = 0; ch < 4; ++ch)
-            vertexEmit(ops, {ALU_MOV(_R(dst + row), ch, _GX2_C(base + row), ch)});
-}
-
-static void vertexMatrixTransform(std::vector<uint64_t>& ops, uint32_t source, uint32_t indexReg,
-                                  uint32_t indexChan, uint32_t dst, uint32_t base, bool relative) {
-    // Rows go to R58..R60, clear of every destination and source the
-    // callers use (texgen writes R55, which used to alias matrix row 2).
-    if (relative) vertexLoadRelativeMatrix(ops, indexReg, indexChan, 58, base, 3);
-    else vertexLoadAbsoluteMatrix(ops, 58, base, 3);
-    for (uint32_t ch = 0; ch < 3; ++ch)
-        vertexEmitDot4(ops, dst, ch, _R(source), _R(58 + ch));
-}
-
-static void vertexNormalTransform(std::vector<uint64_t>& ops) {
-    vertexLoadRelativeMatrix(ops, RAW_ATTR_MTX0 + 1, _x, 53, kXfNormalBase, 3);
-    for (uint32_t ch = 0; ch < 3; ++ch)
-        vertexEmitDot4(ops, 41, ch, _R(2), _R(53 + ch));
-    // Three-component length: R41.w is never written.
-    vertexEmit(ops, {ALU_MUL(_R(45), _x, _R(41), _x, _R(41), _x)});
-    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(41), _y, _R(41), _y, _R(45), _x)});
-    vertexEmit(ops, {ALU_MULADD(_R(45), _x, _R(41), _z, _R(41), _z, _R(45), _x)});
-    vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
-    vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _x, _R(45), _x)});
-    for (uint32_t ch = 0; ch < 3; ++ch) {
-        vertexEmit(ops, {ALU_MUL(_R(41), ch, _R(41), ch, _R(46), _x)});
-        vertexEmit(ops, {ALU_MUL(_R(41), ch, _R(41), ch, _R(47), _x)});
-    }
-    vertexEmit(ops, {ALU_CNDGT(_R(41), _z, _R(47), _x, _R(41), _z, ALU_SRC_1, _x)});
-}
-
-static void vertexEmitLighting(std::vector<uint64_t>& ops, uint32_t ctrl, uint32_t channel,
-                               uint32_t dst, uint32_t first, uint32_t count) {
-    const uint32_t input = 5 + channel;
-    const uint32_t mat = kVtxLiveBase + 5 + channel * 2;
-    const uint32_t amb = mat + 1;
-    // R44 is the material, R43 the accumulated ambient/light sum.  The
-    // light records are four vectors each: Cbase is the decoded RGBA colour,
-    // Cbase+1 is attenuation a.xyz/k.x, Cbase+2 is k.yz/position.xy, and
-    // Cbase+3 is position.z/direction.xyz.
-    for (uint32_t ch = 0; ch < 4; ++ch) {
-        if (ctrl & 1) vertexEmit(ops, {ALU_MOV(_R(44), ch, _R(input), ch)});
-        else vertexEmit(ops, {ALU_MOV(_R(44), ch, _GX2_C(mat), ch)});
-        if (ctrl & 64) vertexEmit(ops, {ALU_MOV(_R(43), ch, _R(input), ch)});
-        else vertexEmit(ops, {ALU_MOV(_R(43), ch, _GX2_C(amb), ch)});
-    }
-    // Mirrors chanColor.  Light record vectors: C(c) = decoded colour,
-    // C(c+1) = (a0, a1, a2, k0), C(c+2) = (k1, k2, pos.x, pos.y),
-    // C(c+3) = (pos.z, dir.x, dir.y, dir.z).  Dots are three-component:
-    // the w lanes of R41/R42 are not defined.
-    // dst.chan = A.xyz . B.(b0, b0+1, b0+2)
-    auto dot3 = [&](uint32_t dst, uint32_t dstChan, uint32_t aReg, uint32_t bSel, uint32_t b0) {
-        vertexEmit(ops, {ALU_MUL(_R(dst), dstChan, _R(aReg), _x, bSel, b0)});
-        vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, _R(aReg), _y, bSel, b0 + 1, _R(dst), dstChan)});
-        vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, _R(aReg), _z, bSel, b0 + 2, _R(dst), dstChan)});
-    };
-    if (!(ctrl & 2)) {
-        // Lighting off: the material alone (no ambient term).
-        for (uint32_t ch = 0; ch < 4; ++ch) vertexEmit(ops, {ALU_MOV(_R(43), ch, ALU_SRC_1, _x)});
-    } else {
-        const uint32_t mask = ((ctrl >> 2) & 15) | (((ctrl >> 11) & 15) << 4);
-        const uint32_t diff = (ctrl >> 7) & 3;
-        const bool atten = (ctrl >> 9) & 1;
-        const bool spot = (ctrl >> 10) & 1;
-        for (uint32_t light = 0; light < 8; ++light) {
-            if (!(mask & (1u << light))) continue;
-            const uint32_t c = kXfLightBase + light * 4;
-            // R42 = light vector (normalised below), R48.x = its length.
-            if (!atten || spot) {
-                vertexEmit(ops, {ALU_ADD(_R(42), _x, _GX2_C(c + 2), _z, _R(40) _NEG, _x)});
-                vertexEmit(ops, {ALU_ADD(_R(42), _y, _GX2_C(c + 2), _w, _R(40) _NEG, _y)});
-                vertexEmit(ops, {ALU_ADD(_R(42), _z, _GX2_C(c + 3), _x, _R(40) _NEG, _z)});
-            } else {
-                vertexEmit(ops, {ALU_MOV(_R(42), _x, _GX2_C(c + 2), _z)});
-                vertexEmit(ops, {ALU_MOV(_R(42), _y, _GX2_C(c + 2), _w)});
-                vertexEmit(ops, {ALU_MOV(_R(42), _z, _GX2_C(c + 3), _x)});
-            }
-            dot3(45, _x, 42, _R(42), _x);                                   // len^2
-            vertexEmit(ops, {ALU_SETGT(_R(47), _x, _R(45), _x, ALU_SRC_0, _x)});
-            vertexEmit(ops, {ALU_RECIPSQRT_IEEE(_R(46), _y, _R(45), _x)});   // 1/len
-            vertexEmit(ops, {ALU_MUL(_R(46), _y, _R(46), _y, _R(47), _x)});  // 0 when len == 0
-            vertexEmit(ops, {ALU_MUL(_R(48), _x, _R(45), _x, _R(46), _y)});  // len
-            for (uint32_t ch = 0; ch < 3; ++ch)
-                vertexEmit(ops, {ALU_MUL(_R(42), ch, _R(42), ch, _R(46), _y)});
-
-            if (atten) {
-                // R45.y = attenuation variable (cos for spot, t for specular),
-                // R48.y = distance variable (len for spot, t for specular).
-                if (spot) {
-                    dot3(45, _y, 42, _GX2_C(c + 3), _y);
-                    vertexEmit(ops, {ALU_MAX(_R(45), _y, _R(45), _y, ALU_SRC_0, _x)});
-                    vertexEmit(ops, {ALU_MOV(_R(48), _y, _R(48), _x)});
-                } else {
-                    dot3(45, _z, 41, _R(42), _x);                           // n . l
-                    vertexEmit(ops, {ALU_SETGT(_R(47), _z, _R(45), _z, ALU_SRC_0, _x)});
-                    dot3(45, _y, 41, _GX2_C(c + 3), _y);                    // n . dir
-                    vertexEmit(ops, {ALU_MAX(_R(45), _y, _R(45), _y, ALU_SRC_0, _x)});
-                    vertexEmit(ops, {ALU_MUL(_R(45), _y, _R(45), _y, _R(47), _z)});
-                    vertexEmit(ops, {ALU_MOV(_R(48), _y, _R(45), _y)});
-                }
-                // num = max(a0 + a1 v + a2 v^2, 0)
-                vertexEmit(ops, {ALU_MULADD(_R(46), _x, _GX2_C(c + 1), _z, _R(45), _y, _GX2_C(c + 1), _y)});
-                vertexEmit(ops, {ALU_MULADD(_R(46), _x, _R(46), _x, _R(45), _y, _GX2_C(c + 1), _x)});
-                vertexEmit(ops, {ALU_MAX(_R(46), _x, _R(46), _x, ALU_SRC_0, _x)});
-                // den = k0 + k1 d + k2 d^2; a non-positive denominator gives no light
-                vertexEmit(ops, {ALU_MULADD(_R(46), _z, _GX2_C(c + 2), _y, _R(48), _y, _GX2_C(c + 2), _x)});
-                vertexEmit(ops, {ALU_MULADD(_R(46), _z, _R(46), _z, _R(48), _y, _GX2_C(c + 1), _w)});
-                vertexEmit(ops, {ALU_SETGT(_R(47), _y, _R(46), _z, ALU_SRC_0, _x)});
-                vertexEmit(ops, {ALU_RECIP_IEEE(_R(46), _z, _R(46), _z)});
-                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(46), _z)});
-                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(47), _y)});
-            } else {
-                vertexEmit(ops, {ALU_MOV(_R(46), _x, ALU_SRC_1, _x)});
-            }
-            if (diff != 0) {
-                dot3(45, _x, 41, _R(42), _x);
-                if (diff >= 2) vertexEmit(ops, {ALU_MAX(_R(45), _x, _R(45), _x, ALU_SRC_0, _x)});
-                vertexEmit(ops, {ALU_MUL(_R(46), _x, _R(46), _x, _R(45), _x)});
-            }
-            for (uint32_t ch = 0; ch < 4; ++ch)
-                vertexEmit(ops, {ALU_MULADD(_R(43), ch, _R(46), _x, _GX2_C(c), ch, _R(43), ch)});
-        }
-    }
-    for (uint32_t ch = first; ch < first + count; ++ch) {
-        vertexEmit(ops, {ALU_MAX(_R(43), ch, _R(43), ch, ALU_SRC_0, _x)});
-        vertexEmit(ops, {ALU_MIN(_R(43), ch, _R(43), ch, ALU_SRC_1, _x)});
-        vertexEmit(ops, {ALU_MUL(_R(dst), ch, _R(44), ch, _R(43), ch)});
-    }
-}
-
-static void vertexEmitColour(std::vector<uint64_t>& ops, const VertexKey& key, uint32_t channel, uint32_t dst) {
-    if (channel >= key.numChans) {
-        for (uint32_t ch = 0; ch < 4; ++ch) vertexEmit(ops, {ALU_MOV(_R(dst), ch, ALU_SRC_0, _x)});
-        return;
-    }
-    const uint32_t ctrl = key.colorCtrl[channel];
-    const uint32_t alphaCtrl = key.alphaCtrl[channel];
-    if (ctrl == alphaCtrl) {
-        vertexEmitLighting(ops, ctrl, channel, dst, 0, 4);
-    } else {
-        vertexEmitLighting(ops, ctrl, channel, dst, 0, 3);
-        vertexEmitLighting(ops, alphaCtrl, channel, dst, 3, 1);
-    }
-}
-
-static bool vertexKeySupported(const VertexKey& key) {
-    if (key.numTexGens > 8 || key.fixedCoord > 7 || key.fixedTextured > 1) return false;
-    return true;
-}
-
 static bool runningUnderCemu();
 static bool s_vertexOneClause;
 static bool s_vertexNameXf;
 static bool s_vertexOneXf;
 
-struct VertexAluGroup {
-    size_t begin;
-    size_t end;
-    bool readsPvPs;
-};
 
-struct VertexAluClause {
-    size_t offset;
-    size_t count;
-};
-
-static bool vertexAluPvPs(uint32_t sel) {
-    return sel == ALU_SRC_PV || sel == ALU_SRC_PS;
-}
-
-static bool vertexAluReadsPvPs(uint64_t op) {
-    const uint32_t word0 = __builtin_bswap32(uint32_t(op >> 32));
-    const uint32_t word1 = __builtin_bswap32(uint32_t(op));
-    if (vertexAluPvPs(word0 & 0x1ff) || vertexAluPvPs((word0 >> 13) & 0x1ff))
-        return true;
-    // OP3 puts its third source in word1.  OP2 uses these bits for the
-    // instruction flags, so only inspect them when the OP3 encoding field is
-    // nonzero.
-    return ((word1 >> 15) & 7) != 0 && vertexAluPvPs(word1 & 0x1ff);
-}
-
-// AR (set by MOVA) does not survive a clause boundary either, so a group that
-// addresses a source or destination relatively must stay with the MOVA that
-// precedes it.
-static bool vertexAluUsesAr(uint64_t op) {
-    const uint32_t word0 = __builtin_bswap32(uint32_t(op >> 32));
-    const uint32_t word1 = __builtin_bswap32(uint32_t(op));
-    if (((word0 >> 9) & 1) || ((word0 >> 22) & 1) || ((word1 >> 28) & 1))
-        return true;
-    return ((word1 >> 15) & 7) != 0 && ((word1 >> 9) & 1);
-}
-
-static bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
-                                  std::vector<VertexAluClause>& clauses) {
-    const uint64_t aluLast = to_QWORD(to_LE(1ull << 31), 0);
-    std::vector<VertexAluGroup> groups;
-    for (size_t begin = 0; begin < alu.size();) {
-        bool readsPvPs = false, hasLiteral = false, ended = false;
-        size_t end = begin;
-        while (end < alu.size()) {
-            readsPvPs = readsPvPs || vertexAluReadsPvPs(alu[end]) || vertexAluUsesAr(alu[end]);
-            const uint32_t word0 = __builtin_bswap32(uint32_t(alu[end] >> 32));
-            const uint32_t word1 = __builtin_bswap32(uint32_t(alu[end]));
-            hasLiteral = hasLiteral || ((word0 & 0x1ff) == ALU_SRC_LITERAL) ||
-                         (((word0 >> 13) & 0x1ff) == ALU_SRC_LITERAL);
-            hasLiteral = hasLiteral || (((word1 >> 15) & 7) != 0 &&
-                                        (word1 & 0x1ff) == ALU_SRC_LITERAL);
-            ended = (alu[end] & aluLast) != 0;
-            ++end;
-            if (ended) break;
-        }
-        if (!ended) return false;
-        // A literal is a slot belonging to the group, immediately following
-        // its LAST-marked instruction.  Vertex programs currently do not emit
-        // literals, but keep the splitter correct if one is added later.
-        if (hasLiteral) {
-            if (end == alu.size()) return false;
-            ++end;
-        }
-        groups.push_back({begin, end, readsPvPs});
-        begin = end;
+static GX2AttribFormat latteAttribFormat(uint32_t kind) {
+    switch (kind) {
+    case kLatteAttribFloat32x2: return GX2_ATTRIB_FORMAT_FLOAT_32_32;
+    case kLatteAttribFloat32x3: return GX2_ATTRIB_FORMAT_FLOAT_32_32_32;
+    case kLatteAttribUnorm8x4: return GX2_ATTRIB_FORMAT_UNORM_8_8_8_8;
+    case kLatteAttribUscaled8x4: return GX2AttribFormat(GX2_ATTRIB_FLAG_SCALED | GX2_ATTRIB_TYPE_8_8_8_8);
+    default: return GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
     }
-    if (groups.empty()) return false;
-
-    // A boundary before a PV/PS reader (or an AR user) would discard the
-    // producer's value.
-    // Turn each such adjacency into an indivisible component, then pack whole
-    // components.  This also naturally keeps every boundary at a LAST bit.
-    std::vector<std::pair<size_t, size_t>> components;
-    size_t componentBegin = 0;
-    for (size_t i = 1; i < groups.size(); ++i) {
-        if (groups[i].readsPvPs) continue;
-        components.push_back({componentBegin, i});
-        componentBegin = i;
-    }
-    components.push_back({componentBegin, groups.size()});
-
-    std::vector<uint64_t> rebuilt;
-    rebuilt.reserve(alu.size() + components.size());
-    clauses.clear();
-    size_t clauseBegin = 0, clauseCount = 0;
-    for (const auto& component : components) {
-        const size_t first = component.first, last = component.second;
-        const size_t componentSlots = groups[last - 1].end - groups[first].begin;
-        if (componentSlots > 128) return false;
-        if (clauseCount && clauseCount + componentSlots > 128) {
-            clauses.push_back({clauseBegin, clauseCount});
-            clauseBegin = rebuilt.size();
-            clauseCount = 0;
-        }
-        // This is only reachable for a malformed/hand-built program whose
-        // first group itself consumes PV/PS.  Start it with a harmless scratch
-        // group so the reader is never the first group in a clause.
-        if (!clauseCount && groups[first].readsPvPs) {
-            if (componentSlots == 128) return false;
-            vertexEmit(rebuilt, {ALU_MOV(_R(57), _x, ALU_SRC_0, _x)});
-            ++clauseCount;
-        }
-        if (clauseCount + componentSlots > 128) return false;
-        rebuilt.insert(rebuilt.end(), alu.begin() + groups[first].begin,
-                       alu.begin() + groups[last - 1].end);
-        clauseCount += componentSlots;
-    }
-    if (clauseCount) clauses.push_back({clauseBegin, clauseCount});
-    alu.swap(rebuilt);
-    return !clauses.empty();
 }
 
+static void latteToGx2Attrib(const LatteAttrib& in, GX2AttribStream& attr) {
+    attr.location = in.location;
+    attr.buffer = in.buffer;
+    attr.offset = in.offset;
+    attr.format = latteAttribFormat(in.kind);
+    attr.type = GX2_ATTRIB_INDEX_PER_VERTEX;
+    attr.aluDivisor = 0;
+    attr.mask = GX2_COMP_MAP(in.sel[0], in.sel[1], in.sel[2], in.sel[3]);
+    attr.endianSwap = GX2_ENDIAN_SWAP_DEFAULT;
+}
+
+static void latteToGx2Regs(const LatteVertexRegs& in, GX2VertexShader& shader) {
+    shader.regs.sq_pgm_resources_vs = in.sq_pgm_resources_vs;
+    shader.regs.spi_vs_out_config = in.spi_vs_out_config;
+    shader.regs.num_spi_vs_out_id = in.num_spi_vs_out_id;
+    memcpy(shader.regs.spi_vs_out_id, in.spi_vs_out_id, sizeof(shader.regs.spi_vs_out_id));
+    shader.regs.sq_vtx_semantic_clear = in.sq_vtx_semantic_clear;
+    shader.regs.num_sq_vtx_semantic = in.num_sq_vtx_semantic;
+    memcpy(shader.regs.sq_vtx_semantic, in.sq_vtx_semantic, sizeof(shader.regs.sq_vtx_semantic));
+    shader.regs.vgt_vertex_reuse_block_cntl = in.vgt_vertex_reuse_block_cntl;
+    shader.regs.vgt_hos_reuse_depth = in.vgt_hos_reuse_depth;
+}
+
+static_assert(sizeof(((GX2VertexShader*)0)->regs.spi_vs_out_id) == sizeof(((LatteVertexRegs*)0)->spi_vs_out_id),
+              "LatteVertexRegs mirrors GX2VertexShader::regs.spi_vs_out_id");
+static_assert(sizeof(((GX2VertexShader*)0)->regs.sq_vtx_semantic) == sizeof(((LatteVertexRegs*)0)->sq_vtx_semantic),
+              "LatteVertexRegs mirrors GX2VertexShader::regs.sq_vtx_semantic");
+
+// The program words and register/attribute description come from
+// gx2_vertex_program.h (host-tested by platform/wiiu/tests); only the GX2
+// objects are made here.
 static bool initVertexProgram(VertexProgram& shader) {
     s_vertexRejectReason = "unknown";
-    if (!vertexKeySupported(shader.key)) {
-        s_vertexRejectReason = "key-range";
+    LatteVertexImage image;
+    const LatteVertexFlags flags = {runningUnderCemu() || s_vertexNameXf, s_vertexOneXf, s_vertexOneClause};
+    if (!buildGeneratedVertexImage(shader.key, flags, image)) {
+        s_vertexRejectReason = image.reject;
         return false;
     }
-    std::vector<uint64_t> alu;
-    alu.reserve(512);
-    const VertexKey& key = shader.key;
-    // Only the uniform registers a program names statically are valid for
-    // it, so matrices reached through AR read stale values otherwise.  Name
-    // every XF vector under Cemu or when explicitly enabled for hardware.
-    if (runningUnderCemu() || s_vertexNameXf) {
-        for (uint32_t r = 0; r < kXfUniformRegs; ++r)
-            vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
-    } else if (s_vertexOneXf) {
-        vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(0), _x)});
-    }
-
-    // Position: raw position -> the per-vertex model matrix selected through
-    // MOVA/AR-indexed constant reads -> live projection and target mapping.
-    vertexMatrixTransform(alu, 1, RAW_ATTR_MTX0 + 1, _x, 40, 0, true);
-    if (key.projectionOrtho) {
-        vertexEmit(alu, {ALU_MULADD(_R(20), _x, _R(40), _x, _GX2_C(kVtxLiveBase), _x,
-                                    _GX2_C(kVtxLiveBase), _y)});
-        vertexEmit(alu, {ALU_MULADD(_R(20), _y, _R(40), _y, _GX2_C(kVtxLiveBase), _z,
-                                    _GX2_C(kVtxLiveBase), _w)});
-        vertexEmit(alu, {ALU_MULADD(_R(20), _z, _R(40), _z, _GX2_C(kVtxLiveBase + 1), _x,
-                                    _GX2_C(kVtxLiveBase + 1), _y)});
-        vertexEmit(alu, {ALU_MOV(_R(20), _w, ALU_SRC_1, _x)});
-    } else {
-        vertexEmit(alu, {ALU_MUL(_R(20), _x, _R(40), _x, _GX2_C(kVtxLiveBase), _x)});
-        vertexEmit(alu, {ALU_MULADD(_R(20), _x, _R(40), _z, _GX2_C(kVtxLiveBase), _y,
-                                    _R(20), _x)});
-        vertexEmit(alu, {ALU_MUL(_R(20), _y, _R(40), _y, _GX2_C(kVtxLiveBase), _z)});
-        vertexEmit(alu, {ALU_MULADD(_R(20), _y, _R(40), _z, _GX2_C(kVtxLiveBase), _w,
-                                    _R(20), _y)});
-        vertexEmit(alu, {ALU_MULADD(_R(20), _z, _R(40), _z, _GX2_C(kVtxLiveBase + 1), _x,
-                                    _GX2_C(kVtxLiveBase + 1), _y)});
-        vertexEmit(alu, {ALU_ADD(_R(20), _w, ALU_SRC_0, _x, _R(40) _NEG, _z)});
-    }
-    // viewport -> TV clip coordinates. C186 is the six-value viewport block;
-    // C187.x/y/z/w are game scale, game X, and TV dimensions. Keep this
-    // algebra identical to transformPosition: the generated path must land
-    // in the same 640x480 letterboxed rectangle as the CPU reference.
-    vertexEmit(alu, {ALU_MUL(_R(54), _x, _GX2_C(kVtxLiveBase + 2), _z,
-                             _GX2_C(kVtxLiveBase + 3), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(54), _x, _R(54), _x, ALU_SRC_0_5, _x)});
-    vertexEmit(alu, {ALU_MUL(_R(54), _y, _GX2_C(kVtxLiveBase + 2), _w,
-                             _GX2_C(kVtxLiveBase + 3), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(54), _y, _R(54), _y, ALU_SRC_0_5, _x)});
-    vertexEmit(alu, {ALU_MULADD(_R(55), _x, _GX2_C(kVtxLiveBase + 2), _x,
-                                _GX2_C(kVtxLiveBase + 3), _x,
-                                _R(54), _x)});
-    vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _GX2_C(kVtxLiveBase + 3), _y)});
-    vertexEmit(alu, {ALU_MULADD(_R(55), _y, _GX2_C(kVtxLiveBase + 2), _y,
-                                _GX2_C(kVtxLiveBase + 3), _x,
-                                _R(54), _y)});
-    vertexEmit(alu, {ALU_MUL(_R(55), _x, _R(55), _x, _R(20), _w)});
-    vertexEmit(alu, {ALU_MULADD(_R(55), _x, _R(54), _x, _R(20), _x, _R(55), _x)});
-    vertexEmit(alu, {ALU_MUL(_R(55), _y, _R(55), _y, _R(20), _w)});
-    vertexEmit(alu, {ALU_MULADD(_R(55), _y, _R(54), _y, _R(20) _NEG, _y, _R(55), _y)});
-    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 3), _z)});
-    vertexEmit(alu, {ALU_MUL_x2(_R(55), _x, _R(55), _x, _R(56), _x)});
-    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 3), _w)});
-    vertexEmit(alu, {ALU_MUL_x2(_R(55), _y, _R(55), _y, _R(56), _x)});
-    vertexEmit(alu, {ALU_ADD(_R(20), _x, _R(55), _x, _R(20) _NEG, _w)});
-    vertexEmit(alu, {ALU_ADD(_R(20), _y, _R(20), _w, _R(55) _NEG, _y)});
-    // depth = scale * cz + offset * cw (transformPosition's out[2]).
-    vertexEmit(alu, {ALU_MUL(_R(56), _y, _GX2_C(kVtxLiveBase + 4), _y, _R(20), _w)});
-    vertexEmit(alu, {ALU_MULADD(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _x, _R(20), _z, _R(56), _y)});
-
-#if SMS_GX2_VX_ORACLE == 1
-    // Diagnostic: export the CPU reference clip position, which flushBatch
-    // stores in the raw tex[6..7] slot (R10), instead of the generated one.
-    for (uint32_t ch = 0; ch < 4; ++ch)
-        vertexEmit(alu, {ALU_MOV(_R(20), ch, _R(10), ch)});
-#endif
-
-    if (key.outputMode) {
-        // The fixed pixel programs consume the old five-parameter contract:
-        // PARAM0 is the selected UV and PARAM4 is the vertex colour.  Keep
-        // the other three slots defined so their existing register layout is
-        // unchanged on both Cafe and Cemu.
-        if (key.fixedTextured) vertexCopyTexSource(alu, key.fixedCoord, 21);
-        else {
-            vertexEmit(alu, {ALU_MOV(_R(21), _x, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(21), _y, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(21), _z, ALU_SRC_1, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(21), _w, ALU_SRC_1, _x)});
-        }
-        for (uint32_t reg = 22; reg <= 24; ++reg) {
-            vertexEmit(alu, {ALU_MOV(_R(reg), _x, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(reg), _y, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(reg), _z, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(reg), _w, ALU_SRC_1, _x)});
-        }
-        vertexCopySource(alu, 5, 29, true);
-    } else {
-        bool needsNormal = false;
-        for (uint32_t c = 0; c < 2; ++c)
-            needsNormal = needsNormal || (c < key.numChans &&
-                                          ((key.colorCtrl[c] | key.alphaCtrl[c]) & 2));
-        if (needsNormal) vertexNormalTransform(alu);
-        vertexEmitColour(alu, key, 0, 29);
-        vertexEmitColour(alu, key, 1, 30);
-        const uint32_t matrixIndexBase = RAW_ATTR_MTX0 + 1;
-        for (uint32_t coord = 0; coord < 8; ++coord) {
-        const uint32_t dst = 21 + coord;
-        if (coord >= key.numTexGens) {
-            vertexEmit(alu, {ALU_MOV(_R(dst), _x, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(dst), _y, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(dst), _z, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
-            continue;
-        }
-        const uint32_t tg = key.texgen[coord];
-        const uint32_t type = (tg >> 4) & 7;
-        const uint32_t row = (tg >> 7) & 31;
-        const uint32_t form = (tg >> 2) & 1;
-        if (type == 0) {
-            if (row >= 5) vertexCopyTexSource(alu, row - 5, 52);
-            else {
-                const uint32_t source = row == 2 ? 29 : vertexInputForRow(row);
-                vertexCopySource(alu, source, 52, row == 2);
-            }
-            const uint32_t index = matrixIndexBase + (coord + 1) / 4;
-            const uint32_t indexChan = (coord + 1) & 3;
-            vertexMatrixTransform(alu, 52, index, indexChan, 55, SMS_GX2_VX_ORACLE == 4 ? 60 : 0,
-                                  SMS_GX2_VX_ORACLE != 4);
-            if ((key.dualTex & 1) != 0) {
-                const uint32_t post = key.postTex[coord];
-                if ((post >> 8) & 1) {
-                    vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_0, _x)});
-                    vertexEmitDot4(alu, 56, _x, _R(55), _R(55));
-                    vertexEmit(alu, {ALU_SETGT(_R(56), _y, _R(56), _x, ALU_SRC_0, _x)});
-                    vertexEmit(alu, {ALU_CNDGT(_R(56), _z, _R(56), _y, _R(56), _x, ALU_SRC_1, _x)});
-                    vertexEmit(alu, {ALU_RECIPSQRT_IEEE(_R(56), _x, _R(56), _z)});
-                    for (uint32_t ch = 0; ch < 3; ++ch) {
-                        vertexEmit(alu, {ALU_MUL(_R(55), ch, _R(55), ch, _R(56), _x)});
-                    }
-                    vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
-                }
-                vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
-                // R55 is both input and output: accumulate into R57 first.
-                vertexLoadAbsoluteMatrix(alu, 58, kXfPostTexBase + (post & 63), 3);
-                for (uint32_t ch = 0; ch < 3; ++ch)
-                    vertexEmitDot4(alu, 57, ch, _R(55), _R(58 + ch));
-                for (uint32_t ch = 0; ch < 3; ++ch)
-                    vertexEmit(alu, {ALU_MOV(_R(55), ch, _R(57), ch)});
-            }
-        } else if (type == 1) {
-            const uint32_t emboss = (tg >> 12) & 7;
-            const uint32_t source = 31 + (emboss < coord ? emboss : 0);
-            vertexEmit(alu, {ALU_MOV(_R(55), _x, _R(source), _x)});
-            vertexEmit(alu, {ALU_MOV(_R(55), _y, _R(source), _y)});
-            vertexEmit(alu, {ALU_MOV(_R(55), _z, _R(source), _z)});
-            vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
-        } else {
-            vertexCopySource(alu, type == 3 ? 30 : 29, 55, true);
-        }
-        if (form == 0 && row < 5) {
-            vertexEmit(alu, {ALU_MOV(_R(55), _z, ALU_SRC_1, _x)});
-            vertexEmit(alu, {ALU_MOV(_R(55), _w, ALU_SRC_1, _x)});
-        }
-        if ((tg >> 1) & 1) {
-            // Avoid reciprocal(0), preserving the CPU path's zero divide
-            // guard while keeping the common path branch-free.
-            vertexEmit(alu, {ALU_SETGT(_R(56), _x, _R(55), _z, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_SETGT(_R(56), _y, _R(55) _NEG, _z, ALU_SRC_0, _x)});
-            vertexEmit(alu, {ALU_MAX(_R(56), _x, _R(56), _x, _R(56), _y)});
-            vertexEmit(alu, {ALU_CNDGT(_R(56), _z, _R(56), _x, _R(55), _z, ALU_SRC_1, _x)});
-            vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _R(56), _z)});
-            vertexEmit(alu, {ALU_MUL(_R(55), _x, _R(55), _x, _R(56), _x)});
-            vertexEmit(alu, {ALU_MUL(_R(55), _y, _R(55), _y, _R(56), _x)});
-        }
-        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _x, _R(55), _x)});
-        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _y, _R(55), _y)});
-        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _z, _R(55), _z)});
-        vertexEmit(alu, {ALU_MOV(_R(31 + coord), _w, ALU_SRC_1, _x)});
-        // u = copy.z + (u * manualScale.x) * copy.x, as transformTev and
-        // adjustCopyUv compute it; the scale pair for coord n sits in
-        // live vector 9 + n/2, channels (n&1)*2 and (n&1)*2+1.
-        const uint32_t scale = kVtxLiveBase + 9 + coord / 2;
-        const uint32_t scaleChan = (coord & 1) * 2;
-        const uint32_t copy = kVtxLiveBase + 13 + coord;
-        vertexEmit(alu, {ALU_MUL(_R(56), _x, _R(55), _x, _GX2_C(scale), scaleChan)});
-        vertexEmit(alu, {ALU_MUL(_R(56), _y, _R(55), _y, _GX2_C(scale), scaleChan + 1)});
-        vertexEmit(alu, {ALU_MULADD(_R(dst), _x, _R(56), _x, _GX2_C(copy), _x,
-                                    _GX2_C(copy), _z)});
-        vertexEmit(alu, {ALU_MULADD(_R(dst), _y, _R(56), _y, _GX2_C(copy), _y,
-                                    _GX2_C(copy), _w)});
-        vertexEmit(alu, {ALU_MOV(_R(dst), _z, ALU_SRC_0, _x)});
-        vertexEmit(alu, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
-        }
-    }
-
-#if SMS_GX2_VX_ORACLE == 3
-    // Diagnostic: raw texcoord 0 attribute straight through (identity texmtx).
-    if (!key.outputMode) {
-        vertexEmit(alu, {ALU_MOV(_R(21), _x, _R(7), _x)});
-        vertexEmit(alu, {ALU_MOV(_R(21), _y, _R(7), _y)});
-    }
-#endif
-#if SMS_GX2_VX_ORACLE == 6
-    // Diagnostic: CPU reference colour channels 0/1 (R9/R10) replace the generated ones.
-    if (!key.outputMode)
-        for (uint32_t ch = 0; ch < 4; ++ch) {
-            vertexEmit(alu, {ALU_MOV(_R(29), ch, _R(9), ch)});
-            vertexEmit(alu, {ALU_MOV(_R(30), ch, _R(10), ch)});
-        }
-#endif
-#if SMS_GX2_VX_ORACLE == 2
-    // Diagnostic: CPU reference texcoords 0/1 (R10.xy/zw) replace the generated ones.
-    if (!key.outputMode) {
-        vertexEmit(alu, {ALU_MOV(_R(21), _x, _R(10), _x)});
-        vertexEmit(alu, {ALU_MOV(_R(21), _y, _R(10), _y)});
-        vertexEmit(alu, {ALU_MOV(_R(22), _x, _R(10), _z)});
-        vertexEmit(alu, {ALU_MOV(_R(22), _y, _R(10), _w)});
-    }
-#endif
-    std::vector<VertexAluClause> aluClauses;
-    if (!vertexBuildAluClauses(alu, aluClauses) || alu.size() > 2048) {
-        s_vertexRejectReason = alu.size() > 2048 ? "alu-limit" : "clause-layout";
-        return false;
-    }
-    shader.aluCount = uint32_t(alu.size());
-    const size_t clauses = aluClauses.size();
-    if (!clauses || clauses > 16) {
-        s_vertexRejectReason = "clause-limit";
-        return false;
-    }
-    if (clauses > 1 && s_vertexOneClause) {
-        s_vertexRejectReason = "multi-clause (gpuxf1clause marker)";
-        return false;
-    }
-    // Control flow first, ALU code after it: the CF stream must end in the
-    // END_OF_PROGRAM export, or execution runs on into the ALU words.
-    // The first export keeps its barrier: it reads GPRs the ALU clauses just
-    // wrote, and without one Latte may start it before they retire (Cemu runs
-    // CF in order, so only hardware shows the stale positions).  Later exports
-    // follow it and need none, as in initTevVertex.
-    std::vector<uint64_t> exports;
-    exports.push_back(EXP_DONE(POS0, _R(20), _x, _y, _z, _w));
-    if (key.outputMode) {
-        for (uint32_t i = 0; i < 4; ++i)
-            exports.push_back(EXP(PARAM(i), _R(21 + i), _x, _y, _z, _w) NO_BARRIER);
-        exports.push_back(EXP_DONE(PARAM(4), _R(29), _x, _y, _z, _w) END_OF_PROGRAM);
-    } else {
-        for (uint32_t coord = 0; coord < 8; ++coord)
-            exports.push_back(EXP(PARAM(coord), _R(21 + coord), _x, _y, _z, _w) NO_BARRIER);
-        exports.push_back(EXP(PARAM(8), _R(29), _x, _y, _z, _w) NO_BARRIER);
-        exports.push_back(EXP_DONE(PARAM(9), _R(30), _x, _y, _z, _w) END_OF_PROGRAM);
-    }
-    const size_t cfCount = 1 + clauses + exports.size();
-    const size_t aluOffset = (cfCount + 1) & ~size_t(1);
-    std::vector<uint64_t> program(aluOffset, 0);
-    program[0] = CALL_FS NO_BARRIER;
-    for (size_t clause = 0; clause < clauses; ++clause)
-        program[1 + clause] = ALU(aluOffset + aluClauses[clause].offset,
-                                  aluClauses[clause].count);
-    for (size_t i = 0; i < exports.size(); ++i) program[1 + clauses + i] = exports[i];
-    program.insert(program.end(), alu.begin(), alu.end());
-    const size_t bytes = program.size() * sizeof(uint64_t);
+    shader.aluCount = image.aluCount;
+    const size_t bytes = image.words.size() * sizeof(uint64_t);
     shader.vsProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, bytes);
     if (!shader.vsProgram) {
         s_vertexRejectReason = "vertex-program-allocation";
         return false;
     }
-    memcpy(shader.vsProgram, program.data(), bytes);
+    memcpy(shader.vsProgram, image.words.data(), bytes);
     memset(&shader.vertex, 0, sizeof(shader.vertex));
-    shader.vertex.regs.sq_pgm_resources_vs = 64 | (1u << 8);
-    shader.vertex.regs.spi_vs_out_config = key.outputMode ? (4 << 1) : (9 << 1);
-    shader.vertex.regs.num_spi_vs_out_id = 3;
-    memset(shader.vertex.regs.spi_vs_out_id, 0xff, sizeof(shader.vertex.regs.spi_vs_out_id));
-    shader.vertex.regs.spi_vs_out_id[0] = 0x03020100;
-    shader.vertex.regs.spi_vs_out_id[1] = 0x07060504;
-    // Keep the fixed path's export map identical to the packed shader that
-    // the legacy path binds. Cemu rejects the fixed pixel shader when the
-    // unused slots are advertised as absent rather than as its ABI's 0x0a.
-    shader.vertex.regs.spi_vs_out_id[2] = key.outputMode ? 0xff0a0908 : 0xffff0908;
-    shader.vertex.regs.sq_vtx_semantic_clear = ~((1u << RAW_ATTR_COUNT) - 1);
-    shader.vertex.regs.num_sq_vtx_semantic = RAW_ATTR_COUNT;
-    for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) shader.vertex.regs.sq_vtx_semantic[i] = i;
-    shader.vertex.regs.vgt_vertex_reuse_block_cntl = 14;
-    shader.vertex.regs.vgt_hos_reuse_depth = 16;
+    latteToGx2Regs(image.regs, shader.vertex);
     shader.vertex.size = uint32_t(bytes);
     shader.vertex.program = shader.vsProgram;
     shader.vertex.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
     shader.vertex.attribVarCount = RAW_ATTR_COUNT;
     shader.vertex.attribVars = shader.attribVars;
-
-    const uint32_t offsets[RAW_ATTR_COUNT] = {
-        uint32_t(offsetof(RawVertex, pos)), uint32_t(offsetof(RawVertex, nrm)),
-        uint32_t(offsetof(RawVertex, bin)), uint32_t(offsetof(RawVertex, tan)),
-        uint32_t(offsetof(RawVertex, clr[0])), uint32_t(offsetof(RawVertex, clr[1])),
-        uint32_t(offsetof(RawVertex, tex[0])), uint32_t(offsetof(RawVertex, tex[2])),
-        uint32_t(offsetof(RawVertex, tex[4])), uint32_t(offsetof(RawVertex, tex[6])),
-        uint32_t(offsetof(RawVertex, mtx[0])), uint32_t(offsetof(RawVertex, mtx[4])),
-        uint32_t(offsetof(RawVertex, mtx[8])),
-    };
-    const uint32_t components[RAW_ATTR_COUNT] = {3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4};
-    const bool colourAttr[RAW_ATTR_COUNT] = {false, false, false, false, true, true};
-    const bool indexAttr[RAW_ATTR_COUNT] = {false, false, false, false, false, false,
-                                            false, false, false, false, true, true, true};
     for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) {
         shader.attribVars[i] = {"raw", GX2_SHADER_VAR_TYPE_FLOAT4, 0, i};
-        GX2AttribStream& attr = shader.attrs[i];
-        attr.location = i;
-        attr.buffer = 0;
-        attr.offset = offsets[i];
-        attr.format = colourAttr[i] ? GX2_ATTRIB_FORMAT_UNORM_8_8_8_8 :
-                      indexAttr[i] ? GX2AttribFormat(GX2_ATTRIB_FLAG_SCALED | GX2_ATTRIB_TYPE_8_8_8_8) :
-                      components[i] == 3 ? GX2_ATTRIB_FORMAT_FLOAT_32_32_32 : GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
-        attr.type = GX2_ATTRIB_INDEX_PER_VERTEX;
-        attr.aluDivisor = 0;
-        // Positions are fetched as three floats; w must read as 1 so the
-        // dot4 with a matrix row picks up its translation (a missing
-        // component's SEL_W reads 0).  Normals keep w = 0.
-        attr.mask = GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z,
-                                 i == RAW_ATTR_POS ? GX2_SQ_SEL_1 : GX2_SQ_SEL_W);
-        attr.endianSwap = GX2_ENDIAN_SWAP_DEFAULT;
+        latteToGx2Attrib(image.attribs[i], shader.attrs[i]);
     }
-    shader.stride = kRawVertexStride;
+    shader.stride = image.stride;
     shader.fetch.size = GX2CalcFetchShaderSizeEx(RAW_ATTR_COUNT, GX2_FETCH_SHADER_TESSELLATION_NONE,
                                                    GX2_TESSELLATION_MODE_DISCRETE);
     shader.fetchProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, shader.fetch.size);
@@ -3416,26 +2779,13 @@ static bool initTevPixel(TevShader& shader) {
     TevAlloc& ra = s_ra;
     memset(&ra, 0xff, sizeof(ra));
     bool useCoord[8] = {}, useRas[2] = {}, anyInd = false, anyFb = false;
-    for (uint32_t i = 0; i < numInd; ++i) useCoord[(key.iref >> (6 * i + 3)) & 7] = true;
-    for (uint32_t stage = 0; stage < key.stages; ++stage) {
-        const uint32_t order = key.order[stage], ce = key.colorEnv[stage], ae = key.alphaEnv[stage];
-        if ((order >> 6) & 1) useCoord[(order >> 3) & 7] = true;
+    tevScanInputs(key.stages, key.order, key.colorEnv, key.alphaEnv, numInd, key.iref, useCoord, useRas);
+    for (uint32_t stage = 0; stage < key.stages; ++stage)
         if (indStage(stage)) { anyInd = true; if ((key.ind[stage] >> 20) & 1) anyFb = true; }
-        const uint32_t chan = (order >> 7) & 7;
-        const uint32_t cs[4] = {(ce >> 12) & 15, (ce >> 8) & 15, (ce >> 4) & 15, ce & 15};
-        const uint32_t as[4] = {(ae >> 13) & 7, (ae >> 10) & 7, (ae >> 7) & 7, (ae >> 4) & 7};
-        for (int i = 0; i < 4; ++i) {
-            if (cs[i] == 10 || cs[i] == 11 || as[i] == 5) { if (chan <= 1) useRas[chan] = true; }
-        }
-    }
-    uint32_t next = 0;
-    ra.inputs = 0;
-    for (uint32_t c = 0; c < 8; ++c)
-        if (useCoord[c]) { ra.coord[c] = next; ra.semantic[next++] = c; }
-    for (uint32_t c = 0; c < 2; ++c)
-        if (useRas[c]) { ra.ras[c] = next; ra.semantic[next++] = 8 + c; }
+    // Imported semantics (host-tested in platform/wiiu/tests): coord n -> n,
+    // colour channel c -> 8 + c, at least one input.
+    uint32_t next = tevImportSemantics(useCoord, useRas, ra.semantic, ra.coord, ra.ras);
     ra.inputs = next;
-    if (!ra.inputs) { ra.semantic[0] = 8; ra.inputs = 1; next = 1; }  // a pixel shader imports at least one value
     for (uint32_t i = 0; i < numInd; ++i) { ra.ind[i] = next++; ra.icoord[i] = next++; }
     // A texture fetch may overwrite its coordinate's GPR when no later fetch
     // and no indirect stage (whose ALU runs after the fetches) reads it.
@@ -5514,51 +4864,27 @@ static bool evalTev(const HostVertex& in, float* rgba, bool* usesTex) {
     return true;
 }
 
+static XfViewInputs xfViewInputs() {
+    XfViewInputs v;
+    v.proj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
+    v.ortho = (g.xfReg[XFR_PROJ + 6] & 1) != 0;
+    v.viewport = g.viewport;
+    v.xfViewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
+    v.xmapA = s_xmap.a;
+    v.xmapB = s_xmap.b;
+    v.xmapClip = s_xmap.clip;
+    v.gameScale = s_gameScale;
+    v.gameX = s_gameX;
+    v.tvW = s_tvW;
+    v.tvH = s_tvH;
+    return v;
+}
+
 static void transformPosition(const HostVertex& in, float* out) {
     const uint32_t matrix = in.mtx[0] & 63;
     const uint32_t addr = matrix * 4;
     const float* m = reinterpret_cast<const float*>(&g.xfMem[addr]);
-    const float x = m[0] * in.pos[0] + m[1] * in.pos[1] + m[2] * in.pos[2] + m[3];
-    const float y = m[4] * in.pos[0] + m[5] * in.pos[1] + m[6] * in.pos[2] + m[7];
-    const float z = m[8] * in.pos[0] + m[9] * in.pos[1] + m[10] * in.pos[2] + m[11];
-    // The game can update projection through display-list XF writes rather
-    // than GXSetProjection(), so g.projection may lag the live registers.
-    // The PC shader reads XF_PROJ directly for this reason.
-    const float* xfProj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
-    const float p1 = xfProj[0], p2 = xfProj[1], p3 = xfProj[2], p4 = xfProj[3],
-                p5 = xfProj[4], p6 = xfProj[5];
-    const bool ortho = (g.xfReg[XFR_PROJ + 6] & 1) != 0;
-    float cx, cy, cz, cw;
-    if (ortho) {  // GX_ORTHOGRAPHIC: {sx, tx, sy, ty, sz, tz, 1}
-        cx = p1 * x + p2;
-        cy = p3 * y + p4;
-        cz = p5 * z + p6;
-        cw = 1.0f;
-    } else {  // GX_PERSPECTIVE == 0
-        cx = p1 * x + p2 * z;
-        cy = p3 * y + p4 * z;
-        cz = p5 * z + p6;
-        cw = -z;
-    }
-    if (fabsf(cw) < 0.00001f) cw = 0.00001f;
-    // Match the PC renderer's XF viewport conversion, then apply the current
-    // draw XMap before mapping the original game rectangle into the TV target.
-    const float viewportCenter = g.viewport[0] + g.viewport[2] * 0.5f;
-    const float mappedCenter = viewportCenter * s_xmap.a + s_xmap.b;
-    const float halfW = g.viewport[2] * 0.5f * s_xmap.a * s_xmap.clip * s_gameScale;
-    const float halfH = g.viewport[3] * 0.5f * s_gameScale;
-    const float centerX = s_gameX + mappedCenter * s_gameScale;
-    const float centerY = g.viewport[1] * s_gameScale + halfH;
-    out[0] = ((centerX * cw + halfW * cx) * (2.0f / s_tvW)) - cw;
-    // GX screen y grows downwards; GX2 clip-space y grows upwards.
-    out[1] = cw - ((centerY * cw - halfH * cy) * (2.0f / s_tvH));
-    // GX's XF viewport writes a 24-bit depth range. GX2's clip-space depth
-    // uses the same positive-w convention as the lus/DKR shader path.
-    float* vp = reinterpret_cast<float*>(&g.xfReg[XFR_VIEWPORT]);
-    // XF viewport: depth * w = (zoffset * w + zscale * z) / 2^24-1, already in
-    // GX2's 0..w clip range (the PC GL path maps the same value to -w..w).
-    out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
-    out[3] = cw;
+    xfTransformPositionMath(m, in.pos, xfViewInputs(), out);
 }
 
 static void transform(const HostVertex& in, float* out, int texCoord, bool textured, TextureEntry* texture) {
@@ -5599,33 +4925,7 @@ static TextureEntry* textureForCoord(const TevKey& key, TextureEntry* const* tex
 
 static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textures) {
     memset(s_vtxLive, 0, sizeof(s_vtxLive));
-    const float* proj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
-    const float* xfViewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
-    memcpy(&s_vtxLive[0], proj, 6 * sizeof(float));
-    s_vtxLive[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
-    // C186 is left/top/width/height in game coordinates.  Map its horizontal
-    // centre and half-width exactly as transformPosition does so the GPU
-    // vertex-program path lands on the same pixels as the CPU path.
-    const float viewportCenter = g.viewport[0] + g.viewport[2] * 0.5f;
-    const float mappedCenter = viewportCenter * s_xmap.a + s_xmap.b;
-    s_vtxLive[8] = mappedCenter - g.viewport[2] * 0.5f * s_xmap.a * s_xmap.clip;
-    s_vtxLive[9] = g.viewport[1];
-    s_vtxLive[10] = g.viewport[2] * s_xmap.a * s_xmap.clip;
-    s_vtxLive[11] = g.viewport[3];
-    // C187 is the viewport mapping block consumed by the generated vertex
-    // program: game scale/X followed by the target dimensions.  Do not leave
-    // the XF viewport's depth pair in front of it; that made the generated
-    // path use z-offset/scale as its 2D scale and sent every vertex offscreen.
-    s_vtxLive[12] = s_gameScale;
-    s_vtxLive[13] = s_gameX;
-    s_vtxLive[14] = s_tvW;
-    s_vtxLive[15] = s_tvH;
-    // C188.xy are depth scale/offset, already divided by the XF 24-bit
-    // depth range.  This keeps the live block self-contained without
-    // spending a constant register on 1 / 16777215.  The generated shader
-    // evaluates C188.x * z + C188.y * w, matching transformPosition.
-    s_vtxLive[16] = xfViewport[2] / 16777215.0f;
-    s_vtxLive[17] = xfViewport[5] / 16777215.0f;
+    xfPackLiveView(xfViewInputs(), s_vtxLive);
     auto colour = [](uint32_t value, float* out) {
         out[0] = float((value >> 24) & 255) / 255.0f;
         out[1] = float((value >> 16) & 255) / 255.0f;
