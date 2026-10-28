@@ -171,6 +171,217 @@ void check(bool ok, const char* what) {
     if (!ok) ++s_failures;
 }
 
+/* ---- Grass: the real grass program vs the CPU loop ----------------------
+ * For every blade of a group built from game-layout arrays, every corner,
+ * both passes and several draw/swing states, the grass program's clip
+ * position and colour must equal, bit for bit, what the generated GPU-XF
+ * program produces for the vertex the CPU loop emits (position from
+ * grassCpuNearVertex/grassCpuFarVertex, colour-table entry by index), and
+ * match the CPU XF path within the generated program's own tolerance. */
+using namespace sms_wiiu_grass;
+
+struct GrassGroupFixture {
+    uint32_t count;
+    std::vector<float> near;     // TVec3<f32>: x, apex y, z
+    std::vector<int16_t> far;    // TVec3<s16>: x, base y, z
+    std::vector<int16_t> apex;   // s16 apex
+    float baseY;
+    std::vector<GrassGpuRecord> nearRecords, farRecords;
+};
+
+void makeGrassGroup(GrassGroupFixture& f, uint32_t count) {
+    // TMapObjGrassGroup::load: near = scale * rand around mPosition, far =
+    // the s16 truncation, apex = s16(mPosition.y + near.y).
+    f.count = count;
+    f.baseY = -37.0f;
+    f.near.resize(count * 3);
+    f.far.resize(count * 3);
+    f.apex.resize(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const float x = rndf(-900.0f, 900.0f), z = rndf(-1500.0f, 300.0f);
+        const float y = rndf(0.0f, 200.0f) + f.baseY + 100.0f;
+        f.near[i * 3 + 0] = x;
+        f.near[i * 3 + 1] = y;
+        f.near[i * 3 + 2] = z;
+        f.far[i * 3 + 0] = int16_t(x);
+        f.far[i * 3 + 1] = int16_t(f.baseY);
+        f.far[i * 3 + 2] = int16_t(z);
+        f.apex[i] = int16_t(f.baseY + y);
+    }
+    f.nearRecords.resize(count * 3);
+    f.farRecords.resize(count * 3);
+    grassExpandGroup(count, f.near.data(), f.far.data(), f.apex.data(), f.baseY,
+                     f.nearRecords.data(), f.farRecords.data());
+}
+
+int s_grassChecked;
+
+bool runGrassCase(const GrassGroupFixture& f, bool ortho, bool far, float drawXf, float drawZf,
+                  const float* swingf, std::string& err) {
+    LatteVertexImage grass, generated;
+    if (!buildGrassVertexImage(ortho, grass)) { err = std::string("grass build: ") + grass.reject; return false; }
+    if (!buildGeneratedVertexImage(grassStateKey(ortho), {false, false, false}, generated)) {
+        err = "generated build";
+        return false;
+    }
+    if (grass.stride != sizeof(GrassGpuRecord)) { err = "grass stride"; return false; }
+    Scene scene;
+    makeScene(scene, ortho, false);
+    // initDrawNear: GX_PNMTX0 holds the view matrix.
+    memcpy(&scene.xfPos[0][0], &scene.xfPos[9][0], 12 * sizeof(float));
+    latte::VsInterpreter vm;
+    loadConstants(vm, scene);
+    // The dynamic values exactly as the renderer receives them: the near pass
+    // gets mDrawVec / unk20, the far pass mDrawVecS16 / unk24 (truncations
+    // the game already made) as floats.
+    GrassNearDynamic nd;
+    GrassFarDynamic fd;
+    nd.drawX = drawXf;
+    nd.drawZ = drawZf;
+    fd.drawX = int16_t(drawXf);
+    fd.drawZ = int16_t(drawZf);
+    float shaderSwing[kGrassSwingSlots];
+    for (uint32_t k = 0; k < kGrassSwingSlots; ++k) {
+        nd.swing[k] = swingf[k];
+        fd.swing[k] = int16_t(swingf[k]);
+        shaderSwing[k] = far ? float(fd.swing[k]) : nd.swing[k];
+    }
+    float block[kGrassUniformRegs * 4];
+    grassPackUniforms(far ? float(fd.drawX) : nd.drawX, far ? float(fd.drawZ) : nd.drawZ, shaderSwing, block);
+    for (uint32_t r = 0; r < kGrassUniformRegs; ++r)
+        vm.setConst(kGrassUniformDrawReg + r, block[r * 4], block[r * 4 + 1], block[r * 4 + 2], block[r * 4 + 3]);
+    if (far && !grassFarFitsS16(grassFarMaxAbs(f.count, f.far.data()), 12.0f, 50.0f)) {
+        err = "fixture outside the s16 guard";
+        return false;
+    }
+    const uint8_t (*table)[4] = nullptr;
+    static const uint8_t colours[2][4] = {{0x3c, 0xc8, 0x3c, 0xff}, {0x28, 0x64, 0x28, 0xff}};
+    table = colours;
+    for (uint32_t i = 0; i < f.count; ++i) {
+        for (GrassCorner c : {kGrassLeft, kGrassCenter, kGrassRight}) {
+            float cpuPos[3];
+            uint8_t colourIndex;
+            if (far) {
+                const GrassFarBlade b = {f.far[i * 3 + 0], f.far[i * 3 + 2], f.far[i * 3 + 1], f.apex[i]};
+                const GrassFarVertex v = grassCpuFarVertex(b, fd, i, c);
+                // GXPosition3s16 with frac 0: the decoder's float position.
+                cpuPos[0] = float(v.x); cpuPos[1] = float(v.y); cpuPos[2] = float(v.z);
+                colourIndex = v.color;
+            } else {
+                const GrassNearBlade b = {f.near[i * 3 + 0], f.near[i * 3 + 2], f.near[i * 3 + 1], f.baseY};
+                const GrassNearVertex v = grassCpuNearVertex(b, nd, i, c);
+                cpuPos[0] = v.x; cpuPos[1] = v.y; cpuPos[2] = v.z;
+                colourIndex = v.color;
+            }
+            const GrassGpuRecord& rec = (far ? f.farRecords : f.nearRecords)[i * 3 + c];
+            latte::VsResult g;
+            if (!vm.run(grass.words, grass.regs, grass.attribs, grass.attribCount,
+                        reinterpret_cast<const uint8_t*>(&rec), g)) {
+                err = "grass program: " + g.error;
+                return false;
+            }
+            HostVertex hv;
+            memset(static_cast<void*>(&hv), 0, sizeof hv);
+            memcpy(hv.pos, cpuPos, sizeof cpuPos);
+            memcpy(hv.clr[0], table[colourIndex], 4);
+            hv.mtx[0] = 0;
+            latte::VsResult ref;
+            if (!vm.run(generated.words, generated.regs, generated.attribs, generated.attribCount,
+                        reinterpret_cast<const uint8_t*>(&hv), ref)) {
+                err = "generated program: " + ref.error;
+                return false;
+            }
+            char buf[400];
+            if (memcmp(g.pos, ref.pos, sizeof g.pos) != 0) {
+                snprintf(buf, sizeof buf, "%s blade %u corner %u: clip (%.9g %.9g %.9g %.9g) != generated (%.9g %.9g %.9g %.9g) for cpu pos (%.9g %.9g %.9g)",
+                         far ? "far" : "near", i, unsigned(c), g.pos[0], g.pos[1], g.pos[2], g.pos[3],
+                         ref.pos[0], ref.pos[1], ref.pos[2], ref.pos[3], cpuPos[0], cpuPos[1], cpuPos[2]);
+                err = buf;
+                return false;
+            }
+            float cpuClip[4];
+            xfTransformPositionMath(&scene.xfPos[0][0], cpuPos, scene.view, cpuClip);
+            for (int k = 0; k < 4; ++k)
+                if (!close(g.pos[k], cpuClip[k], std::fabs(cpuClip[3]) + 1.0f)) {
+                    snprintf(buf, sizeof buf, "%s blade %u corner %u: clip %d %.9g vs CPU XF %.9g",
+                             far ? "far" : "near", i, unsigned(c), k, g.pos[k], cpuClip[k]);
+                    err = buf;
+                    return false;
+                }
+            if (!g.hasSemantic[8] || memcmp(g.semantic[8], ref.semantic[8], sizeof g.semantic[8]) != 0 ||
+                !g.hasSemantic[9] || memcmp(g.semantic[9], ref.semantic[9], sizeof g.semantic[9]) != 0) {
+                snprintf(buf, sizeof buf, "%s blade %u corner %u: colour semantic 8 (%g %g %g %g) != colour-table[%u]",
+                         far ? "far" : "near", i, unsigned(c), g.semantic[8][0], g.semantic[8][1],
+                         g.semantic[8][2], g.semantic[8][3], unsigned(colourIndex));
+                err = buf;
+                return false;
+            }
+            for (uint32_t id = 0; id < 8; ++id)
+                if (!g.hasSemantic[id] || memcmp(g.semantic[id], ref.semantic[id], sizeof g.semantic[id]) != 0) {
+                    err = "texcoord semantic differs from the generated program";
+                    return false;
+                }
+            ++s_grassChecked;
+        }
+    }
+    return true;
+}
+
+void runGrassOracle() {
+    GrassGroupFixture f;
+    makeGrassGroup(f, 137);  // blades 0, 1, 9, 10 ... 136: every swing slot many times
+    struct Dyn { float dx, dz; const char* name; };
+    const Dyn dyns[] = {
+        {11.93f, -1.27f, "positive x / negative z draw vector"},
+        {-8.51f, -8.43f, "negative draw vector"},
+        {-0.4f, 11.99f, "draw vector truncating to zero in x"},
+    };
+    for (int ortho = 0; ortho < 2; ++ortho)
+        for (int far = 0; far < 2; ++far)
+            for (const Dyn& d : dyns) {
+                float swing[kGrassSwingSlots];
+                for (uint32_t k = 0; k < kGrassSwingSlots; ++k)
+                    swing[k] = 50.0f * std::sin(0.7f + 0.2f * float(k) + d.dx);  // distinct, both signs
+                std::string err;
+                const bool ok = runGrassCase(f, ortho != 0, far != 0, d.dx, d.dz, swing, err);
+                char what[200];
+                snprintf(what, sizeof what, "grass %s pass, %s projection, %s: all %u blades x 3 corners",
+                         far ? "far" : "near", ortho ? "orthographic" : "perspective", d.name, f.count);
+                if (!ok) std::printf("  first error: %s\n", err.c_str());
+                check(ok, what);
+            }
+    std::printf("  grass vertices checked against the CPU loop: %d\n", s_grassChecked);
+
+    // Structure: one program serves both passes; float-only (no integer or
+    // AR instructions), the generated TEV export layout and fetch layout.
+    LatteVertexImage persp;
+    buildGrassVertexImage(false, persp);
+    bool floatOnly = true;
+    // The ALU words start at the first ALU clause's address (CF word 1).
+    const size_t aluStart = __builtin_bswap32(uint32_t(persp.words[1] >> 32)) & 0x3fffff;
+    for (size_t i = aluStart; i < persp.words.size(); ++i) {
+        const uint64_t op = persp.words[i];
+        const uint32_t w1 = __builtin_bswap32(uint32_t(op));
+        if (((w1 >> 15) & 7) != 0) continue;  // OP3: MULADD / CNDGT
+        const uint32_t inst = (w1 >> 7) & 0x7ff;
+        if (inst == ALU_OP2_INST_MOVA_INT || inst == ALU_OP2_INST_FLT_TO_INT || inst == ALU_OP2_INST_INT_TO_FLT ||
+            inst == ALU_OP2_INST_ADD_INT || inst == ALU_OP2_INST_MULLO_INT || inst == ALU_OP2_INST_LSHL_INT ||
+            inst == ALU_OP2_INST_LSHR_INT || inst == ALU_OP2_INST_SETGE_INT || inst == ALU_OP2_INST_AND_INT)
+            floatOnly = false;
+    }
+    LatteVertexImage tev;
+    buildGeneratedVertexImage(grassStateKey(false), {false, false, false}, tev);
+    check(floatOnly, "grass program uses no integer or AR instructions");
+    check(persp.regs.spi_vs_out_config == tev.regs.spi_vs_out_config &&
+              !memcmp(persp.regs.spi_vs_out_id, tev.regs.spi_vs_out_id, sizeof persp.regs.spi_vs_out_id) &&
+              persp.regs.sq_pgm_resources_vs == tev.regs.sq_pgm_resources_vs,
+          "grass exports copy the generated TEV vertex shader (count, config, semantic ids)");
+    check(persp.attribCount == 2 && persp.attribs[0].location == 0 && persp.attribs[0].offset == 0 &&
+              persp.attribs[1].location == 1 && persp.attribs[1].offset == offsetof(GrassGpuRecord, drawBiased) &&
+              persp.attribs[1].kind == kLatteAttribUscaled8x4 && persp.regs.num_sq_vtx_semantic == 2,
+          "grass fetch: location 0 = xyz floats, location 1 = unsigned scaled metadata bytes");
+}
+
 } // namespace
 
 int main() {
@@ -252,6 +463,9 @@ int main() {
                   r.semantic[4][1] == float(0xc8) / 255.0f,
               "N5: the five-param fixed layout puts colour on semantic 4 and leaves semantic 8 unwritten");
     }
+
+    // 4. Grass near and far programs against the CPU loop.
+    runGrassOracle();
 
     if (s_failures) {
         std::printf("latte vertex oracle: %d FAILED\n", s_failures);

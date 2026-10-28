@@ -1,5 +1,5 @@
 #include "../grass_math.h"
-#include "../gx2_shader_inl.h"
+#include "../gx2_vertex_program.h"
 
 #include <cmath>
 #include <cstdio>
@@ -41,7 +41,7 @@ static bool equalFar(const GrassFarVertex& a, const GrassFarVertex& b,
 
 static GrassNearRecord nearRecord(const GrassNearBlade& b, uint32_t slot,
                                   GrassCorner corner) {
-    return grassMakeRecord(b.x, b.z, corner == kGrassCenter ? b.apexY : b.baseY,
+    return grassMakeRecord(b.x, corner == kGrassCenter ? b.apexY : b.baseY, b.z,
                            corner == kGrassLeft ? -1 : corner == kGrassRight ? 1 : 0,
                            corner == kGrassCenter ? 1 : 0, slot,
                            corner == kGrassCenter ? 0 : 1);
@@ -49,8 +49,8 @@ static GrassNearRecord nearRecord(const GrassNearBlade& b, uint32_t slot,
 
 static GrassFarRecord farRecord(const GrassFarBlade& b, uint32_t slot,
                                 GrassCorner corner) {
-    return grassMakeRecord(float(b.x), float(b.z),
-                           float(corner == kGrassCenter ? b.apexY : b.baseY),
+    return grassMakeRecord(float(b.x), float(corner == kGrassCenter ? b.apexY : b.baseY),
+                           float(b.z),
                            corner == kGrassLeft ? -1 : corner == kGrassRight ? 1 : 0,
                            corner == kGrassCenter ? 1 : 0, slot,
                            corner == kGrassCenter ? 0 : 1);
@@ -72,13 +72,78 @@ static bool runWireRoundTrip() {
     return true;
 }
 
-static bool runArEncodingCheck() {
-    const uint64_t toPv = ALU_MOV(__, _x, ALU_SRC_PS, _x);
-    const uint64_t mova = ALU_MOVA_INT(__, _x, ALU_SRC_PV, _x);
-    const uint32_t toPvWord = __builtin_bswap32(uint32_t(toPv >> 32));
-    const uint32_t movaWord = __builtin_bswap32(uint32_t(mova));
-    return (toPvWord & 0x1ffu) == (ALU_SRC_PS & 0x1ffu) &&
-           ((movaWord >> 7) & 0xffu) == ALU_OP2_INST_MOVA_INT;
+static bool runNegEncodingCheck() {
+    // `_R(n) _NEG, ch` sets the source negate bit (round 1's `ch _NEG` shifted
+    // it out of the channel field; that form no longer appears anywhere).
+    if (!gx::latteNegEncodingOk()) {
+        std::fprintf(stderr, "_R(n) _NEG, ch does not set the negate bit\n");
+        return false;
+    }
+    return true;
+}
+
+static bool runGameLayoutExpansion() {
+    // The game's arrays: TVec3<f32> (x, apex y, z), TVec3<s16> (x, base y, z),
+    // s16 apex, base y.  Records must follow the CPU loop's vertex order.
+    const uint32_t count = 23;
+    float near[count * 3];
+    int16_t far[count * 3], apex[count];
+    for (uint32_t i = 0; i < count; ++i) {
+        near[i * 3 + 0] = float(i) * 3.5f - 40.0f;
+        near[i * 3 + 1] = 250.0f + float(i);
+        near[i * 3 + 2] = -float(i) * 2.25f + 9.0f;
+        far[i * 3 + 0] = int16_t(near[i * 3 + 0]);
+        far[i * 3 + 1] = int16_t(-60);
+        far[i * 3 + 2] = int16_t(near[i * 3 + 2]);
+        apex[i] = int16_t(-60 + int(near[i * 3 + 1]));
+    }
+    GrassGpuRecord nearRec[count * 3], farRec[count * 3];
+    grassExpandGroup(count, near, far, apex, -60.0f, nearRec, farRec);
+    GrassNearDynamic nd = {-7.5f, 11.25f, {1, -2, 3, -4, 5, -6, 7, -8, 9, -10}};
+    GrassFarDynamic fd = {-7, 11, {1, -2, 3, -4, 5, -6, 7, -8, 9, -10}};
+    for (uint32_t i = 0; i < count; ++i) {
+        const GrassNearBlade nb = {near[i * 3 + 0], near[i * 3 + 2], near[i * 3 + 1], -60.0f};
+        const GrassFarBlade fb = {far[i * 3 + 0], far[i * 3 + 2], far[i * 3 + 1], apex[i]};
+        for (GrassCorner c : {kGrassLeft, kGrassCenter, kGrassRight}) {
+            if (!equalNear(grassCpuNearVertex(nb, nd, i, c), grassShaderNearVertex(nearRec[i * 3 + c], nd), i, c) ||
+                !equalFar(grassCpuFarVertex(fb, fd, i, c), grassShaderFarVertex(farRec[i * 3 + c], fd), i, c))
+                return false;
+        }
+    }
+    return true;
+}
+
+static bool runUniformLayout() {
+    float swing[kGrassSwingSlots];
+    for (uint32_t k = 0; k < kGrassSwingSlots; ++k) swing[k] = float(k) * 10.0f - 45.0f;
+    float block[kGrassUniformRegs * 4];
+    grassPackUniforms(-3.0f, 4.0f, swing, block);
+    if (block[0] != -3.0f || block[1] != 4.0f) return false;
+    for (uint32_t k = 0; k < kGrassSwingSlots; ++k) {
+        // One swing per vector: C[214 + k] = (swing[k], k, 0, 0).
+        const float* v = block + (kGrassUniformSwingReg - kGrassUniformDrawReg + k) * 4;
+        if (v[0] != swing[k] || v[1] != float(k) || v[2] != 0.0f || v[3] != 0.0f) {
+            std::fprintf(stderr, "swing slot %u is not alone in C%u.x\n", k, kGrassUniformSwingReg + k);
+            return false;
+        }
+    }
+    const float* upper = block + (kGrassUniformColourReg - kGrassUniformDrawReg) * 4;
+    for (uint32_t c = 0; c < 4; ++c)
+        if (upper[c] != float(kGrassUpperColor[c]) / 255.0f || upper[4 + c] != float(kGrassLowerColor[c]) / 255.0f)
+            return false;
+    return kGrassUniformDrawReg >= gx::kVtxLiveBase + gx::kVtxLiveRegs;
+}
+
+static bool runS16Guard() {
+    // mWidth 12, mSwingWidth 50: |coordinate| up to 32702 fits, 32703 does not.
+    if (!grassFarFitsS16(32702, 12.0f, 50.0f) || grassFarFitsS16(32703, 12.0f, 50.0f)) return false;
+    const int16_t far[6] = {-32000, 0, 100, 5, 0, -32703};
+    if (grassFarMaxAbs(2, far) != 32703) return false;
+    const int16_t swing[kGrassSwingSlots] = {0, 0, 0, -50, 0, 0, 0, 0, 0, 0};
+    // maxAbs + max(|drawX|, |drawZ|) + max|swing| must stay below 32767.
+    return grassFarDrawFitsS16(32704, 12, 0, swing) && !grassFarDrawFitsS16(32705, 12, 0, swing) &&
+           grassFarDrawFitsS16(32704, 0, -12, swing) && !grassFarDrawFitsS16(32705, 0, -12, swing) &&
+           grassFarDrawFitsS16(32716, 0, 0, swing) && !grassFarDrawFitsS16(32717, 0, 0, swing);
 }
 
 static bool runSamples() {
@@ -156,17 +221,14 @@ static bool runGenerationAndHookSequence() {
 int main() {
     static_assert(sizeof(GrassNearRecord) == 16, "near record ABI changed");
     static_assert(sizeof(GrassFarRecord) == 16, "far record ABI changed");
-    static_assert(offsetof(GrassNearRecord, drawCoefficient) == 12,
+    static_assert(offsetof(GrassNearRecord, drawBiased) == 12,
                   "near packed metadata offset changed");
-    static_assert(offsetof(GrassNearRecord, swingCoefficient) == 13,
-                  "near swing coefficient offset changed");
+    static_assert(offsetof(GrassNearRecord, tip) == 13,
+                  "near tip coefficient offset changed");
     static_assert(offsetof(GrassFarRecord, swingSlot) == 14,
                   "far swing slot offset changed");
     static_assert(kGrassDrawPayloadBytes == 52,
                   "escape payload must carry 12 + 10*4 bytes");
-    static_assert(kGrassUniformDrawOffset == 0 && kGrassUniformModeOffset == 8 &&
-                      kGrassUniformSwingOffset == 16,
-                  "grass dynamic uniform offsets changed");
     if (kGrassUpperColor[0] != 0x3c || kGrassUpperColor[1] != 0xc8 ||
         kGrassUpperColor[2] != 0x3c || kGrassUpperColor[3] != 0xff ||
         kGrassLowerColor[0] != 0x28 || kGrassLowerColor[1] != 0x64 ||
@@ -175,7 +237,8 @@ int main() {
         return 1;
     }
     if (!runSamples() || !runOverflow() || !runGenerationAndHookSequence() ||
-        !runWireRoundTrip() || !runArEncodingCheck()) return 1;
+        !runWireRoundTrip() || !runNegEncodingCheck() || !runGameLayoutExpansion() ||
+        !runUniformLayout() || !runS16Guard()) return 1;
     std::puts("grass GPU math oracle: PASS");
     return 0;
 }

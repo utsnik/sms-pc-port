@@ -11,6 +11,7 @@
 #define SMS_GX2_VERTEX_PROGRAM_H
 
 #include "gx2_shader_inl.h"
+#include "grass_math.h"
 #include "../gx/src/gx_internal.h"
 
 #include <stddef.h>
@@ -460,35 +461,11 @@ static inline bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
     return !clauses.empty();
 }
 
-/* Builds the generated GPU-XF vertex program for `key`.  On failure
- * image.reject names the reason (the renderer logs it). */
-static inline bool buildGeneratedVertexImage(const VertexKey& key, const LatteVertexFlags& flags,
-                                      LatteVertexImage& image) {
-    image.reject = "unknown";
-    image.words.clear();
-    image.aluCount = 0;
-    image.attribCount = 0;
-    image.stride = 0;
-    memset(&image.regs, 0, sizeof(image.regs));
-    if (!vertexKeySupported(key)) {
-        image.reject = "key-range";
-        return false;
-    }
-    std::vector<uint64_t> alu;
-    alu.reserve(512);
-    // Only the uniform registers a program names statically are valid for
-    // it, so matrices reached through AR read stale values otherwise.  Name
-    // every XF vector under Cemu or when explicitly enabled for hardware.
-    if (flags.nameXf) {
-        for (uint32_t r = 0; r < kXfUniformRegs; ++r)
-            vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
-    } else if (flags.oneXf) {
-        vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(0), _x)});
-    }
-
-    // MOVA/AR-indexed constant reads -> live projection and target mapping.
-    vertexMatrixTransform(alu, 1, RAW_ATTR_MTX0 + 1, _x, 40, 0, true);
-    if (key.projectionOrtho) {
+/* View-space R40.xyz -> clip position R20 through the live projection,
+ * viewport and target mapping (C192..C196).  Uses R54..R56 as scratch.
+ * Shared by the generated program and the grass program. */
+static inline void vertexEmitClipTail(std::vector<uint64_t>& alu, bool ortho) {
+    if (ortho) {
         vertexEmit(alu, {ALU_MULADD(_R(20), _x, _R(40), _x, _GX2_C(kVtxLiveBase), _x,
                                     _GX2_C(kVtxLiveBase), _y)});
         vertexEmit(alu, {ALU_MULADD(_R(20), _y, _R(40), _y, _GX2_C(kVtxLiveBase), _z,
@@ -537,6 +514,87 @@ static inline bool buildGeneratedVertexImage(const VertexKey& key, const LatteVe
     // depth = scale * cz + offset * cw (transformPosition's out[2]).
     vertexEmit(alu, {ALU_MUL(_R(56), _y, _GX2_C(kVtxLiveBase + 4), _y, _R(20), _w)});
     vertexEmit(alu, {ALU_MULADD(_R(20), _z, _GX2_C(kVtxLiveBase + 4), _x, _R(20), _z, _R(56), _y)});
+}
+
+/* Exports of the generated programs: POS0 from R20, then outputMode 1's
+ * five-param fixed layout or the TEV layout (PARAM0..7 = texcoords R21..R28,
+ * PARAM8/9 = colour channels R29/R30). */
+static inline void vertexEmitExports(std::vector<uint64_t>& exports, bool fixedLayout) {
+    exports.push_back(EXP_DONE(POS0, _R(20), _x, _y, _z, _w));
+    if (fixedLayout) {
+        for (uint32_t i = 0; i < 4; ++i)
+            exports.push_back(EXP(PARAM(i), _R(21 + i), _x, _y, _z, _w) NO_BARRIER);
+        exports.push_back(EXP_DONE(PARAM(4), _R(29), _x, _y, _z, _w) END_OF_PROGRAM);
+    } else {
+        for (uint32_t coord = 0; coord < 8; ++coord)
+            exports.push_back(EXP(PARAM(coord), _R(21 + coord), _x, _y, _z, _w) NO_BARRIER);
+        exports.push_back(EXP(PARAM(8), _R(29), _x, _y, _z, _w) NO_BARRIER);
+        exports.push_back(EXP_DONE(PARAM(9), _R(30), _x, _y, _z, _w) END_OF_PROGRAM);
+    }
+}
+
+/* The matching export registers (GPR budget, parameter count, semantics). */
+static inline void vertexOutputRegs(LatteVertexRegs& regs, bool fixedLayout) {
+    regs.sq_pgm_resources_vs = 64 | (1u << 8);
+    regs.spi_vs_out_config = fixedLayout ? (4 << 1) : (9 << 1);
+    regs.num_spi_vs_out_id = 3;
+    memset(regs.spi_vs_out_id, 0xff, sizeof(regs.spi_vs_out_id));
+    regs.spi_vs_out_id[0] = 0x03020100;
+    regs.spi_vs_out_id[1] = 0x07060504;
+    // Keep the fixed path's export map identical to the packed shader that
+    // the legacy path binds. Cemu rejects the fixed pixel shader when the
+    // unused slots are advertised as absent rather than as its ABI's 0x0a.
+    regs.spi_vs_out_id[2] = fixedLayout ? 0xff0a0908 : 0xffff0908;
+    regs.vgt_vertex_reuse_block_cntl = 14;
+    regs.vgt_hos_reuse_depth = 16;
+}
+
+/* CF stream (CALL_FS, ALU clauses, exports) followed by the ALU words. */
+static inline void vertexAssembleProgram(const std::vector<uint64_t>& alu,
+                                         const std::vector<VertexAluClause>& aluClauses,
+                                         const std::vector<uint64_t>& exports,
+                                         std::vector<uint64_t>& program) {
+    const size_t clauses = aluClauses.size();
+    const size_t cfCount = 1 + clauses + exports.size();
+    const size_t aluOffset = (cfCount + 1) & ~size_t(1);
+    program.assign(aluOffset, 0);
+    program[0] = CALL_FS NO_BARRIER;
+    for (size_t clause = 0; clause < clauses; ++clause)
+        program[1 + clause] = ALU(aluOffset + aluClauses[clause].offset,
+                                  aluClauses[clause].count);
+    for (size_t i = 0; i < exports.size(); ++i) program[1 + clauses + i] = exports[i];
+    program.insert(program.end(), alu.begin(), alu.end());
+}
+
+/* Builds the generated GPU-XF vertex program for `key`.  On failure
+ * image.reject names the reason (the renderer logs it). */
+static inline bool buildGeneratedVertexImage(const VertexKey& key, const LatteVertexFlags& flags,
+                                      LatteVertexImage& image) {
+    image.reject = "unknown";
+    image.words.clear();
+    image.aluCount = 0;
+    image.attribCount = 0;
+    image.stride = 0;
+    memset(&image.regs, 0, sizeof(image.regs));
+    if (!vertexKeySupported(key)) {
+        image.reject = "key-range";
+        return false;
+    }
+    std::vector<uint64_t> alu;
+    alu.reserve(512);
+    // Only the uniform registers a program names statically are valid for
+    // it, so matrices reached through AR read stale values otherwise.  Name
+    // every XF vector under Cemu or when explicitly enabled for hardware.
+    if (flags.nameXf) {
+        for (uint32_t r = 0; r < kXfUniformRegs; ++r)
+            vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
+    } else if (flags.oneXf) {
+        vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(0), _x)});
+    }
+
+    // MOVA/AR-indexed constant reads -> live projection and target mapping.
+    vertexMatrixTransform(alu, 1, RAW_ATTR_MTX0 + 1, _x, 40, 0, true);
+    vertexEmitClipTail(alu, key.projectionOrtho != 0);
 
 #if SMS_GX2_VX_ORACLE == 1
     // Diagnostic: export the CPU reference clip position, which flushBatch
@@ -709,44 +767,14 @@ static inline bool buildGeneratedVertexImage(const VertexKey& key, const LatteVe
     // CF in order, so only hardware shows the stale positions).  Later exports
     // follow it and need none, as in initTevVertex.
     std::vector<uint64_t> exports;
-    exports.push_back(EXP_DONE(POS0, _R(20), _x, _y, _z, _w));
-    if (key.outputMode) {
-        for (uint32_t i = 0; i < 4; ++i)
-            exports.push_back(EXP(PARAM(i), _R(21 + i), _x, _y, _z, _w) NO_BARRIER);
-        exports.push_back(EXP_DONE(PARAM(4), _R(29), _x, _y, _z, _w) END_OF_PROGRAM);
-    } else {
-        for (uint32_t coord = 0; coord < 8; ++coord)
-            exports.push_back(EXP(PARAM(coord), _R(21 + coord), _x, _y, _z, _w) NO_BARRIER);
-        exports.push_back(EXP(PARAM(8), _R(29), _x, _y, _z, _w) NO_BARRIER);
-        exports.push_back(EXP_DONE(PARAM(9), _R(30), _x, _y, _z, _w) END_OF_PROGRAM);
-    }
-    const size_t cfCount = 1 + clauses + exports.size();
-    const size_t aluOffset = (cfCount + 1) & ~size_t(1);
-    std::vector<uint64_t>& program = image.words;
-    program.assign(aluOffset, 0);
-    program[0] = CALL_FS NO_BARRIER;
-    for (size_t clause = 0; clause < clauses; ++clause)
-        program[1 + clause] = ALU(aluOffset + aluClauses[clause].offset,
-                                  aluClauses[clause].count);
-    for (size_t i = 0; i < exports.size(); ++i) program[1 + clauses + i] = exports[i];
-    program.insert(program.end(), alu.begin(), alu.end());
+    vertexEmitExports(exports, key.outputMode != 0);
+    vertexAssembleProgram(alu, aluClauses, exports, image.words);
 
     LatteVertexRegs& regs = image.regs;
-    regs.sq_pgm_resources_vs = 64 | (1u << 8);
-    regs.spi_vs_out_config = key.outputMode ? (4 << 1) : (9 << 1);
-    regs.num_spi_vs_out_id = 3;
-    memset(regs.spi_vs_out_id, 0xff, sizeof(regs.spi_vs_out_id));
-    regs.spi_vs_out_id[0] = 0x03020100;
-    regs.spi_vs_out_id[1] = 0x07060504;
-    // Keep the fixed path's export map identical to the packed shader that
-    // the legacy path binds. Cemu rejects the fixed pixel shader when the
-    // unused slots are advertised as absent rather than as its ABI's 0x0a.
-    regs.spi_vs_out_id[2] = key.outputMode ? 0xff0a0908 : 0xffff0908;
+    vertexOutputRegs(regs, key.outputMode != 0);
     regs.sq_vtx_semantic_clear = ~((1u << RAW_ATTR_COUNT) - 1);
     regs.num_sq_vtx_semantic = RAW_ATTR_COUNT;
     for (uint32_t i = 0; i < RAW_ATTR_COUNT; ++i) regs.sq_vtx_semantic[i] = i;
-    regs.vgt_vertex_reuse_block_cntl = 14;
-    regs.vgt_hos_reuse_depth = 16;
 
     const uint32_t offsets[RAW_ATTR_COUNT] = {
         uint32_t(offsetof(RawVertex, pos)), uint32_t(offsetof(RawVertex, nrm)),
@@ -779,6 +807,107 @@ static inline bool buildGeneratedVertexImage(const VertexKey& key, const LatteVe
     }
     image.attribCount = RAW_ATTR_COUNT;
     image.stride = kRawVertexStride;
+    return true;
+}
+
+/* Latte negation is a bit in the operand's source select: `_R(n) _NEG, ch`
+ * sets it, while `ch _NEG` pushes it out of the channel field and silently
+ * drops it (round 1's grass shader lost every negation that way). */
+static inline bool latteNegEncodingOk() {
+    const uint64_t neg0 = ALU_ADD(_R(3), _x, _R(2) _NEG, _y, ALU_SRC_1, _x);
+    const uint64_t neg1 = ALU_ADD(_R(3), _x, _R(2), _y, ALU_SRC_1 _NEG, _x);
+    const uint64_t neg2 = ALU_MULADD(_R(3), _x, _R(2), _y, _R(1), _z, _R(4) _NEG, _w);
+    const uint32_t a = __builtin_bswap32(uint32_t(neg0 >> 32));
+    const uint32_t b = __builtin_bswap32(uint32_t(neg1 >> 32));
+    const uint32_t c = __builtin_bswap32(uint32_t(neg2));
+    return ((a >> 12) & 1) && ((a >> 10) & 3) == _y && !((a >> 9) & 1) && (a & 0x1ff) == 2 &&
+           !((a >> 25) & 1) &&
+           ((b >> 25) & 1) && ((b >> 23) & 3) == _x && !((b >> 22) & 1) &&
+           ((b >> 13) & 0x1ff) == ALU_SRC_1 && !((b >> 12) & 1) &&
+           ((c >> 12) & 1) && ((c >> 10) & 3) == _w && !((c >> 9) & 1) && (c & 0x1ff) == 4;
+}
+
+/* Grass program for TMapObjGrassGroup::drawNear/drawFar (one program for
+ * both passes; the far pass is fed integers stored exactly as floats).
+ *
+ * Inputs (fetch location n -> R(n+1), proven on the generated program):
+ *   R1 = record x, y, z, 1
+ *   R2 = (draw coefficient + 1, tip, swing slot, colour index) as floats
+ * Model position = (x + c*drawX + tip*swing[slot], y, z + c*drawZ, 1), all
+ * float: SETE/MULADD/ADD/MOV/CNDGT only, no integer ops, no AR.  Then the
+ * generated program's own PNMTX0 transform and clip tail, and its TEV export
+ * layout: PARAM0..7 texcoords (0, 0, 0, 1), PARAM8 colour (the colour-table
+ * entry, imported by the TEV pixel shader as semantic 8), PARAM9 zero. */
+static inline bool buildGrassVertexImage(bool ortho, LatteVertexImage& image) {
+    image.reject = "unknown";
+    image.words.clear();
+    image.aluCount = 0;
+    image.attribCount = 0;
+    image.stride = 0;
+    memset(&image.regs, 0, sizeof(image.regs));
+    if (!latteNegEncodingOk()) {
+        image.reject = "negation-encoding";
+        return false;
+    }
+    const uint32_t kDraw = sms_wiiu_grass::kGrassUniformDrawReg;
+    const uint32_t kSwing = sms_wiiu_grass::kGrassUniformSwingReg;
+    const uint32_t kColour = sms_wiiu_grass::kGrassUniformColourReg;
+    std::vector<uint64_t> alu;
+    alu.reserve(160);
+    // R3.x = draw coefficient (-1, 0, +1).
+    vertexEmit(alu, {ALU_ADD(_R(3), _x, _R(2), _x, ALU_SRC_1 _NEG, _x)});
+    // R4.x = swing[slot] = sum_k (slot == k) * swing[k]; exactly one term is
+    // nonzero, so the sum is the selected value bit for bit.
+    vertexEmit(alu, {ALU_MOV(_R(4), _x, ALU_SRC_0, _x)});
+    for (uint32_t k = 0; k < sms_wiiu_grass::kGrassSwingSlots; ++k) {
+        vertexEmit(alu, {ALU_SETE(_R(4), _y, _R(2), _z, _GX2_C(kSwing + k), _y)});
+        vertexEmit(alu, {ALU_MULADD(_R(4), _x, _R(4), _y, _GX2_C(kSwing + k), _x, _R(4), _x)});
+    }
+    // R5 = model-space position.
+    vertexEmit(alu, {ALU_MULADD(_R(5), _x, _R(3), _x, _GX2_C(kDraw), _x, _R(1), _x)});
+    vertexEmit(alu, {ALU_MULADD(_R(5), _x, _R(2), _y, _R(4), _x, _R(5), _x)});
+    vertexEmit(alu, {ALU_MOV(_R(5), _y, _R(1), _y)});
+    vertexEmit(alu, {ALU_MULADD(_R(5), _z, _R(3), _x, _GX2_C(kDraw), _y, _R(1), _z)});
+    vertexEmit(alu, {ALU_MOV(_R(5), _w, ALU_SRC_1, _x)});
+    // initDrawNear selects GX_PNMTX0 (C0..C2); the renderer refuses the draw
+    // when the decoder's current position matrix is another one.
+    vertexMatrixTransform(alu, 5, 0, _x, 40, 0, false);
+    vertexEmitClipTail(alu, ortho);
+    for (uint32_t coord = 0; coord < 8; ++coord) {
+        vertexEmit(alu, {ALU_MOV(_R(21 + coord), _x, ALU_SRC_0, _x)});
+        vertexEmit(alu, {ALU_MOV(_R(21 + coord), _y, ALU_SRC_0, _x)});
+        vertexEmit(alu, {ALU_MOV(_R(21 + coord), _z, ALU_SRC_0, _x)});
+        vertexEmit(alu, {ALU_MOV(_R(21 + coord), _w, ALU_SRC_1, _x)});
+    }
+    // Colour index 0 -> C(kColour), 1 -> C(kColour + 1): a select, no math.
+    for (uint32_t ch = 0; ch < 4; ++ch) {
+        vertexEmit(alu, {ALU_MOV(_R(6), ch, _GX2_C(kColour), ch)});
+        vertexEmit(alu, {ALU_CNDGT(_R(29), ch, _R(2), _w, _GX2_C(kColour + 1), ch, _R(6), ch)});
+        vertexEmit(alu, {ALU_MOV(_R(30), ch, ALU_SRC_0, _x)});
+    }
+    std::vector<VertexAluClause> aluClauses;
+    if (!vertexBuildAluClauses(alu, aluClauses) || aluClauses.empty() || aluClauses.size() > 16) {
+        image.reject = "clause-layout";
+        return false;
+    }
+    image.aluCount = uint32_t(alu.size());
+    std::vector<uint64_t> exports;
+    vertexEmitExports(exports, false);
+    vertexAssembleProgram(alu, aluClauses, exports, image.words);
+
+    LatteVertexRegs& regs = image.regs;
+    vertexOutputRegs(regs, false);
+    regs.sq_vtx_semantic_clear = ~((1u << 2) - 1);
+    regs.num_sq_vtx_semantic = 2;
+    regs.sq_vtx_semantic[0] = 0;
+    regs.sq_vtx_semantic[1] = 1;
+
+    image.attribs[0] = {0, 0, uint32_t(offsetof(sms_wiiu_grass::GrassGpuRecord, x)), kLatteAttribFloat32x3,
+                        {kLatteSelX, kLatteSelY, kLatteSelZ, kLatteSel1}};
+    image.attribs[1] = {1, 0, uint32_t(offsetof(sms_wiiu_grass::GrassGpuRecord, drawBiased)),
+                        kLatteAttribUscaled8x4, {kLatteSelX, kLatteSelY, kLatteSelZ, kLatteSelW}};
+    image.attribCount = 2;
+    image.stride = sizeof(sms_wiiu_grass::GrassGpuRecord);
     return true;
 }
 

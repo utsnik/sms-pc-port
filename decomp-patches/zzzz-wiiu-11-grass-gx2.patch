@@ -41,8 +41,8 @@ diff --git a/src/MoveBG/MapObjGrass.cpp b/src/MoveBG/MapObjGrass.cpp
  	}
  
 +#if defined(TARGET_WIIU)
-+	sms_wiiu_grass_register_group(this, unk68, unk6C, unk70, unk74,
-+	                              mPosition.y);
++	sms_wiiu_grass_register_group(this, unk68, unk6C, unk70, unk74, mPosition.y,
++	                              TMapObjGrassManager::mWidth, TMapObjGrassManager::mSwingWidth);
 +#endif
  	gpMapObjGrassManager->entryGrassGroup(this, unk68);
  }

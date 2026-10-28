@@ -9,11 +9,40 @@ namespace sms_wiiu_grass {
 static const uint32_t kGrassSwingSlots = 10;
 static const uint32_t kGrassRegisterPayloadBytes = 28;
 static const uint32_t kGrassDrawPayloadBytes = 12 + kGrassSwingSlots * 4;
-static const uint32_t kGrassUniformDrawOffset = 0;
-static const uint32_t kGrassUniformModeOffset = 8;
-static const uint32_t kGrassUniformSwingOffset = 16;
 static const uint8_t kGrassUpperColor[4] = {0x3c, 0xc8, 0x3c, 0xff};
 static const uint8_t kGrassLowerColor[4] = {0x28, 0x64, 0x28, 0xff};
+
+/* Grass vertex-uniform block, after the generated program's live block
+ * (C192..C212).  One value per vector, no lane selection:
+ *   C213          (drawX, drawZ, 0, 0)
+ *   C214 + k      (swing[k], k, 0, 0)        k = 0..9
+ *   C224, C225    colour-table entries 0 and 1 (RGBA / 255)
+ * The shader selects swing[slot] as sum_k (slot == C[214+k].y) * C[214+k].x
+ * (float SETE/MULADD only), and the colour with CNDGT. */
+static const uint32_t kGrassUniformDrawReg = 213;
+static const uint32_t kGrassUniformSwingReg = 214;
+static const uint32_t kGrassUniformColourReg = kGrassUniformSwingReg + kGrassSwingSlots;
+static const uint32_t kGrassUniformRegs = 1 + kGrassSwingSlots + 2;
+static_assert(kGrassUniformColourReg + 2 == kGrassUniformDrawReg + kGrassUniformRegs,
+              "grass uniform block is contiguous");
+static_assert(kGrassUniformDrawReg + kGrassUniformRegs <= 256, "grass uniform block fits the constant file");
+
+/* Both passes use the same float-only program; the far pass is fed integers
+ * stored exactly as floats (s16 positions, mDrawVecS16, unk24). */
+static inline void grassPackUniforms(float drawX, float drawZ, const float* swing,
+                                     float out[kGrassUniformRegs * 4]) {
+    for (uint32_t i = 0; i < kGrassUniformRegs * 4; ++i) out[i] = 0.0f;
+    out[0] = drawX;
+    out[1] = drawZ;
+    for (uint32_t k = 0; k < kGrassSwingSlots; ++k) {
+        out[(1 + k) * 4 + 0] = swing[k];
+        out[(1 + k) * 4 + 1] = float(k);
+    }
+    for (uint32_t c = 0; c < 4; ++c) {
+        out[(1 + kGrassSwingSlots) * 4 + c] = float(kGrassUpperColor[c]) / 255.0f;
+        out[(2 + kGrassSwingSlots) * 4 + c] = float(kGrassLowerColor[c]) / 255.0f;
+    }
+}
 
 enum GrassCorner : uint8_t {
     kGrassLeft = 0,
@@ -61,42 +90,99 @@ struct GrassFarVertex {
     uint8_t color;
 };
 
-/* One record is one fetched vertex. The final word is four signed/scaled
- * bytes: draw coefficient (-1/0/+1), tip coefficient (0/1), swing slot, and
- * color-table index. This keeps every static vertex at 16 bytes. */
+/* One record is one fetched vertex: position x, y, z as floats (fetch
+ * location 0, w reads 1) and four UNSIGNED bytes (fetch location 1,
+ * USCALED8 -> 0..255 as floats): draw coefficient + 1 (0/1/2), tip
+ * coefficient (0/1), swing slot (0..9) and colour-table index (0/1).
+ * 16 bytes per vertex. */
+static const uint8_t kGrassDrawBias = 1;
 struct GrassGpuRecord {
     float x;
-    float z;
     float y;
-    uint8_t drawCoefficient;
-    uint8_t swingCoefficient;
+    float z;
+    uint8_t drawBiased;
+    uint8_t tip;
     uint8_t swingSlot;
     uint8_t color;
 };
 typedef GrassGpuRecord GrassNearRecord;
 typedef GrassGpuRecord GrassFarRecord;
 static_assert(sizeof(GrassGpuRecord) == 16, "grass GPU record must be 16 bytes");
-static_assert(offsetof(GrassGpuRecord, drawCoefficient) == 12,
+static_assert(offsetof(GrassGpuRecord, y) == 4 && offsetof(GrassGpuRecord, z) == 8,
+              "grass position is x, y, z");
+static_assert(offsetof(GrassGpuRecord, drawBiased) == 12,
               "grass metadata must follow xyz");
 
-static inline uint8_t grassCoefficientByte(int coefficient) {
-    return static_cast<uint8_t>(static_cast<int8_t>(coefficient));
-}
-
-static inline GrassGpuRecord grassMakeRecord(float x, float z, float y,
+static inline GrassGpuRecord grassMakeRecord(float x, float y, float z,
                                               int drawCoefficient,
-                                              int swingCoefficient,
+                                              int tip,
                                               uint32_t swingSlot,
                                               uint8_t color) {
     GrassGpuRecord result = {};
     result.x = x;
-    result.z = z;
     result.y = y;
-    result.drawCoefficient = grassCoefficientByte(drawCoefficient);
-    result.swingCoefficient = static_cast<uint8_t>(swingCoefficient);
+    result.z = z;
+    result.drawBiased = static_cast<uint8_t>(drawCoefficient + kGrassDrawBias);
+    result.tip = static_cast<uint8_t>(tip);
     result.swingSlot = static_cast<uint8_t>(swingSlot % kGrassSwingSlots);
     result.color = color;
     return result;
+}
+
+/* Expands one registered group into its static records, three per blade in
+ * the CPU loop's order (left, centre, right), from the game's own arrays:
+ * near = TVec3<f32>[count] (x, y = apex, z), far = TVec3<s16>[count]
+ * (x, y = base, z), apex = s16[count], baseY = mPosition.y. */
+static inline void grassExpandGroup(uint32_t count, const float* near, const int16_t* far,
+                                    const int16_t* apex, float baseY,
+                                    GrassGpuRecord* nearOut, GrassGpuRecord* farOut) {
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t slot = i % kGrassSwingSlots;
+        const float nx = near[i * 3 + 0], ny = near[i * 3 + 1], nz = near[i * 3 + 2];
+        nearOut[i * 3 + 0] = grassMakeRecord(nx, baseY, nz, -1, 0, slot, 1);
+        nearOut[i * 3 + 1] = grassMakeRecord(nx, ny, nz, 0, 1, slot, 0);
+        nearOut[i * 3 + 2] = grassMakeRecord(nx, baseY, nz, 1, 0, slot, 1);
+        const float fx = float(far[i * 3 + 0]), fy = float(far[i * 3 + 1]);
+        const float fz = float(far[i * 3 + 2]), fay = float(apex[i]);
+        farOut[i * 3 + 0] = grassMakeRecord(fx, fy, fz, -1, 0, slot, 1);
+        farOut[i * 3 + 1] = grassMakeRecord(fx, fay, fz, 0, 1, slot, 0);
+        farOut[i * 3 + 2] = grassMakeRecord(fx, fy, fz, 1, 0, slot, 1);
+    }
+}
+
+/* Largest |x| or |z| of a group's far base positions. */
+static inline int32_t grassFarMaxAbs(uint32_t count, const int16_t* far) {
+    int32_t result = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const int32_t x = far[i * 3 + 0] < 0 ? -int32_t(far[i * 3 + 0]) : far[i * 3 + 0];
+        const int32_t z = far[i * 3 + 2] < 0 ? -int32_t(far[i * 3 + 2]) : far[i * 3 + 2];
+        if (x > result) result = x;
+        if (z > result) result = z;
+    }
+    return result;
+}
+
+/* The float shader never wraps to 16 bits, so a far sum must not be able to
+ * leave the s16 range: |coordinate| + |mWidth| + |mSwingWidth| + 2 < 32767
+ * (mDrawVecS16 is camera right x mWidth, truncated; unk24 is a truncated
+ * mSwingWidth * sin).  A group that fails this uses the CPU loop. */
+static inline bool grassFarFitsS16(int32_t maxAbs, float width, float swingWidth) {
+    const float w = width < 0.0f ? -width : width;
+    const float s = swingWidth < 0.0f ? -swingWidth : swingWidth;
+    return float(maxAbs) + w + s + 2.0f < 32767.0f;
+}
+
+/* Per-draw form of the same bound with the values actually sent. */
+static inline bool grassFarDrawFitsS16(int32_t maxAbs, int32_t drawX, int32_t drawZ,
+                                       const int16_t* swing) {
+    int32_t m = drawX < 0 ? -drawX : drawX;
+    if ((drawZ < 0 ? -drawZ : drawZ) > m) m = drawZ < 0 ? -drawZ : drawZ;
+    int32_t s = 0;
+    for (uint32_t k = 0; k < kGrassSwingSlots; ++k) {
+        const int32_t a = swing[k] < 0 ? -int32_t(swing[k]) : swing[k];
+        if (a > s) s = a;
+    }
+    return maxAbs + m + s < 32767;
 }
 
 static inline int16_t grassWrapS16(int32_t value) {
@@ -153,35 +239,35 @@ static inline GrassFarVertex grassCpuFarVertex(const GrassFarBlade& blade,
     return result;
 }
 
+/* C++ model of the shader arithmetic (the Latte interpreter test runs the
+ * real program; this model documents the intended float sequence). */
 static inline GrassNearVertex grassShaderNearVertex(const GrassNearRecord& record,
                                                      const GrassNearDynamic& dynamic) {
     GrassNearVertex result;
     const uint32_t slot = record.swingSlot % kGrassSwingSlots;
-    const int drawCoefficient = static_cast<int8_t>(record.drawCoefficient);
-    const int swingCoefficient = record.swingCoefficient;
-    result.x = record.x + float(drawCoefficient) * dynamic.drawX +
-               float(swingCoefficient) * dynamic.swing[slot];
+    const float coefficient = float(record.drawBiased) - 1.0f;
+    const float tip = float(record.tip);
+    float x = coefficient * dynamic.drawX + record.x;
+    x = tip * dynamic.swing[slot] + x;
+    result.x = x;
     result.y = record.y;
-    result.z = record.z + float(drawCoefficient) * dynamic.drawZ;
+    result.z = coefficient * dynamic.drawZ + record.z;
     result.color = record.color;
     return result;
 }
 
 static inline GrassFarVertex grassShaderFarVertex(const GrassFarRecord& record,
                                                    const GrassFarDynamic& dynamic) {
+    GrassNearDynamic asFloat;
+    asFloat.drawX = float(dynamic.drawX);
+    asFloat.drawZ = float(dynamic.drawZ);
+    for (uint32_t k = 0; k < kGrassSwingSlots; ++k) asFloat.swing[k] = float(dynamic.swing[k]);
+    const GrassNearVertex v = grassShaderNearVertex(record, asFloat);
     GrassFarVertex result;
-    const uint32_t slot = record.swingSlot % kGrassSwingSlots;
-    const int32_t drawCoefficient = static_cast<int8_t>(record.drawCoefficient);
-    const int32_t swingCoefficient = record.swingCoefficient;
-    const int32_t baseX = static_cast<int32_t>(record.x);
-    const int32_t baseZ = static_cast<int32_t>(record.z);
-    const int32_t x = baseX + drawCoefficient * dynamic.drawX +
-                      swingCoefficient * dynamic.swing[slot];
-    const int32_t z = baseZ + drawCoefficient * dynamic.drawZ;
-    result.x = grassWrapS16(x);
-    result.y = grassWrapS16(static_cast<int32_t>(record.y));
-    result.z = grassWrapS16(z);
-    result.color = record.color;
+    result.x = static_cast<int16_t>(v.x);
+    result.y = static_cast<int16_t>(v.y);
+    result.z = static_cast<int16_t>(v.z);
+    result.color = v.color;
     return result;
 }
 
