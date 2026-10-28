@@ -42,6 +42,7 @@
 #include "gx2_shader_inl.h"
 #include "gx2_vertex_program.h"
 #include "gx2_texture_pack.h"
+#include "widescreen_math.h"
 #include "../grass_math.h"
 #include "../../src/port_include/sms_wiiu_grass.h"
 
@@ -89,6 +90,7 @@ static void gx2ProdCallList(void* list, uint32_t bytes);
 static bool gx2DlOpenForDraw();
 static void gx2DlClose();
 static uint32_t textureCacheEntryCount();
+static void resetTargetScissor();
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
 
@@ -4295,6 +4297,7 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
         return;
     }
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
+    resetTargetScissor();
     // rectclear: the game's own frame clear in renderer_begin covers the whole buffer.
     if (!(s_rectClear && s_frameClearPending && s_ready && ProcUIInForeground())) {
         GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f); invalidateVertexUniforms();
@@ -4320,6 +4323,13 @@ static void updateTarget() {
     s_gameScale = s_tvH / 480.0f;
     s_lodScale = s_gameScale;
     updateWideTarget();
+}
+
+static void resetTargetScissor() {
+    const GX2ColorBuffer* cb = renderColour();
+    if (!cb) return;
+    const TargetScissor scissor = fullTargetScissor(cb->surface.width, cb->surface.height);
+    GX2SetScissor(scissor.left, scissor.top, scissor.width, scissor.height);
 }
 
 static void applyState() {
@@ -7336,6 +7346,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     updateTarget();
+    resetTargetScissor();
     if (s_frameClearPending) {
         GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]); invalidateVertexUniforms();
         s_frameClearPending = false;
