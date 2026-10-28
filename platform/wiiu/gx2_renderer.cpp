@@ -5071,19 +5071,21 @@ void rendererInit(float) {
     updateWideTarget();
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     if (sdMarkerPresent("dlarenasmall")) s_dlArenaLimit = 8u << 20;
-    // Read the Stage 1 switch exactly once.  No frame or present path probes
-    // the marker, and no GX2 display-list call is reachable while it is off.
-    s_gx2DlEnabled = sdMarkerPresent("gx2dl");
+    // Both Stage 1 paths default on.  Read their opt-out markers exactly once;
+    // the legacy gx2dl/gx2prod markers are intentionally ignored.
+    s_gx2DlEnabled = !sdMarkerPresent("nogx2dl");
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
-    s_gx2ProdMarker = sdMarkerPresent("gx2prod");
+    s_gx2ProdMarker = !sdMarkerPresent("nogx2prod");
     s_grassCpuMarker = sdMarkerPresent("cpugrass");
     if (s_grassCpuMarker)
         WHBLogPrintf("SMS Wii U: grass CPU fallback selected by cpugrass marker");
     s_gx2ProdCore2 = sdMarkerPresent("gx2core2");
     if (s_gx2ProdMarker && !s_gx2DlEnabled) {
-        WHBLogPrintf("SMS Wii U: [gx2prod] refused: gx2dl marker is required");
+        WHBLogPrintf("SMS Wii U: [gx2prod] refused: GX2 display-list path is disabled");
         s_gx2ProdMarker = false;
     }
+    WHBLogPrintf("SMS Wii U: [gx2dl] display-list=%s producer=%s",
+                 s_gx2DlEnabled ? "on" : "off", s_gx2ProdMarker ? "on" : "off");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
@@ -5113,8 +5115,8 @@ void rendererInit(float) {
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
-    WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s fallback=%s core-init=%u",
-                 s_gx2DlEnabled ? "on" : "off", s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit);
+    WHBLogPrintf("SMS Wii U: [gx2dl] fallback=%s core-init=%u",
+                 s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit);
     if (s_gx2ProdMarker)
         WHBLogPrintf("SMS Wii U: [gx2prod] requested worker core=%u; core 2 already hosts texpack/AX workers, probe override=%s",
                      s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "enabled" : "disabled");

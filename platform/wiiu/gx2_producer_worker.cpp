@@ -248,8 +248,8 @@ bool start(const Hooks& hooks, bool core2) {
     std::memset(&s_totals, 0, sizeof s_totals);
     std::memset(&s_lastLog, 0, sizeof s_lastLog);
     s_lastLogFrame = 0;
-    if (!sms_wiiu_sd_marker("gx2prod")) return false;
-    if (!sms_wiiu_sd_marker("gx2dl")) {
+    if (sms_wiiu_sd_marker("nogx2prod")) return false;
+    if (sms_wiiu_sd_marker("nogx2dl")) {
         port_log("SMS Wii U: [prod] gx2prod requires gx2dl; worker refused\n");
         return false;
     }

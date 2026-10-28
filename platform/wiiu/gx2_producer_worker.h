@@ -71,7 +71,7 @@ struct Counters {
     uint32_t serviceFailures;
 };
 
-/* start() is inert unless both gx2prod and gx2dl SD markers are present.
+/* start() is inert when either new Stage 1 opt-out marker is present.
  * core2 is the caller's cached gx2core2 selection; the module also checks
  * that marker so an integration cannot accidentally ignore it. */
 bool start(const Hooks& hooks, bool core2 = false);
