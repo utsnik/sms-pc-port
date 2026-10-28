@@ -46,9 +46,9 @@ movement stick. Nunchuk and other controller layouts remain as listed above.
 
 ## Widescreen
 
-Widescreen is opt-in. Create an empty file named `widescreen` in the app
-folder:
+The game runs in 16:9 widescreen by default. For the original 4:3 picture,
+create an empty file named `4x3` in the app folder:
 
 ```text
-sd:/wiiu/apps/sms/widescreen
+sd:/wiiu/apps/sms/4x3
 ```
