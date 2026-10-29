@@ -55,6 +55,7 @@ void park_forever(void)
 
 char s_message[512];
 volatile int s_crashed;
+volatile int s_fault_count;
 char s_trace[2048];
 
 #if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
@@ -195,8 +196,7 @@ BOOL rescue_fatal(const char* type, OSContext* context)
 	context->gpr[1] &= ~0xFu;
 	context->gpr[1] -= 0x100;
 
-	/* The callback does no formatting, symbol lookup, memory walking, or
-	 * logging. Publish the complete snapshot before the rescue thread sees it. */
+	/* Publish the complete snapshot before the rescue thread sees it. */
 	__sync_synchronize();
 	sms_wiiu_crash_pending = 1;
 	sms_wiiu_crash_stage = context == s_rescue_owner_thread ? 1 : 10;
@@ -206,6 +206,14 @@ BOOL rescue_fatal(const char* type, OSContext* context)
 
 BOOL fatal(const char* type, OSContext* context)
 {
+	/* Keep the fault address on one short line before the detailed report. */
+	if (context) {
+		char line[128];
+		std::snprintf(line, sizeof(line), "[x] %s #%d srr0=%08X lr=%08X dar=%08X r1=%08X", type,
+		              __sync_add_and_fetch(&s_fault_count, 1), (unsigned)context->srr0,
+		              (unsigned)context->lr, (unsigned)context->dar, (unsigned)context->gpr[1]);
+		WHBLogPrint(line);
+	}
 #if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
 	return rescue_fatal(type, context);
 #else

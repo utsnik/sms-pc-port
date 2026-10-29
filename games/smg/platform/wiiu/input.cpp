@@ -6,6 +6,15 @@
 #include <cstdlib>
 #include <cstring>
 
+#if defined(PORT_GAME_SMG)
+#include <sysapp/launch.h>
+#endif
+
+#if defined(PORT_GAME_SMG)
+extern "C" volatile int sms_wiiu_menu_exit_pending;
+extern "C" int64_t sms_wiiu_OSGetTime(void);
+#endif
+
 namespace {
 
 enum ScriptKind {
@@ -35,6 +44,11 @@ bool s_initialized;
 bool s_connected;
 bool s_marker;
 bool s_script_loaded;
+bool s_script_present;
+#if defined(PORT_GAME_SMG)
+int64_t s_autopress_start;
+bool s_autopress_exit_requested;
+#endif
 u32 s_previous_hold;
 u32 s_vpad_hold;
 f32 s_vpad_stick_x;
@@ -158,6 +172,33 @@ void log_script_full()
     port_log("[smg-input] autoplay: script full at %u events, dropping the rest\n",
              (unsigned)s_script_count);
 }
+
+#if defined(PORT_GAME_SMG)
+int autoplay_run_seconds()
+{
+    const char* value = std::getenv("SMG_AUTOPLAY_SECS");
+    const int seconds = value ? std::atoi(value) : 0;
+    return seconds > 0 ? seconds : (s_script_present ? 300 : 180);
+}
+
+void check_autoplay_timeout()
+{
+    if (!s_marker || s_autopress_exit_requested)
+        return;
+    const int64_t now = sms_wiiu_OSGetTime();
+    if (!s_autopress_start) {
+        s_autopress_start = now;
+        return;
+    }
+    const int seconds = autoplay_run_seconds();
+    if (now - s_autopress_start < static_cast<int64_t>(seconds) * 62156250)
+        return;
+    s_autopress_exit_requested = true;
+    sms_wiiu_menu_exit_pending = 1;
+    port_log("[smg-input] autopress run over (%d s): returning to the Menu\n", seconds);
+    SYSLaunchMenu();
+}
+#endif
 
 bool parse_timing(char* text, u32* at, u32* hold)
 {
@@ -342,6 +383,7 @@ void load_script()
     std::snprintf(script_path, sizeof(script_path), "%ssmg-autoplay", sms_wiiu_app_root());
     FILE* file = std::fopen(script_path, "rb");
     if (file) {
+        s_script_present = true;
         static char buffer[16384]; // load_script runs once; keep 16 KB off the thread stack
         size_t length = std::fread(buffer, 1, sizeof(buffer) - 1, file);
         const bool truncated = length == sizeof(buffer) - 1 && std::fgetc(file) != EOF;
@@ -361,7 +403,14 @@ void load_script()
             trim(token);
             bool advance = true;
             if (*token && *token != '#') {
-                if (std::strncmp(token, "pointer@", 8) == 0) {
+                char* equals = std::strchr(token, '=');
+                if (equals) {
+                    *equals = '\0';
+                    trim(token);
+                    trim(equals + 1);
+                    setenv(token, equals + 1, 1);
+                    port_log("[smg-input] autoplay env %s=%s\n", token, equals + 1);
+                } else if (std::strncmp(token, "pointer@", 8) == 0) {
                     char* x = ::strtok_r(nullptr, ",\r\n", &save);
                     char* y = ::strtok_r(nullptr, ",\r\n", &save);
                     if (!x || std::strchr(x, '@')) {
@@ -572,6 +621,9 @@ uint32_t KPADReadEx(s32 chan, KPADStatus* statuses, uint32_t count, s32* error)
         *error = KPAD_ERROR_NO_SAMPLES;
     if (!channel_valid(chan) || chan != WPAD_CHAN0 || !statuses || !count)
         return 0;
+#if defined(PORT_GAME_SMG)
+    check_autoplay_timeout();
+#endif
     poll_vpad();
     report_callbacks();
     if (!s_connected)
