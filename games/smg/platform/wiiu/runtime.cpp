@@ -475,6 +475,14 @@ void sms_wiiu_exit(void) { WHBProcStopRunning(); }
 u32 PPCMfmsr(void) { return 0x8000; }
 void PPCMtmsr(u32) {}
 
+/* JAudio2's __DSPHandler (osdsp_task.cpp) swaps the current OSContext around
+ * the task mail, sized for the GameCube struct, and restores NULL when the
+ * DSP HLE calls it as a plain function. coreinit's versions write a larger
+ * Cafe OSContext and switch the real thread's context: no-ops here. The
+ * first rescue run hung right after DSP HLE start (2026-10-29). */
+void OSClearContext(OSContext*) {}
+void OSSetCurrentContext(OSContext*) {}
+
 } // extern "C"
 
 void port_irq_defer(std::function<void()> fn)

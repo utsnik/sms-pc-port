@@ -422,8 +422,35 @@ int rescue(int, const char**)
 #endif
 } // namespace
 
+#if defined(PORT_GAME_SMG)
+/* Galaxy's audio pacer, which drives the hang check in Sunshine, had not
+ * started when the first console runs hung during init: check from a thread
+ * of its own every 10 s. */
+extern "C" void sms_wiiu_hang_check(void);
+static OSThread s_watchdog;
+alignas(16) static uint8_t s_watchdog_stack[8 * 1024];
+
+static int watchdog(int, const char**)
+{
+	for (;;) {
+		OSSleepTicks(OSMillisecondsToTicks(10000));
+		sms_wiiu_hang_check();
+	}
+	return 0;
+}
+#endif
+
 extern "C" void sms_wiiu_install_exception_handlers(void)
 {
+#if defined(PORT_GAME_SMG)
+	if (cafe_OSCreateThread(&s_watchdog, watchdog, 0, nullptr, s_watchdog_stack + sizeof s_watchdog_stack,
+	                        sizeof s_watchdog_stack, 2, OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+		cafe_OSResumeThread(&s_watchdog);
+		WHBLogPrint("[hang] watchdog thread started");
+	} else {
+		WHBLogPrint("[hang] could not start the watchdog thread");
+	}
+#endif
 	/* Priority 0 was refused (2026-10-20); the parked main thread no longer
 	 * competes, so any priority above the game's (16) will do. */
 #if !defined(PORT_GAME_SMG) || SMG_WIIU_ENABLE_RESCUE

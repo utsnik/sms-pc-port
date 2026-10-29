@@ -596,10 +596,20 @@ extern "C" void sms_wiiu_profiler_tick(void)
  * is parked, from its saved context (an OSThread starts with its OSContext:
  * gpr1 at 0x0C, lr at 0x8C, srr0 at 0x98) and its stack's back chain. A
  * thread spinning on its core shows its last switch-out instead. */
+#if defined(PORT_GAME_SMG)
+extern "C" void* sms_wiiu_vi_owner_thread(void);
+#endif
+
 extern "C" void sms_wiiu_hang_check(void)
 {
 	static uint32_t s_lastTicks, s_reported;
 	const uint32_t ticks = s_frameTicks;
+#if defined(PORT_GAME_SMG)
+	/* Galaxy hung once before its first frame (2026-10-29): before the frame
+	 * boundary has named the main thread, watch the thread that owns VI. */
+	if (!s_mainThread)
+		s_mainThread = sms_wiiu_vi_owner_thread();
+#endif
 	if (ticks != s_lastTicks || !s_mainThread) {
 		s_lastTicks = ticks;
 		s_reported = 0;
