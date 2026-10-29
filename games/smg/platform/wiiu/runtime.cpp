@@ -487,21 +487,78 @@ void OSSetCurrentContext(OSContext*) {}
  * reaches the UDP log, and OSPanic/PPCHalt then stop the console instead of
  * taking the crash path. Report to the UDP log; a panic or halt traps, so the
  * exception handler (and the rescue build's Menu return) takes over. */
+void smg_wiiu_flush_reports(void);
+
+/* The DSP HLE reply thread runs __DSPHandler, which reports, with interrupts
+ * disabled: a UDP send (IOS IPC) there could block the core for good. Such
+ * lines wait in a small table and go out with the next report made with
+ * interrupts enabled, or from the 10 s watchdog thread. Slot states: 0 free,
+ * 1 being written, 2 ready. */
+BOOL smg_wut_OSIsInterruptEnabled(void) __asm__("OSIsInterruptEnabled");
+constexpr unsigned kDeferredLines = 16;
+char s_deferred[kDeferredLines][256];
+volatile unsigned s_deferred_state[kDeferredLines];
+volatile unsigned s_deferred_seq[kDeferredLines];
+volatile unsigned s_deferred_next, s_deferred_dropped, s_deferred_flushing;
+
+void report_line(const char* prefix, const char* line)
+{
+    if (smg_wut_OSIsInterruptEnabled()) {
+        smg_wiiu_flush_reports();
+        WHBLogPrintf("%s %s", prefix, line);
+        return;
+    }
+    for (unsigned i = 0; i < kDeferredLines; ++i) {
+        if (!__sync_bool_compare_and_swap(&s_deferred_state[i], 0, 1))
+            continue;
+        std::snprintf(s_deferred[i], sizeof(s_deferred[i]), "%s %s", prefix, line);
+        s_deferred_seq[i] = __sync_fetch_and_add(&s_deferred_next, 1);
+        __sync_synchronize();
+        s_deferred_state[i] = 2;
+        return;
+    }
+    __sync_add_and_fetch(&s_deferred_dropped, 1);
+}
+
 void OSVReport(const char* fmt, va_list args)
 {
     static volatile unsigned s_reports;
     const unsigned n = __sync_add_and_fetch(&s_reports, 1);
     if (n > 4000) {
         if (n == 4001)
-            WHBLogPrint("[OSReport] more than 4000 reports; dropping the rest");
+            report_line("[OSReport]", "more than 4000 reports; dropping the rest");
         return;
     }
-    char line[512];
+    char line[224];
     std::vsnprintf(line, sizeof(line), fmt, args);
     size_t length = std::strlen(line);
     while (length && line[length - 1] == '\n')
         line[--length] = '\0';
-    WHBLogPrintf("[OSReport] %s", line);
+    report_line("[OSReport]", line);
+}
+
+/* Sends the deferred lines, oldest first; the watchdog calls it too. */
+void smg_wiiu_flush_reports(void)
+{
+    if (!smg_wut_OSIsInterruptEnabled() || __sync_lock_test_and_set(&s_deferred_flushing, 1))
+        return;
+    for (;;) {
+        unsigned best = kDeferredLines;
+        for (unsigned i = 0; i < kDeferredLines; ++i) {
+            if (s_deferred_state[i] == 2 &&
+                (best == kDeferredLines || (int)(s_deferred_seq[i] - s_deferred_seq[best]) < 0))
+                best = i;
+        }
+        if (best == kDeferredLines)
+            break;
+        __sync_synchronize();
+        WHBLogPrint(s_deferred[best]);
+        s_deferred_state[best] = 0;
+    }
+    if (s_deferred_dropped)
+        WHBLogPrintf("[OSReport] %u reports with interrupts off were dropped",
+                     (unsigned)__sync_lock_test_and_set(&s_deferred_dropped, 0));
+    __sync_lock_release(&s_deferred_flushing);
 }
 
 void OSReport(const char* fmt, ...)
@@ -519,13 +576,17 @@ void OSPanic(const char* file, uint32_t line, const char* fmt, ...)
     va_start(args, fmt);
     std::vsnprintf(message, sizeof(message), fmt, args);
     va_end(args);
-    WHBLogPrintf("[OSPanic] %s:%u: %s", file ? file : "?", (unsigned)line, message);
+    char where[288];
+    std::snprintf(where, sizeof(where), "%s:%u: %s", file ? file : "?", (unsigned)line, message);
+    report_line("[OSPanic]", where);
     __builtin_trap();
 }
 
 void PPCHalt(void)
 {
-    WHBLogPrintf("[PPCHalt] from lr=%p", __builtin_return_address(0));
+    char where[32];
+    std::snprintf(where, sizeof(where), "from lr=%p", __builtin_return_address(0));
+    report_line("[PPCHalt]", where);
     __builtin_trap();
 }
 

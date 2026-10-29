@@ -427,6 +427,7 @@ int rescue(int, const char**)
  * started when the first console runs hung during init: check from a thread
  * of its own every 10 s. */
 extern "C" void sms_wiiu_hang_check(void);
+extern "C" void smg_wiiu_flush_reports(void);
 static OSThread s_watchdog;
 alignas(16) static uint8_t s_watchdog_stack[8 * 1024];
 
@@ -434,6 +435,7 @@ static int watchdog(int, const char**)
 {
 	for (;;) {
 		OSSleepTicks(OSMillisecondsToTicks(10000));
+		smg_wiiu_flush_reports();
 		sms_wiiu_hang_check();
 	}
 	return 0;
