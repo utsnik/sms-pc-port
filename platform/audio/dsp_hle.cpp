@@ -98,6 +98,13 @@ void post(u32 m)
 	g.fromDsp.push_back(m);
 }
 
+volatile u32 s_syncFrames;
+/* fromWorker: called by the mixer thread. It is an argument, not a shared flag:
+ * a ReleaseHalt arriving on core 1 while the worker ran the 0x82 frame command
+ * read the worker's flag, re-ran the 0x82 inline and dropped the release, so no
+ * subframe was ever rendered and the game was silent from the first frame. */
+void execute(bool fromWorker = false);
+
 #ifdef TARGET_WIIU
 /* wut's coreinit ABI is deliberately kept separate from the decomp's
  * GameCube OS types. These declarations mirror the boundary in
@@ -174,7 +181,6 @@ struct AsyncState {
 };
 
 AsyncState s_async;
-volatile u32 s_syncFrames;
 // Async-path debug counters (logged with the 10 s audio stats).
 volatile u32 s_dbgMails, s_dbgAsserts, s_dbgLastAssertMail, s_dbgSkippedMails;
 volatile u32 s_dbgQueued[4], s_dbgExec[4], s_dbgReleaseIdle, s_dbgReplies, s_dbgReplyPosts;
@@ -201,11 +207,6 @@ BOOL receive_ptr(WutMessageQueue* q, void** p)
 }
 bool s_workerRelease;
 
-/* fromWorker: called by the mixer thread. It is an argument, not a shared flag:
- * a ReleaseHalt arriving on core 1 while the worker ran the 0x82 frame command
- * read the worker's flag, re-ran the 0x82 inline and dropped the release, so no
- * subframe was ever rendered and the game was silent from the first frame. */
-void execute(bool fromWorker = false);
 
 void queue_reply(u32 first, u32 second)
 {
