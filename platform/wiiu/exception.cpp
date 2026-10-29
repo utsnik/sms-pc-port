@@ -448,9 +448,9 @@ extern "C" void sms_wiiu_install_exception_handlers(void)
 	if (cafe_OSCreateThread(&s_watchdog, watchdog, 0, nullptr, s_watchdog_stack + sizeof s_watchdog_stack,
 	                        sizeof s_watchdog_stack, 2, OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
 		cafe_OSResumeThread(&s_watchdog);
-		WHBLogPrint("[hang] watchdog thread started");
+		WHBLogPrint("[watchdog] thread started");
 	} else {
-		WHBLogPrint("[hang] could not start the watchdog thread");
+		WHBLogPrint("[watchdog] could not start the thread");
 	}
 #endif
 	/* Priority 0 was refused (2026-10-20); the parked main thread no longer
