@@ -718,6 +718,17 @@ static inline bool buildGeneratedVertexImage(const VertexKey& key, const LatteVe
                                     _GX2_C(copy), _w)});
         vertexEmit(alu, {ALU_MOV(_R(dst), _z, ALU_SRC_0, _x)});
         vertexEmit(alu, {ALU_MOV(_R(dst), _w, ALU_SRC_1, _x)});
+        if ((tg >> 1) & 1) {
+            // Projective texgen: export (u q, v q, 0, q) and let the TEV pixel
+            // shader divide by w (TevKey::projMask), as GX divides per pixel.
+            // u and v divided here and interpolated across a triangle are
+            // wrong for large ones: the Airstrip sea (mirror reflection)
+            // turned white and showed stretched pieces of Mario.  R56.z still
+            // holds the zero-guarded q.
+            vertexEmit(alu, {ALU_MUL(_R(dst), _x, _R(dst), _x, _R(56), _z)});
+            vertexEmit(alu, {ALU_MUL(_R(dst), _y, _R(dst), _y, _R(56), _z)});
+            vertexEmit(alu, {ALU_MOV(_R(dst), _w, _R(56), _z)});
+        }
         }
     }
 

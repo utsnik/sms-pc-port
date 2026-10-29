@@ -350,6 +350,7 @@ struct TevKey {
     uint32_t alphaCompare;
     uint32_t ind[16];  // BP_IND_CMD per stage (zero without indirect stages)
     uint32_t iref;     // BP_RAS1_IREF (zero without indirect stages)
+    uint32_t projMask; // texgens with projective (stq) output: divide by w per pixel
 };
 
 struct TevShader {
@@ -1501,6 +1502,11 @@ static TevKey currentTevKey() {
         for (uint32_t s = 0; s < k.stages; ++s) k.ind[s] = g.bp[BP_IND_CMD + s] & 0x1fffff;
         k.iref = g.bp[BP_RAS1_IREF] & 0xffffff;
     }
+    // The generated vertex program exports these as (u q, v q, 0, q); the
+    // CPU-transformed path has divided already and fetches w = 1.
+    const uint32_t numTexGens = std::min<uint32_t>(g.xfReg[XFR_NUMTEXGENS] & 15, 8);
+    for (uint32_t c = 0; c < numTexGens; ++c)
+        if ((g.xfReg[XFR_TEXGEN + c] >> 1) & 1) k.projMask |= 1u << c;
     return k;
 }
 
@@ -2409,7 +2415,10 @@ static bool initTevVertex() {
         a.format = components == 2 ? GX2_ATTRIB_FORMAT_FLOAT_32_32 : GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32;
         a.type = GX2_ATTRIB_INDEX_PER_VERTEX;
         a.aluDivisor = 0;
-        a.mask = GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W);
+        // Texcoords (two floats, divided on the CPU already) read w = 1: the
+        // TEV pixel shader divides projective ones by w (TevKey::projMask).
+        a.mask = components == 2 ? GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_1)
+                                 : GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W);
         a.endianSwap = GX2_ENDIAN_SWAP_DEFAULT;
         offset += components * sizeof(float);
     };
@@ -2718,6 +2727,16 @@ static bool initTevPixel(TevShader& shader) {
     // ---- indirect: lookup coordinates, lookups, offsets, indirect stage fetches ----
     size_t prepOffset = program.size(), prepCount = 0, tex1Offset = 0, tex2Offset = 0, indOffset = 0, indCount = 0;
     uint32_t tex1Count = 0, tex2Count = 0;
+    // Projective texgens arrive as (u q, v q, 0, q) (gx2_vertex_program.h):
+    // divide per pixel before any fetch or indirect stage reads them.
+    for (uint32_t c = 0; c < 8; ++c) {
+        if (!useCoord[c] || !((key.projMask >> c) & 1)) continue;
+        tevEmitAlu(program, {ALU_RECIP_IEEE(_R(ra.t[0]), _x, _R(ra.coord[c]), _w)});
+        g.push_back(tevOp(kOpMul, ra.coord[c], _x, tevG(ra.coord[c], _x), tevG(ra.t[0], _x)));
+        g.push_back(tevOp(kOpMul, ra.coord[c], _y, tevG(ra.coord[c], _y), tevG(ra.t[0], _x)));
+        flush();
+    }
+    prepCount = program.size() - prepOffset;
     if (anyInd || numInd) {
         for (uint32_t i = 0; i < numInd; ++i) {
             const uint32_t coord = (key.iref >> (6 * i + 3)) & 7;

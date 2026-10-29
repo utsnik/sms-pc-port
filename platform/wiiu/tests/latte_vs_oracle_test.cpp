@@ -464,6 +464,46 @@ int main() {
               "N5: the five-param fixed layout puts colour on semantic 4 and leaves semantic 8 unwritten");
     }
 
+    // 3b. Projective texgens (the Airstrip sea's mirror reflection) export
+    //     (s, t, 0, q) undivided so the TEV pixel shader divides per pixel
+    //     (TevKey::projMask); a divide per vertex interpolated across the
+    //     sea's large triangles turned it white.  Non-projective ones keep
+    //     (s, t, 0, 1).
+    for (int projective = 0; projective < 2; ++projective) {
+        VertexKey key = grassStateKey(false);
+        key.numTexGens = 1;
+        key.texgen[0] = (projective ? 1u << 1 : 0u) | (1u << 2);  // ABC1 form, position row, matrix
+        LatteVertexImage image;
+        const bool built = buildGeneratedVertexImage(key, hw, image);
+        Scene scene;
+        makeScene(scene, false, false);
+        latte::VsInterpreter vm;
+        vm.gprOffset = 1;
+        loadConstants(vm, scene);
+        HostVertex v;
+        memset(static_cast<void*>(&v), 0, sizeof v);
+        v.pos[0] = 37.0f; v.pos[1] = -12.5f; v.pos[2] = 210.0f;
+        v.mtx[0] = 0; v.mtx[1] = 30;
+        latte::VsResult r;
+        const bool ran = built && vm.run(image.words, image.regs, image.attribs, image.attribCount,
+                                         reinterpret_cast<const uint8_t*>(&v), r);
+        float t[3];
+        for (int row = 0; row < 3; ++row)
+            t[row] = scene.xfPos[30 + row][0] * v.pos[0] + scene.xfPos[30 + row][1] * v.pos[1] +
+                     scene.xfPos[30 + row][2] * v.pos[2] + scene.xfPos[30 + row][3];
+        const float q = projective ? t[2] : 1.0f;
+        const float scale = std::fabs(t[0]) + std::fabs(t[1]) + std::fabs(q) + 1.0f;
+        const bool ok = ran && r.hasSemantic[0] && close(r.semantic[0][0], t[0], scale) &&
+                        close(r.semantic[0][1], t[1], scale) && r.semantic[0][2] == 0.0f &&
+                        close(r.semantic[0][3], q, scale);
+        if (!ok)
+            std::printf("  got (%g %g %g %g) want (%g %g 0 %g)%s%s\n", r.semantic[0][0], r.semantic[0][1],
+                        r.semantic[0][2], r.semantic[0][3], t[0], t[1], q, built ? "" : " build rejected: ",
+                        built ? "" : image.reject);
+        check(ok, projective ? "projective texgen exports (s, t, 0, q) for the per-pixel divide"
+                             : "regular texgen exports (s, t, 0, 1)");
+    }
+
     // 4. Grass near and far programs against the CPU loop.
     runGrassOracle();
 
