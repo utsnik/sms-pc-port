@@ -1,6 +1,6 @@
 set(SMS_WIIU_BUILD_DIR "${PROJECT_SOURCE_DIR}/build/wiiu" CACHE PATH
     "Stage 1 Wii U output directory")
-option(SMS_WIIU_SKIP_INTRO "Skip opening movies in Wii U test builds" ON)
+option(SMS_WIIU_SKIP_INTRO "Skip opening movies in Wii U test builds" OFF)
 
 set(SMS_WIIU_GAME_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -121,7 +121,12 @@ add_library(sms_game STATIC
   ${SMS_DECOMP_CXX_SOURCES}
   ${SMS_DECOMP_C_SOURCES}
   ${SMS_DECOMP}/libs/dolphin/src/pad/Padclamp.c
-  ${SMS_WIIU_GD_SOURCES})
+  ${SMS_WIIU_GD_SOURCES}
+  # THP movie decoders (decomp SDK + decomp-patches/thp-*), as platform/thp/
+  # thp.cmake adds them on the PC: without them the weak sdk_stubs decoders
+  # left every movie black ("A skip" over nothing).
+  ${SMS_PATCH_ROOT}/libs/dolphin/src/thp/THPDec.c
+  ${SMS_PATCH_ROOT}/libs/dolphin/src/thp/THPAudio.c)
 set_source_files_properties(${SMS_DECOMP_CXX_SOURCES} PROPERTIES LANGUAGE CXX)
 target_include_directories(sms_game BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES})
 target_compile_definitions(sms_game PRIVATE ${SMS_COMMON_DEFS})

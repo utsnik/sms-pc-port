@@ -127,10 +127,22 @@ void trace(OSContext* context)
 	}
 }
 
+/* A thread parked after a fault gets this stack, not its own: the THP
+ * decoder's fault (2026-10-29) left a stack that faulted again in
+ * park_forever, eight times in a few ms, and OSFatal wedged the console
+ * before the rescue thread could send the first report. */
+alignas(16) uint8_t s_park_stack[8][1024];
+
 BOOL fatal(const char* type, OSContext* context)
 {
 	OSThread* thread = cafe_OSGetCurrentThread();
 	const char* name = thread ? cafe_OSGetThreadName(thread) : nullptr;
+	/* One short line first: the multi-line report goes out in a burst and UDP
+	 * drops parts of it (2026-10-29: SRR0/LR never arrived in three runs). */
+	if (context)
+		WHBLogPrintf("[x] %s #%d srr0=%08X lr=%08X dar=%08X r1=%08X", type, s_crashed + 1,
+		             (unsigned)context->srr0, (unsigned)context->lr, (unsigned)context->dar,
+		             (unsigned)context->gpr[1]);
 	if (!context) {
 		std::snprintf(s_message, sizeof(s_message), "SMS Wii U %s exception (no context)\n", type);
 	} else {
@@ -143,11 +155,12 @@ BOOL fatal(const char* type, OSContext* context)
 		              (unsigned)context->gpr[1], (unsigned)context->gpr[3], (unsigned)context->gpr[4]);
 	}
 	WHBLogPrint(s_message);
-	if (context) {
+	/* Backtrace and register dump for the first fault only; later ones would
+	 * bury it, and the "[x]" line above already names them. */
+	if (context && !s_crashed) {
 		trace(context);
 		WHBLogPrint(s_trace);
-		if (!s_crashed)
-			std::snprintf(s_first, sizeof(s_first), "%s%s", s_message, s_trace);
+		std::snprintf(s_first, sizeof(s_first), "%s%s", s_message, s_trace);
 		dump(context);
 	}
 	/* No context, a fault in the rescue thread itself, or a runaway string of
@@ -164,8 +177,7 @@ BOOL fatal(const char* type, OSContext* context)
 	if (s_crashed++) {
 		context->srr0 = (uint32_t)&park_forever;
 		context->lr = 0;
-		context->gpr[1] &= ~0xFu;
-		context->gpr[1] -= 0x100;
+		context->gpr[1] = (uint32_t)(s_park_stack[(s_crashed - 1) & 7] + sizeof s_park_stack[0] - 0x40);
 		std::snprintf(s_message, sizeof(s_message), "[crash] fault #%d during the rescue (stage %d): thread %s parked",
 		              s_crashed, sms_wiiu_crash_stage, name ? name : "unnamed");
 		WHBLogPrint(s_message);
@@ -186,12 +198,16 @@ BOOL fatal(const char* type, OSContext* context)
 	 * So the faulting thread only gets a harmless place to be, and the work is
 	 * done elsewhere: a main-thread fault by the rescue thread, any other by
 	 * the main thread at its next frame boundary. */
+	const uint32_t fault_srr0 = context->srr0, fault_lr = context->lr;
 	context->srr0 = (uint32_t)&park_forever;
 	context->lr = 0;
 	context->gpr[1] &= ~0xFu; // keep the stack, 16-byte aligned
 	context->gpr[1] -= 0x100;   // below the faulting frame's red zone
-	std::snprintf(s_message, sizeof(s_message), "[crash] %s thread faulted: context=%p owner=%p",
-	              main_thread ? "main" : "other", (void*)context, sms_wiiu_vi_owner_thread());
+	/* SRR0/LR/DAR again on this one short line: the multi-line report above
+	 * goes out in one burst and UDP dropped exactly those lines (2026-10-29). */
+	std::snprintf(s_message, sizeof(s_message), "[crash] %s thread faulted: context=%p owner=%p srr0=%08X lr=%08X dar=%08X",
+	              main_thread ? "main" : "other", (void*)context, sms_wiiu_vi_owner_thread(),
+	              (unsigned)fault_srr0, (unsigned)fault_lr, (unsigned)context->dar);
 	WHBLogPrint(s_message);
 	if (main_thread) {
 		sms_wiiu_crash_stage = 1;
@@ -213,12 +229,10 @@ namespace {
  * then takes the main thread's place: Menu, ProcUI, exit. */
 alignas(16) uint8_t s_rescue_stack[16 * 1024];
 
-int rescue(int, const char**)
+/* The first report again, line by line and paced, after the handler's burst
+ * (UDP dropped the SRR0/LR lines of an other-thread fault, 2026-10-29). */
+void report_first()
 {
-	while (sms_wiiu_crash_stage != 1)
-		OSSleepTicks(OSMillisecondsToTicks(100));
-	WHBLogPrint("[crash] rescue thread takes over");
-	/* The first report again, line by line and paced, after the handler's burst. */
 	OSSleepTicks(OSMillisecondsToTicks(200));
 	for (char* line = s_first; line && *line;) {
 		char* end = std::strchr(line, '\n');
@@ -227,6 +241,31 @@ int rescue(int, const char**)
 		OSSleepTicks(OSMillisecondsToTicks(20));
 		line = end ? end + 1 : nullptr;
 	}
+}
+
+int rescue(int, const char**)
+{
+	/* An other-thread fault (stage 10) is left to the main thread's next frame
+	 * boundary. A main thread blocked on the parked thread never gets there
+	 * (the THP player, 2026-10-29: silent until a reboot), so after 3 s the
+	 * rescue takes over as for a main-thread fault. */
+	int waited = 0;
+	while (sms_wiiu_crash_stage != 1) {
+		OSSleepTicks(OSMillisecondsToTicks(100));
+		if (sms_wiiu_crash_stage != 10)
+			continue;
+		if (!waited++)
+			report_first();
+		if (waited >= 30 && sms_wiiu_crash_pending) {
+			sms_wiiu_crash_pending = 0;
+			sms_wiiu_crash_stage = 1;
+			WHBLogPrint("[crash] main thread did not leave in 3 s");
+			break;
+		}
+	}
+	WHBLogPrint("[crash] rescue thread takes over");
+	if (!waited)
+		report_first();
 	sms_wiiu_crash_return_to_menu();
 	return 0;
 }

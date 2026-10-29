@@ -101,6 +101,48 @@ OSThread* current_game_thread()
 	return r ? r->game : &s_main_thread;
 }
 
+/* GameCube OSCancelThread ends a waiting thread at once; coreinit's only
+ * flags it, and the thread sleeps on. The THP player cancels its decoder
+ * threads when a movie closes and creates them again on the same OSThread
+ * for the next movie, whose first message then woke the old audio decoder
+ * too: on a stack the new one had reused (DSI in THPAudioDecode reading
+ * 0x50FCFAB0, title movie -> opening movie, 2026-10-29). A cancelled
+ * thread now leaves as soon as it wakes, before it can take a message. */
+WutThread* s_cancelled[16];
+
+void mark_cancelled(WutThread* wut)
+{
+	BOOL level = wut_OSDisableInterrupts();
+	WutThread** slot = nullptr;
+	for (WutThread*& c : s_cancelled) {
+		if (c == wut) {
+			wut_OSRestoreInterrupts(level);
+			return;
+		}
+		if (c && wut_OSIsThreadTerminated(c))
+			c = nullptr;  // ended some other way; OSThreads are never freed
+		if (!c && !slot)
+			slot = &c;
+	}
+	if (slot)
+		*slot = wut;
+	wut_OSRestoreInterrupts(level);
+	if (!slot)
+		port_log("[os] cancelled-thread table full\n");
+}
+
+void sleep_cancellable(WutQueue* queue)
+{
+	wut_OSSleepThread(queue);
+	WutThread* self = wut_OSGetCurrentThread();
+	for (WutThread*& c : s_cancelled) {
+		if (c == self) {
+			c = nullptr;
+			wut_OSExitThread(-1);
+		}
+	}
+}
+
 QueueRecord* queue_for(OSThreadQueue* game, bool create)
 {
 	for (unsigned i = 0; i < kMaxQueues; ++i)
@@ -250,6 +292,14 @@ int sms_wiiu_OSCreateThread(OSThread* game, void* (*entry)(void*), void* arg,
 	 * system heap, reused when the record is. */
 	void* host_stack = r->host_stack;
 	uint32_t host_stack_bytes = r->host_stack_bytes;
+	/* The record's previous thread may still be alive (cancelled while it
+	 * waited, see sleep_cancellable): it keeps its stack, and the new thread
+	 * gets a fresh one. The old stack and OSThread are not freed. */
+	if (r->active && r->wut && !wut_OSIsThreadTerminated(r->wut)) {
+		port_log("[os] thread %p recreated while its previous thread lives; new stack\n", (void*)game);
+		host_stack = nullptr;
+		host_stack_bytes = 0;
+	}
 	if (stack_size < kMinThreadStack) {
 		if (host_stack_bytes < kMinThreadStack) {
 			if (host_stack)
@@ -339,8 +389,11 @@ void sms_wiiu_OSExitThread(OSThread* game)
 void sms_wiiu_OSCancelThread(OSThread* game)
 {
 	ThreadRecord* r = record_for_game(game);
-	if (r)
-		wut_OSCancelThread(r->wut);
+	if (!r)
+		return;
+	if (r->wut != wut_OSGetCurrentThread())
+		mark_cancelled(r->wut);
+	wut_OSCancelThread(r->wut);
 }
 
 int sms_wiiu_OSJoinThread(OSThread* game, void** value)
@@ -380,7 +433,7 @@ void sms_wiiu_OSSleepThread(OSThreadQueue* queue)
 {
 	QueueRecord* q = queue_for(queue, true);
 	if (q)
-		wut_OSSleepThread(&q->wut);
+		sleep_cancellable(&q->wut);
 }
 
 void sms_wiiu_OSWakeupThread(OSThreadQueue* queue)
@@ -433,7 +486,7 @@ void sms_wiiu_OSLockMutex(OSMutex* mutex)
 		// Sleep before re-enabling interrupts: a wakeup sent in between found no
 		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
-			wut_OSSleepThread(&q->wut);
+			sleep_cancellable(&q->wut);
 		wut_OSRestoreInterrupts(level);
 	}
 }
@@ -476,7 +529,7 @@ void sms_wiiu_OSWaitCond(struct OSCond* cond, OSMutex* mutex)
 	unlock_mutex_without_switch(mutex, current_game_thread());
 	QueueRecord* q = queue_for(&cond->queue, true);
 	if (q)
-		wut_OSSleepThread(&q->wut);  // before re-enabling interrupts (lost wakeup)
+		sleep_cancellable(&q->wut);  // before re-enabling interrupts (lost wakeup)
 	wut_OSRestoreInterrupts(level);
 	sms_wiiu_OSLockMutex(mutex);
 }
@@ -532,7 +585,7 @@ int send_message(OSMessageQueue* mq, void* msg, long flags, bool front)
 		// Sleep before re-enabling interrupts: a wakeup sent in between found no
 		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
-			wut_OSSleepThread(&q->wut);
+			sleep_cancellable(&q->wut);
 		wut_OSRestoreInterrupts(level);
 	}
 }
@@ -573,7 +626,7 @@ int sms_wiiu_OSReceiveMessage(OSMessageQueue* mq, void* msg, long flags)
 		// Sleep before re-enabling interrupts: a wakeup sent in between found no
 		// sleeper and was lost (the audio thread slept with a message queued).
 		if (q)
-			wut_OSSleepThread(&q->wut);
+			sleep_cancellable(&q->wut);
 		wut_OSRestoreInterrupts(level);
 	}
 }
