@@ -196,7 +196,8 @@ BOOL rescue_fatal(const char* type, OSContext* context)
 	context->gpr[1] &= ~0xFu;
 	context->gpr[1] -= 0x100;
 
-	/* Publish the complete snapshot before the rescue thread sees it. */
+	/* The callback does no formatting, symbol lookup, memory walking, or
+	 * logging. Publish the complete snapshot before the rescue thread sees it. */
 	__sync_synchronize();
 	sms_wiiu_crash_pending = 1;
 	sms_wiiu_crash_stage = context == s_rescue_owner_thread ? 1 : 10;
@@ -206,7 +207,9 @@ BOOL rescue_fatal(const char* type, OSContext* context)
 
 BOOL fatal(const char* type, OSContext* context)
 {
-	/* Keep the fault address on one short line before the detailed report. */
+	/* Keep the fault address on one short line before the detailed report.
+	 * The rescue build stays capture-only here; its rescue thread prints it. */
+#if !(defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE)
 	if (context) {
 		char line[128];
 		std::snprintf(line, sizeof(line), "[x] %s #%d srr0=%08X lr=%08X dar=%08X r1=%08X", type,
@@ -214,6 +217,7 @@ BOOL fatal(const char* type, OSContext* context)
 		              (unsigned)context->lr, (unsigned)context->dar, (unsigned)context->gpr[1]);
 		WHBLogPrint(line);
 	}
+#endif
 #if defined(PORT_GAME_SMG) && SMG_WIIU_ENABLE_RESCUE
 	return rescue_fatal(type, context);
 #else
@@ -362,6 +366,10 @@ bool report_capture(const RescueCapture& capture)
 		OSFatal(s_message);
 		return false;
 	}
+	std::snprintf(s_message, sizeof(s_message), "[x] %s #%d srr0=%08X lr=%08X dar=%08X r1=%08X",
+	              capture.type, __sync_add_and_fetch(&s_fault_count, 1), (unsigned)capture.srr0,
+	              (unsigned)capture.lr, (unsigned)capture.dar, (unsigned)capture.gpr[1]);
+	WHBLogPrint(s_message);
 	std::snprintf(s_message, sizeof(s_message),
 	              "SMS Wii U %s exception\nSRR0=%08X SRR1=%08X\nDAR=%08X DSISR=%08X\n"
 	              "LR=%08X R1=%08X R3=%08X R4=%08X\n",
