@@ -483,6 +483,52 @@ void PPCMtmsr(u32) {}
 void OSClearContext(OSContext*) {}
 void OSSetCurrentContext(OSContext*) {}
 
+/* The game's OSReport/OSPanic/PPCHalt bound to coreinit, whose output never
+ * reaches the UDP log, and OSPanic/PPCHalt then stop the console instead of
+ * taking the crash path. Report to the UDP log; a panic or halt traps, so the
+ * exception handler (and the rescue build's Menu return) takes over. */
+void OSVReport(const char* fmt, va_list args)
+{
+    static volatile unsigned s_reports;
+    const unsigned n = __sync_add_and_fetch(&s_reports, 1);
+    if (n > 4000) {
+        if (n == 4001)
+            WHBLogPrint("[OSReport] more than 4000 reports; dropping the rest");
+        return;
+    }
+    char line[512];
+    std::vsnprintf(line, sizeof(line), fmt, args);
+    size_t length = std::strlen(line);
+    while (length && line[length - 1] == '\n')
+        line[--length] = '\0';
+    WHBLogPrintf("[OSReport] %s", line);
+}
+
+void OSReport(const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    OSVReport(fmt, args);
+    va_end(args);
+}
+
+void OSPanic(const char* file, uint32_t line, const char* fmt, ...)
+{
+    char message[512];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(message, sizeof(message), fmt, args);
+    va_end(args);
+    WHBLogPrintf("[OSPanic] %s:%u: %s", file ? file : "?", (unsigned)line, message);
+    __builtin_trap();
+}
+
+void PPCHalt(void)
+{
+    WHBLogPrintf("[PPCHalt] from lr=%p", __builtin_return_address(0));
+    __builtin_trap();
+}
+
 } // extern "C"
 
 void port_irq_defer(std::function<void()> fn)
