@@ -2752,6 +2752,11 @@ static bool initTevPixel(TevShader& shader) {
         }
         prepCount = program.size() - prepOffset;
     }
+    // A fetch clause starts on a 16-byte boundary (two words), as r600's
+    // assembler aligns it: the projective divide above made the prep clause
+    // odd (RECIP is a one-word group) and the fetches then ran misaligned
+    // (flat yellow sand and water).  The pad word is outside every clause.
+    if (program.size() & 1) program.push_back(0);
     tex1Offset = program.size();
     for (uint32_t i = 0; i < numInd; ++i) {
         const uint32_t map = (key.iref >> (6 * i)) & 7;
@@ -2778,6 +2783,7 @@ static bool initTevPixel(TevShader& shader) {
         for (uint32_t stage = 0; stage < key.stages; ++stage)
             if (indStage(stage)) tevEmitIndirectStage(program, key, stage);
         indCount = program.size() - indOffset;
+        if (program.size() & 1) program.push_back(0);
         tex2Offset = program.size();
         for (uint32_t stage = 0; stage < key.stages; ++stage) {
             if (!indStage(stage)) continue;
