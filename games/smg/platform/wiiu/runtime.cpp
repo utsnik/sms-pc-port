@@ -40,6 +40,7 @@ constexpr size_t kMem2ArenaBytes = 64u * 1024u * 1024u;
 static_assert(kMem1ArenaBytes == 25165824u, "SMG MEM1 arena size changed");
 static_assert(kMem2ArenaBytes == 67108864u, "SMG MEM2 arena size changed");
 const char kAppRootCandidates[][128] = {
+    "fs:/vol/external01/smg-data/",
     "fs:/vol/external01/wiiu/apps/smg/",
     "wiiu/apps/smg/",
     "/vol/external01/wiiu/apps/smg/",
