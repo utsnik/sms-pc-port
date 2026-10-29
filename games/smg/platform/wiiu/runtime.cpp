@@ -468,6 +468,13 @@ void smg_wiiu_audio_init(void)
 }
 void sms_wiiu_exit(void) { WHBProcStopRunning(); }
 
+/* JUTException::run masks FP exceptions through the MSR. coreinit exports
+ * PPCMfmsr/PPCMtmsr, but mfmsr is privileged: the first console boot took a
+ * PROGRAM exception there (Cemu does not trap it). Report FP-available only,
+ * as Sunshine's os_core.cpp does, and ignore writes. */
+u32 PPCMfmsr(void) { return 0x8000; }
+void PPCMtmsr(u32) {}
+
 } // extern "C"
 
 void port_irq_defer(std::function<void()> fn)
