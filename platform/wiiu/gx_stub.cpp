@@ -230,7 +230,7 @@ void drc_setup(bool first)
 		GX2SetContextState(WHBGfxGetTVContextState());
 		sms_wiiu_d4_event(D4_CONTEXT);
 		GX2DrawDone();
-		sms_wiiu_d4_submit("done", GX2GetLastSubmittedTimeStamp());
+		sms_wiiu_d4_submit_at("done", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 		DCInvalidateRange(drc->surface.image, drc->surface.imageSize);
 		s_canary_word = static_cast<const uint32_t*>(drc->surface.image)[drc->surface.imageSize / 8];
 		s_canary_armed = true;
@@ -388,9 +388,9 @@ void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
 	sms_wiiu_d4_event(D4_EFB_COPY);
 	sms_wiiu_d4_event(D4_READBACK);
 	GX2Flush();
-	sms_wiiu_d4_submit("flush", GX2GetLastSubmittedTimeStamp());
+	sms_wiiu_d4_submit_at("flush", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 	GX2DrawDone();
-	sms_wiiu_d4_submit("done", GX2GetLastSubmittedTimeStamp());
+	sms_wiiu_d4_submit_at("done", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 	DCInvalidateRange(dst.image, dst.imageSize);
 	const bool ok = write_bmp(path, static_cast<const uint8_t*>(dst.image), dst.width, dst.height, dst.pitch, shrink);
 	port_log("[shots] %s %s (%ux%u)\n", ok ? "wrote" : "FAILED", path, unsigned(dst.width / shrink),
@@ -448,7 +448,7 @@ void present_diagnostics()
 	if (!(p == 2 || p == 120 || p == 1800 || p == 3600 || p % 18000 == 0))
 		return;
 	GX2DrawDone(); /* the reads below assume a finished frame */
-	sms_wiiu_d4_submit("done", GX2GetLastSubmittedTimeStamp());
+	sms_wiiu_d4_submit_at("done", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 	sms_wiiu_d4_event(D4_READBACK);
 	uint32_t swaps = 0, flips = 0;
 	OSTime lastFlip = 0, lastVsync = 0;
@@ -586,11 +586,24 @@ static uint32_t s_presentFrames;
  * safe. */
 static void present_finish_pipelined(void)
 {
+	static uint32_t s_d5sCalls;
+	const bool d5s = s_d5sCalls < 40;
+	uint64_t before = 0, afterSwap = 0, afterFlush = 0;
 	sms_wiiu_d1_note_present_core();
+	if (d5s) before = GX2GetLastSubmittedTimeStamp();
 	GX2SwapScanBuffers();
+	if (d5s) afterSwap = GX2GetLastSubmittedTimeStamp();
 	sms_wiiu_d4_event(D4_SWAP);
 	GX2Flush();
-	sms_wiiu_d4_submit("flush", GX2GetLastSubmittedTimeStamp());
+	const uint64_t submitted = GX2GetLastSubmittedTimeStamp();
+	if (d5s) afterFlush = submitted;
+	sms_wiiu_d4_submit_at("flush", 's', __LINE__, submitted);
+	if (d5s) {
+		WHBLogPrintf("[d5s] before=%llu afterSwap=%llu afterFlush=%llu",
+		             (unsigned long long)before, (unsigned long long)afterSwap,
+		             (unsigned long long)afterFlush);
+		++s_d5sCalls;
+	}
 	static bool s_enabled;
 	if (!s_enabled) {
 		GX2SetTVEnable(TRUE);
@@ -781,7 +794,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
 	else {
 		WHBGfxFinishRender();
-		sms_wiiu_d4_submit("whb-finish", GX2GetLastSubmittedTimeStamp());
+		sms_wiiu_d4_submit_at("whb-finish", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 	}
 	const int64_t t1 = wut_OSGetTime_stub();
 	sms_wiiu_d1_present_line();

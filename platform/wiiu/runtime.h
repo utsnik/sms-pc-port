@@ -18,6 +18,8 @@ enum D4Event {
 void sms_wiiu_d4_event(uint32_t event);
 void sms_wiiu_d4_draw(uint32_t verts, uint32_t stages, uint32_t blend, uint32_t texmask);
 void sms_wiiu_d4_submit(const char* kind, uint64_t raw_timestamp);
+void sms_wiiu_d4_submit_at(const char* kind, char file_char, uint32_t line,
+                           uint64_t raw_timestamp);
 void sms_wiiu_d4_timeout(uint64_t ret_after);
 
 /* The active PORT_GAME runtime owns the target MEM1/MEM2 bounds.  SMG uses

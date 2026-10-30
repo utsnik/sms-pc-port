@@ -100,6 +100,7 @@ struct D4Segment {
 static D4Segment s_d4Ring[4096];
 static D4Segment s_d4Pending;
 static uint32_t s_d4Head, s_d4Size, s_d4Dropped, s_d4Timeouts;
+static uint32_t s_d5Submits;
 extern "C" void sms_wiiu_d4_event(uint32_t event) {
     if (g_displayFrames >= 60 || event > D4_READBACK) return;
     if (s_d4Pending.count[event] != 0xffff) ++s_d4Pending.count[event];
@@ -115,6 +116,21 @@ extern "C" void sms_wiiu_d4_draw(uint32_t verts, uint32_t stages, uint32_t blend
     sms_wiiu_d4_event(D4_DRAW);
 }
 extern "C" void sms_wiiu_d4_submit(const char* kind, uint64_t raw_timestamp) {
+    sms_wiiu_d4_submit_at(kind, '?', 0, raw_timestamp);
+}
+extern "C" void sms_wiiu_d4_submit_at(const char* kind, char file_char, uint32_t line,
+                                       uint64_t raw_timestamp) {
+    if (s_d5Submits < 120) {
+        WHBLogPrintf("[d5] n=%u at=%c%u kind=%s ts=%llu ret=%llu frame=%u d=%u scan=%u swap=%u ctx=%u rt=%u cc=%u cz=%u",
+                     unsigned(s_d5Submits + 1), file_char, unsigned(line), kind,
+                     (unsigned long long)raw_timestamp,
+                     (unsigned long long)::GX2GetRetiredTimeStamp(), unsigned(g_displayFrames),
+                     unsigned(s_d4Pending.count[D4_DRAW]), unsigned(s_d4Pending.count[D4_SCAN_COPY]),
+                     unsigned(s_d4Pending.count[D4_SWAP]), unsigned(s_d4Pending.count[D4_CONTEXT]),
+                     unsigned(s_d4Pending.count[D4_TARGET]), unsigned(s_d4Pending.count[D4_CLEAR_COLOR]),
+                     unsigned(s_d4Pending.count[D4_CLEAR_DEPTH]));
+        ++s_d5Submits;
+    }
     if (g_displayFrames >= 60) return;
     s_d4Pending.ts = raw_timestamp;
     s_d4Pending.frame = g_displayFrames;
@@ -708,8 +724,8 @@ static void gx2DlSplit(int reason);
 #define GX2SetContextState(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_CONTEXT), ::GX2SetContextState(__VA_ARGS__))
 #define GX2SetColorBuffer(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_TARGET), ::GX2SetColorBuffer(__VA_ARGS__))
 #define GX2SetDepthBuffer(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_TARGET), ::GX2SetDepthBuffer(__VA_ARGS__))
-#define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__), sms_wiiu_d4_submit("done", (::GX2GetLastSubmittedTimeStamp)()))
-#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__), sms_wiiu_d4_submit("flush", (::GX2GetLastSubmittedTimeStamp)()))
+#define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__), sms_wiiu_d4_submit_at("done", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
+#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__), sms_wiiu_d4_submit_at("flush", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
 #define GX2GetLastSubmittedTimeStamp(...) (gx2DlSplit(kDlSplitFrame), ::GX2GetLastSubmittedTimeStamp(__VA_ARGS__))
 static uint8_t* s_gx2DlArena[kVertexArenas];
 static uint32_t s_gx2DlUsed[kVertexArenas];
@@ -4960,7 +4976,7 @@ static bool gx2DlEndCall(void* list) {
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
     s_perfDlCoreCall = OSGetCoreId();
     GX2DirectCallDisplayList(list, bytes);
-    sms_wiiu_d4_submit("list", (::GX2GetLastSubmittedTimeStamp)());
+    sms_wiiu_d4_submit_at("list", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)());
     return true;
 }
 
