@@ -62,6 +62,7 @@ const uint32_t kMaxFstBytes = 64u * 1024u;
 const uint32_t kMaxFiles = 96;
 const uint32_t kMaxPending = 96;
 const uint32_t kCacheSlots = 6;
+const uint32_t kPackCacheSlot = 0;
 const size_t kReadAheadSize = 128u * 1024u;
 const size_t kLargeReadSize = 64u * 1024u;
 
@@ -89,6 +90,12 @@ struct FileState {
 	bool active;
 };
 
+struct PackIndexEntry {
+	uint32_t offset;
+	uint32_t size;
+	bool valid;
+};
+
 struct Pending {
 	DVDFileInfo* file;
 	DVDCallback callback;
@@ -114,22 +121,32 @@ bool s_mutex_initialized;
 CafeOSMutex s_read_mutex;
 CachedFile s_cache[kCacheSlots];
 alignas(64) static uint8_t s_read_ahead[kCacheSlots][kReadAheadSize];
+PackIndexEntry s_pack_entries[kMaxEntries];
+FILE* s_pack_file;
+uint32_t s_pack_file_size;
 uint64_t s_cache_clock;
 uint64_t s_stat_reads;
 uint64_t s_stat_bytes;
 uint64_t s_stat_fill_bytes;
 uint64_t s_stat_opens;
+uint64_t s_stat_pack_reads;
 uint64_t s_stat_read_ticks;
 OSTime s_stat_log_time;
 
-void close_cached_file(unsigned slot)
+void reset_cached_file(unsigned slot)
 {
-	if (s_cache[slot].file) {
-		std::fclose(s_cache[slot].file);
-		s_cache[slot].file = nullptr;
-	}
 	s_cache[slot].window_length = 0;
 	s_cache[slot].position = 0;
+}
+
+void close_cached_file(unsigned slot)
+{
+	if (s_cache[slot].file &&
+	    !(slot == kPackCacheSlot && s_cache[slot].file == s_pack_file)) {
+		std::fclose(s_cache[slot].file);
+	}
+	s_cache[slot].file = nullptr;
+	reset_cached_file(slot);
 }
 
 void log_read_stats()
@@ -138,8 +155,9 @@ void log_read_stats()
 	if (!s_stat_log_time)
 		s_stat_log_time = now;
 	if (now - s_stat_log_time >= OSSecondsToTicks(5)) {
-		port_log("[dvd] stats reads=%llu bytes=%llu fill_bytes=%llu opens=%llu read_ms=%llu\n",
+		port_log("[dvd] stats reads=%llu pack_reads=%llu bytes=%llu fill_bytes=%llu opens=%llu read_ms=%llu\n",
 		         static_cast<unsigned long long>(s_stat_reads),
+		         static_cast<unsigned long long>(s_stat_pack_reads),
 		         static_cast<unsigned long long>(s_stat_bytes),
 		         static_cast<unsigned long long>(s_stat_fill_bytes),
 		         static_cast<unsigned long long>(s_stat_opens),
@@ -290,6 +308,98 @@ int find_entry(const char* path)
 	return -1;
 }
 
+bool load_pack()
+{
+	char pack_path[192];
+	std::snprintf(pack_path, sizeof(pack_path), "%spack.bin", sms_wiiu_app_root());
+	FILE* pack = std::fopen(pack_path, "rb");
+	if (!pack)
+		return false;
+	auto failed = [&]() {
+		std::fclose(pack);
+		std::memset(s_pack_entries, 0, sizeof(s_pack_entries));
+		s_pack_file_size = 0;
+		return false;
+	};
+	if (std::setvbuf(pack, nullptr, _IONBF, 0) != 0)
+		return failed();
+	if (std::fseek(pack, 0, SEEK_END) != 0)
+		return failed();
+	long pack_size = std::ftell(pack);
+	if (pack_size < 32 || static_cast<unsigned long>(pack_size) > 0xfffffffful)
+		return failed();
+	s_pack_file_size = static_cast<uint32_t>(pack_size);
+	if (std::fseek(pack, 0, SEEK_SET) != 0)
+		return failed();
+
+	uint8_t header[32];
+	if (std::fread(header, 1, sizeof(header), pack) != sizeof(header) ||
+	    std::memcmp(header, "SMGP", 4) != 0 || be32(header + 4) != 1 ||
+	    be32(header + 8) > kMaxEntries || be32(header + 16) < 32 ||
+	    (be32(header + 16) & 63u) != 0)
+		return failed();
+	const uint32_t count = be32(header + 8);
+	const uint32_t index_size = be32(header + 12);
+	const uint32_t data_offset = be32(header + 16);
+	if (index_size > s_pack_file_size - 32 ||
+	    data_offset < 32 + index_size || data_offset > s_pack_file_size ||
+	    std::fseek(pack, 32, SEEK_SET) != 0)
+		return failed();
+
+	std::memset(s_pack_entries, 0, sizeof(s_pack_entries));
+	const uint32_t index_end = 32 + index_size;
+	uint32_t index_position = 32;
+	uint32_t mapped = 0;
+	for (uint32_t i = 0; i < count; ++i) {
+		uint8_t record_header[4];
+		if (index_position + sizeof(record_header) > index_end ||
+		    std::fread(record_header, 1, sizeof(record_header), pack) !=
+		        sizeof(record_header))
+			return failed();
+		index_position += sizeof(record_header);
+		const uint32_t path_length = (static_cast<uint32_t>(record_header[0]) << 8) |
+		                             record_header[1];
+		if (!path_length || path_length >= kMaxPath ||
+		    path_length + 8 > index_end - index_position)
+			return failed();
+		char path[kMaxPath];
+		if (std::fread(path, 1, path_length, pack) != path_length)
+			return failed();
+		path[path_length] = '\0';
+		index_position += path_length;
+		uint8_t location[8];
+		if (std::fread(location, 1, sizeof(location), pack) != sizeof(location))
+			return failed();
+		index_position += sizeof(location);
+		const uint32_t offset = be32(location);
+		const uint32_t size = be32(location + 4);
+		if ((offset & 63u) != 0 || offset < data_offset ||
+		    offset > s_pack_file_size || size > s_pack_file_size - offset)
+			return failed();
+		const int entry = find_entry(path);
+		if (entry >= 0 && !s_entries[entry].directory) {
+			if (s_pack_entries[entry].valid || s_entries[entry].size != size)
+				return failed();
+			s_pack_entries[entry].offset = offset;
+			s_pack_entries[entry].size = size;
+			s_pack_entries[entry].valid = true;
+			++mapped;
+		}
+	}
+	if (index_position != index_end)
+		return failed();
+
+	s_pack_file = pack;
+	s_cache[kPackCacheSlot].file = pack;
+	s_cache[kPackCacheSlot].entry = 0xffffffffu;
+	reset_cached_file(kPackCacheSlot);
+	++s_stat_opens;
+	port_log("[dvd] pack: %u entries, %u mapped, %u bytes\n", count,
+	         mapped,
+	         s_pack_file_size);
+	return true;
+}
+
 u32 parent_for(u32 index)
 {
 	u32 parent = 0;
@@ -367,18 +477,23 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 	const size_t want = static_cast<uint32_t>(length) < remaining ? static_cast<size_t>(length) : remaining;
 	char path[kMaxPath + 128];
 	static uint32_t s_failures;
-	if (!files_path(state->entry, path, sizeof(path))) {
+	const bool packed = s_pack_file && s_pack_entries[state->entry].valid;
+	if (!packed && !files_path(state->entry, path, sizeof(path))) {
 		if (s_failures++ < 16)
 			port_log("[dvd] read rejected: bad path for entry %u (%s)\n", state->entry, entry.path);
 		return DVD_RESULT_FATAL_ERROR;
 	}
-	unsigned slot = 0;
-	for (; slot < kCacheSlots; ++slot)
-		if (s_cache[slot].file && s_cache[slot].entry == state->entry)
-			break;
-	if (slot == kCacheSlots) {
-		slot = 0;
-		for (unsigned i = 0; i < kCacheSlots; ++i)
+	const char* log_path = packed ? entry.path : path;
+	const unsigned first_file_slot = s_pack_file ? kPackCacheSlot + 1 : kPackCacheSlot;
+	unsigned slot = packed ? kPackCacheSlot : first_file_slot;
+	if (!packed) {
+		for (; slot < kCacheSlots; ++slot)
+			if (s_cache[slot].file && s_cache[slot].entry == state->entry)
+				break;
+	}
+	if (!packed && slot == kCacheSlots) {
+		slot = first_file_slot;
+		for (unsigned i = first_file_slot; i < kCacheSlots; ++i)
 			if (!s_cache[i].file || s_cache[i].used < s_cache[slot].used)
 				slot = i;
 		close_cached_file(slot);
@@ -386,15 +501,15 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 	const OSTime read_start = OSGetTime();
 	FILE* file = s_cache[slot].file;
 	if (!file) {
-		file = std::fopen(path, "rb");
+		file = packed ? s_pack_file : std::fopen(path, "rb");
 		if (!file) {
 			if (s_failures++ < 16)
-				port_log("[dvd] read failed: cannot open %s\n", path);
+				port_log("[dvd] read failed: cannot open %s\n", log_path);
 			s_stat_read_ticks += OSGetTime() - read_start;
 			log_read_stats();
 			return DVD_RESULT_FATAL_ERROR;
 		}
-		if (std::setvbuf(file, nullptr, _IONBF, 0) != 0) {
+		if (!packed && std::setvbuf(file, nullptr, _IONBF, 0) != 0) {
 			std::fclose(file);
 			s_stat_read_ticks += OSGetTime() - read_start;
 			log_read_stats();
@@ -402,15 +517,25 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		}
 		s_cache[slot].file = file;
 		s_cache[slot].entry = state->entry;
-		s_cache[slot].window_length = 0;
-		s_cache[slot].position = 0;
-		++s_stat_opens;
+		reset_cached_file(slot);
+		if (!packed)
+			++s_stat_opens;
 	}
+	if (packed)
+		++s_stat_pack_reads;
 	s_cache[slot].used = ++s_cache_clock;
 	size_t got = 0;
 	size_t fill = 0;
 	if (want != 0) {
-		const uint32_t request_offset = static_cast<uint32_t>(offset);
+		const uint32_t file_offset = static_cast<uint32_t>(offset);
+		if (packed && s_pack_entries[state->entry].offset > 0xffffffffu - file_offset) {
+			reset_cached_file(slot);
+			s_stat_read_ticks += OSGetTime() - read_start;
+			log_read_stats();
+			return DVD_RESULT_FATAL_ERROR;
+		}
+		const uint32_t request_offset = packed ?
+			s_pack_entries[state->entry].offset + file_offset : file_offset;
 		const bool in_window = request_offset >= s_cache[slot].window_offset &&
 		                       request_offset <= s_cache[slot].window_offset + s_cache[slot].window_length &&
 		                       want <= s_cache[slot].window_length -
@@ -421,8 +546,11 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 			got = want;
 		} else if (want >= kLargeReadSize) {
 			if (s_cache[slot].position != request_offset) {
-				if (std::fseek(file, offset, SEEK_SET) != 0) {
-					close_cached_file(slot);
+				if (std::fseek(file, static_cast<long>(request_offset), SEEK_SET) != 0) {
+					if (packed)
+						reset_cached_file(slot);
+					else
+						close_cached_file(slot);
 					s_stat_read_ticks += OSGetTime() - read_start;
 					log_read_stats();
 					return DVD_RESULT_FATAL_ERROR;
@@ -435,8 +563,11 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 			s_cache[slot].window_length = 0;
 		} else {
 			if (s_cache[slot].position != request_offset) {
-				if (std::fseek(file, offset, SEEK_SET) != 0) {
-					close_cached_file(slot);
+				if (std::fseek(file, static_cast<long>(request_offset), SEEK_SET) != 0) {
+					if (packed)
+						reset_cached_file(slot);
+					else
+						close_cached_file(slot);
 					s_stat_read_ticks += OSGetTime() - read_start;
 					log_read_stats();
 					return DVD_RESULT_FATAL_ERROR;
@@ -461,9 +592,12 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 	if (got)
 		DCFlushRange(address, got);
 	if (got != want) {
-		close_cached_file(slot);
+		if (packed)
+			reset_cached_file(slot);
+		else
+			close_cached_file(slot);
 		if (s_failures++ < 16)
-			port_log("[dvd] short read %s: %u of %u\n", path, static_cast<unsigned>(got), static_cast<unsigned>(want));
+			port_log("[dvd] short read %s: %u of %u\n", log_path, static_cast<unsigned>(got), static_cast<unsigned>(want));
 		log_read_stats();
 		return DVD_RESULT_FATAL_ERROR;
 	}
@@ -645,6 +779,7 @@ void port_dvd_init(void)
 		              s_entries[parent].path,
 		              std::strcmp(s_entries[parent].path, "/") ? "/" : "", name);
 	}
+	load_pack();
 	char boot_path[192];
 	std::snprintf(boot_path, sizeof(boot_path), "%ssys/boot.bin", sms_wiiu_app_root());
 	FILE* boot = std::fopen(boot_path, "rb");
@@ -683,6 +818,10 @@ void sms_wiiu_dvd_shutdown(void)
 	cafe_OSLockMutex(&s_read_mutex);
 	for (unsigned i = 0; i < kCacheSlots; ++i)
 		close_cached_file(i);
+	if (s_pack_file) {
+		std::fclose(s_pack_file);
+		s_pack_file = nullptr;
+	}
 	cafe_OSUnlockMutex(&s_read_mutex);
 }
 
