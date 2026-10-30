@@ -1914,29 +1914,29 @@ static bool initVertexProgram(VertexProgram& shader) {
         vertexEmit(alu, {ALU_ADD(_R(20), _w, ALU_SRC_0, _x, _R(40) _NEG, _z)});
     }
     // viewport -> TV clip coordinates. C186 is the six-value viewport block;
-    // C187.x/y/z/w are game scale, game X, and TV dimensions. Keep this
-    // algebra identical to transformPosition: the generated path must land
-    // in the same 640x480 letterboxed rectangle as the CPU reference.
+    // C187 is X/Y scale, X offset and TV width; C188.z is TV height. Keep this
+    // algebra identical to transformPosition so the generated path lands in
+    // the same mapped rectangle as the CPU reference.
     vertexEmit(alu, {ALU_MUL(_R(54), _x, _GX2_C(kVtxLiveBase + 2), _z,
                              _GX2_C(kVtxLiveBase + 3), _x)});
     vertexEmit(alu, {ALU_MUL(_R(54), _x, _R(54), _x, ALU_SRC_0_5, _x)});
     vertexEmit(alu, {ALU_MUL(_R(54), _y, _GX2_C(kVtxLiveBase + 2), _w,
-                             _GX2_C(kVtxLiveBase + 3), _x)});
+                             _GX2_C(kVtxLiveBase + 3), _y)});
     vertexEmit(alu, {ALU_MUL(_R(54), _y, _R(54), _y, ALU_SRC_0_5, _x)});
     vertexEmit(alu, {ALU_MULADD(_R(55), _x, _GX2_C(kVtxLiveBase + 2), _x,
                                 _GX2_C(kVtxLiveBase + 3), _x,
                                 _R(54), _x)});
-    vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _GX2_C(kVtxLiveBase + 3), _y)});
+    vertexEmit(alu, {ALU_ADD(_R(55), _x, _R(55), _x, _GX2_C(kVtxLiveBase + 3), _z)});
     vertexEmit(alu, {ALU_MULADD(_R(55), _y, _GX2_C(kVtxLiveBase + 2), _y,
-                                _GX2_C(kVtxLiveBase + 3), _x,
+                                _GX2_C(kVtxLiveBase + 3), _y,
                                 _R(54), _y)});
     vertexEmit(alu, {ALU_MUL(_R(55), _x, _R(55), _x, _R(20), _w)});
     vertexEmit(alu, {ALU_MULADD(_R(55), _x, _R(54), _x, _R(20), _x, _R(55), _x)});
     vertexEmit(alu, {ALU_MUL(_R(55), _y, _R(55), _y, _R(20), _w)});
     vertexEmit(alu, {ALU_MULADD(_R(55), _y, _R(54), _y, _R(20) _NEG, _y, _R(55), _y)});
-    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 3), _z)});
-    vertexEmit(alu, {ALU_MUL_x2(_R(55), _x, _R(55), _x, _R(56), _x)});
     vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 3), _w)});
+    vertexEmit(alu, {ALU_MUL_x2(_R(55), _x, _R(55), _x, _R(56), _x)});
+    vertexEmit(alu, {ALU_RECIP_IEEE(_R(56), _x, _GX2_C(kVtxLiveBase + 4), _z)});
     vertexEmit(alu, {ALU_MUL_x2(_R(55), _y, _R(55), _y, _R(56), _x)});
     vertexEmit(alu, {ALU_ADD(_R(20), _x, _R(55), _x, _R(20) _NEG, _w)});
     vertexEmit(alu, {ALU_ADD(_R(20), _y, _R(20), _w, _R(55) _NEG, _y)});
@@ -3366,7 +3366,9 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     }
 }
 
-static float s_tvW = 1280.0f, s_tvH = 720.0f, s_gameScale = 1.5f, s_gameX = 160.0f;
+static float s_tvW = 1280.0f, s_tvH = 720.0f;
+static float s_gameScaleX = 2.0f, s_gameScaleY = 1.5f, s_gameOffsetX = 0.0f;
+static bool s_aspect43;
 
 // EFB copies to textures (GXCopyTex): the game renders a pass, copies the
 // frame into a texture and draws it back (water, heat haze, shadows). The
@@ -3522,8 +3524,8 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     ++s_copyGeneration;
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return;
-    const uint32_t tx = uint32_t(s_gameX + float(x) * s_gameScale), ty = uint32_t(float(y) * s_gameScale);
-    uint32_t tw = uint32_t(float(w) * s_gameScale), th = uint32_t(float(h) * s_gameScale);
+    const uint32_t tx = uint32_t(s_gameOffsetX + float(x) * s_gameScaleX), ty = uint32_t(float(y) * s_gameScaleY);
+    uint32_t tw = uint32_t(float(w) * s_gameScaleX), th = uint32_t(float(h) * s_gameScaleY);
     if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
     if (ty + th > cb->surface.height) th = cb->surface.height - ty;
     if (!tw || !th) return;
@@ -4153,21 +4155,23 @@ static void updateTarget() {
         s_tvW = float(cb->surface.width);
         s_tvH = float(cb->surface.height);
     }
-    s_gameScale = s_tvH / 480.0f;
-    s_lodScale = s_gameScale;
-    s_gameX = (s_tvW - 640.0f * s_gameScale) * 0.5f;
+    s_gameScaleY = s_tvH / 480.0f;
+    s_gameScaleX = s_aspect43 ? s_gameScaleY : s_tvW / 640.0f;
+    s_lodScale = s_gameScaleY;
+    s_gameOffsetX = s_aspect43 ? (s_tvW - 640.0f * s_gameScaleX) * 0.5f : 0.0f;
 }
 
 static void applyState() {
     // Same inputs as the last draw: GX2 already holds this state.
-    struct StateInputs { uint32_t zmode, xf5, cm0, cm1, pe, genmode, scissor[4]; float scale, x, w, h; };
+    struct StateInputs { uint32_t zmode, xf5, cm0, cm1, pe, genmode, lpsize, scissor[4]; float scaleX, scaleY, offsetX, w, h; };
     StateInputs in;
     memset(&in, 0, sizeof(in));
     in.zmode = g.bp[BP_ZMODE]; in.xf5 = g.xfReg[0x05];
     in.cm0 = g.bp[BP_CMODE0]; in.cm1 = g.bp[BP_CMODE1];
-    in.pe = g.bp[BP_PE_CONTROL]; in.genmode = g.bp[BP_GENMODE];
+    in.pe = g.bp[BP_PE_CONTROL]; in.genmode = g.bp[BP_GENMODE]; in.lpsize = g.bp[BP_LPSIZE];
     memcpy(in.scissor, g.scissor, sizeof(in.scissor));
-    in.scale = s_gameScale; in.x = s_gameX; in.w = s_tvW; in.h = s_tvH;
+    in.scaleX = s_gameScaleX; in.scaleY = s_gameScaleY; in.offsetX = s_gameOffsetX;
+    in.w = s_tvW; in.h = s_tvH;
     static StateInputs s_last;
     if (s_stateValid && !memcmp(&in, &s_last, sizeof(in))) return;
     s_last = in;
@@ -4230,8 +4234,8 @@ static void applyState() {
     const uint32_t cull = (g.bp[BP_GENMODE] >> 14) & 3;
     GX2SetPolygonControl(GX2_FRONT_FACE_CW, cull == 2 || cull == 3, cull == 1 || cull == 3, FALSE,
                          GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
-    const float scaleX = s_gameScale, scaleY = s_gameScale;
-    const int vx = int(s_gameX + g.viewport[0] * scaleX);
+    const float scaleX = s_gameScaleX, scaleY = s_gameScaleY;
+    const int vx = int(s_gameOffsetX + g.viewport[0] * scaleX);
     const int vy = int(g.viewport[1] * scaleY);
     const int vw = int(g.viewport[2] * scaleX);
     const int vh = int(g.viewport[3] * scaleY);
@@ -4239,11 +4243,14 @@ static void applyState() {
     // so GX2's own viewport must be the identity mapping.
     (void)vx; (void)vy; (void)vw; (void)vh;
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
-    const int sx = int(s_gameX + g.scissor[0] * scaleX);
+    const int sx = int(s_gameOffsetX + g.scissor[0] * scaleX);
     const int sy = int(g.scissor[1] * scaleY);
     const int sw = int(g.scissor[2] * scaleX);
     const int sh = int(g.scissor[3] * scaleY);
     GX2SetScissor(sx, sy, sw, sh);
+    GX2SetLineWidth(float(g.bp[BP_LPSIZE] & 0xffu) / 6.0f * scaleX);
+    const float pointSize = float((g.bp[BP_LPSIZE] >> 8) & 0xffu) / 6.0f;
+    GX2SetPointSize(pointSize * scaleX, pointSize * scaleY);
     // Color update is independent of blending in CMODE0.  The title's
     // blend-off cloud and light-ray passes still have cupd set, so use that
     // bit for GX2's color mask rather than treating GX_BM_NONE as write-off.
@@ -4473,11 +4480,11 @@ static void transformPosition(const HostVertex& in, float* out) {
     }
     if (fabsf(cw) < 0.00001f) cw = 0.00001f;
     // Match the PC renderer's XF viewport conversion, then map the original
-    // 640x480 game rectangle into the TV target (4:3 letterboxed).
-    const float halfW = g.viewport[2] * 0.5f * s_gameScale;
-    const float halfH = g.viewport[3] * 0.5f * s_gameScale;
-    const float centerX = s_gameX + g.viewport[0] * s_gameScale + halfW;
-    const float centerY = g.viewport[1] * s_gameScale + halfH;
+    // 640x480 game rectangle into the TV target.
+    const float halfW = g.viewport[2] * 0.5f * s_gameScaleX;
+    const float halfH = g.viewport[3] * 0.5f * s_gameScaleY;
+    const float centerX = s_gameOffsetX + g.viewport[0] * s_gameScaleX + halfW;
+    const float centerY = g.viewport[1] * s_gameScaleY + halfH;
     out[0] = ((centerX * cw + halfW * cx) * (2.0f / s_tvW)) - cw;
     // GX screen y grows downwards; GX2 clip-space y grows upwards.
     out[1] = cw - ((centerY * cw - halfH * cy) * (2.0f / s_tvH));
@@ -4534,19 +4541,21 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
     s_vtxLive[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
     memcpy(&s_vtxLive[8], g.viewport, 4 * sizeof(float));
     // C187 is the viewport mapping block consumed by the generated vertex
-    // program: game scale/X followed by the target dimensions.  Do not leave
-    // the XF viewport's depth pair in front of it; that made the generated
-    // path use z-offset/scale as its 2D scale and sent every vertex offscreen.
-    s_vtxLive[12] = s_gameScale;
-    s_vtxLive[13] = s_gameX;
-    s_vtxLive[14] = s_tvW;
-    s_vtxLive[15] = s_tvH;
+    // program: X/Y scales, X offset and TV width. C188.z is the TV height.
+    // Do not leave the XF viewport's depth pair in front of it; that made the
+    // generated path use z-offset/scale as its 2D scale and sent every vertex
+    // offscreen.
+    s_vtxLive[12] = s_gameScaleX;
+    s_vtxLive[13] = s_gameScaleY;
+    s_vtxLive[14] = s_gameOffsetX;
+    s_vtxLive[15] = s_tvW;
     // C188.xy are depth scale/offset, already divided by the XF 24-bit
     // depth range.  This keeps the live block self-contained without
     // spending a constant register on 1 / 16777215.  The generated shader
     // evaluates C188.x * z + C188.y * w, matching transformPosition.
     s_vtxLive[16] = xfViewport[2] / 16777215.0f;
     s_vtxLive[17] = xfViewport[5] / 16777215.0f;
+    s_vtxLive[18] = s_tvH;
     auto colour = [](uint32_t value, float* out) {
         out[0] = float((value >> 24) & 255) / 255.0f;
         out[1] = float((value >> 16) & 255) / 255.0f;
@@ -4805,6 +4814,7 @@ void rendererInit(float) {
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_noScanTv = sdMarkerPresent("noscantv");
     s_noScanDrc = sdMarkerPresent("noscandrc");
+    s_aspect43 = sdMarkerPresent("aspect43");
     s_d7NoSwap = sdMarkerPresent("noswap");
     s_d7FencePoll = sdMarkerPresent("fencepoll");
     s_d6Force = sdMarkerPresent("forcepres");
@@ -5640,8 +5650,8 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
             GX2WaitTimeStamp(s_peekStamp);
             sms_wiiu_d4_event(D4_READBACK);
             for (uint32_t i = 0; i < count; ++i) {
-                uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
-                uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
+                uint32_t px = uint32_t(s_gameOffsetX + (float(points[i][0]) + 0.5f) * s_gameScaleX);
+                uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScaleY);
                 if (px >= s_peekSurface.width) px = s_peekSurface.width - 1;
                 if (py >= s_peekSurface.height) py = s_peekSurface.height - 1;
                 uint8_t* texel = static_cast<uint8_t*>(s_peekSurface.image) + (size_t(py) * s_peekSurface.pitch + px) * 4;
@@ -5667,8 +5677,8 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
     sms_wiiu_d4_event(D4_READBACK);
     for (uint32_t i = 0; i < count; ++i) {
-        uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
-        uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
+        uint32_t px = uint32_t(s_gameOffsetX + (float(points[i][0]) + 0.5f) * s_gameScaleX);
+        uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScaleY);
         if (px >= linear.width) px = linear.width - 1;
         if (py >= linear.height) py = linear.height - 1;
         uint8_t* texel = static_cast<uint8_t*>(linear.image) + (size_t(py) * linear.pitch + px) * 4;
@@ -5789,8 +5799,8 @@ uint32_t peekZ(int x, int y) {
         s_frame = g_displayFrames;
         if (!had) return 0xffffff;
     }
-    uint32_t px = uint32_t(s_gameX + (float(x) + 0.5f) * s_gameScale);
-    uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScale);
+    uint32_t px = uint32_t(s_gameOffsetX + (float(x) + 0.5f) * s_gameScaleX);
+    uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScaleY);
     if (px >= s_linear.width) px = s_linear.width - 1;
     if (py >= s_linear.height) py = s_linear.height - 1;
     uint8_t* texel = static_cast<uint8_t*>(s_linear.image) + (size_t(py) * s_linear.pitch + px) * 4;

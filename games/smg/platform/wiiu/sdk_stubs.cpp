@@ -4,6 +4,10 @@
 
 #include <cstring>
 
+#ifndef SC_ASPECT_RATIO_16x9
+#define SC_ASPECT_RATIO_16x9 1u
+#endif
+
 namespace {
 
 const unsigned kMaxLoggedStubs = 64;
@@ -44,4 +48,14 @@ extern "C" void smg_stage1_stub_log_once(const char* symbol)
 
 SMG_STAGE1_STUB_SYMBOLS(SMG_DEFINE_STAGE1_STUB)
 
+#define SMG_DEFINE_STAGE1_VALUE_STUB(symbol, value) \
+  extern "C" unsigned char symbol(void) \
+  { \
+    smg_stage1_stub_log_once(#symbol); \
+    return value; \
+  }
+
+SMG_STAGE1_VALUE_STUB_SYMBOLS(SMG_DEFINE_STAGE1_VALUE_STUB)
+
 #undef SMG_DEFINE_STAGE1_STUB
+#undef SMG_DEFINE_STAGE1_VALUE_STUB

@@ -23,7 +23,6 @@
   X(VIEnableDimming) \
   X(VIGetDimmingCount) \
   X(SCGetSoundMode) \
-  X(SCGetAspectRatio) \
   X(SCGetProgressiveMode) \
   X(SCGetEuRgb60Mode) \
   X(RFLSearchOfficialData) \
@@ -77,6 +76,9 @@
   X(__syscall_tls_delete) \
   X(__syscall_tls_get) \
   X(__syscall_tls_set)
+
+#define SMG_STAGE1_VALUE_STUB_SYMBOLS(X) \
+  X(SCGetAspectRatio, SC_ASPECT_RATIO_16x9)
 
 #ifdef __cplusplus
 extern "C" {
