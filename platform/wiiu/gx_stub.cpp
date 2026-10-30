@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include <sys/stat.h>
 #include <whb/gfx.h>
+#include <coreinit/thread.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/core.h>
 #include <gx2/clear.h>
