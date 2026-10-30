@@ -192,6 +192,20 @@ void HeapMemoryWatcher::memoryErrorCallback(void* pHeap, u32 size, int align) {
              pHeap, size, align, heap ? heap->getFreeSize() : 0, heap ? heap->getTotalFreeSize() : 0,
              heap ? heap->mSize : 0, w ? w->mSceneHeapNapa : nullptr, w ? w->mSceneHeapGDDR : nullptr,
              w ? w->mGameHeapNapa : nullptr, w ? w->mGameHeapGDDR : nullptr, w ? w->mFileCacheHeap : nullptr);
+    port_log("[smg-heap] root=%p rootGDDR3=%p system=%p current=%p", (void*)JKRHeap::sRootHeap,
+             (void*)HeapMemoryWatcher::sRootHeapGDDR3, (void*)JKRHeap::sSystemHeap, (void*)JKRHeap::sCurrentHeap);
+    /* The crash report cannot walk past OSPanic: log the caller chain here. */
+    {
+        const u32* sp;
+        asm volatile("mr %0, 1" : "=r"(sp));
+        for (int i = 0; i < 20 && sp; ++i) {
+            const u32* next = reinterpret_cast< const u32* >(sp[0]);
+            if (!next || next <= sp || reinterpret_cast< u32 >(next) >= 0x50000000u)
+                break;
+            port_log("[smg-heap] bt %d %08x", i, (unsigned)next[1]);
+            sp = next;
+        }
+    }
 #endif
     OSPanic(__FILE__, 537, "");
 }
