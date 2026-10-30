@@ -9,6 +9,17 @@
 extern "C" {
 #endif
 
+/* CPU-only d4 GPU submission breadcrumbs. */
+enum D4Event {
+	D4_DRAW, D4_CLEAR_COLOR, D4_CLEAR_DEPTH, D4_EFB_COPY, D4_DEPTH_COPY,
+	D4_RETile, D4_SCAN_COPY, D4_PEEK, D4_UPLOAD, D4_SWAP, D4_CONTEXT,
+	D4_TARGET, D4_READBACK
+};
+void sms_wiiu_d4_event(uint32_t event);
+void sms_wiiu_d4_draw(uint32_t verts, uint32_t stages, uint32_t blend, uint32_t texmask);
+void sms_wiiu_d4_submit(const char* kind, uint64_t raw_timestamp);
+void sms_wiiu_d4_timeout(uint64_t ret_after);
+
 /* The active PORT_GAME runtime owns the target MEM1/MEM2 bounds.  SMG uses
  * static Wii-sized arenas; SMS keeps its default-heap runtime ownership. */
 void sms_wiiu_runtime_init(void);

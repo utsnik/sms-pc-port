@@ -130,6 +130,7 @@ void sms_wiiu_frame_boundary(void)
 		 * ask for the Menu. GX2DrawDone alone gave up after ~1 s with work
 		 * outstanding, and the foreground release never completed. */
 		GX2Flush();
+		sms_wiiu_d4_submit("exit-flush", GX2GetLastSubmittedTimeStamp());
 		const uint64_t target = GX2GetLastSubmittedTimeStamp();
 		const int64_t start = sms_wiiu_native_time();
 		int logged = 0, kicks = 0;
@@ -149,7 +150,9 @@ void sms_wiiu_frame_boundary(void)
 				lastProgress = now;
 			} else if (now - lastProgress > 62156250 / 10 * 3 && kicks < 50) {
 				GX2SwapScanBuffers();
+				sms_wiiu_d4_event(D4_SWAP);
 				GX2Flush();
+				sms_wiiu_d4_submit("exit-flush", GX2GetLastSubmittedTimeStamp());
 				++kicks;
 				lastProgress = now;
 				WHBLogPrintf("SMS Wii U: exit drain: kick %d (empty swap) retired=%llu", kicks,
@@ -172,6 +175,7 @@ void sms_wiiu_frame_boundary(void)
 		SYSLaunchMenu();
 #else
 		GX2DrawDone();
+		sms_wiiu_d4_submit("exit-done", GX2GetLastSubmittedTimeStamp());
 		WHBLogPrintf("SMS Wii U: exit drain: done retired=%llu; pumping ProcUI",
 		             (unsigned long long)GX2GetRetiredTimeStamp());
 #endif

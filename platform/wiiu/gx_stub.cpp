@@ -226,8 +226,11 @@ void drc_setup(bool first)
 	         static_cast<void*>(WHBGfxGetDRCContextState()));
 	if (drc->surface.image && drc->surface.imageSize >= 64) {
 		GX2ClearColor(drc, kCanary[0], kCanary[1], kCanary[2], kCanary[3]);
+		sms_wiiu_d4_event(D4_CLEAR_COLOR);
 		GX2SetContextState(WHBGfxGetTVContextState());
+		sms_wiiu_d4_event(D4_CONTEXT);
 		GX2DrawDone();
+		sms_wiiu_d4_submit("done", GX2GetLastSubmittedTimeStamp());
 		DCInvalidateRange(drc->surface.image, drc->surface.imageSize);
 		s_canary_word = static_cast<const uint32_t*>(drc->surface.image)[drc->surface.imageSize / 8];
 		s_canary_armed = true;
@@ -382,8 +385,12 @@ void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
 	std::memset(dst.image, 0, dst.imageSize);
 	DCFlushRange(dst.image, dst.imageSize);
 	GX2CopySurface(const_cast<GX2Surface*>(&src), 0, 0, &dst, 0, 0);
+	sms_wiiu_d4_event(D4_EFB_COPY);
+	sms_wiiu_d4_event(D4_READBACK);
 	GX2Flush();
+	sms_wiiu_d4_submit("flush", GX2GetLastSubmittedTimeStamp());
 	GX2DrawDone();
+	sms_wiiu_d4_submit("done", GX2GetLastSubmittedTimeStamp());
 	DCInvalidateRange(dst.image, dst.imageSize);
 	const bool ok = write_bmp(path, static_cast<const uint8_t*>(dst.image), dst.width, dst.height, dst.pitch, shrink);
 	port_log("[shots] %s %s (%ux%u)\n", ok ? "wrote" : "FAILED", path, unsigned(dst.width / shrink),
@@ -441,6 +448,8 @@ void present_diagnostics()
 	if (!(p == 2 || p == 120 || p == 1800 || p == 3600 || p % 18000 == 0))
 		return;
 	GX2DrawDone(); /* the reads below assume a finished frame */
+	sms_wiiu_d4_submit("done", GX2GetLastSubmittedTimeStamp());
+	sms_wiiu_d4_event(D4_READBACK);
 	uint32_t swaps = 0, flips = 0;
 	OSTime lastFlip = 0, lastVsync = 0;
 	GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
@@ -579,7 +588,9 @@ static void present_finish_pipelined(void)
 {
 	sms_wiiu_d1_note_present_core();
 	GX2SwapScanBuffers();
+	sms_wiiu_d4_event(D4_SWAP);
 	GX2Flush();
+	sms_wiiu_d4_submit("flush", GX2GetLastSubmittedTimeStamp());
 	static bool s_enabled;
 	if (!s_enabled) {
 		GX2SetTVEnable(TRUE);
@@ -602,6 +613,7 @@ static void present_begin_pipelined(void)
 		GX2WaitForVsync();
 	}
 	GX2SetContextState(WHBGfxGetTVContextState());
+	sms_wiiu_d4_event(D4_CONTEXT);
 }
 
 /* Real vsyncs, counted by GX2's vsync event. The VI emulation advances its
@@ -767,7 +779,10 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	const int64_t t0 = wut_OSGetTime_stub();
 	sms_wiiu_gx2_target_present();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
-	else WHBGfxFinishRender();
+	else {
+		WHBGfxFinishRender();
+		sms_wiiu_d4_submit("whb-finish", GX2GetLastSubmittedTimeStamp());
+	}
 	const int64_t t1 = wut_OSGetTime_stub();
 	sms_wiiu_d1_present_line();
 	drc_register_scan_buffer();

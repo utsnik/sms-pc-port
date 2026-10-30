@@ -88,6 +88,74 @@ void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
 
 uint32_t g_displayFrames = 0;
+// A fixed CPU ring retains submissions from the first sixty game frames.
+// The pending record describes work since the previous submission, including
+// commands queued by a display list before its direct call.
+struct D4Segment {
+    uint64_t ts;
+    uint32_t frame, firstVerts, firstStages, firstBlend, firstTexmask;
+    uint16_t count[D4_READBACK + 1];
+    const char* kind;
+};
+static D4Segment s_d4Ring[4096];
+static D4Segment s_d4Pending;
+static uint32_t s_d4Head, s_d4Size, s_d4Dropped, s_d4Timeouts;
+extern "C" void sms_wiiu_d4_event(uint32_t event) {
+    if (g_displayFrames >= 60 || event > D4_READBACK) return;
+    if (s_d4Pending.count[event] != 0xffff) ++s_d4Pending.count[event];
+}
+extern "C" void sms_wiiu_d4_draw(uint32_t verts, uint32_t stages, uint32_t blend, uint32_t texmask) {
+    if (g_displayFrames >= 60) return;
+    if (!s_d4Pending.count[D4_DRAW]) {
+        s_d4Pending.firstVerts = verts;
+        s_d4Pending.firstStages = stages;
+        s_d4Pending.firstBlend = blend;
+        s_d4Pending.firstTexmask = texmask;
+    }
+    sms_wiiu_d4_event(D4_DRAW);
+}
+extern "C" void sms_wiiu_d4_submit(const char* kind, uint64_t raw_timestamp) {
+    if (g_displayFrames >= 60) return;
+    s_d4Pending.ts = raw_timestamp;
+    s_d4Pending.frame = g_displayFrames;
+    s_d4Pending.kind = kind;
+    s_d4Ring[s_d4Head] = s_d4Pending;
+    s_d4Head = (s_d4Head + 1) % 4096;
+    if (s_d4Size < 4096) ++s_d4Size; else ++s_d4Dropped;
+    s_d4Pending = {};
+}
+static void d4LogStuck(uint64_t ts) {
+    const D4Segment* found = nullptr;
+    for (uint32_t i = 0; i < s_d4Size; ++i) {
+        const D4Segment& segment = s_d4Ring[(s_d4Head + 4096 - s_d4Size + i) % 4096];
+        if (segment.ts == ts) { found = &segment; break; }
+    }
+    char tag[192];
+    if (found) {
+        std::snprintf(tag, sizeof(tag), "%s,d=%u,v=%u,st=%u,b=%08x,tm=%02x,cc=%u,cz=%u,efb=%u,z=%u,retile=%u,scan=%u,peek=%u,upload=%u,swap=%u,ctx=%u,rt=%u,read=%u",
+                      found->kind, unsigned(found->count[D4_DRAW]), unsigned(found->firstVerts),
+                      unsigned(found->firstStages), unsigned(found->firstBlend), unsigned(found->firstTexmask),
+                      unsigned(found->count[D4_CLEAR_COLOR]), unsigned(found->count[D4_CLEAR_DEPTH]),
+                      unsigned(found->count[D4_EFB_COPY]), unsigned(found->count[D4_DEPTH_COPY]),
+                      unsigned(found->count[D4_RETile]), unsigned(found->count[D4_SCAN_COPY]),
+                      unsigned(found->count[D4_PEEK]), unsigned(found->count[D4_UPLOAD]),
+                      unsigned(found->count[D4_SWAP]), unsigned(found->count[D4_CONTEXT]),
+                      unsigned(found->count[D4_TARGET]), unsigned(found->count[D4_READBACK]));
+    } else {
+        std::snprintf(tag, sizeof(tag), "unmapped,dropped=%u", unsigned(s_d4Dropped));
+    }
+    ++s_d4Timeouts;
+    WHBLogPrintf("[d4] stuck ts=%llu frame=%u tag=%s",
+                 (unsigned long long)ts, unsigned(found ? found->frame : g_displayFrames), tag);
+}
+extern "C" void sms_wiiu_d4_timeout(uint64_t ret_after) {
+    if (s_d4Timeouts >= 20 * 3) return;
+    const uint32_t timeout = s_d4Timeouts / 3;
+    if (timeout >= 20) return;
+    d4LogStuck(ret_after);
+    d4LogStuck(ret_after + 1);
+    d4LogStuck(ret_after + 2);
+}
 double g_flushSeconds = 0.0;
 double g_presentWaited = 0.0, g_presentDrain = 0.0;
 bool g_gxStats = false;
@@ -632,16 +700,16 @@ static constexpr uint32_t kGx2DlReserveBytes = 512u << 10;
 static constexpr uint32_t kGx2DlMaxDraws = 48;
 enum { kDlSplitCopy, kDlSplitClear, kDlSplitContext, kDlSplitFrame };
 static void gx2DlSplit(int reason);
-#define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurface(__VA_ARGS__))
-#define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurfaceEx(__VA_ARGS__))
-#define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopyColorBufferToScanBuffer(__VA_ARGS__))
-#define GX2ClearColor(...) (gx2DlSplit(kDlSplitClear), ::GX2ClearColor(__VA_ARGS__))
-#define GX2ClearDepthStencilEx(...) (gx2DlSplit(kDlSplitClear), ::GX2ClearDepthStencilEx(__VA_ARGS__))
-#define GX2SetContextState(...) (gx2DlSplit(kDlSplitContext), ::GX2SetContextState(__VA_ARGS__))
-#define GX2SetColorBuffer(...) (gx2DlSplit(kDlSplitContext), ::GX2SetColorBuffer(__VA_ARGS__))
-#define GX2SetDepthBuffer(...) (gx2DlSplit(kDlSplitContext), ::GX2SetDepthBuffer(__VA_ARGS__))
-#define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__))
-#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__))
+#define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_EFB_COPY), ::GX2CopySurface(__VA_ARGS__))
+#define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_EFB_COPY), ::GX2CopySurfaceEx(__VA_ARGS__))
+#define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_SCAN_COPY), ::GX2CopyColorBufferToScanBuffer(__VA_ARGS__))
+#define GX2ClearColor(...) (gx2DlSplit(kDlSplitClear), sms_wiiu_d4_event(D4_CLEAR_COLOR), ::GX2ClearColor(__VA_ARGS__))
+#define GX2ClearDepthStencilEx(...) (gx2DlSplit(kDlSplitClear), sms_wiiu_d4_event(D4_CLEAR_DEPTH), ::GX2ClearDepthStencilEx(__VA_ARGS__))
+#define GX2SetContextState(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_CONTEXT), ::GX2SetContextState(__VA_ARGS__))
+#define GX2SetColorBuffer(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_TARGET), ::GX2SetColorBuffer(__VA_ARGS__))
+#define GX2SetDepthBuffer(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_TARGET), ::GX2SetDepthBuffer(__VA_ARGS__))
+#define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__), sms_wiiu_d4_submit("done", (::GX2GetLastSubmittedTimeStamp)()))
+#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__), sms_wiiu_d4_submit("flush", (::GX2GetLastSubmittedTimeStamp)()))
 #define GX2GetLastSubmittedTimeStamp(...) (gx2DlSplit(kDlSplitFrame), ::GX2GetLastSubmittedTimeStamp(__VA_ARGS__))
 static uint8_t* s_gx2DlArena[kVertexArenas];
 static uint32_t s_gx2DlUsed[kVertexArenas];
@@ -769,13 +837,16 @@ static void beginVertexArena() {
         s_vertexFenceWait += elapsed;
         if (elapsed > OSMillisecondsToTicks(1) && s_vertexFenceDiagCount < 200) {
             ++s_vertexFenceDiagCount;
+            const OSTime retAfter = ::GX2GetRetiredTimeStamp();
             WHBLogPrintf("[d3f] n=%u fence=%llu ret_before=%llu rc=%d ms=%llu ret_after=%llu sub=%llu",
                          unsigned(s_vertexFenceDiagCount), (unsigned long long)fence,
                          (unsigned long long)retiredBefore, int(rc),
                          (unsigned long long)OSTicksToMilliseconds(elapsed),
-                         (unsigned long long)::GX2GetRetiredTimeStamp(),
+                         (unsigned long long)retAfter,
                          (unsigned long long)(::GX2GetLastSubmittedTimeStamp)());
         }
+        if (rc == 0)
+            sms_wiiu_d4_timeout(::GX2GetRetiredTimeStamp());
     }
     // The matching vertex fence also covers every command list submitted from
     // this slot.  Only now may the bounded list arena be reused.
@@ -3508,6 +3579,7 @@ static bool s_retileTextures = true;
 static uint32_t s_whiteFillLogs;
 static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
     if (level >= tiled.surface.mipLevels) return false;
+    sms_wiiu_d4_event(D4_RETile);
     GX2CopySurface(&linear.surface, level, 0, &tiled.surface, level, 0); invalidateVertexUniforms();
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tiled.surface.image, tiled.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tiled.surface.image, tiled.surface.imageSize);
@@ -3696,6 +3768,7 @@ static TextureEntry* getTexture(int map) {
     if (rgba) MEMFreeToDefaultHeap(rgba);
     if (prev) MEMFreeToDefaultHeap(prev);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
+    sms_wiiu_d4_event(D4_UPLOAD);
     if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
     retileTexture(e.texture);
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
@@ -3810,6 +3883,7 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
         if (e.packLevelBytes[chunk.level] != level.rgbaSize) return false;
         GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, base,
                       static_cast<uint32_t>(levelEnd - (chunk.level == 0 ? 0 : mipOff)));
+        sms_wiiu_d4_event(D4_UPLOAD);
         if (!retileTexture(e.packLinear, e.packTiled, chunk.level)) return false;
         e.packLevelDone |= 1u << chunk.level;
     }
@@ -4886,6 +4960,7 @@ static bool gx2DlEndCall(void* list) {
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
     s_perfDlCoreCall = OSGetCoreId();
     GX2DirectCallDisplayList(list, bytes);
+    sms_wiiu_d4_submit("list", (::GX2GetLastSubmittedTimeStamp)());
     return true;
 }
 
@@ -5067,6 +5142,7 @@ void flushBatch() {
             ++s_perfDraws; ++s_perfGpuDraws; ++s_perfDlDraws;
             s_perfVerts += pend.nidx; s_perfGpuVerts += pend.nidx;
             const uint32_t debugDrawNo = s_debugDrawNo++;
+            sms_wiiu_d4_draw(pend.nidx, tevKey.stages, g.bp[BP_CMODE0], tevTextureMask(tevKey));
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
@@ -5260,6 +5336,7 @@ void flushBatch() {
                      (unsigned)k.texgen[0], (unsigned)k.texgen[1], (unsigned)k.texgen[2], (unsigned)k.texgen[3],
                      (unsigned)k.numTexGens, (unsigned)k.dualTex, (unsigned)k.postTex[0], (unsigned)k.projectionOrtho);
     }
+    sms_wiiu_d4_draw(indexCount, tevPath ? tevKey.stages : 0, g.bp[BP_CMODE0], tevTextureMask(tevKey));
     if (listReady) {
         GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
         ++s_gx2DlOpenDraws;
@@ -5399,6 +5476,7 @@ static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
     ++s_perfPeeks;
+    sms_wiiu_d4_event(D4_PEEK);
     GX2ColorBuffer* cb = renderColour();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
     if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
@@ -5446,6 +5524,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         const bool have = s_peekQueued;
         if (have) {
             GX2WaitTimeStamp(s_peekStamp);
+            sms_wiiu_d4_event(D4_READBACK);
             for (uint32_t i = 0; i < count; ++i) {
                 uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
                 uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
@@ -5472,6 +5551,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     if (cemu) GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms();
     rebindTvTarget();
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
+    sms_wiiu_d4_event(D4_READBACK);
     for (uint32_t i = 0; i < count; ++i) {
         uint32_t px = uint32_t(s_gameX + (float(points[i][0]) + 0.5f) * s_gameScale);
         uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScale);
@@ -5535,6 +5615,7 @@ uint32_t peekZ(int x, int y) {
         WHBLogPrintf("SMS Wii U: GXPeekZ %s", s_enabled ? "reads the depth target (one frame late)" : "stub (far plane)");
     }
     if (!s_enabled || x < 0 || y < 0) return 0xffffff;
+    sms_wiiu_d4_event(D4_PEEK);
     flushBatch();
     GX2DepthBuffer* db = renderDepth();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
@@ -5581,7 +5662,9 @@ uint32_t peekZ(int x, int y) {
         // long ago); this frame's is queued without waiting for it.
         if (s_queued) GX2WaitTimeStamp(s_stamp);
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
+        sms_wiiu_d4_event(D4_DEPTH_COPY);
         GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
+        sms_wiiu_d4_event(D4_DEPTH_COPY);
         GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
         rebindTvTarget();
         GX2Flush();
@@ -5596,6 +5679,7 @@ uint32_t peekZ(int x, int y) {
     if (px >= s_linear.width) px = s_linear.width - 1;
     if (py >= s_linear.height) py = s_linear.height - 1;
     uint8_t* texel = static_cast<uint8_t*>(s_linear.image) + (size_t(py) * s_linear.pitch + px) * 4;
+    sms_wiiu_d4_event(D4_READBACK);
     DCInvalidateRange(texel, 4);  // only the line read: the GPU rewrote it since
     float d;
     memcpy(&d, texel, 4);
