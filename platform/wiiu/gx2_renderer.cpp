@@ -568,7 +568,50 @@ struct BoundPixelTexture {
     bool valid;
 };
 static BoundPixelTexture s_boundPixelTex[8];
+// d8 bisect: nodraw skips every GX2DrawIndexedEx; notex binds a 4x4 dummy in
+// place of every pixel texture; the first binds log what the GPU samples.
+static bool s_d8NoDraw, s_d8NoTex;
+static uint32_t s_d8Binds;
+static GX2Texture* d8DummyTexture() {
+    static GX2Texture t;
+    static bool made;
+    if (!made) {
+        made = true;
+        memset(&t, 0, sizeof(t));
+        t.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        t.surface.width = 4; t.surface.height = 4; t.surface.depth = 1; t.surface.mipLevels = 1;
+        t.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+        t.surface.aa = GX2_AA_MODE1X;
+        t.surface.use = GX2_SURFACE_USE_TEXTURE;
+        t.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        t.viewNumMips = 1; t.viewNumSlices = 1; t.compMap = 0x00010203;
+        GX2CalcSurfaceSizeAndAlignment(&t.surface);
+        t.surface.image = MEMAllocFromDefaultHeapEx(t.surface.imageSize, t.surface.alignment);
+        if (t.surface.image) memset(t.surface.image, 0x80, t.surface.imageSize);
+        DCFlushRange(t.surface.image, t.surface.imageSize);
+        GX2InitTextureRegs(&t);
+    }
+    return &t;
+}
 static void bindPixelTexture(GX2Texture* texture, GX2Sampler* sampler, uint32_t unit) {
+    if (s_d8Binds == 0) {
+    {
+            GX2ColorBuffer* cb = renderColour();
+            WHBLogPrintf("[d8c] colour=%p %ux%u fmt=%x tile=%u size=%u aux=%p depth=%p hiz=%p",
+                         cb->surface.image, unsigned(cb->surface.width),
+                         unsigned(cb->surface.height), unsigned(cb->surface.format), unsigned(cb->surface.tileMode),
+                         unsigned(cb->surface.imageSize), cb->aaBuffer, renderDepth()->surface.image, renderDepth()->hiZPtr);
+        }
+    }
+    if (s_d8Binds < 40) {
+        ++s_d8Binds;
+        const GX2Surface& sf = texture->surface;
+        WHBLogPrintf("[d8t] unit=%u img=%p mip=%p %ux%u fmt=%x tile=%u swz=%x pitch=%u size=%u mips=%u use=%x dim=%u",
+                     unsigned(unit), sf.image, sf.mipmaps, unsigned(sf.width), unsigned(sf.height),
+                     unsigned(sf.format), unsigned(sf.tileMode), unsigned(sf.swizzle), unsigned(sf.pitch),
+                     unsigned(sf.imageSize), unsigned(sf.mipLevels), unsigned(sf.use), unsigned(sf.dim));
+    }
+    if (s_d8NoTex) texture = d8DummyTexture();
     BoundPixelTexture& b = s_boundPixelTex[unit];
     if (!b.valid || b.image != texture->surface.image || b.mipmaps != texture->surface.mipmaps ||
         memcmp(b.texRegs, texture->regs, sizeof(b.texRegs))) {
@@ -4749,6 +4792,9 @@ void rendererInit(float) {
     s_d7NoSwap = sdMarkerPresent("noswap");
     s_d7FencePoll = sdMarkerPresent("fencepoll");
     s_d6Force = sdMarkerPresent("forcepres");
+    s_d8NoDraw = sdMarkerPresent("nodraw");
+    s_d8NoTex = sdMarkerPresent("notex");
+    WHBLogPrintf("[d8m] nodraw=%d notex=%d", int(s_d8NoDraw), int(s_d8NoTex));
     WHBLogPrintf("[d7m] noswap=%d fencepoll=%d forcepres=%d", int(s_d7NoSwap), int(s_d7FencePoll), int(s_d6Force));
     WHBLogPrintf("[d3m] noscantv=%u noscandrc=%u", s_noScanTv ? 1u : 0u, s_noScanDrc ? 1u : 0u);
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
@@ -5196,13 +5242,13 @@ void flushBatch() {
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
-                GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                if (!s_d8NoDraw) GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
                 ++s_gx2DlOpenDraws;
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
-                GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                if (!s_d8NoDraw) GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
             }
             if (s_padUniforms == 5) GX2DrawDone();
@@ -5388,10 +5434,10 @@ void flushBatch() {
     }
     sms_wiiu_d4_draw(indexCount, tevPath ? tevKey.stages : 0, g.bp[BP_CMODE0], tevTextureMask(tevKey));
     if (listReady) {
-        GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
         ++s_gx2DlOpenDraws;
     } else {
-        GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
     }
     if (s_padUniforms == 5) GX2DrawDone();  // diagnostic fence stays outside a list
     if (bracket) {
