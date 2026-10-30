@@ -62,8 +62,8 @@ const uint32_t kMaxFstBytes = 64u * 1024u;
 const uint32_t kMaxFiles = 96;
 const uint32_t kMaxPending = 96;
 const uint32_t kCacheSlots = 6;
-const size_t kReadAheadSize = 256u * 1024u;
-const size_t kLargeReadSize = 128u * 1024u;
+const size_t kReadAheadSize = 128u * 1024u;
+const size_t kLargeReadSize = 64u * 1024u;
 
 struct CachedFile {
 	FILE* file;
