@@ -14,6 +14,7 @@
 extern "C" volatile int sms_wiiu_menu_exit_pending;
 extern "C" int64_t sms_wiiu_OSGetTime(void);
 #endif
+extern "C" volatile int sms_wiiu_shot_request;
 
 namespace {
 
@@ -21,6 +22,7 @@ enum ScriptKind {
     SCRIPT_BUTTON,
     SCRIPT_STICK,
     SCRIPT_POINTER,
+    SCRIPT_SHOT,
 };
 
 struct ScriptEvent {
@@ -340,6 +342,8 @@ AppendResult append_button_or_stick(char* name, char* timing)
         kind = SCRIPT_BUTTON;
     } else if (stick_control(name, &stick_x, &stick_y)) {
         kind = SCRIPT_STICK;
+    } else if (std::strcmp(name, "shot") == 0) {
+        kind = SCRIPT_SHOT; /* shot@<field>: one TV+DRC screenshot (needs <app root>shots/) */
     } else {
         return APPEND_INVALID;
     }
@@ -561,12 +565,17 @@ void fill_status(KPADStatus& status)
             continue;
         if (!event.logged) {
             event.logged = true;
-            if (event.kind == SCRIPT_POINTER)
+            if (event.kind == SCRIPT_SHOT) {
+                sms_wiiu_shot_request = 1;
+                port_log("[smg-input] autoplay: shot field %u\n", (unsigned)field);
+            } else if (event.kind == SCRIPT_POINTER)
                 port_log("[smg-input] autoplay: pointer field %u\n", (unsigned)field);
             else
                 port_log("[smg-input] autoplay: press %s field %u\n", event.name,
                          (unsigned)field);
         }
+        if (event.kind == SCRIPT_SHOT)
+            continue;
         if (event.kind == SCRIPT_BUTTON)
             hold |= event.button;
         else if (event.kind == SCRIPT_STICK) {

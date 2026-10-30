@@ -275,6 +275,9 @@ void canary_check()
  * presenting thread between frames (rare, <= 10 times); every file is closed
  * before returning. */
 int s_shots_marker = -1;
+}
+extern "C" volatile int sms_wiiu_shot_request = 0;
+namespace {
 uint32_t s_shots_written;
 constexpr uint32_t kShotsMax = 10;
 
@@ -289,6 +292,11 @@ bool shots_wanted(uint32_t p)
 	}
 	if (!s_shots_marker || s_shots_written >= kShotsMax)
 		return false;
+	/* shot@<field> in the autoplay script (games/smg input.cpp) */
+	if (sms_wiiu_shot_request) {
+		sms_wiiu_shot_request = 0;
+		return true;
+	}
 	/* SMS_SHOTS_FROM=<present> (autoplay file): 4 shots, 400 presents apart,
 	 * from there instead (A/B pictures of one place in a level). */
 	static int s_from = -1;
