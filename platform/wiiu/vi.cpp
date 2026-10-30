@@ -30,6 +30,7 @@ void sms_wiiu_profiler_stop(void);
 void sms_wiiu_dvd_pump(void);
 void sms_wiiu_crash_return_to_menu(void);
 extern volatile int sms_wiiu_crash_pending;
+extern "C" volatile int sms_wiiu_crash_stage;
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
 void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
 void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -113,6 +114,11 @@ void sms_wiiu_frame_boundary(void)
 	if (sms_wiiu_crash_pending) {
 		s_exit_logged = true;
 		sms_wiiu_profiler_stop();
+		/* A non-main fault: the rescue thread (polling every 100 ms) prints
+		 * the report and then sets stage 11. Leaving first lost every report
+		 * (2026-10-30, the File Select crash), so wait for it, 2 s at most. */
+		for (int i = 0; i < 200 && sms_wiiu_crash_stage == 10; ++i)
+			sms_wiiu_native_sleep_ticks(kFrameTicks / 2);
 		sms_wiiu_crash_return_to_menu();
 		return;
 	}
