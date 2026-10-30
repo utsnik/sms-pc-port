@@ -20,6 +20,9 @@
 #include "Game/System/GameSystemStationedArchiveLoader.hpp"
 #include "Game/LiveActor/Spine.hpp"
 #include "port/port.h"
+#include "Game/Scene/Scene.hpp"
+#include "Game/System/SaveDataHandleSequence.hpp"
+#include "Game/System/GameSystemSceneController.hpp"
 #include "Game/System/HeapMemoryWatcher.hpp"
 #include "Game/System/HomeButtonStateNotifier.hpp"
 #include "Game/System/MainLoopFramework.hpp"
@@ -293,13 +296,22 @@ void GameSystem::update() {
         const Nerve* sys = mSpine ? mSpine->getCurrentNerve() : nullptr;
         const Nerve* ld = (mStationedArchiveLoader && mStationedArchiveLoader->mSpine)
                               ? mStationedArchiveLoader->mSpine->getCurrentNerve() : nullptr;
-        if (sys != sLastSys || ld != sLastLoader || (++sCalls % 300) == 0) {
-            port_log("[smg-boot] sys=%p step=%d loader=%p step=%d execLoad=%d", (const void*)sys,
-                     (int)getNerveStep(), (const void*)ld,
+        static const Nerve* sLastScene;
+        static const Nerve* sLastSave;
+        Scene* scene = mSceneController ? mSceneController->mScene : nullptr;
+        const Nerve* sn = (scene && scene->mSpine) ? scene->mSpine->getCurrentNerve() : nullptr;
+        SaveDataHandleSequence* save = mSequenceDirector ? mSequenceDirector->mSaveDataHandleSequence : nullptr;
+        const Nerve* sv = (save && save->mSpine) ? save->mSpine->getCurrentNerve() : nullptr;
+        if (sys != sLastSys || ld != sLastLoader || sn != sLastScene || sv != sLastSave || (++sCalls % 300) == 0) {
+            port_log("[smg-boot] sys=%p step=%d loader=%p step=%d execLoad=%d scene=%p step=%d save=%p step=%d",
+                     (const void*)sys, (int)getNerveStep(), (const void*)ld,
                      mStationedArchiveLoader ? (int)mStationedArchiveLoader->getNerveStep() : -1,
-                     (int)mIsExecuteLoadSystemArchive);
+                     (int)mIsExecuteLoadSystemArchive, (const void*)sn, scene ? (int)scene->getNerveStep() : -1,
+                     (const void*)sv, save ? (int)save->getNerveStep() : -1);
             sLastSys = sys;
             sLastLoader = ld;
+            sLastScene = sn;
+            sLastSave = sv;
         }
     }
 }

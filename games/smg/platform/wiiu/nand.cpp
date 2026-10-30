@@ -11,6 +11,14 @@
 
 #include "runtime.h"
 
+extern "C" void port_log(const char* fmt, ...);
+static unsigned s_nlog;
+static s32 nlog(const char* fn, const char* path, s32 r)
+{
+    if (s_nlog < 120) { ++s_nlog; port_log("[smg-nand] %s %s -> %d", fn, path ? path : "-", (int)r); }
+    return r;
+}
+
 namespace {
 
 constexpr int kMaxFiles = 32;
@@ -243,7 +251,7 @@ s32 NANDGetHomeDir(char path[NAND_MAX_PATH])
     return NAND_RESULT_OK;
 }
 
-s32 NANDCreate(const char* path, u8, u8)
+static s32 NANDCreate_impl(const char* path, u8, u8)
 {
     char full[kMaxHostPath];
     if (!make_path(full, sizeof(full), path))
@@ -261,14 +269,32 @@ s32 NANDCreate(const char* path, u8, u8)
     return NAND_RESULT_OK;
 }
 
+s32 NANDCreate(const char* path, u8 a, u8 b)
+{ return nlog("NANDCreate", path, NANDCreate_impl(path, a, b)); }
+s32 NANDOpen(const char* path, NANDFileInfo* info, u8 mode)
+{ return nlog("NANDOpen", path, NANDOpen_impl(path, info, mode)); }
+s32 NANDClose(NANDFileInfo* info)
+{ return nlog("NANDClose", nullptr, NANDClose_impl(info)); }
+s32 NANDRead(NANDFileInfo* info, void* buffer, u32 length)
+{ return nlog("NANDRead", nullptr, NANDRead_impl(info, buffer, length)); }
+s32 NANDWrite(NANDFileInfo* info, const void* buffer, u32 length)
+{ return nlog("NANDWrite", nullptr, NANDWrite_impl(info, buffer, length)); }
+s32 NANDGetLength(NANDFileInfo* info, u32* length)
+{ return nlog("NANDGetLength", nullptr, NANDGetLength_impl(info, length)); }
+s32 NANDDelete(const char* path)
+{ return nlog("NANDDelete", path, NANDDelete_impl(path)); }
+s32 NANDMove(const char* path, const char* destination)
+{ return nlog("NANDMove", path, NANDMove_impl(path, destination)); }
+s32 NANDCheck(u32 a, u32 b, u32* answer)
+{ return nlog("NANDCheck", nullptr, NANDCheck_impl(a, b, answer)); }
 s32 NANDPrivateCreate(const char* path, u8 perm, u8 attr)
 { return NANDCreate(path, perm, attr); }
-s32 NANDOpen(const char* path, NANDFileInfo* info, u8 mode)
+static s32 NANDOpen_impl(const char* path, NANDFileInfo* info, u8 mode)
 { return open_file(path, info, mode); }
 s32 NANDPrivateOpen(const char* path, NANDFileInfo* info, u8 mode)
 { return open_file(path, info, mode); }
 
-s32 NANDClose(NANDFileInfo* info)
+static s32 NANDClose_impl(NANDFileInfo* info)
 {
     FILE* file = file_for(info);
     if (file == nullptr)
@@ -286,7 +312,7 @@ s32 NANDClose(NANDFileInfo* info)
     return result == 0 ? NAND_RESULT_OK : NAND_RESULT_UNKNOWN;
 }
 
-s32 NANDRead(NANDFileInfo* info, void* buffer, u32 length)
+static s32 NANDRead_impl(NANDFileInfo* info, void* buffer, u32 length)
 {
     FILE* file = file_for(info);
     if (file == nullptr || (buffer == nullptr && length != 0))
@@ -297,7 +323,7 @@ s32 NANDRead(NANDFileInfo* info, void* buffer, u32 length)
     return static_cast<s32>(count);
 }
 
-s32 NANDWrite(NANDFileInfo* info, const void* buffer, u32 length)
+static s32 NANDWrite_impl(NANDFileInfo* info, const void* buffer, u32 length)
 {
     FILE* file = file_for(info);
     if (file == nullptr || (buffer == nullptr && length != 0))
@@ -315,7 +341,7 @@ s32 NANDSeek(NANDFileInfo* info, s32 offset, s32 whence)
     return position < 0 ? NAND_RESULT_UNKNOWN : static_cast<s32>(position);
 }
 
-s32 NANDGetLength(NANDFileInfo* info, u32* length)
+static s32 NANDGetLength_impl(NANDFileInfo* info, u32* length)
 {
     FILE* file = file_for(info);
     if (file == nullptr || length == nullptr)
@@ -330,7 +356,7 @@ s32 NANDGetLength(NANDFileInfo* info, u32* length)
     return NAND_RESULT_OK;
 }
 
-s32 NANDDelete(const char* path)
+static s32 NANDDelete_impl(const char* path)
 {
     char full[kMaxHostPath];
     if (!make_path(full, sizeof(full), path))
@@ -338,7 +364,7 @@ s32 NANDDelete(const char* path)
     return remove(full) == 0 ? NAND_RESULT_OK : errno_result();
 }
 
-s32 NANDMove(const char* path, const char* destination)
+static s32 NANDMove_impl(const char* path, const char* destination)
 {
     char source[kMaxHostPath];
     char directory[kMaxHostPath];
@@ -354,7 +380,7 @@ s32 NANDMove(const char* path, const char* destination)
     return rename(source, target) == 0 ? NAND_RESULT_OK : errno_result();
 }
 
-s32 NANDCheck(u32, u32, u32* answer)
+static s32 NANDCheck_impl(u32, u32, u32* answer)
 {
     if (answer != nullptr)
         *answer = 0;
