@@ -257,12 +257,22 @@ void set_pointer_source(PointerSource source)
 void update_hardware_pointer(const VPADStatus& vpad)
 {
     static const f32 kDeadzone = 0.12f;
-    static const f32 kSpeedPerFrame = 4.0f / 60.0f;  // pointer range is -1..1: two screen widths per second
+    /* Pointer units are -1..1 on both axes of a 16:9 screen: equal pixel
+     * speed needs 16/9 more units vertically. Integrate over real time, not
+     * frames, so frame-rate dips neither slow nor stutter it (user: faster
+     * left/right than up/down, jittery). Two screen widths per second. */
+    static const f32 kSpeedX = 4.0f;
+    static const f32 kSpeedY = 4.0f * 16.0f / 9.0f;
+    static int64_t s_last_ticks;
+    const int64_t now_ticks = sms_wiiu_OSGetTime();
+    f32 dt = s_last_ticks ? static_cast<f32>(now_ticks - s_last_ticks) / 62156250.0f : 1.0f / 60.0f;
+    s_last_ticks = now_ticks;
+    if (dt > 0.1f) dt = 0.1f;
     const bool stick_x_moved = vpad.rightStick.x < -kDeadzone || vpad.rightStick.x > kDeadzone;
     const bool stick_y_moved = vpad.rightStick.y < -kDeadzone || vpad.rightStick.y > kDeadzone;
     if (stick_x_moved || stick_y_moved) {
-        s_stick_pointer_x += vpad.rightStick.x * kSpeedPerFrame;
-        s_stick_pointer_y -= vpad.rightStick.y * kSpeedPerFrame;
+        s_stick_pointer_x += vpad.rightStick.x * kSpeedX * dt;
+        s_stick_pointer_y -= vpad.rightStick.y * kSpeedY * dt;
         clamp_normalized(&s_stick_pointer_x);
         clamp_normalized(&s_stick_pointer_y);
         s_stick_pointer_active = true;
