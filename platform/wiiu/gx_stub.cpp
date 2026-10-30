@@ -19,6 +19,7 @@
 #include <sys/stat.h>
 #include <whb/gfx.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/core.h>
 #include <gx2/clear.h>
 #include <gx2/display.h>
 #include <gx2/event.h>
@@ -41,6 +42,13 @@ extern "C" void sms_wiiu_gx2_target_present(void);
 namespace {
 
 uint32_t s_present_count;
+extern "C" int64_t wut_OSGetTime_stub(void) __asm__("OSGetTime");
+static int64_t s_d1_start;
+static int s_d1_init_core = -1;
+static int s_d1_draw_core = -1;
+static int s_d1_present_core = -1;
+static bool s_d1_core_logged;
+static uint32_t s_d1_presented;
 float s_widescreen = 1.0f;
 bool s_logged;
 bool s_gfx_initialized;
@@ -59,6 +67,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
 extern "C" void sms_wiiu_gx2_texture_pack_pump(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
+extern "C" void sms_wiiu_d1_note_present_core(void);
 
 void log_active_once()
 {
@@ -459,6 +468,8 @@ void present_diagnostics()
 
 } // namespace
 
+static void d1_log_cores_if_ready();
+
 /* 1 forces the renderer's full-surface EFB copy (the Cemu path) on hardware. */
 extern "C" const int sms_wiiu_efb_full_copy = 0;
 
@@ -469,6 +480,10 @@ extern "C" void sms_wiiu_gfx_init(void)
 #if defined(PORT_GAME_SMG)
 	GXPC_SetMemoryWindow(nullptr, 0x40000000u);
 #endif
+	s_d1_start = wut_OSGetTime_stub();
+	if (s_d1_init_core < 0)
+		s_d1_init_core = OSGetCoreId();
+	d1_log_cores_if_ready();
 	s_gfx_initialized = WHBGfxInit() != FALSE;
 	if (!s_gfx_initialized)
 		WHBLogPrintf("SMS Wii U: WHBGfxInit failed");
@@ -562,6 +577,7 @@ static uint32_t s_presentFrames;
  * safe. */
 static void present_finish_pipelined(void)
 {
+	sms_wiiu_d1_note_present_core();
 	GX2SwapScanBuffers();
 	GX2Flush();
 	static bool s_enabled;
@@ -600,6 +616,85 @@ static int s_pace = -1;
 static uint32_t s_paceCalls, s_paceWaits, s_paceFields;
 
 static void on_vsync(GX2EventType, void*) { ++s_vsyncs; }
+
+extern "C" uint32_t sms_wiiu_vsync_event_count(void)
+{
+	return s_vsyncs;
+}
+
+enum D1Caller { D1_CALLER_OTHER, D1_CALLER_VI_FLUSH, D1_CALLER_COPY_XFB_TRIPLE };
+static volatile int s_d1_caller = D1_CALLER_OTHER;
+
+static void d1_log_cores_if_ready()
+{
+	if (!s_d1_core_logged && s_d1_init_core >= 0 && s_d1_draw_core >= 0 && s_d1_present_core >= 0) {
+		s_d1_core_logged = true;
+		WHBLogPrintf("[d1c] init=%d draw=%d present=%d", s_d1_init_core, s_d1_draw_core, s_d1_present_core);
+	}
+}
+
+extern "C" void sms_wiiu_d1_note_copy_xfb_triple(void)
+{
+	s_d1_caller = D1_CALLER_COPY_XFB_TRIPLE;
+}
+
+extern "C" void sms_wiiu_d1_note_vi_flush(void)
+{
+	if (s_d1_caller != D1_CALLER_COPY_XFB_TRIPLE)
+		s_d1_caller = D1_CALLER_VI_FLUSH;
+}
+
+extern "C" void sms_wiiu_d1_note_draw_core(void)
+{
+	if (s_d1_draw_core < 0) {
+		s_d1_draw_core = OSGetCoreId();
+		d1_log_cores_if_ready();
+	}
+}
+
+extern "C" void sms_wiiu_d1_note_present_core(void)
+{
+	if (s_d1_present_core < 0) {
+		s_d1_present_core = OSGetCoreId();
+		d1_log_cores_if_ready();
+	}
+}
+
+extern "C" void sms_wiiu_d1_present_line(void)
+{
+	const uint32_t p = ++s_d1_presented;
+	if (p <= 400 || p % 50 == 0) {
+		uint32_t swaps = 0, flips = 0;
+		OSTime lastFlip = 0, lastVsync = 0;
+		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+		const char* caller = "other";
+		if (s_d1_caller == D1_CALLER_COPY_XFB_TRIPLE)
+			caller = "copyXfb_triple";
+		else if (s_d1_caller == D1_CALLER_VI_FLUSH)
+			caller = "VIFlush";
+		WHBLogPrintf("[d1p] n=%u frame=%u caller=%s draws=%d swaps=%u flips=%u", unsigned(p),
+		             unsigned(sms_wiiu_frame_count()), caller, sms_wiiu_gx2_renderer_has_draws(),
+		             unsigned(swaps), unsigned(flips));
+	}
+	s_d1_caller = D1_CALLER_OTHER;
+}
+
+extern "C" void sms_wiiu_d1_tick(void)
+{
+	if (!s_gfx_initialized || !s_d1_start)
+		return;
+	uint32_t swaps = 0, flips = 0;
+	OSTime lastFlip = 0, lastVsync = 0;
+	GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+	const OSTime now = wut_OSGetTime_stub();
+	WHBLogPrintf("[d1] t=%llu vs=%u swaps=%u flips=%u lastFlip=%llu lastVsync=%llu sub=%llu ret=%llu",
+	             (unsigned long long)OSTicksToMilliseconds(now - s_d1_start),
+	             unsigned(sms_wiiu_vsync_event_count()), unsigned(swaps), unsigned(flips),
+	             (unsigned long long)OSTicksToMilliseconds(lastFlip),
+	             (unsigned long long)OSTicksToMilliseconds(lastVsync),
+	             (unsigned long long)GX2GetLastSubmittedTimeStamp(),
+	             (unsigned long long)GX2GetRetiredTimeStamp());
+}
 
 extern "C" uint32_t sms_wiiu_vsync_fields(void)
 {
@@ -674,6 +769,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
 	else WHBGfxFinishRender();
 	const int64_t t1 = wut_OSGetTime_stub();
+	sms_wiiu_d1_present_line();
 	drc_register_scan_buffer();
 	present_diagnostics();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_begin_pipelined();

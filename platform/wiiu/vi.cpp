@@ -267,6 +267,7 @@ void VIFlush(void)
 #if defined(PORT_GAME_SMG)
 	if (s_in_boundary)
 		return;
+	sms_wiiu_d1_note_vi_flush();
 #endif
 	if (!s_flush_pumped) {
 		sms_wiiu_frame_boundary();

@@ -11,6 +11,10 @@
 #include <revolution/gx/GXRegs.h>
 #include <runtime.h>
 
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_d1_note_copy_xfb_triple(void);
+#endif
+
 MainLoopFramework* MainLoopFramework::sManager;
 
 MR::BothDirList< MainLoopFrameworkAlarm > MainLoopFrameworkAlarm::sList(false);
@@ -190,6 +194,9 @@ void MainLoopFramework::exchangeXfb_triple() {
 void MainLoopFramework::copyXfb_triple() {
     JUTXfb* pXfbMgr = JUTXfb::sManager;
     if (pXfbMgr->mDrawingXfbIndex >= 0) {
+#if defined(PORT_GAME_SMG)
+        sms_wiiu_d1_note_copy_xfb_triple();
+#endif
         if (mPreRenderCallback) {
             mPreRenderCallback();
         }

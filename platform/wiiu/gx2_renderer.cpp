@@ -78,6 +78,8 @@
 #include <unordered_map>
 #include <vector>
 
+extern "C" void sms_wiiu_d1_note_draw_core(void);
+
 namespace gx {
 
 static GX2ColorBuffer* renderColour();
@@ -5057,6 +5059,7 @@ void flushBatch() {
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
             }
             if (s_padUniforms == 5) GX2DrawDone();
+            sms_wiiu_d1_note_draw_core();
             ++s_drawsThisFrame;
             if (s_gpuDiag) {
                 GpuDrawInfo info = {};
@@ -5247,6 +5250,7 @@ void flushBatch() {
         GX2DrawDone();
         WHBLogPrintf("SMS Wii U: [vxbracket] done");
     }
+    sms_wiiu_d1_note_draw_core();
     ++s_drawsThisFrame;
     {
         if (s_gpuDiag) {

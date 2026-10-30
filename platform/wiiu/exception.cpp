@@ -36,6 +36,7 @@ extern "C" void* sms_wiiu_vi_owner_thread(void);
 extern "C" void sms_wiiu_crash_return_to_menu(void);
 extern "C" void sms_wiiu_exit(void);
 extern "C" void sms_wiiu_audio_shutdown(void);
+extern "C" void sms_wiiu_d1_tick(void);
 extern "C" volatile int sms_wiiu_crash_pending;
 volatile int sms_wiiu_crash_pending;
 /* How far the crash path got, reported by the audio thread's stats line: a
@@ -433,10 +434,15 @@ alignas(16) static uint8_t s_watchdog_stack[8 * 1024];
 
 static int watchdog(int, const char**)
 {
+	unsigned ticks = 0;
 	for (;;) {
-		OSSleepTicks(OSMillisecondsToTicks(10000));
-		smg_wiiu_flush_reports();
-		sms_wiiu_hang_check();
+		OSSleepTicks(OSMillisecondsToTicks(1000));
+		sms_wiiu_d1_tick();
+		if (++ticks == 10) {
+			ticks = 0;
+			smg_wiiu_flush_reports();
+			sms_wiiu_hang_check();
+		}
 	}
 	return 0;
 }

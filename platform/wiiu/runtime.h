@@ -31,6 +31,8 @@ void sms_wiiu_dvd_pump(void);
 int port_dvd_busy(void);
 const char* port_dvd_stage_path(void);
 void sms_wiiu_gfx_init(void);
+void sms_wiiu_d1_note_copy_xfb_triple(void);
+void sms_wiiu_d1_note_vi_flush(void);
 void port_pad_init(void);
 void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
 int64_t sms_wiiu_OSGetTime(void);
