@@ -33,6 +33,7 @@ int main(int, char**)
     smg_wiiu_audio_init();
     s_game_entry();
 
+    sms_wiiu_dvd_shutdown();
     WHBProcShutdown();
     WHBLogUdpDeinit();
     return 0;

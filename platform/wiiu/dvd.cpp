@@ -1,6 +1,41 @@
 #include "port_os.h"
 #include "runtime.h"
 
+/* The game's OSMutex/OSThread layouts differ from coreinit's. */
+#define OSMutex CafeOSMutex
+#define OSMutexLink CafeOSMutexLink
+#define OSThread CafeOSThread
+#define OSThreadQueue CafeOSThreadQueue
+#define OSThreadLink CafeOSThreadLink
+#define OSPanic cafe_OSPanic
+#undef OSInitThreadQueue
+#undef OSTryLockMutex
+#undef OSInitMutex
+#undef OSLockMutex
+#undef OSUnlockMutex
+#define OSInitMutex cafe_OSInitMutex
+#define OSLockMutex cafe_OSLockMutex
+#define OSUnlockMutex cafe_OSUnlockMutex
+#define OSInitThreadQueue cafe_OSInitThreadQueue
+#define OSTryLockMutex cafe_OSTryLockMutex
+#include <coreinit/mutex.h>
+#undef OSInitMutex
+#undef OSLockMutex
+#undef OSUnlockMutex
+#undef OSInitThreadQueue
+#undef OSTryLockMutex
+#undef OSMutex
+#undef OSMutexLink
+#undef OSThread
+#undef OSThreadQueue
+#undef OSThreadLink
+#undef OSPanic
+extern "C" {
+void cafe_OSInitMutex(CafeOSMutex*) __asm__("OSInitMutex");
+void cafe_OSLockMutex(CafeOSMutex*) __asm__("OSLockMutex");
+void cafe_OSUnlockMutex(CafeOSMutex*) __asm__("OSUnlockMutex");
+}
+
 #include <dolphin/dvd.h>
 #include <dolphin/os/OSCache.h>
 #if defined(PORT_GAME_SMG)
@@ -26,6 +61,14 @@ const uint32_t kMaxFstBytes = 64u * 1024u;
 #endif
 const uint32_t kMaxFiles = 96;
 const uint32_t kMaxPending = 96;
+const uint32_t kCacheSlots = 6;
+const size_t kStdioBufferSize = 128u * 1024u;
+
+struct CachedFile {
+	FILE* file;
+	u32 entry;
+	uint64_t used;
+};
 
 struct FstEntry {
 	bool directory;
@@ -63,6 +106,39 @@ uint32_t s_file_count;
 uint32_t s_directory_count;
 bool s_initialized;
 bool s_busy;
+bool s_mutex_initialized;
+CafeOSMutex s_read_mutex;
+CachedFile s_cache[kCacheSlots];
+alignas(32) char s_stdio_buffers[kCacheSlots][kStdioBufferSize];
+uint64_t s_cache_clock;
+uint64_t s_stat_reads;
+uint64_t s_stat_bytes;
+uint64_t s_stat_opens;
+uint64_t s_stat_read_ticks;
+OSTime s_stat_log_time;
+
+void close_cached_file(unsigned slot)
+{
+	if (s_cache[slot].file) {
+		std::fclose(s_cache[slot].file);
+		s_cache[slot].file = nullptr;
+	}
+}
+
+void log_read_stats()
+{
+	const OSTime now = OSGetTime();
+	if (!s_stat_log_time)
+		s_stat_log_time = now;
+	if (now - s_stat_log_time >= OSSecondsToTicks(5)) {
+		port_log("[dvd] stats reads=%llu bytes=%llu opens=%llu read_ms=%llu\n",
+		         static_cast<unsigned long long>(s_stat_reads),
+		         static_cast<unsigned long long>(s_stat_bytes),
+		         static_cast<unsigned long long>(s_stat_opens),
+		         static_cast<unsigned long long>(OSTicksToMilliseconds(s_stat_read_ticks)));
+		s_stat_log_time = now;
+	}
+}
 
 uint32_t be32(const uint8_t* p)
 {
@@ -288,25 +364,58 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 			port_log("[dvd] read rejected: bad path for entry %u (%s)\n", state->entry, entry.path);
 		return DVD_RESULT_FATAL_ERROR;
 	}
-	FILE* file = std::fopen(path, "rb");
-	if (!file) {
-		if (s_failures++ < 16)
-			port_log("[dvd] read failed: cannot open %s\n", path);
-		return DVD_RESULT_FATAL_ERROR;
+	unsigned slot = 0;
+	for (; slot < kCacheSlots; ++slot)
+		if (s_cache[slot].file && s_cache[slot].entry == state->entry)
+			break;
+	if (slot == kCacheSlots) {
+		slot = 0;
+		for (unsigned i = 0; i < kCacheSlots; ++i)
+			if (!s_cache[i].file || s_cache[i].used < s_cache[slot].used)
+				slot = i;
+		close_cached_file(slot);
 	}
+	const OSTime read_start = OSGetTime();
+	FILE* file = s_cache[slot].file;
+	if (!file) {
+		file = std::fopen(path, "rb");
+		if (!file) {
+			if (s_failures++ < 16)
+				port_log("[dvd] read failed: cannot open %s\n", path);
+			s_stat_read_ticks += OSGetTime() - read_start;
+			log_read_stats();
+			return DVD_RESULT_FATAL_ERROR;
+		}
+		if (std::setvbuf(file, s_stdio_buffers[slot], _IOFBF, kStdioBufferSize) != 0) {
+			std::fclose(file);
+			s_stat_read_ticks += OSGetTime() - read_start;
+			log_read_stats();
+			return DVD_RESULT_FATAL_ERROR;
+		}
+		s_cache[slot].file = file;
+		s_cache[slot].entry = state->entry;
+		++s_stat_opens;
+	}
+	s_cache[slot].used = ++s_cache_clock;
 	if (std::fseek(file, offset, SEEK_SET) != 0) {
-		std::fclose(file);
+		close_cached_file(slot);
+		s_stat_read_ticks += OSGetTime() - read_start;
+		log_read_stats();
 		return DVD_RESULT_FATAL_ERROR;
 	}
 	size_t got = std::fread(address, 1, want, file);
+	s_stat_read_ticks += OSGetTime() - read_start;
+	s_stat_bytes += got;
+	++s_stat_reads;
 	/* A GameCube DVD read is a DMA; callers may invalidate the buffer after it,
 	 * which on the Wii U would drop this CPU copy. Write it back to memory. */
 	if (got)
 		DCFlushRange(address, got);
-	std::fclose(file);
 	if (got != want) {
+		close_cached_file(slot);
 		if (s_failures++ < 16)
 			port_log("[dvd] short read %s: %u of %u\n", path, static_cast<unsigned>(got), static_cast<unsigned>(want));
+		log_read_stats();
 		return DVD_RESULT_FATAL_ERROR;
 	}
 	if (want < static_cast<size_t>(length))
@@ -321,6 +430,7 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		port_log("[dvd] read #%u path=%s entry=%u offset=0x%x bytes=%d state=complete\n",
 		         s_reads, entry.path, state->entry, offset, length);
 	++s_reads;
+	log_read_stats();
 	return length;
 }
 
@@ -345,6 +455,10 @@ extern "C" {
 
 void port_dvd_init(void)
 {
+	if (!s_mutex_initialized) {
+		cafe_OSInitMutex(&s_read_mutex);
+		s_mutex_initialized = true;
+	}
 	if (s_initialized)
 		return;
 #if defined(PORT_GAME_SMG)
@@ -513,6 +627,16 @@ void port_dvd_init(void)
 
 void DVDInit(void) { port_dvd_init(); }
 
+void sms_wiiu_dvd_shutdown(void)
+{
+	if (!s_mutex_initialized)
+		return;
+	cafe_OSLockMutex(&s_read_mutex);
+	for (unsigned i = 0; i < kCacheSlots; ++i)
+		close_cached_file(i);
+	cafe_OSUnlockMutex(&s_read_mutex);
+}
+
 s32 DVDConvertPathToEntrynum(char* path)
 {
 	if (!s_initialized)
@@ -525,14 +649,18 @@ BOOL DVDFastOpen(s32 entry, DVDFileInfo* file)
 	if (!file || entry < 0 || static_cast<uint32_t>(entry) >= s_entry_count ||
 	    s_entries[entry].directory)
 		return FALSE;
+	cafe_OSLockMutex(&s_read_mutex);
 	std::memset(file, 0, sizeof(*file));
 	FileState* state = state_for(file, true);
-	if (!state)
+	if (!state) {
+		cafe_OSUnlockMutex(&s_read_mutex);
 		return FALSE;
+	}
 	state->entry = static_cast<u32>(entry);
 	file->startAddr = s_entries[entry].offset;
 	file->length = s_entries[entry].size;
 	file->cb.state = DVD_STATE_END;
+	cafe_OSUnlockMutex(&s_read_mutex);
 	return TRUE;
 }
 
@@ -550,58 +678,82 @@ BOOL DVDOpen(char* name, DVDFileInfo* file)
 
 BOOL DVDClose(DVDFileInfo* file)
 {
+	cafe_OSLockMutex(&s_read_mutex);
 	FileState* state = state_for(file, false);
-	if (!state)
+	if (!state) {
+		cafe_OSUnlockMutex(&s_read_mutex);
 		return FALSE;
+	}
 	state->active = false;
 	file->cb.state = DVD_STATE_END;
+	cafe_OSUnlockMutex(&s_read_mutex);
 	return TRUE;
 }
 
 s32 DVDReadPrio(DVDFileInfo* file, void* address, s32 length, s32 offset, s32)
 {
+	cafe_OSLockMutex(&s_read_mutex);
 	FileState* state = state_for(file, false);
-	if (!state)
+	if (!state) {
+		cafe_OSUnlockMutex(&s_read_mutex);
 		return DVD_RESULT_FATAL_ERROR;
+	}
 	s_busy = true;
 	file->cb.state = DVD_STATE_BUSY;
 	s32 result = read_file(state, address, length, offset);
 	file->cb.state = result < 0 ? DVD_STATE_FATAL_ERROR : DVD_STATE_END;
 	file->cb.transferredSize = result > 0 ? static_cast<u32>(result) : 0;
 	s_busy = false;
+	cafe_OSUnlockMutex(&s_read_mutex);
 	return result;
 }
 
 BOOL DVDReadAsyncPrio(DVDFileInfo* file, void* address, s32 length, s32 offset,
                       DVDCallback callback, s32)
 {
+	cafe_OSLockMutex(&s_read_mutex);
 	FileState* state = state_for(file, false);
-	if (!state)
+	if (!state) {
+		cafe_OSUnlockMutex(&s_read_mutex);
 		return FALSE;
+	}
 	file->cb.state = DVD_STATE_BUSY;
 	s32 result = read_file(state, address, length, offset);
 	file->cb.state = result < 0 ? DVD_STATE_FATAL_ERROR : DVD_STATE_END;
 	file->cb.transferredSize = result > 0 ? static_cast<u32>(result) : 0;
 	queue_callback(file, callback, result);
+	cafe_OSUnlockMutex(&s_read_mutex);
 	return TRUE;
 }
 
 void sms_wiiu_dvd_pump(void)
 {
 	for (unsigned i = 0; i < kMaxPending; ++i) {
-		if (!s_pending[i].active)
+		cafe_OSLockMutex(&s_read_mutex);
+		if (!s_pending[i].active) {
+			cafe_OSUnlockMutex(&s_read_mutex);
 			continue;
+		}
 		Pending pending = s_pending[i];
 		s_pending[i].active = false;
+		cafe_OSUnlockMutex(&s_read_mutex);
 		if (pending.file)
 			pending.file->cb.state = pending.result < 0 ? DVD_STATE_FATAL_ERROR : DVD_STATE_END;
 		if (pending.callback)
 			pending.callback(pending.result, pending.file);
 	}
+	cafe_OSLockMutex(&s_read_mutex);
 	s_busy = false;
+	cafe_OSUnlockMutex(&s_read_mutex);
 }
 
-int port_dvd_busy(void) { return s_busy ? 1 : 0; }
+int port_dvd_busy(void)
+{
+	cafe_OSLockMutex(&s_read_mutex);
+	const int busy = s_busy ? 1 : 0;
+	cafe_OSUnlockMutex(&s_read_mutex);
+	return busy;
+}
 const char* port_dvd_stage_path(void) { return s_last_stage_path; }
 
 void* sms_wiiu_dvd_read_file(const char* path, size_t* size)
@@ -646,8 +798,11 @@ void* sms_wiiu_dvd_read_file(const char* path, size_t* size)
 	if (!data)
 		return nullptr;
 	DVDFileInfo file;
-	if (!DVDFastOpen(entry, &file) ||
-	    DVDReadPrio(&file, data, static_cast<s32>(s_entries[entry].size), 0, 2) < 0)
+	if (!DVDFastOpen(entry, &file))
+		return nullptr;
+	s32 result = DVDReadPrio(&file, data, static_cast<s32>(s_entries[entry].size), 0, 2);
+	DVDClose(&file);
+	if (result < 0)
 		return nullptr;
 	if (size)
 		*size = s_entries[entry].size;

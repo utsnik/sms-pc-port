@@ -23,6 +23,7 @@ void smg_wiiu_game_heap_ready(void);
 /* Task 2's retail FST/DVD boundary, used by the native-BE main.dol loader. */
 void port_dvd_init(void);
 void* sms_wiiu_dvd_read_file(const char* path, size_t* size);
+void sms_wiiu_dvd_shutdown(void);
 
 /* Shared Wii U services owned by the SMG entry sequence. */
 void port_os_init(void);

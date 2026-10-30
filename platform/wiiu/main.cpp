@@ -64,6 +64,7 @@ int main(int argc, char** argv)
 			cafe_OSJoinThread(&thread, &ret);
 			gx::texturePackShutdown();
 			sms_wiiu_audio_shutdown();
+			sms_wiiu_dvd_shutdown();
 			WHBProcShutdown();
 			return 0;
 		}
@@ -77,6 +78,7 @@ int main(int argc, char** argv)
 
 	gx::texturePackShutdown();
 	sms_wiiu_audio_shutdown();
+	sms_wiiu_dvd_shutdown();
 	WHBProcShutdown();
 	return 0;
 }

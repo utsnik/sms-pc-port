@@ -41,6 +41,7 @@ const char* sms_wiiu_stage_path(void);
 void sms_wiiu_frame_boundary(void);
 void sms_wiiu_input_poll(void);
 void sms_wiiu_dvd_pump(void);
+void sms_wiiu_dvd_shutdown(void);
 int port_dvd_busy(void);
 const char* port_dvd_stage_path(void);
 void sms_wiiu_gfx_init(void);

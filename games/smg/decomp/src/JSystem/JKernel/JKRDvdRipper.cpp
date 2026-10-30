@@ -197,7 +197,11 @@ void* JKRDvdRipper::loadToMainRAM(JKRDvdFile* dvdFile, u8* dst, JKRExpandSwitch 
 
 static u8 lit_491[12];
 static OSMutex decompMutex;
+#if defined(PORT_GAME_SMG)
+u32 JKRDvdRipper::sSZSBufferSize = 0x00004000;
+#else
 u32 JKRDvdRipper::sSZSBufferSize = 0x00000400;
+#endif
 static u8* szpBuf;
 static u8* szpEnd;
 static u8* refBuf;
@@ -429,6 +433,5 @@ static int JKRDecompressFromDVD(JKRDvdFile* dvdFile, void* dst, u32 fileSize, u3
     OSUnlockMutex(&decompMutex);
     return result;
 }
-
 
 

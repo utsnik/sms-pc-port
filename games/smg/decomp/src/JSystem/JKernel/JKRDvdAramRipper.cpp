@@ -218,7 +218,11 @@ JKRADCommand::~JKRADCommand() {
 
 static OSMutex decompMutex;
 
+#if defined(PORT_GAME_SMG)
+u32 JKRDvdAramRipper::sSZSBufferSize = 0x00004000;
+#else
 u32 JKRDvdAramRipper::sSZSBufferSize = 0x00000400;
+#endif
 
 static u8* szpBuf;
 

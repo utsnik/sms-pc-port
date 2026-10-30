@@ -526,6 +526,7 @@ extern "C" void sms_wiiu_exit(void)
 	gx::texturePackShutdown();
 	sms_wiiu_audio_shutdown();
 	sms_wiiu_vsync_pace_stop();
+	sms_wiiu_dvd_shutdown();
 	if (s_gfx_initialized) {
 		if (s_frame_open) {
 			WHBLogPrintf("SMS Wii U: exit: renderer end");
