@@ -257,7 +257,7 @@ void set_pointer_source(PointerSource source)
 void update_hardware_pointer(const VPADStatus& vpad)
 {
     static const f32 kDeadzone = 0.12f;
-    static const f32 kSpeedPerFrame = 1.5f / 60.0f;
+    static const f32 kSpeedPerFrame = 4.0f / 60.0f;  // pointer range is -1..1: two screen widths per second
     const bool stick_x_moved = vpad.rightStick.x < -kDeadzone || vpad.rightStick.x > kDeadzone;
     const bool stick_y_moved = vpad.rightStick.y < -kDeadzone || vpad.rightStick.y > kDeadzone;
     if (stick_x_moved || stick_y_moved) {
