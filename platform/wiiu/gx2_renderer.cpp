@@ -82,8 +82,6 @@ extern "C" void sms_wiiu_d1_note_draw_core(void);
 
 namespace gx {
 
-extern "C" void sms_wiiu_gpuframe_stamp(int kind);
-
 static GX2ColorBuffer* renderColour();
 static GX2DepthBuffer* renderDepth();
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
@@ -3947,10 +3945,8 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
-    sms_wiiu_gpuframe_stamp(0);
     GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
     GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
-    sms_wiiu_gpuframe_stamp(7);
 }
 
 // TV target size (WHBGfx picks 720p or 1080p) and the 4:3 game rectangle in it:
@@ -4868,9 +4864,7 @@ static bool gx2DlEndCall(void* list) {
     s_perfDlBytes += bytes;
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
     s_perfDlCoreCall = OSGetCoreId();
-    sms_wiiu_gpuframe_stamp(1);
     GX2DirectCallDisplayList(list, bytes);
-    sms_wiiu_gpuframe_stamp(1);
     return true;
 }
 
