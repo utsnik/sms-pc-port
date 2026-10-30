@@ -63,6 +63,7 @@ extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" const GX2Surface* sms_wiiu_render_surface(void);
+extern "C" void sms_wiiu_dvd_pump(void);
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
@@ -758,7 +759,24 @@ extern "C" uint32_t sms_wiiu_vsync_fields(void)
 		return 1;
 	int32_t fields = int32_t(s_vsyncs - s_vsyncsSeen);
 	if (fields <= 0) {
-		GX2WaitForVsync();
+		/* Drain DVD completions while waiting: async reads complete only
+		 * through sms_wiiu_dvd_pump(), once per frame otherwise, so every
+		 * loader thread got one read round trip per 16.7 ms and boot sat
+		 * idle ~25 s (2026-10-30). Callbacks stay on this thread, between
+		 * frames, as before. SD marker nodvdpoll restores the plain wait. */
+		static int s_dvdPoll = -1;
+		if (s_dvdPoll < 0)
+			s_dvdPoll = !sms_wiiu_sd_marker("nodvdpoll");
+		const uint32_t before = s_vsyncs;
+		if (s_dvdPoll) {
+			const OSTime t0 = OSGetTime();
+			while (s_vsyncs == before && OSGetTime() - t0 < OSMillisecondsToTicks(40)) {
+				sms_wiiu_dvd_pump();
+				OSSleepTicks(OSMicrosecondsToTicks(500));
+			}
+		}
+		if (s_vsyncs == before)
+			GX2WaitForVsync();
 		++s_paceWaits;
 		/* The event callback may not have run yet: the wait itself is a field. */
 		fields = int32_t(s_vsyncs - s_vsyncsSeen);
