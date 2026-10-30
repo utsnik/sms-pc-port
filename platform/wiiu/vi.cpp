@@ -8,6 +8,7 @@ extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 
 #include <dolphin/vi.h>
 #include <whb/proc.h>
+#include <proc_ui/procui.h>
 #include <gx2/event.h>
 #include <gx2/state.h>
 #include <gx2/swap.h>
@@ -170,6 +171,54 @@ void sms_wiiu_frame_boundary(void)
 		             GX2GetRetiredTimeStamp() >= target ? "done" : "GPU STUCK",
 		             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned long long)target, kicks);
 		SYSLaunchMenu();
+		/* After the drain the blocking pump never got RELEASE_FOREGROUND
+		 * (2026-10-30 h7). Poll instead: log swaps/flips each second and, while
+		 * still in the foreground, queue an empty swap when a flip has been
+		 * pending 0.5 s with no progress (Galaxy's flips only completed when
+		 * another swap followed). Hand over exactly as WHBProcIsRunning does. */
+		const int64_t menuStart = sms_wiiu_native_time();
+		int64_t lastFlipChange = menuStart;
+		uint32_t lastFlips = 0, menuKicks = 0;
+		int menuLogged = 0;
+		for (;;) {
+			const ProcUIStatus status = ProcUIProcessMessages(FALSE);
+			const int64_t now = sms_wiiu_native_time();
+			if (status == PROCUI_STATUS_RELEASE_FOREGROUND) {
+				WHBLogPrintf("SMS Wii U: menu wait: RELEASE_FOREGROUND after %d ms, %u kicks",
+				             (int)((now - menuStart) / 62156), (unsigned)menuKicks);
+				ProcUIDrawDoneRelease();
+				break;
+			}
+			if (status == PROCUI_STATUS_EXITING) {
+				WHBLogPrintf("SMS Wii U: menu wait: EXITING after %d ms", (int)((now - menuStart) / 62156));
+				s_exit_logged = true;
+				sms_wiiu_profiler_stop();
+				sms_wiiu_exit();
+				return;
+			}
+			uint32_t swaps = 0, flips = 0;
+			OSTime lastFlip = 0, lastVsync = 0;
+			GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+			if (flips != lastFlips) {
+				lastFlips = flips;
+				lastFlipChange = now;
+			} else if (flips < swaps && now - lastFlipChange > 62156250 / 2 && menuKicks < 60) {
+				GX2SwapScanBuffers();
+				GX2Flush();
+				++menuKicks;
+				lastFlipChange = now;
+			}
+			const int second = (int)((now - menuStart) / 62156250);
+			if (second > menuLogged) {
+				menuLogged = second;
+				WHBLogPrintf("SMS Wii U: menu wait: %d s status=%d swaps=%u flips=%u retired=%llu kicks=%u",
+				             second, (int)status, (unsigned)swaps, (unsigned)flips,
+				             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned)menuKicks);
+			}
+			if (second >= 60)
+				break;
+			sms_wiiu_native_sleep_ticks(62156250 / 100);
+		}
 #else
 		GX2DrawDone();
 		WHBLogPrintf("SMS Wii U: exit drain: done retired=%llu; pumping ProcUI",
