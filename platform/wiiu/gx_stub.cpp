@@ -65,6 +65,8 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" const GX2Surface* sms_wiiu_render_surface(void);
 extern "C" void sms_wiiu_dvd_pump(void);
 extern "C" void gxs_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
+extern "C" void* gxs_default_thread(uint32_t core) __asm__("OSGetDefaultThread");
+static uint32_t s_d1_last_swaps;
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
@@ -743,6 +745,31 @@ extern "C" void sms_wiiu_d1_tick(void)
 	             (unsigned long long)OSTicksToMilliseconds(lastVsync),
 	             (unsigned long long)GX2GetLastSubmittedTimeStamp(),
 	             (unsigned long long)GX2GetRetiredTimeStamp());
+	/* d28: when no frame was presented since the last tick, print where the
+	 * main thread (core 1 default thread) is parked: saved srr0/lr and the
+	 * r1 back chain. Symbolize on the host with addr2line -e smg.elf. */
+	if (swaps == s_d1_last_swaps) {
+		const uint32_t* ctx = static_cast<const uint32_t*>(gxs_default_thread(1));
+		if (ctx) {
+			char bt[200];
+			int n = 0;
+			uint32_t sp = ctx[(0x08 + 4) / 4];
+			for (int i = 0; i < 12 && sp >= 0x10000000u && sp < 0x50000000u && !(sp & 3); ++i) {
+				const uint32_t* frame = reinterpret_cast<const uint32_t*>(sp);
+				n += std::snprintf(bt + n, sizeof(bt) - n, " %08x", unsigned(frame[1]));
+				if (n >= int(sizeof(bt)) - 10)
+					break;
+				const uint32_t next = frame[0];
+				if (next <= sp)
+					break;
+				sp = next;
+			}
+			bt[n < int(sizeof(bt)) ? n : int(sizeof(bt)) - 1] = 0;
+			WHBLogPrintf("[d1s] main parked srr0=%08x lr=%08x bt=%s", unsigned(ctx[0x98 / 4]),
+			             unsigned(ctx[0x8C / 4]), n ? bt : " -");
+		}
+	}
+	s_d1_last_swaps = swaps;
 }
 
 extern "C" uint32_t sms_wiiu_vsync_fields(void)
