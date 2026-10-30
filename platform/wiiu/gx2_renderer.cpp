@@ -3295,7 +3295,7 @@ static void textureUvTransform(const TextureEntry* texture, float out[4]) {
 // most once a frame) and a changed entry is retired, so a fresh one decodes
 // and asks the HD pack for the new data.  SD marker notexrecheck turns it off.
 static bool s_texRecheck = true;
-static uint32_t s_texRetired;
+static uint32_t s_texRetired, s_texReused;
 static void retireStaleTexture(TextureEntry& e) {
     e.valid = false;
     ++s_texRetired;
@@ -3854,10 +3854,34 @@ static TextureEntry* getTexture(int map) {
     WorkerOpTimer missTiming(kWorkerTextureMiss, textureInfo, textureCacheEntryCount());
     SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
     WorkerOpTimer allocationTiming(kWorkerTextureAlloc, textureInfo, textureCacheEntryCount());
-    s_textures.push_back(TextureEntry());
-    TextureEntry& e = s_textures.back();
-    e.next = first;
-    index[source] = uint32_t(s_textures.size() - 1);
+    // Reuse a retired entry of this source whose images retireStaleTexture
+    // already released (no pack texture, or a negative pack lookup): data
+    // rewritten every frame at one address (THP movie planes) otherwise
+    // appended an entry per frame, ~800 bytes each and never freed. 25,300
+    // of them in a 30-minute title loop made every lookup of that address
+    // walk the whole chain (4 fps after the FLUDD movie), starved the heap
+    // and ended in a DSI inside getTexture (2026-10-30).
+    TextureEntry* slot = nullptr;
+    for (uint32_t i = first; i != UINT32_MAX; i = s_textures[i].next) {
+        TextureEntry& r = s_textures[i];
+        if (!r.valid && (r.packState == 0 || r.packState == 2) && !r.texture.surface.image &&
+            !r.texture.surface.mipmaps) {
+            slot = &r;
+            break;
+        }
+    }
+    if (slot) {
+        const uint32_t next = slot->next;
+        *slot = TextureEntry();
+        slot->next = next;
+        ++s_texReused;
+    } else {
+        s_textures.push_back(TextureEntry());
+        slot = &s_textures.back();
+        slot->next = first;
+        index[source] = uint32_t(s_textures.size() - 1);
+    }
+    TextureEntry& e = *slot;
     missTiming.setCacheEntries(static_cast<uint32_t>(s_textures.size()));
     e.source = source; e.fmt = fmt; e.width = w; e.height = h; e.tlut = tlut; e.tlutFmt = tlutFmt;
     e.levels = levels;
@@ -4025,6 +4049,19 @@ static void packFreeLoading(TextureEntry& e) {
     e.packEntry = nullptr; e.packLevelDone = 0; e.packStagingBytes = 0;
 }
 
+// retireStaleTexture leaves a pending (1) or resident (3) pack entry's images
+// to the pump, which then marked a retired one negative but kept its decoded
+// image: one RGBA8 image leaked per THP movie plane per frame. Free them so
+// getTexture can reuse the slot.
+static void packReleaseRetired(TextureEntry& e) {
+    packFreeLoading(e);
+    deferFree(e.texture.surface.image);
+    deferFree(e.texture.surface.mipmaps);
+    e.texture.surface.image = nullptr;
+    e.texture.surface.mipmaps = nullptr;
+    e.packState = 2;
+}
+
 static void packEvict(TextureEntry& e) {
     if (!e.packState || !e.packResidentBytes) return;
     deferFree(e.texture.surface.image);
@@ -4033,6 +4070,12 @@ static void packEvict(TextureEntry& e) {
     std::memset(&e.packFallback, 0, sizeof e.packFallback);
     e.packState = 2;
     e.packResidentBytes = 0;
+    if (!e.valid) {  // retired while resident: nothing will use the fallback
+        deferFree(e.texture.surface.image);
+        deferFree(e.texture.surface.mipmaps);
+        e.texture.surface.image = nullptr;
+        e.texture.surface.mipmaps = nullptr;
+    }
     ++s_packEvictions;
 }
 
@@ -4140,6 +4183,7 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     for (unsigned i = 0; i != 8 && texturePackPopResult(&result); ++i) {
         TextureEntry* e = packTextureForRequest(result.request.requestId);
         if (!e) continue;
+        if (!e->valid) { packReleaseRetired(*e); continue; }
         if (result.changed) {
             if (result.retry <= 1) {
                 result.request.retry = result.retry; result.request.writeClock = writeClock();
@@ -4172,6 +4216,7 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
             };
             uploadTiming.setTexture(info, static_cast<uint32_t>(s_textures.size()));
         }
+        if (e && !e->valid) { packReleaseRetired(*e); texturePackReleaseUploadChunk(); continue; }
         if (!e || e->packState != 1 || !packCopyChunk(*e, chunk)) {
             if (e) { packFreeLoading(*e); e->packState = 2; ++s_packFallback; }
             texturePackReleaseUploadChunk(); continue;
@@ -4188,12 +4233,13 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     if (++s_packDiagFrames == 30) {
         TexturePackStats stats = {};
         texturePackGetStats(&stats);
-        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u fallback=%u cap=%u",
+        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u fallback=%u cap=%u texEntries=%u retired=%u reused=%u",
                      unsigned(g_displayFrames), unsigned(stats.hashBytes), unsigned(stats.hashMicros),
                      unsigned(stats.archiveReadBytes), unsigned(stats.queuedJobs),
                      unsigned(s_packLru.residentBytes()), unsigned(s_packStagingPeak), unsigned(s_packCompleted),
                      unsigned(s_packEvictions), unsigned(s_packUploadBytes), unsigned(s_packUploadMicros),
-                     unsigned(s_packFallback), unsigned(s_packResidentBudget));
+                     unsigned(s_packFallback), unsigned(s_packResidentBudget), unsigned(s_textures.size()),
+                     unsigned(s_texRetired), unsigned(s_texReused));
         s_packDiagFrames = 0;
         s_packUploadBytes = s_packUploadMicros = s_packFallback = 0;
     }
