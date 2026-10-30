@@ -590,12 +590,30 @@ static void present_finish_pipelined(void)
 	const bool d5s = s_d5sCalls < 40;
 	uint64_t before = 0, afterSwap = 0, afterFlush = 0;
 	sms_wiiu_d1_note_present_core();
-	if (d5s) before = GX2GetLastSubmittedTimeStamp();
+	before = GX2GetLastSubmittedTimeStamp();
 	GX2SwapScanBuffers();
 	if (d5s) afterSwap = GX2GetLastSubmittedTimeStamp();
 	sms_wiiu_d4_event(D4_SWAP);
 	GX2Flush();
-	const uint64_t submitted = GX2GetLastSubmittedTimeStamp();
+	uint64_t submitted = GX2GetLastSubmittedTimeStamp();
+	/* d6: a present flush that did not submit (seen whenever the GPU had just
+	 * caught up) merges the scan copies and swap into the next frame's
+	 * segment, and that merged segment is the one that stalls. Force a
+	 * segment of its own: one harmless context load, then flush again. */
+	static uint32_t s_d6Forced;
+	if (submitted == before) {
+		uint32_t swaps = 0, flips = 0;
+		OSTime lastFlip = 0, lastVsync = 0;
+		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+		GX2SetContextState(WHBGfxGetTVContextState());
+		GX2Flush();
+		const uint64_t forced = GX2GetLastSubmittedTimeStamp();
+		if (s_d6Forced++ < 40)
+			WHBLogPrintf("[d6] forced present segment: before=%llu forced=%llu ret=%llu swaps=%u flips=%u",
+			             (unsigned long long)before, (unsigned long long)forced,
+			             (unsigned long long)GX2GetRetiredTimeStamp(), unsigned(swaps), unsigned(flips));
+		submitted = forced;
+	}
 	if (d5s) afterFlush = submitted;
 	sms_wiiu_d4_submit_at("flush", 's', __LINE__, submitted);
 	if (d5s) {
