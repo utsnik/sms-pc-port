@@ -1,3 +1,4 @@
+#include <sysapp/launch.h>
 #include "runtime.h"
 extern "C" uint32_t sms_port_heap_fallbacks(void);
 extern "C" uint32_t sms_port_heap_fallback_bytes(void);
@@ -8,6 +9,7 @@ extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 #include <dolphin/vi.h>
 #include <whb/proc.h>
 #include <gx2/event.h>
+#include <gx2/state.h>
 #include <whb/log.h>
 
 #include <cstdint>
@@ -30,6 +32,7 @@ extern volatile int sms_wiiu_crash_pending;
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
 void* sms_wiiu_native_current_thread(void) __asm__("OSGetCurrentThread");
 void sms_wiiu_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
+int64_t sms_wiiu_native_time(void) __asm__("OSGetTime");
 }
 
 namespace {
@@ -120,9 +123,39 @@ void sms_wiiu_frame_boundary(void)
 		WHBLogPrintf("SMS Wii U: exit drain: submitted=%llu retired=%llu",
 		             (unsigned long long)GX2GetLastSubmittedTimeStamp(),
 		             (unsigned long long)GX2GetRetiredTimeStamp());
+#if defined(PORT_GAME_SMG)
+		/* Galaxy's timer only flags the exit: drain every submitted
+		 * timestamp (bounded at 15 s, logged each second) and only then
+		 * ask for the Menu. GX2DrawDone alone gave up after ~1 s with work
+		 * outstanding, and the foreground release never completed. */
+		GX2Flush();
+		const uint64_t target = GX2GetLastSubmittedTimeStamp();
+		const int64_t start = sms_wiiu_native_time();
+		int logged = 0;
+		while (GX2GetRetiredTimeStamp() < target) {
+			const int second = (int)((sms_wiiu_native_time() - start) / 62156250);
+			if (second >= 15)
+				break;
+			if (second > logged) {
+				logged = second;
+				uint32_t swaps = 0, flips = 0;
+				OSTime lastFlip = 0, lastVsync = 0;
+				GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+				WHBLogPrintf("SMS Wii U: exit drain: %d s submitted=%llu retired=%llu swaps=%u flips=%u",
+				             second, (unsigned long long)target,
+				             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned)swaps, (unsigned)flips);
+			}
+			sms_wiiu_native_sleep_ticks(62156250 / 100);
+		}
+		WHBLogPrintf("SMS Wii U: exit drain: %s retired=%llu of %llu; asking for the Menu",
+		             GX2GetRetiredTimeStamp() >= target ? "done" : "GPU STUCK",
+		             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned long long)target);
+		SYSLaunchMenu();
+#else
 		GX2DrawDone();
 		WHBLogPrintf("SMS Wii U: exit drain: done retired=%llu; pumping ProcUI",
 		             (unsigned long long)GX2GetRetiredTimeStamp());
+#endif
 	}
 	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
 	if (!WHBProcIsRunning()) {

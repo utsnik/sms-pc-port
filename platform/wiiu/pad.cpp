@@ -458,6 +458,11 @@ void sms_wiiu_input_poll(void)
 		 * console at the Menu (wiiload into a running title wedges it). */
 		static OSTime s_marker_start;
 		static bool s_exit_requested;
+#if defined(PORT_GAME_SMG)
+		/* Galaxy's input.cpp owns the run timer (SMG_AUTOPLAY_SECS); two
+		 * timers made two Menu requests. */
+		s_exit_requested = true;
+#endif
 		if (s_marker && !s_exit_requested) {
 			const OSTime now = OSGetTime();
 			if (!s_marker_start)

@@ -603,18 +603,25 @@ extern "C" void* sms_wiiu_vi_owner_thread(void);
 extern "C" void sms_wiiu_hang_check(void)
 {
 	static uint32_t s_lastTicks, s_reported;
+	static WutTime s_lastChange;
 	const uint32_t ticks = s_frameTicks;
+	const WutTime checkNow = wut_OSGetTime();
 #if defined(PORT_GAME_SMG)
 	/* Galaxy hung once before its first frame (2026-10-29): before the frame
 	 * boundary has named the main thread, watch the thread that owns VI. */
 	if (!s_mainThread)
 		s_mainThread = sms_wiiu_vi_owner_thread();
 #endif
-	if (ticks != s_lastTicks || !s_mainThread) {
+	if (ticks != s_lastTicks || !s_mainThread || !s_lastChange) {
 		s_lastTicks = ticks;
+		s_lastChange = checkNow;
 		s_reported = 0;
 		return;
 	}
+	/* Report only after 10 s by the clock: two callers a few ms apart both
+	 * saw "no new frame" and reported false hangs (2026-10-30). */
+	if (checkNow - s_lastChange < (WutTime)62156250 * 10)
+		return;
 	if (s_reported >= 3) return;
 	++s_reported;
 	const uint8_t* ctx = static_cast<const uint8_t*>(s_mainThread);
@@ -627,7 +634,7 @@ extern "C" void sms_wiiu_hang_check(void)
 	const uint32_t srr0 = *reinterpret_cast<const uint32_t*>(ctx + 0x98);
 	const uint32_t lr = *reinterpret_cast<const uint32_t*>(ctx + 0x8C);
 	name(srr0, sym, sizeof(sym));
-	port_log("[hang] no frame for 10 s: main pc=%08x %s\n", (unsigned)srr0, sym);
+	port_log("[hang] no frame for %u s: main pc=%08x %s\n", (unsigned)((checkNow - s_lastChange) / 62156250), (unsigned)srr0, sym);
 	name(lr, sym, sizeof(sym));
 	port_log("[hang]   lr=%08x %s\n", (unsigned)lr, sym);
 	uint32_t sp = *reinterpret_cast<const uint32_t*>(ctx + 0x0C);

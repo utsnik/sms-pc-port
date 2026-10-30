@@ -194,9 +194,11 @@ void check_autoplay_timeout()
     if (now - s_autopress_start < static_cast<int64_t>(seconds) * 62156250)
         return;
     s_autopress_exit_requested = true;
-    sms_wiiu_menu_exit_pending = 1;
     port_log("[smg-input] autopress run over (%d s): returning to the Menu\n", seconds);
-    SYSLaunchMenu();
+    /* Only flag it: the frame boundary drains the GPU before it asks for the
+     * Menu. Asking first released the foreground with six GPU timestamps
+     * outstanding and the exit never completed (2026-10-30). */
+    sms_wiiu_menu_exit_pending = 1;
 }
 #endif
 

@@ -215,7 +215,9 @@ void log_stats(int64_t now)
 	g.peak       = 0;
 	g.statsSince     = now;
 	g.statsSubframes = sub;
-	sms_wiiu_hang_check();
+#if !defined(PORT_GAME_SMG)
+	sms_wiiu_hang_check(); // Galaxy: exception.cpp's watchdog thread is the only caller
+#endif
 	if (sms_wiiu_crash_stage)
 		port_log("[crash] recovery stage %d\n", sms_wiiu_crash_stage);
 	g.blocks = g.underruns = g.pendingWaits = 0;
