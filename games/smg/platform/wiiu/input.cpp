@@ -57,9 +57,14 @@ f32 s_gyro_pointer_x;
 f32 s_gyro_pointer_y;
 f32 s_gyro_center_x;
 f32 s_gyro_center_y;
+f32 s_stick_pointer_x;
+f32 s_stick_pointer_y;
+bool s_stick_pointer_active;
+bool s_gyro_pointer_enabled;
 enum PointerSource {
     POINTER_SOURCE_NONE,
     POINTER_SOURCE_TOUCH,
+    POINTER_SOURCE_STICK,
     POINTER_SOURCE_GYRO,
 };
 PointerSource s_pointer_source;
@@ -240,18 +245,29 @@ void set_pointer_source(PointerSource source)
 {
     if (source == s_pointer_source)
         return;
-    const PointerSource previous = s_pointer_source;
     s_pointer_source = source;
-    if (previous == POINTER_SOURCE_NONE)
-        return;
     if (source == POINTER_SOURCE_TOUCH)
         port_log("[smg-input] hardware pointer source: touch\n");
+    else if (source == POINTER_SOURCE_STICK)
+        port_log("[smg-input] hardware pointer source: right stick\n");
     else if (source == POINTER_SOURCE_GYRO)
         port_log("[smg-input] hardware pointer source: gyro\n");
 }
 
 void update_hardware_pointer(const VPADStatus& vpad)
 {
+    static const f32 kDeadzone = 0.12f;
+    static const f32 kSpeedPerFrame = 1.5f / 60.0f;
+    const bool stick_x_moved = vpad.rightStick.x < -kDeadzone || vpad.rightStick.x > kDeadzone;
+    const bool stick_y_moved = vpad.rightStick.y < -kDeadzone || vpad.rightStick.y > kDeadzone;
+    if (stick_x_moved || stick_y_moved) {
+        s_stick_pointer_x += vpad.rightStick.x * kSpeedPerFrame;
+        s_stick_pointer_y -= vpad.rightStick.y * kSpeedPerFrame;
+        clamp_normalized(&s_stick_pointer_x);
+        clamp_normalized(&s_stick_pointer_y);
+        s_stick_pointer_active = true;
+    }
+
     VPADTouchData touch;
     std::memset(&touch, 0, sizeof(touch));
     VPADGetTPCalibratedPoint(VPAD_CHAN_0, &touch, &vpad.tpNormal);
@@ -260,10 +276,23 @@ void update_hardware_pointer(const VPADStatus& vpad)
          * target used by the Galaxy port.  KPAD expects -1..1 coordinates. */
         s_hardware_pointer_x = static_cast<f32>(touch.x) / 427.0f - 1.0f;
         s_hardware_pointer_y = static_cast<f32>(touch.y) / 240.0f - 1.0f;
+        clamp_normalized(&s_hardware_pointer_x);
+        clamp_normalized(&s_hardware_pointer_y);
         s_hardware_pointer_valid = true;
         set_pointer_source(POINTER_SOURCE_TOUCH);
         return;
     }
+
+    if (s_stick_pointer_active) {
+        s_hardware_pointer_x = s_stick_pointer_x;
+        s_hardware_pointer_y = s_stick_pointer_y;
+        s_hardware_pointer_valid = true;
+        set_pointer_source(POINTER_SOURCE_STICK);
+        return;
+    }
+
+    if (!s_gyro_pointer_enabled)
+        return;
 
     /* The DRC gyro is exposed as a normalized aiming position relative to
      * the current R-button baseline.  R is intentionally not forwarded as a
@@ -587,6 +616,12 @@ void WPADInit(void)
     s_gyro_pointer_y = 0.0f;
     s_gyro_center_x = 0.0f;
     s_gyro_center_y = 0.0f;
+    s_stick_pointer_x = 0.0f;
+    s_stick_pointer_y = 0.0f;
+    s_stick_pointer_active = false;
+    s_gyro_pointer_enabled = sms_wiiu_sd_marker("gyropointer") != 0;
+    port_log("[smg-input] gyro pointer %s (SD marker gyropointer)\n",
+             s_gyro_pointer_enabled ? "enabled" : "disabled");
     s_pointer_source = POINTER_SOURCE_NONE;
     s_hardware_pointer_valid = false;
     s_hardware_pointer_x = 0.0f;

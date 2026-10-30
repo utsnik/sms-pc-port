@@ -198,6 +198,8 @@ static uint32_t g_field;
 static uint32_t g_vpad_hold;
 static float g_stick_x;
 static float g_stick_y;
+static float g_right_stick_x;
+static float g_right_stick_y;
 static uint16_t g_touch_x;
 static uint16_t g_touch_y;
 static uint16_t g_touch_touched;
@@ -210,6 +212,13 @@ static std::string g_log;
 static volatile unsigned char g_stack_sink;
 
 extern "C" const char* sms_wiiu_app_root(void) { return g_root.c_str(); }
+extern "C" int sms_wiiu_sd_marker(const char* name) {
+    std::string path = g_root + name;
+    FILE* marker = std::fopen(path.c_str(), "rb");
+    if (!marker) return 0;
+    std::fclose(marker);
+    return 1;
+}
 extern "C" uint32_t sms_wiiu_frame_count(void) { return g_field; }
 extern "C" void port_log(const char* fmt, ...) {
     char line[512];
@@ -230,6 +239,8 @@ extern "C" int32_t VPADRead(VPADChan, VPADStatus* status, uint32_t count,
     status->hold = g_vpad_hold;
     status->leftStick.x = g_stick_x;
     status->leftStick.y = g_stick_y;
+    status->rightStick.x = g_right_stick_x;
+    status->rightStick.y = g_right_stick_y;
     status->tpNormal.x = g_touch_x;
     status->tpNormal.y = g_touch_y;
     status->tpNormal.touched = g_touch_touched;
@@ -347,8 +358,8 @@ int main(int argc, char** argv) {
 
     g_field = 14;
     status = read_status();
-    check(status.dpd_valid_fg == 2 && status.pos.x == 0.0f && status.pos.y == 0.0f,
-          "script pointer yields to gyro fallback");
+    check(status.dpd_valid_fg == 0 && status.pos.x == 0.0f && status.pos.y == 0.0f,
+          "script pointer does not enable a gyro fallback");
 
     g_vpad_hold = VPAD_BUTTON_A | VPAD_BUTTON_LEFT;
     g_stick_x = -0.75f;
@@ -402,11 +413,24 @@ int main(int argc, char** argv) {
     g_gyro_y = -2.0f;
     g_field = 31;
     status = read_status();
-    check(status.dpd_valid_fg == 2 && status.pos.x == 1.0f && status.pos.y == -1.0f,
-          "gyro pointer fallback and clamp");
+    check(status.dpd_valid_fg == 2 && status.pos.x == 0.0f && status.pos.y == 0.0f,
+          "gyro pointer is disabled without its marker");
     check(status.horizon.x == 1.0f && status.horizon.y == 0.0f,
           "neutral pointer horizon");
+    g_right_stick_x = 1.0f;
+    g_right_stick_y = -1.0f;
     g_field = 32;
+    status = read_status();
+    check(status.dpd_valid_fg == 2 && status.pos.x > 0.02f && status.pos.x < 0.03f &&
+              status.pos.y > 0.02f && status.pos.y < 0.03f,
+          "right stick starts a normalized pointer");
+    g_right_stick_x = 0.0f;
+    g_right_stick_y = 0.0f;
+    g_field = 33;
+    status = read_status();
+    check(status.pos.x > 0.02f && status.pos.y > 0.02f,
+          "right-stick pointer persists after release");
+    g_field = 34;
     KPADStatus five_frame_status{};
     for (int frame = 0; frame < 5; ++frame) {
         five_frame_status = read_status();
@@ -417,15 +441,10 @@ int main(int argc, char** argv) {
     g_gyro_y = -0.25f;
     g_field = 38;
     status = read_status();
-    check(status.pos.x == 0.0f && status.pos.y == 0.0f &&
+    check(status.pos.x > 0.02f && status.pos.y > 0.02f &&
               (status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_Z |
                               WPAD_BUTTON_C)) == 0,
-          "R recentres gyro without Wii button");
-    int gyro_log_count = 0;
-    for (size_t at = 0; (at = g_log.find("hardware pointer source: gyro", at)) !=
-                           std::string::npos; ++at)
-        ++gyro_log_count;
-    check(gyro_log_count == 1, "gyro source diagnostic is edge-triggered");
+          "R does not disturb the right-stick pointer or Wii buttons");
     g_vpad_hold = VPAD_BUTTON_A;
     g_field = 39;
     status = read_status();
@@ -434,7 +453,7 @@ int main(int argc, char** argv) {
     status = read_status();
     check((status.hold & WPAD_BUTTON_A) && !(status.trig & WPAD_BUTTON_A),
           "pointer A is not a repeating trigger");
-    std::puts("input-host: PASS: touchscreen pointer and gyro fallback; five-frame DPD validity");
+    std::puts("input-host: PASS: touchscreen/right-stick pointer; gyro off by default; five-frame DPD validity");
 
     check(g_log.find("[smg-input] autoplay: press a field 2") != std::string::npos,
           "exact button log after script buffer lifetime");
@@ -515,6 +534,7 @@ def main() -> int:
     parser.add_argument("--require-stage3-gamepad", action="store_true")
     parser.add_argument("--require-touch-pointer", action="store_true")
     parser.add_argument("--require-gyro-pointer", action="store_true")
+    parser.add_argument("--require-right-stick-pointer", action="store_true")
     args = parser.parse_args()
 
     if not args.provider.is_file():
@@ -558,6 +578,11 @@ def main() -> int:
         missing = [token for token in required if token not in source]
         if missing:
             return fail("missing gyro pointer path: " + ", ".join(missing))
+    if args.require_right_stick_pointer:
+        required = ("rightStick", "s_stick_pointer_x", "POINTER_SOURCE_STICK", "gyropointer")
+        missing = [token for token in required if token not in source]
+        if missing:
+            return fail("missing right-stick pointer path: " + ", ".join(missing))
     try:
         output = host_check(args.provider)
     except RuntimeError as exc:
