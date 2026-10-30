@@ -3120,7 +3120,22 @@ static bool initTevPixel(TevShader& shader) {
     memcpy(shader.psProgram, program.data(), programSize);
     memset(&shader.pixel, 0, sizeof(shader.pixel));
     shader.pixel.regs.sq_pgm_resources_ps = ra.count;
+#if defined(PORT_GAME_SMG)
+    // EXPORT_MODE = colour exports << 1 | Z. A Z export that SQ was not told
+    // about, with DB_SHADER_CONTROL.Z_EXPORT_ENABLE set, hangs SX/SPI/DB/CB.
+    shader.pixel.regs.sq_pgm_exports_ps = ztexExport ? 3 : 2;
+    {
+        static uint32_t s_d9Logged;
+        if (s_d9Logged < 24) {
+            ++s_d9Logged;
+            WHBLogPrintf("[d9] tev pixel stages=%u ztex2=%08x ztexStage=%d op=%u export=%d inputs=%u",
+                         unsigned(key.stages), unsigned(key.ztex2), ztexStage, unsigned(ztexOp),
+                         int(ztexExport), unsigned(ra.inputs));
+        }
+    }
+#else
     shader.pixel.regs.sq_pgm_exports_ps = 2;
+#endif
     // Import only the interpolated values the key reads, packed from R0.
     shader.pixel.regs.spi_ps_in_control_0 = ra.inputs | (1u << 26) | (1u << 28);
     shader.pixel.regs.num_spi_ps_input_cntl = ra.inputs;
