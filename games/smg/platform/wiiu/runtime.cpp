@@ -80,13 +80,22 @@ void write_stage2_log(const char* line)
 
 void write_stage2_log_locked(const char* line)
 {
-    char marker_path[192];
-    std::snprintf(marker_path, sizeof(marker_path), "%sstage2log",
-                  kAppRootCandidates[s_app_root_index]);
-    FILE* marker = std::fopen(marker_path, "rb");
-    if (!marker)
+    /* The stage2log marker used to be fopen()ed on every port_log line: an SD
+     * open per log line, thousands during a boot. Check it once per app root. */
+    static int s_marker_state = -1;
+    static unsigned s_marker_root = ~0u;
+    if (s_marker_root != s_app_root_index) {
+        char marker_path[192];
+        std::snprintf(marker_path, sizeof(marker_path), "%sstage2log",
+                      kAppRootCandidates[s_app_root_index]);
+        FILE* marker = std::fopen(marker_path, "rb");
+        s_marker_state = marker ? 1 : 0;
+        if (marker)
+            std::fclose(marker);
+        s_marker_root = s_app_root_index;
+    }
+    if (s_marker_state != 1)
         return;
-    std::fclose(marker);
 
     char log_path[192];
     std::snprintf(log_path, sizeof(log_path), "%sstage2.log",
