@@ -269,24 +269,6 @@ static s32 NANDCreate_impl(const char* path, u8, u8)
     return NAND_RESULT_OK;
 }
 
-s32 NANDCreate(const char* path, u8 a, u8 b)
-{ return nlog("NANDCreate", path, NANDCreate_impl(path, a, b)); }
-s32 NANDOpen(const char* path, NANDFileInfo* info, u8 mode)
-{ return nlog("NANDOpen", path, NANDOpen_impl(path, info, mode)); }
-s32 NANDClose(NANDFileInfo* info)
-{ return nlog("NANDClose", nullptr, NANDClose_impl(info)); }
-s32 NANDRead(NANDFileInfo* info, void* buffer, u32 length)
-{ return nlog("NANDRead", nullptr, NANDRead_impl(info, buffer, length)); }
-s32 NANDWrite(NANDFileInfo* info, const void* buffer, u32 length)
-{ return nlog("NANDWrite", nullptr, NANDWrite_impl(info, buffer, length)); }
-s32 NANDGetLength(NANDFileInfo* info, u32* length)
-{ return nlog("NANDGetLength", nullptr, NANDGetLength_impl(info, length)); }
-s32 NANDDelete(const char* path)
-{ return nlog("NANDDelete", path, NANDDelete_impl(path)); }
-s32 NANDMove(const char* path, const char* destination)
-{ return nlog("NANDMove", path, NANDMove_impl(path, destination)); }
-s32 NANDCheck(u32 a, u32 b, u32* answer)
-{ return nlog("NANDCheck", nullptr, NANDCheck_impl(a, b, answer)); }
 s32 NANDPrivateCreate(const char* path, u8 perm, u8 attr)
 { return NANDCreate(path, perm, attr); }
 static s32 NANDOpen_impl(const char* path, NANDFileInfo* info, u8 mode)
@@ -435,6 +417,24 @@ s32 NANDPrivateCreateAsync(const char* path, u8 perm, u8 attr,
                            NANDCallback callback, NANDCommandBlock* block)
 { const s32 result = NANDCreate(path, perm, attr); finish(callback, result, block); return result; }
 
+s32 NANDCreate(const char* path, u8 a, u8 b)
+{ return nlog("NANDCreate", path, NANDCreate_impl(path, a, b)); }
+s32 NANDOpen(const char* path, NANDFileInfo* info, u8 mode)
+{ return nlog("NANDOpen", path, NANDOpen_impl(path, info, mode)); }
+s32 NANDClose(NANDFileInfo* info)
+{ return nlog("NANDClose", nullptr, NANDClose_impl(info)); }
+s32 NANDRead(NANDFileInfo* info, void* buffer, u32 length)
+{ return nlog("NANDRead", nullptr, NANDRead_impl(info, buffer, length)); }
+s32 NANDWrite(NANDFileInfo* info, const void* buffer, u32 length)
+{ return nlog("NANDWrite", nullptr, NANDWrite_impl(info, buffer, length)); }
+s32 NANDGetLength(NANDFileInfo* info, u32* length)
+{ return nlog("NANDGetLength", nullptr, NANDGetLength_impl(info, length)); }
+s32 NANDDelete(const char* path)
+{ return nlog("NANDDelete", path, NANDDelete_impl(path)); }
+s32 NANDMove(const char* path, const char* destination)
+{ return nlog("NANDMove", path, NANDMove_impl(path, destination)); }
+s32 NANDCheck(u32 a, u32 b, u32* answer)
+{ return nlog("NANDCheck", nullptr, NANDCheck_impl(a, b, answer)); }
 s32 nandConvertErrorCode(const ISFSError) { return NAND_RESULT_UNKNOWN; }
 BOOL nandIsPrivatePath(const char*) { return FALSE; }
 void nandGenerateAbsPath(char* out, const char* path)
