@@ -366,7 +366,14 @@ static s32 NANDMove_impl(const char* path, const char* destination)
         static_cast<int>(sizeof(target)))
         return NAND_RESULT_INVALID;
     make_parent_dirs(target);
-    return rename(source, target) == 0 ? NAND_RESULT_OK : errno_result();
+    if (rename(source, target) == 0)
+        return NAND_RESULT_OK;
+    /* The Wii's IOS rename replaces an existing file; the Wii U SD devoptab
+     * refuses (EEXIST), which failed Galaxy's second save at the banner.bin
+     * move ("Could not write to/read from Wii System Memory", 2026-10-30). */
+    if (errno == EEXIST && remove(target) == 0 && rename(source, target) == 0)
+        return NAND_RESULT_OK;
+    return errno_result();
 }
 
 static s32 NANDCheck_impl(u32, u32, u32* answer)
