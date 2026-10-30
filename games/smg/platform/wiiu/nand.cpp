@@ -11,11 +11,11 @@
 
 #include "runtime.h"
 
-extern "C" void port_log(const char* fmt, ...);
+extern "C" void port_log(const char* fmt, ...) __attribute__((weak));
 static unsigned s_nlog;
 static s32 nlog(const char* fn, const char* path, s32 r)
 {
-    if (s_nlog < 120) { ++s_nlog; port_log("[smg-nand] %s %s -> %d", fn, path ? path : "-", (int)r); }
+    if (port_log && s_nlog < 120) { ++s_nlog; port_log("[smg-nand] %s %s -> %d", fn, path ? path : "-", (int)r); }
     return r;
 }
 
@@ -62,8 +62,12 @@ bool path_stays_in_root(const char* path)
     // realpath() may use its whole PATH_MAX (4096 on devkitPPC) output buffer;
     // 256-byte buffers overran into the caller's frame on the NAND thread.
     char root[PATH_MAX];
-    if (realpath(smg_wiiu_save_root(), root) == nullptr)
-        return false;
+    if (realpath(smg_wiiu_save_root(), root) == nullptr) {
+        /* No realpath() on this device (the Wii U SD devoptab): make_path()
+         * built the path from the root plus components valid_path() already
+         * cleared of ".", ".." and "\\", so a lexical check is exact. */
+        return within_root(smg_wiiu_save_root(), path);
+    }
 
     char resolved[PATH_MAX];
     if (realpath(path, resolved) != nullptr)
@@ -81,7 +85,9 @@ bool path_stays_in_root(const char* path)
         *separator = '\0';
     }
     // The remaining check is intentionally a small TOCTOU window; the save SD card is single-user.
-    return realpath(prefix, resolved) != nullptr && within_root(root, resolved);
+    if (realpath(prefix, resolved) == nullptr)
+        return within_root(smg_wiiu_save_root(), path);  // nothing resolves: lexical, as above
+    return within_root(root, resolved);
 }
 
 bool reject_path_escape(const char* path)
@@ -90,6 +96,7 @@ bool reject_path_escape(const char* path)
         return false;
     if (!s_path_escape_logged) {
         fprintf(stderr, "SMG Wii U NAND: refusing path outside save root\n");
+        if (port_log) port_log("[smg-nand] refusing path outside save root: %s", path);
         s_path_escape_logged = true;
     }
     return true;
