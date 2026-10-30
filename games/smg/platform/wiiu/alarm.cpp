@@ -30,8 +30,9 @@
  *    callback-context disarm retires them without waiting, while external
  *    disarm still waits for handlers so its return remains a completion
  *    boundary. Records with handlers in flight are not reused. The native
- *    arm/cancel handoff is made while s_lock is held, so cancellation cannot
- *    race the instance selected for arming.
+ *    thread-side native arm/cancel calls happen outside s_lock. A pending
+ *    native arm keeps its record reserved until the call completes, and an
+ *    operation reference keeps its instance alive across each native call.
  */
 #include "port/port.h"
 
@@ -91,6 +92,7 @@ struct AlarmRecord {
     uint64_t generation;          // next generation for this record
     bool armed;                   // an arming is live
     bool active;                  // owned by a game alarm
+    bool native_arm_pending;      // thread-side OSSetAlarm is outside s_lock
 };
 
 WutSpinLock s_lock;
@@ -171,7 +173,7 @@ AlarmRecord* claim_locked(OSAlarm* game)
     AlarmRecord* best = nullptr;
     for (unsigned i = 0; i < kMaxAlarms; ++i) {
         AlarmRecord* r = &s_alarms[i];
-        if (r->active || r->in_flight)
+        if (r->active || r->in_flight || r->native_arm_pending)
             continue;
         if (!best || r->released < best->released)
             best = r;
@@ -293,7 +295,7 @@ void trampoline(WutAlarm* wut, void* /*context*/)
 
 /* Disarm and stop the coreinit alarm. Callback-context callers do not wait;
  * external callers wait for handlers after the native transition. The native
- * native hold keeps a dequeued callback's instance alive until it enters the
+ * hold keeps a dequeued callback's instance alive until it enters the
  * trampoline; its callback hold then keeps it alive through the handler. */
 void disarm(AlarmRecord* r)
 {
@@ -307,15 +309,31 @@ void disarm(AlarmRecord* r)
         instance = r->instance;
         r->instance = nullptr;
         if (instance) {
+            ++instance->refs;           // hold across the thread-side cancel
             if (release_locked(instance))
                 destroy = true;       // drop the record holder
+        }
+    }
+    if (instance) {
+        /* A thread-side arm may still be between publication and OSSetAlarm.
+         * Let that native transition finish before cancelling, while the
+         * operation reference keeps the instance alive. */
+        for (;;) {
+            {
+                Lock lock;
+                if (!r->native_arm_pending)
+                    break;
+            }
+            wut_OSYieldThread();
+        }
 
-            /* Keep the adapter lock through the native transition. A
-             * callback already in flight can finish only after this block;
-             * a callback not yet entered owns the native hold until entry. */
-            const BOOL cancelled = wut_OSCancelAlarm(&instance->wut);
+        const BOOL cancelled = wut_OSCancelAlarm(&instance->wut);
+        {
+            Lock lock;
             if (cancelled && release_native_locked(instance))
                 destroy = true;
+            if (release_locked(instance))
+                destroy = true;       // drop the cancel operation holder
         }
     }
     if (instance && !defer_wait) {
@@ -365,35 +383,61 @@ AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, OSTime first, OS
 #if defined(SMG_ALARM_HOST_TEST)
     ++s_live_instances;
 #endif
-    Lock lock;
-    AlarmRecord* r = claim_locked(alarm);
-    if (!r) {
-        port_log("[smg-alarm] alarm side table exhausted");
-        destroy_instance(instance);
-        return nullptr;
-    }
-    instance->record = r;
-    instance->generation = ++r->generation;
-    instance->periodic = period > 0;
-    r->instance = instance;
-    const OSTime now = wut_OSGetTime();
-    r->handler = handler;
-    r->period = period;
-    r->start = start;
-    if (period > 0)
-        r->due = start > now ? start : start + ((now - start) / period + 1) * period;
-    else
-        r->due = now + first;
-    r->armed = true;
-    alarm->handler = handler;
-    alarm->start = start;
-    alarm->period = period;
+    /* Create and identify the native alarm before publishing the instance.
+     * The generation field is initialized before OSSetAlarm can dispatch it. */
     wut_OSCreateAlarm(&instance->wut);
     wut_OSSetAlarmUserData(&instance->wut, &instance->generation);
-    instance->refs = 2;                // record holder + native alarm holder
-    instance->native_held = true;
-    const OSTime delay = period > 0 ? r->due - now : first;
-    wut_OSSetAlarm(&instance->wut, delay, trampoline);
+
+    AlarmRecord* r;
+    OSTime delay;
+    {
+        Lock lock;
+        r = claim_locked(alarm);
+        if (!r) {
+            port_log("[smg-alarm] alarm side table exhausted");
+            destroy_instance(instance);
+            return nullptr;
+        }
+        instance->record = r;
+        instance->generation = ++r->generation;
+        instance->periodic = period > 0;
+        r->instance = instance;
+        const OSTime now = wut_OSGetTime();
+        r->handler = handler;
+        r->period = period;
+        r->start = start;
+        if (period > 0)
+            r->due = start > now ? start : start + ((now - start) / period + 1) * period;
+        else
+            r->due = now + first;
+        r->armed = true;
+        r->native_arm_pending = true;
+        alarm->handler = handler;
+        alarm->start = start;
+        alarm->period = period;
+        instance->refs = 3;            // record + native + arm-call holders
+        instance->native_held = true;
+        delay = period > 0 ? r->due - now : first;
+    }
+
+    const BOOL set = wut_OSSetAlarm(&instance->wut, delay, trampoline);
+    bool destroy = false;
+    {
+        Lock lock;
+        r->native_arm_pending = false;
+        if (!set && r->instance == instance && r->armed) {
+            r->armed = false;
+            r->instance = nullptr;
+            if (release_locked(instance))
+                destroy = true;       // drop the record holder
+            if (release_native_locked(instance))
+                destroy = true;
+        }
+        if (release_locked(instance))
+            destroy = true;            // drop the arm-call holder
+    }
+    if (destroy)
+        destroy_instance(instance);
     return r;
 }
 

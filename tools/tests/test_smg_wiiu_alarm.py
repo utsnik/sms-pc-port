@@ -83,6 +83,7 @@ struct FakeState {
     std::atomic<bool> requeued{false};
 };
 static std::mutex g_fake;
+static std::recursive_mutex g_alarm_lock;                 // coreinit's global alarm lock
 static std::map<void*, void*> g_user;                     // alarm -> user data
 static std::map<void*, std::shared_ptr<FakeState>> g_state;
 static std::vector<std::thread> g_threads;
@@ -108,9 +109,10 @@ static bool g_handoff_release = false, g_handoff_cancel_called = false;
 // before it gets it (it has read whatever it reads without the lock).
 static thread_local bool t_is_cb = false, t_held_once = false;
 static std::atomic<bool> g_lockhold{false};
+static std::atomic<bool> g_wait_external_lock{false};
 static std::mutex g_lh_m;
 static std::condition_variable g_lh_cv;
-static bool g_lh_parked = false, g_lh_release = false;
+static bool g_lh_parked = false, g_lh_release = false, g_external_lock_acquired = false;
 
 static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s, double period_s, WutCb cb) {
     std::mt19937 rng(reinterpret_cast<uintptr_t>(alarm) ^ (uintptr_t)period_s);
@@ -144,10 +146,16 @@ static void fire_loop(void* alarm, std::shared_ptr<FakeState> st, double first_s
         { std::lock_guard<std::mutex> l(g_fake); user = g_user[alarm]; }
         (void)user;
         g_native_callback_calls++;
-        t_is_cb = true;
-        t_held_once = false;
-        cb(alarm, nullptr);
-        t_is_cb = false;
+        {
+            // coreinit dispatches callbacks with its global alarm lock held.
+            // It is recursive for the dispatching thread, so a callback can
+            // re-arm or cancel its own alarm.
+            std::lock_guard<std::recursive_mutex> l(g_alarm_lock);
+            t_is_cb = true;
+            t_held_once = false;
+            cb(alarm, nullptr);
+            t_is_cb = false;
+        }
         st->dequeued = false;
         if (period_s <= 0)
             return;                                        // at most one late call
@@ -169,6 +177,7 @@ void fake_create(void* a) __asm__("OSCreateAlarm");
 void fake_create(void* a) { std::lock_guard<std::mutex> l(g_fake); auto& s = g_state[a]; if (s) s->cancelled = true; s.reset(); }
 int fake_set(void* a, OSTime t, WutCb cb) __asm__("OSSetAlarm");
 int fake_set(void* a, OSTime t, WutCb cb) {
+    std::lock_guard<std::recursive_mutex> alarm_lock(g_alarm_lock);
     {
         std::unique_lock<std::mutex> l(g_handoff_m);
         if (g_handoff_gate) {
@@ -188,6 +197,7 @@ int fake_setp(void* a, OSTime, OSTime period, WutCb cb) {
 }
 int fake_cancel(void* a) __asm__("OSCancelAlarm");
 int fake_cancel(void* a) {
+    std::lock_guard<std::recursive_mutex> alarm_lock(g_alarm_lock);
     {
         std::lock_guard<std::mutex> l(g_handoff_m);
         if (g_handoff_gate) {
@@ -220,6 +230,11 @@ int fake_spin_acq(void*) {
         }
     }
     g_spin.lock();
+    if (!t_is_cb && g_wait_external_lock.exchange(false)) {
+        std::lock_guard<std::mutex> l(g_lh_m);
+        g_external_lock_acquired = true;
+        g_lh_cv.notify_all();
+    }
     return 1;
 }
 int fake_spin_rel(void*) __asm__("OSUninterruptibleSpinLock_Release");
@@ -292,20 +307,17 @@ static void handler_self_rearm(OSAlarm* a, OSContext*) {
     g_self_done++;
 }
 
-// Both handlers cancel the other alarm while both records have a handler in
-// flight. Disarm must not wait for the other callback to return.
+// Each handler cancels the other alarm. The fake coreinit dispatch lock
+// serializes callback bodies, so this deliberately does not require both
+// callbacks to be in flight at once.
 static std::atomic<int> g_cross_entered{0}, g_cross_done{0};
 static void handler_cross_a(OSAlarm* a, OSContext*) {
     g_cross_entered++;
-    while (g_cross_entered.load() < 2)
-        std::this_thread::yield();
     smg_wiiu_OSCancelAlarm(&g_alarms[5]);
     g_cross_done++;
 }
 static void handler_cross_b(OSAlarm* a, OSContext*) {
     g_cross_entered++;
-    while (g_cross_entered.load() < 2)
-        std::this_thread::yield();
     smg_wiiu_OSCancelAlarm(&g_alarms[4]);
     g_cross_done++;
 }
@@ -316,9 +328,9 @@ static bool cross_cancel_test() {
     smg_wiiu_OSCreateAlarm(&g_alarms[5]);
     smg_wiiu_OSSetAlarm(&g_alarms[4], OSTime(kTimerHz * 0.001), handler_cross_a);
     smg_wiiu_OSSetAlarm(&g_alarms[5], OSTime(kTimerHz * 0.001), handler_cross_b);
-    for (int i = 0; i < 200 && g_cross_done.load() != 2; ++i)
+    for (int i = 0; i < 200 && g_cross_done.load() == 0; ++i)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    const bool ok = g_cross_done.load() == 2;
+    const bool ok = g_cross_done.load() != 0;
     std::printf("alarm-host: cross-cancel %s\n", ok ? "returned" : "DEADLOCKED");
     if (ok) {
         smg_wiiu_OSCancelAlarm(&g_alarms[4]);
@@ -537,14 +549,32 @@ static bool wrap_test() {
             return false;
         }
     }
-    smg_wiiu_OSCancelAlarm(&g_alarms[0]);
+    // The parked callback owns coreinit's dispatch lock. Cancellation first
+    // publishes the adapter-side disarm, then waits for that native lock, so
+    // let the callback leave its adapter-lock gate before joining cancel.
+    {
+        std::lock_guard<std::mutex> l(g_lh_m);
+        g_wait_external_lock = true;
+        g_external_lock_acquired = false;
+    }
+    std::thread canceller([&] { smg_wiiu_OSCancelAlarm(&g_alarms[0]); });
+    {
+        std::unique_lock<std::mutex> l(g_lh_m);
+        if (!g_lh_cv.wait_for(l, std::chrono::seconds(2), [] { return g_external_lock_acquired; })) {
+            { std::lock_guard<std::mutex> release(g_lh_m); g_lh_release = true; }
+            g_lh_cv.notify_all();
+            canceller.join();
+            return false;
+        }
+    }
+    { std::lock_guard<std::mutex> l(g_lh_m); g_lh_release = true; g_lh_cv.notify_all(); }
+    canceller.join();
     smg_wiiu_OSCreateAlarm(&g_alarms[1]);
     for (int n = 0; n < 255; ++n) {
         smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 1.0), handler_wrap);
         smg_wiiu_OSCancelAlarm(&g_alarms[1]);
     }
     smg_wiiu_OSSetAlarm(&g_alarms[1], OSTime(kTimerHz * 0.001), handler_wrap);
-    { std::lock_guard<std::mutex> l(g_lh_m); g_lh_release = true; g_lh_cv.notify_all(); }
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     smg_wiiu_OSCancelAlarm(&g_alarms[1]);
     const int a0 = g_hits[0][0] + g_hits[0][1], b1 = g_hits[1][0] + g_hits[1][1];
