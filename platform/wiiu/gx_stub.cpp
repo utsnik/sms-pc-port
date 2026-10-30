@@ -584,6 +584,8 @@ static uint32_t s_presentFrames;
  * next frame starts once at most one swap is still outstanding.  The vertex
  * arenas are fenced and GXPeekARGB is asynchronous, so one frame in flight is
  * safe. */
+extern "C" int sms_wiiu_d7_noswap(void);
+extern "C" int sms_wiiu_d6_force(void);
 static void present_finish_pipelined(void)
 {
 	static uint32_t s_d5sCalls;
@@ -591,7 +593,7 @@ static void present_finish_pipelined(void)
 	uint64_t before = 0, afterSwap = 0, afterFlush = 0;
 	sms_wiiu_d1_note_present_core();
 	before = GX2GetLastSubmittedTimeStamp();
-	GX2SwapScanBuffers();
+	if (!sms_wiiu_d7_noswap()) GX2SwapScanBuffers();
 	if (d5s) afterSwap = GX2GetLastSubmittedTimeStamp();
 	sms_wiiu_d4_event(D4_SWAP);
 	GX2Flush();
@@ -601,7 +603,7 @@ static void present_finish_pipelined(void)
 	 * segment, and that merged segment is the one that stalls. Force a
 	 * segment of its own: one harmless context load, then flush again. */
 	static uint32_t s_d6Forced;
-	if (submitted == before) {
+	if (submitted == before && sms_wiiu_d6_force()) {
 		uint32_t swaps = 0, flips = 0;
 		OSTime lastFlip = 0, lastVsync = 0;
 		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);

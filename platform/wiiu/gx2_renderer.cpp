@@ -25,6 +25,7 @@
 #ifndef SMS_GX2_DEBUG_DRAW_LIMIT
 #define SMS_GX2_DEBUG_DRAW_LIMIT 0
 #endif
+#include <coreinit/thread.h>
 #include <coreinit/memdefaultheap.h>
 /* Small GX2 host for the shared GX register decoder.
  *
@@ -91,6 +92,12 @@ uint32_t g_displayFrames = 0;
 // A fixed CPU ring retains submissions from the first sixty game frames.
 // The pending record describes work since the previous submission, including
 // commands queued by a display list before its direct call.
+// d7 A/B switches (SD markers): noswap = no scan copies and no swap in the
+// present; fencepoll = poll the arena fence for up to 3 s instead of
+// GX2WaitTimeStamp; forcepres = the d6 forced present segment.
+static bool s_d7NoSwap, s_d7FencePoll, s_d6Force;
+extern "C" int sms_wiiu_d7_noswap(void) { return s_d7NoSwap ? 1 : 0; }
+extern "C" int sms_wiiu_d6_force(void) { return s_d6Force ? 1 : 0; }
 struct D4Segment {
     uint64_t ts;
     uint32_t frame, firstVerts, firstStages, firstBlend, firstTexmask;
@@ -848,7 +855,29 @@ static void beginVertexArena() {
         const OSTime t0 = OSGetTime();
         const OSTime retiredBefore = ::GX2GetRetiredTimeStamp();
         const OSTime fence = s_vertexArenaFence[s_vertexArenaIndex];
-        const auto rc = ::GX2WaitTimeStamp(fence);
+        BOOL rc;
+        if (s_d7FencePoll) {
+            const OSTime limit = OSMillisecondsToTicks(3000);
+            while (::GX2GetRetiredTimeStamp() < fence && OSGetTime() - t0 < limit)
+                OSSleepTicks(OSMillisecondsToTicks(1));
+            rc = ::GX2GetRetiredTimeStamp() >= fence;
+            const OSTime waited = OSGetTime() - t0;
+            if (waited > OSMillisecondsToTicks(5)) {
+                static uint32_t s_d7Polls;
+                uint32_t swaps = 0, flips = 0;
+                OSTime lastFlip = 0, lastVsync = 0;
+                GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+                if (s_d7Polls++ < 60)
+                    WHBLogPrintf("[d7p] fence=%llu freed=%d ms=%llu ret=%llu sub=%llu swaps=%u flips=%u lastFlip=%llu",
+                                 (unsigned long long)fence, int(rc),
+                                 (unsigned long long)OSTicksToMilliseconds(waited),
+                                 (unsigned long long)::GX2GetRetiredTimeStamp(),
+                                 (unsigned long long)(::GX2GetLastSubmittedTimeStamp)(),
+                                 unsigned(swaps), unsigned(flips), (unsigned long long)lastFlip);
+            }
+        } else {
+            rc = ::GX2WaitTimeStamp(fence);
+        }
         const OSTime elapsed = OSGetTime() - t0;
         s_vertexFenceWait += elapsed;
         if (elapsed > OSMillisecondsToTicks(1) && s_vertexFenceDiagCount < 200) {
@@ -4049,6 +4078,7 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
+    if (s_d7NoSwap) return;
     if (!s_noScanTv) {
         GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
     }
@@ -4716,6 +4746,10 @@ void rendererInit(float) {
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_noScanTv = sdMarkerPresent("noscantv");
     s_noScanDrc = sdMarkerPresent("noscandrc");
+    s_d7NoSwap = sdMarkerPresent("noswap");
+    s_d7FencePoll = sdMarkerPresent("fencepoll");
+    s_d6Force = sdMarkerPresent("forcepres");
+    WHBLogPrintf("[d7m] noswap=%d fencepoll=%d forcepres=%d", int(s_d7NoSwap), int(s_d7FencePoll), int(s_d6Force));
     WHBLogPrintf("[d3m] noscantv=%u noscandrc=%u", s_noScanTv ? 1u : 0u, s_noScanDrc ? 1u : 0u);
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
