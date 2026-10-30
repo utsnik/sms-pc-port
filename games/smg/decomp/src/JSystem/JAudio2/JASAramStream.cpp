@@ -1,3 +1,4 @@
+#include "port/port.h"
 #include "JSystem/JAudio2/JASAramStream.hpp"
 #include "JSystem/JAudio2/JASAiCtrl.hpp"
 #include "JSystem/JAudio2/JASChannel.hpp"
@@ -23,7 +24,17 @@ bool UNK_BOOL_A;
 bool UNK_BOOL_B;
 
 void JASAramStream::initSystem(u32 block_size, u32 channel_max) {
-    if (JASDriver::registerSubFrameCallback(dvdErrorCheck, nullptr)) {
+    const bool registered = JASDriver::registerSubFrameCallback(dvdErrorCheck, nullptr);
+#if defined(PORT_GAME_SMG)
+    /* Port: the load thread does not depend on the callback slot; a null
+     * sLoadThread crashed the first streamed BGM (STM_TITLE) in
+     * JASTaskThread::sendCmdMsg on the audio thread (2026-10-30). */
+    if (sLoadThread == nullptr)
+        sLoadThread = JASDvd::getThreadPointer();
+    port_log("[smg-audio] JASAramStream::initSystem registered=%d loadThread=%p block=%u channels=%u",
+             (int)registered, (void*)sLoadThread, (unsigned)block_size, (unsigned)channel_max);
+#endif
+    if (registered) {
         if (sLoadThread == nullptr) {
             sLoadThread = JASDvd::getThreadPointer();
         }
