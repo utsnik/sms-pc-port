@@ -9,6 +9,7 @@ extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 #include <dolphin/vi.h>
 #include <whb/proc.h>
 #include <proc_ui/procui.h>
+#include <coreinit/launch.h>
 #include <gx2/event.h>
 #include <gx2/state.h>
 #include <gx2/swap.h>
@@ -180,6 +181,7 @@ void sms_wiiu_frame_boundary(void)
 		int64_t lastFlipChange = menuStart;
 		uint32_t lastFlips = 0, menuKicks = 0;
 		int menuLogged = 0;
+		bool rebootAsked = false;
 		for (;;) {
 			const ProcUIStatus status = ProcUIProcessMessages(FALSE);
 			const int64_t now = sms_wiiu_native_time();
@@ -215,7 +217,14 @@ void sms_wiiu_frame_boundary(void)
 				             second, (int)status, (unsigned)swaps, (unsigned)flips,
 				             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned)menuKicks);
 			}
-			if (second >= 60)
+			if (second >= 60 && !rebootAsked) {
+				/* Last resort so nobody has to power-cycle: ask for a full
+				 * system reboot (what reboot.rpx does) and keep pumping. */
+				rebootAsked = true;
+				WHBLogPrintf("SMS Wii U: menu wait: no handover in 60 s; requesting a full system reboot");
+				OSLaunchTitlel(OS_TITLE_ID_REBOOT, 0);
+			}
+			if (second >= 120)
 				break;
 			sms_wiiu_native_sleep_ticks(62156250 / 100);
 		}
