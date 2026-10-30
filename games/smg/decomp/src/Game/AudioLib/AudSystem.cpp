@@ -1,3 +1,4 @@
+#include "port/port.h"
 #include "Game/AudioLib/AudSystem.hpp"
 #include "Game/AudioLib/AudEffector.hpp"
 #include "Game/AudioLib/AudLimitedSound.hpp"
@@ -62,6 +63,15 @@ namespace {
         initJAS.audioMemory_ = AudParams::aramAddr;
         initJAS.audioMemSize_ = AudParams::aramSize;
         initJAS.heapSize_ = AudParams::workAreaSize;
+#if defined(PORT_GAME_SMG)
+        /* Port: 4 KB holds three 1036-byte JAS command chunks; the first
+         * streamed BGM needed a fourth, operator new returned null and
+         * JASTaskThread::sendCmdMsg stored through it (DSI dar=4 on the audio
+         * thread at File Select, 2026-10-30). */
+        port_log("[smg-audio] JAS work area 0x%x -> 0x8000, audio heap free=%u", (unsigned)initJAS.heapSize_,
+                 (unsigned)pHeap->getFreeSize());
+        initJAS.heapSize_ = 0x8000;
+#endif
         initJAS.dvdThreadPriority_ = AudParams::dvdThreadPriority;
         initJAS.audioThreadPriority_ = AudParams::audioThreadPriority;
         initJAS.dvdThreadId_ = AudParams::dvdThreadSwitchID;
