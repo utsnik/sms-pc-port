@@ -5961,3 +5961,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
 }
 
 } // namespace gx
+
+/* The surface the game is drawn to (the native target inside the TV buffer
+ * when it is smaller): screenshots read this, not the TV buffer's descriptor. */
+extern "C" const GX2Surface* sms_wiiu_render_surface(void) { return &gx::renderColour()->surface; }

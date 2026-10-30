@@ -62,6 +62,7 @@ bool s_smg_z_scale_logged;
 extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
+extern "C" const GX2Surface* sms_wiiu_render_surface(void);
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
@@ -417,7 +418,7 @@ void take_shots(uint32_t p)
 	}
 	const uint32_t n = s_base + s_shots_written++;
 	std::snprintf(path, sizeof(path), "%s/shot%02u-tv.bmp", dir, unsigned(n));
-	shot_surface(WHBGfxGetTVColourBuffer()->surface, path, 2);
+	shot_surface(*sms_wiiu_render_surface(), path, 2);
 	GX2Texture last;
 	std::memset(&last, 0, sizeof(last));
 	if (GX2GetLastFrame(GX2_SCAN_TARGET_DRC, &last)) {
