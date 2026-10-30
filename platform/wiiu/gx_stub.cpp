@@ -18,7 +18,6 @@
 #include <malloc.h>
 #include <sys/stat.h>
 #include <whb/gfx.h>
-#include <coreinit/thread.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/core.h>
 #include <gx2/clear.h>
@@ -65,6 +64,7 @@ extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" const GX2Surface* sms_wiiu_render_surface(void);
 extern "C" void sms_wiiu_dvd_pump(void);
+extern "C" void gxs_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
 extern "C" void sms_wiiu_gx2_force_nodiff(int on);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
@@ -770,10 +770,11 @@ extern "C" uint32_t sms_wiiu_vsync_fields(void)
 			s_dvdPoll = !sms_wiiu_sd_marker("nodvdpoll");
 		const uint32_t before = s_vsyncs;
 		if (s_dvdPoll) {
-			const OSTime t0 = OSGetTime();
-			while (s_vsyncs == before && OSGetTime() - t0 < OSMillisecondsToTicks(40)) {
+			const int64_t t0 = wut_OSGetTime_stub();
+			const int64_t tps = 248625000 / 4;  /* bus clock / 4 */
+			while (s_vsyncs == before && wut_OSGetTime_stub() - t0 < tps / 25) {
 				sms_wiiu_dvd_pump();
-				OSSleepTicks(OSMicrosecondsToTicks(500));
+				gxs_native_sleep_ticks(tps / 2000);
 			}
 		}
 		if (s_vsyncs == before)
