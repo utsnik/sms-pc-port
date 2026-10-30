@@ -18,6 +18,8 @@
 #include "Game/System/GameSystemResetAndPowerProcess.hpp"
 #include "Game/System/GameSystemSceneController.hpp"
 #include "Game/System/GameSystemStationedArchiveLoader.hpp"
+#include "Game/LiveActor/Spine.hpp"
+#include "port/port.h"
 #include "Game/System/HeapMemoryWatcher.hpp"
 #include "Game/System/HomeButtonStateNotifier.hpp"
 #include "Game/System/MainLoopFramework.hpp"
@@ -282,6 +284,24 @@ void GameSystem::update() {
     mDimmingWatcher->_5 = mErrorWatcher->isWarning() || mHomeButtonLayout->isActive() || GameSequenceFunction::isActiveSaveDataHandleSequence();
     mDimmingWatcher->update();
     updateNerve();
+    /* d11: the boot sequence state, on every change and every 300 updates
+     * (map the nerve addresses with smg.map). */
+    {
+        static const Nerve* sLastSys;
+        static const Nerve* sLastLoader;
+        static u32 sCalls;
+        const Nerve* sys = mSpine ? mSpine->getCurrentNerve() : nullptr;
+        const Nerve* ld = (mStationedArchiveLoader && mStationedArchiveLoader->mSpine)
+                              ? mStationedArchiveLoader->mSpine->getCurrentNerve() : nullptr;
+        if (sys != sLastSys || ld != sLastLoader || (++sCalls % 300) == 0) {
+            port_log("[smg-boot] sys=%p step=%d loader=%p step=%d execLoad=%d", (const void*)sys,
+                     (int)getNerveStep(), (const void*)ld,
+                     mStationedArchiveLoader ? (int)mStationedArchiveLoader->getNerveStep() : -1,
+                     (int)mIsExecuteLoadSystemArchive);
+            sLastSys = sys;
+            sLastLoader = ld;
+        }
+    }
 }
 
 void GameSystem::updateSceneController() {
