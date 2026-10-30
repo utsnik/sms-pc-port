@@ -618,6 +618,7 @@ static uint32_t s_vertexArenaIndex;
 static uint32_t s_vertexArenaUsed;
 static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
+static uint32_t s_vertexFenceDiagCount;
 static bool s_vertexArenaInvalidated;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
@@ -761,8 +762,20 @@ static void beginVertexArena() {
     s_vertexArenaInvalidated = false;
     if (s_vertexArenaFence[s_vertexArenaIndex]) {
         const OSTime t0 = OSGetTime();
-        GX2WaitTimeStamp(s_vertexArenaFence[s_vertexArenaIndex]);
-        s_vertexFenceWait += OSGetTime() - t0;
+        const OSTime retiredBefore = ::GX2GetRetiredTimeStamp();
+        const OSTime fence = s_vertexArenaFence[s_vertexArenaIndex];
+        const auto rc = ::GX2WaitTimeStamp(fence);
+        const OSTime elapsed = OSGetTime() - t0;
+        s_vertexFenceWait += elapsed;
+        if (elapsed > OSMillisecondsToTicks(1) && s_vertexFenceDiagCount < 200) {
+            ++s_vertexFenceDiagCount;
+            WHBLogPrintf("[d3f] n=%u fence=%llu ret_before=%llu rc=%d ms=%llu ret_after=%llu sub=%llu",
+                         unsigned(s_vertexFenceDiagCount), (unsigned long long)fence,
+                         (unsigned long long)retiredBefore, int(rc),
+                         (unsigned long long)OSTicksToMilliseconds(elapsed),
+                         (unsigned long long)::GX2GetRetiredTimeStamp(),
+                         (unsigned long long)(::GX2GetLastSubmittedTimeStamp)());
+        }
     }
     // The matching vertex fence also covers every command list submitted from
     // this slot.  Only now may the bounded list arena be reused.
@@ -3888,6 +3901,7 @@ static uint32_t kRenderW = 854, kRenderH = 480;
 static GX2ColorBuffer s_renderColour;
 static GX2DepthBuffer s_renderDepth;
 static bool s_renderOwn, s_renderTried;
+static bool s_noScanTv, s_noScanDrc;
 
 static void initRenderTarget() {
     if (s_renderTried) return;
@@ -3945,8 +3959,12 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
-    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
-    GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+    if (!s_noScanTv) {
+        GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+    }
+    if (!s_noScanDrc) {
+        GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+    }
 }
 
 // TV target size (WHBGfx picks 720p or 1080p) and the 4:3 game rectangle in it:
@@ -4606,6 +4624,9 @@ void rendererInit(float) {
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    s_noScanTv = sdMarkerPresent("noscantv");
+    s_noScanDrc = sdMarkerPresent("noscandrc");
+    WHBLogPrintf("[d3m] noscantv=%u noscandrc=%u", s_noScanTv ? 1u : 0u, s_noScanDrc ? 1u : 0u);
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
