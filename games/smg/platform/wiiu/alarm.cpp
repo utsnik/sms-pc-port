@@ -104,12 +104,42 @@ uint32_t s_handler_depth[kMaxAlarms];
 std::atomic<int> s_live_instances{0};
 #endif
 
+/* Instances come from a fixed pool, never from operator new: that routed to
+ * the game's current JKR heap, which during a scene change is the deliberately
+ * full MEM2 root heap (OSPanic in HeapMemoryWatcher when a file is started,
+ * 2026-10-30), and frees ran in alarm-callback context. */
+const unsigned kInstancePool = 96;
+AlarmInstance s_instance_pool[kInstancePool];
+bool s_instance_used[kInstancePool];
+WutSpinLock s_pool_lock;
+
+AlarmInstance* alloc_instance()
+{
+    AlarmInstance* instance = nullptr;
+    wut_spin_acquire(&s_pool_lock);
+    for (unsigned i = 0; i < kInstancePool; ++i) {
+        if (!s_instance_used[i]) {
+            s_instance_used[i] = true;
+            instance = &s_instance_pool[i];
+            break;
+        }
+    }
+    wut_spin_release(&s_pool_lock);
+    if (instance)
+        *instance = AlarmInstance{};
+    return instance;
+}
+
 void destroy_instance(AlarmInstance* instance)
 {
 #if defined(SMG_ALARM_HOST_TEST)
     --s_live_instances;
 #endif
-    delete instance;
+    const unsigned index = static_cast<unsigned>(instance - s_instance_pool);
+    wut_spin_acquire(&s_pool_lock);
+    if (index < kInstancePool)
+        s_instance_used[index] = false;
+    wut_spin_release(&s_pool_lock);
 }
 
 struct Lock {
@@ -375,9 +405,9 @@ AlarmRecord* arm_record(OSAlarm* alarm, OSAlarmHandler handler, OSTime first, OS
                         OSTime period)
 {
     retire(alarm);
-    AlarmInstance* instance = new (std::nothrow) AlarmInstance{};
+    AlarmInstance* instance = alloc_instance();
     if (!instance) {
-        port_log("[smg-alarm] alarm instance allocation failed");
+        port_log("[smg-alarm] alarm instance pool exhausted");
         return nullptr;
     }
 #if defined(SMG_ALARM_HOST_TEST)
