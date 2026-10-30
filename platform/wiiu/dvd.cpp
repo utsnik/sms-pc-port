@@ -62,12 +62,16 @@ const uint32_t kMaxFstBytes = 64u * 1024u;
 const uint32_t kMaxFiles = 96;
 const uint32_t kMaxPending = 96;
 const uint32_t kCacheSlots = 6;
-const size_t kStdioBufferSize = 128u * 1024u;
+const size_t kReadAheadSize = 256u * 1024u;
+const size_t kLargeReadSize = 128u * 1024u;
 
 struct CachedFile {
 	FILE* file;
 	u32 entry;
 	uint64_t used;
+	uint32_t window_offset;
+	size_t window_length;
+	uint32_t position;
 };
 
 struct FstEntry {
@@ -109,10 +113,11 @@ bool s_busy;
 bool s_mutex_initialized;
 CafeOSMutex s_read_mutex;
 CachedFile s_cache[kCacheSlots];
-alignas(32) char s_stdio_buffers[kCacheSlots][kStdioBufferSize];
+alignas(64) static uint8_t s_read_ahead[kCacheSlots][kReadAheadSize];
 uint64_t s_cache_clock;
 uint64_t s_stat_reads;
 uint64_t s_stat_bytes;
+uint64_t s_stat_fill_bytes;
 uint64_t s_stat_opens;
 uint64_t s_stat_read_ticks;
 OSTime s_stat_log_time;
@@ -123,6 +128,8 @@ void close_cached_file(unsigned slot)
 		std::fclose(s_cache[slot].file);
 		s_cache[slot].file = nullptr;
 	}
+	s_cache[slot].window_length = 0;
+	s_cache[slot].position = 0;
 }
 
 void log_read_stats()
@@ -131,9 +138,10 @@ void log_read_stats()
 	if (!s_stat_log_time)
 		s_stat_log_time = now;
 	if (now - s_stat_log_time >= OSSecondsToTicks(5)) {
-		port_log("[dvd] stats reads=%llu bytes=%llu opens=%llu read_ms=%llu\n",
+		port_log("[dvd] stats reads=%llu bytes=%llu fill_bytes=%llu opens=%llu read_ms=%llu\n",
 		         static_cast<unsigned long long>(s_stat_reads),
 		         static_cast<unsigned long long>(s_stat_bytes),
+		         static_cast<unsigned long long>(s_stat_fill_bytes),
 		         static_cast<unsigned long long>(s_stat_opens),
 		         static_cast<unsigned long long>(OSTicksToMilliseconds(s_stat_read_ticks)));
 		s_stat_log_time = now;
@@ -386,7 +394,7 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 			log_read_stats();
 			return DVD_RESULT_FATAL_ERROR;
 		}
-		if (std::setvbuf(file, s_stdio_buffers[slot], _IOFBF, kStdioBufferSize) != 0) {
+		if (std::setvbuf(file, nullptr, _IONBF, 0) != 0) {
 			std::fclose(file);
 			s_stat_read_ticks += OSGetTime() - read_start;
 			log_read_stats();
@@ -394,18 +402,59 @@ s32 read_file(FileState* state, void* address, s32 length, s32 offset)
 		}
 		s_cache[slot].file = file;
 		s_cache[slot].entry = state->entry;
+		s_cache[slot].window_length = 0;
+		s_cache[slot].position = 0;
 		++s_stat_opens;
 	}
 	s_cache[slot].used = ++s_cache_clock;
-	if (std::fseek(file, offset, SEEK_SET) != 0) {
-		close_cached_file(slot);
-		s_stat_read_ticks += OSGetTime() - read_start;
-		log_read_stats();
-		return DVD_RESULT_FATAL_ERROR;
+	size_t got = 0;
+	size_t fill = 0;
+	if (want != 0) {
+		const uint32_t request_offset = static_cast<uint32_t>(offset);
+		const bool in_window = request_offset >= s_cache[slot].window_offset &&
+		                       request_offset <= s_cache[slot].window_offset + s_cache[slot].window_length &&
+		                       want <= s_cache[slot].window_length -
+		                                  (request_offset - s_cache[slot].window_offset);
+		if (in_window) {
+			std::memcpy(address, s_read_ahead[slot] +
+			                         (request_offset - s_cache[slot].window_offset), want);
+			got = want;
+		} else if (want >= kLargeReadSize) {
+			if (s_cache[slot].position != request_offset) {
+				if (std::fseek(file, offset, SEEK_SET) != 0) {
+					close_cached_file(slot);
+					s_stat_read_ticks += OSGetTime() - read_start;
+					log_read_stats();
+					return DVD_RESULT_FATAL_ERROR;
+				}
+				s_cache[slot].position = request_offset;
+			}
+			got = std::fread(address, 1, want, file);
+			fill = got;
+			s_cache[slot].position += static_cast<uint32_t>(got);
+			s_cache[slot].window_length = 0;
+		} else {
+			if (s_cache[slot].position != request_offset) {
+				if (std::fseek(file, offset, SEEK_SET) != 0) {
+					close_cached_file(slot);
+					s_stat_read_ticks += OSGetTime() - read_start;
+					log_read_stats();
+					return DVD_RESULT_FATAL_ERROR;
+				}
+				s_cache[slot].position = request_offset;
+			}
+			fill = std::fread(s_read_ahead[slot], 1, kReadAheadSize, file);
+			s_cache[slot].window_offset = request_offset;
+			s_cache[slot].window_length = fill;
+			s_cache[slot].position += static_cast<uint32_t>(fill);
+			got = fill < want ? fill : want;
+			if (got)
+				std::memcpy(address, s_read_ahead[slot], got);
+		}
 	}
-	size_t got = std::fread(address, 1, want, file);
 	s_stat_read_ticks += OSGetTime() - read_start;
 	s_stat_bytes += got;
+	s_stat_fill_bytes += fill;
 	++s_stat_reads;
 	/* A GameCube DVD read is a DMA; callers may invalidate the buffer after it,
 	 * which on the Wii U would drop this CPU copy. Write it back to memory. */
