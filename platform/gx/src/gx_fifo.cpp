@@ -255,6 +255,20 @@ bool g_defaultArrayBE = false;
 #endif
 uint32_t g_arrayGen = 1;
 #define s_defaultArrayBE g_defaultArrayBE
+bool g_dlVariantsEnabled = true;
+uint32_t g_dlExternalState = 1;
+
+static uint32_t s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotions;
+
+void dlCacheExternalStateChanged() {
+    ++g_dlExternalState;
+    if (!g_dlExternalState) g_dlExternalState = 1;
+}
+
+void dlCacheTakeStats(DlCacheStats& out) {
+    out = {s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotions};
+    s_dlHits = s_dlVariantHits = s_dlMisses = s_dlEvictions = s_dlArenaPromotions = 0;
+}
 
 void resetState() {
     bool be[16];
@@ -262,6 +276,7 @@ void resetState() {
     memset(&g, 0, sizeof(g));
     for (int i = 0; i < 16; i++) g.arrayBigEndian[i] = s_defaultArrayBE;
     g_arrayGen++;
+    dlCacheExternalStateChanged();
     g.bpMask = 0xFFFFFF;
     for (int i = 0; i < 256; i++) g.bp[i] = 0;
     // identity matrices where the SDK expects them: GX_IDENTITY (row 60) and
@@ -357,6 +372,9 @@ void writeBP(uint32_t value) {
     }
     switch (reg) {
     case BP_COPY_EXEC:
+        // Copies and their optional EFB clears are renderer state boundaries;
+        // keep cached display-list variants from crossing them.
+        dlCacheExternalStateChanged();
         onStateChange();
         g.bp[reg] = data;
         executeCopy(data);
@@ -1183,6 +1201,11 @@ struct DlEntry {
     uint32_t skip = 0;    // calls left to run without the cache
     uint32_t checkedClock = 0, checkedFrame = 0;  // when its source bytes were last compared
     bool hashAlways = false;  // its bytes once changed with no write reported: compared on every call
+    DlEntry* alt = nullptr;   // same list recorded under another state
+    uint32_t usedFrame = 0;   // last hit or recording, for LRU replacement
+    uint32_t hits = 0;        // clean hits since this recording
+    uint32_t ztex2 = 0, ztexBias = 0;  // PORT_GAME_SMG pixel/depth state
+    uint32_t externalState = 0;  // EFB copy/clear/peek boundary
 };
 // The entries (stable addresses) and an open-addressing index of them by
 // list address (a thousand lookups a frame).
@@ -1236,6 +1259,8 @@ FILE* traceFile();
 
 // Lists are compared by hash at least this often (texture data: kRecheckFrames).
 enum { kDlRecheckFrames = 30 };
+// Recordings kept per list address, one per state it is drawn under.
+enum { kDlVariants = 4 };
 
 static bool dlCacheEnabled() {
     static int on = -1;
@@ -1282,7 +1307,10 @@ static void dlRecordPrimitive(uint8_t opcode, const uint8_t* p, uint32_t count, 
     }
 }
 
-static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
+// The state a recording depends on besides the list's bytes. Keep the
+// Galaxy-specific renderer boundaries in this key: the decoded vertices are
+// reusable only within the same z-texture and EFB/peek state.
+static bool dlStateMatches(const DlEntry& e, uint32_t size) {
     if (!e.valid || e.size != size) return false;
     if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return false;
     for (int v = 0; v < 8; v++)
@@ -1292,6 +1320,13 @@ static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
     for (const DlArray& a : e.arrays)
         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
             return false;
+    if (e.ztex2 != g.bp[BP_ZTEX2] || e.ztexBias != g.bp[BP_ZTEX_BIAS]) return false;
+    if (e.externalState != g_dlExternalState) return false;
+    return true;
+}
+
+static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
+    if (!dlStateMatches(e, size)) return false;
     bool unwritten = trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
@@ -1406,24 +1441,37 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         runCommands(data, size);
         return;
     }
-    DlEntry& e = dlLookup(data);
-    if (e.skip) {
-        e.skip--;
+    DlEntry& head = dlLookup(data);
+    if (head.skip) {
+        head.skip--;
         runCommands(data, size);
         return;
     }
-    if (dlReusable(e, data, size)) {
+    DlEntry* hit = &head;
+    if (g_dlVariantsEnabled) {
+        while (hit && !dlReusable(*hit, data, size)) hit = hit->alt;
+    } else if (!dlReusable(*hit, data, size)) {
+        hit = nullptr;
+    }
+    if (hit) {
+        DlEntry& e = *hit;
+        ++s_dlHits;
+        e.usedFrame = g_displayFrames;
+        if (&e != &head) ++s_dlVariantHits;
         if (e.stateOnly) {
             dlReplayState(e);
-            e.misses = 0;
+            head.misses = 0;
             return;
         }
         const bool arena = arenaEnabled() && !traceFile();  // traces list the batch's own vertices
         for (DlRun& r : e.runs) {
             const uint32_t nidx = uint32_t(r.idx.size());
-            if (arena && nidx &&
-                (r.arena.gen == arenaGeneration() ||
-                 arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena)))
+            bool useArena = arena && nidx && r.arena.gen == arenaGeneration();
+            if (arena && nidx && !useArena && head.misses == 0 && e.hits > 0) {
+                useArena = arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena);
+                if (useArena) ++s_dlArenaPromotions;
+            }
+            if (useArena)
                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());
             else
                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
@@ -1431,19 +1479,78 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         s_vertsLoaded += e.verts;
         for (const DlRun& r : e.runs) g_dlReplayIdx += uint32_t(r.idx.size());
         g_traceLastVat = e.lastVat;
-        e.misses = 0;
+        ++e.hits;
+        head.misses = 0;
         return;
     }
-    // (re)record; a list that keeps changing is left alone for a while
-    if (e.valid || e.size) e.misses++;
+
+    // (Re)record. A list drawn under another state gets a variant per state
+    // (up to kDlVariants, then the least recently used one is replaced). A
+    // list whose bytes changed is recorded in place. Only non-fresh records
+    // count as misses, so the counters distinguish new state variants from
+    // actual re-record churn.
+    DlEntry* target = &head;
+    uint32_t variant = 0;
+    bool fresh = false;
+    if (g_dlVariantsEnabled && head.valid && head.size == size && !dlStateMatches(head, size)) {
+        DlEntry* lru = &head;
+        uint32_t n = 0, lruIndex = 0;
+        target = nullptr;
+        for (DlEntry* v = &head; v; v = v->alt, ++n) {
+            if (dlStateMatches(*v, size)) {
+                target = v;
+                variant = n;
+                break;
+            }
+            if (int32_t(v->usedFrame - lru->usedFrame) < 0) {
+                lru = v;
+                lruIndex = n;
+            }
+        }
+        if (!target && n < kDlVariants) {
+            s_dlEntries->emplace_back();
+            target = &s_dlEntries->back();
+            DlEntry* last = &head;
+            while (last->alt) last = last->alt;
+            last->alt = target;
+            variant = n;
+            fresh = true;
+        } else if (!target) {
+            target = lru;
+            variant = lruIndex;
+            ++s_dlEvictions;
+        }
+    } else if (head.size != size && head.alt) {
+        // Another list now occupies this address: discard stale variants.
+        if (batchUsesArena()) flushBatch();
+        for (DlEntry* v = head.alt; v; ) {
+            s_dlCacheBytes -= v->bytes;
+            DlEntry* next = v->alt;
+            *v = DlEntry();
+            v->alt = next;
+        }
+        head.alt = nullptr;
+    }
+    if (!fresh && (head.valid || head.size)) {
+        ++head.misses;
+        ++s_dlMisses;
+    }
     if (batchUsesArena()) flushBatch();  // the batch may still read the runs about to be dropped
+    DlEntry& e = *target;
     s_dlCacheBytes -= e.bytes;
-    uint32_t misses = e.misses;
+    uint32_t misses = head.misses;
     bool hashAlways = e.hashAlways;
+    DlEntry* alt = e.alt;
     e = DlEntry();
-    e.misses = misses;
+    e.alt = alt;
+    e.misses = 0;
     e.hashAlways = hashAlways;
-    if (misses >= 3) e.skip = 4u << (misses - 3 < 8 ? misses - 3 : 8);
+    e.usedFrame = g_displayFrames;
+    e.ztex2 = g.bp[BP_ZTEX2];
+    e.ztexBias = g.bp[BP_ZTEX_BIAS];
+    e.externalState = g_dlExternalState;
+    head.misses = misses;
+    if (misses >= 3) head.skip = 4u << (misses - 3 < 8 ? misses - 3 : 8);
     if (s_dlCacheBytes > (size_t(96) << 20)) {  // keep the cache bounded: start over
         dlClear();
         runCommands(data, size);
@@ -1460,7 +1567,10 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         s_dlElem[i] = 0;
     }
     e.checkedClock = writeClock();
-    e.checkedFrame = g_displayFrames;
+    // Spread the first periodic source-hash check over the 30-frame window;
+    // lists recorded during one load should not all recheck together.
+    e.checkedFrame = g_displayFrames -
+        ((uint32_t((reinterpret_cast<uintptr_t>(data) >> 5) + variant) * 2654435761u) >> 16) % kDlRecheckFrames;
     s_dlRec = &e;
     s_dlRecFail = false;
     uint32_t need = 0;

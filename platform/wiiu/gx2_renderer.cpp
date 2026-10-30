@@ -4796,6 +4796,7 @@ void rendererInit(float) {
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
+    g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
@@ -4827,8 +4828,9 @@ void rendererInit(float) {
     s_vertexSelfCheck = sdMarkerPresent("vxcheck") || envFlag("SMS_GX2_VERTEX_SELF_CHECK", false);
     WHBLogPrintf("SMS Wii U: GPU vertex transform=%s self-check=%s",
                  s_gpuXfEnabled ? "on" : "off", s_vertexSelfCheck ? "on" : "off");
-    WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s fallback=%s core-init=%u",
-                 s_gx2DlEnabled ? "on" : "off", s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit);
+    WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s fallback=%s core-init=%u dlvariants=%s",
+                 s_gx2DlEnabled ? "on" : "off", s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit,
+                 g_dlVariantsEnabled ? "on" : "off");
     s_ready = initShaders();
     if (!s_ready) WHBLogPrintf("SMS Wii U: GX2 shader setup failed");
 }
@@ -4938,7 +4940,7 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     const uint32_t vbytes = (n + 1) * kRawVertexStride;  // + a zeroed slot for out-of-range indices
     const uint32_t ioff = (vbytes + 255) & ~255u;
     const uint32_t total = (ioff + nidx * 4 + 255) & ~255u;  // 256-aligned: no GPU cache line spans two runs
-    if (total > kDlArenaBytes / 8) return false;
+    if (total > kDlArenaBytes / 4) return false;
     if (!s_dlArena) {
         const uint32_t freeBefore = sms_wiiu_heap_free();
         s_dlArena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
@@ -5586,6 +5588,7 @@ void markXfMemDirty() {
 static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
+    dlCacheExternalStateChanged();
     ++s_perfPeeks;
     sms_wiiu_d4_event(D4_PEEK);
     GX2ColorBuffer* cb = renderColour();
@@ -5720,6 +5723,7 @@ extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Su
                                                       uint32_t dstSlice);
 uint32_t peekZ(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
+    dlCacheExternalStateChanged();
     static int s_enabled = -1;
     if (s_enabled < 0) {
         s_enabled = !runningUnderCemu() && !sdMarkerPresent("nopeekz");
@@ -5897,7 +5901,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_perfLastEnd = perfNow;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        DlCacheStats dlcache;
+        dlCacheTakeStats(dlcache);
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotions=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -5907,6 +5913,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
                      (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)s_perfDlUploads, (unsigned)s_perfDlDecoded,
+                     (unsigned)dlcache.hits, (unsigned)dlcache.variantHits, (unsigned)dlcache.misses, (unsigned)dlcache.evictions,
+                     (unsigned)dlcache.arenaPromotions,
                      s_gx2DlEnabled ? 1 : 0, (unsigned)s_perfDlRecorded, (unsigned)s_perfDlCalled, (unsigned)s_perfDlBytes,
                      (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,

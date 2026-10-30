@@ -130,6 +130,8 @@ extern double g_presentWaited, g_presentDrain;  // gx_render.cpp, GXPC_GetTimes
 extern bool g_defaultArrayBE;
 extern bool g_gxStats;  // SMS_GX_STATS: per-part timers run
 extern uint32_t g_arrayGen;  // bumped by every write to g.arrayBase/Stride/BigEndian
+extern bool g_dlVariantsEnabled;  // Wii U: SD marker nodlvariants restores one entry per list
+extern uint32_t g_dlExternalState;  // EFB copies, clears and peeks invalidate cached list state
 
 // ---------------------------------------------------------------- register writes (gx_fifo.cpp)
 void writeBP(uint32_t value);
@@ -222,6 +224,11 @@ bool batchUsesArena();
 void onStateChange();  // called before any register write that changes state
 void executeCopy(uint32_t execReg);
 void markXfMemDirty();
+void dlCacheExternalStateChanged();
+struct DlCacheStats {
+    uint32_t hits, variantHits, misses, evictions, arenaPromotions;
+};
+void dlCacheTakeStats(DlCacheStats& out);
 // XF memory words changed since the backend last consumed them (inclusive;
 // lo > hi = none). writeXF keeps them; a backend resets them after upload.
 extern uint32_t g_xfDirtyLo, g_xfDirtyHi;
