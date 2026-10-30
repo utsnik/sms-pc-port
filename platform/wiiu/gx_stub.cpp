@@ -469,6 +469,7 @@ void present_diagnostics()
 } // namespace
 
 static void d1_log_cores_if_ready();
+namespace { void gf_init(); }
 
 /* 1 forces the renderer's full-surface EFB copy (the Cemu path) on hardware. */
 extern "C" const int sms_wiiu_efb_full_copy = 0;
@@ -490,6 +491,7 @@ extern "C" void sms_wiiu_gfx_init(void)
 	else if (!sms_wiiu_gx2_renderer_init())
 		WHBLogPrintf("SMS Wii U: GX2 renderer setup failed");
 	else {
+		gf_init();
 		WHBLogPrintf("SMS Wii U: [gx2dl] display-list path %s",
 		             sms_wiiu_gx2_display_list_enabled() ? "enabled" : "disabled");
 		drc_setup(true);
@@ -564,6 +566,97 @@ extern "C" void port_gx_camera(const float*) {}
 #endif
 
 extern "C" int64_t wut_OSGetTime_stub(void) __asm__("OSGetTime");
+extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
+extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
+
+/* Default-on Galaxy GPU span diagnostics.  Stamp kinds are 0 top-of-pipe,
+ * 1 display lists, 5 frame draws, 6 swap, and 7 the scan-buffer copies. */
+namespace {
+constexpr uint32_t kGfFrames = 4, kGfStamps = 512;
+uint64_t* s_gfStamp;
+uint8_t s_gfKind[kGfFrames][kGfStamps];
+uint32_t s_gfCount[kGfFrames], s_gfFrame;
+bool s_gf;
+struct GfResult { uint64_t lists, draws, scan, swap, idle, scanGap, swapGap; bool ready; };
+GfResult s_gfResult;
+
+void gf_init()
+{
+	s_gfStamp = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGfFrames * kGfStamps * sizeof(uint64_t), 64));
+	if (s_gfStamp) {
+		memset(s_gfStamp, 0, kGfFrames * kGfStamps * sizeof(uint64_t));
+		DCFlushRange(s_gfStamp, kGfFrames * kGfStamps * sizeof(uint64_t));
+		s_gf = true;
+	}
+	port_log("SMS Wii U: [gpuframe] busy by kind on=%u\n", s_gf ? 1u : 0u);
+}
+
+void gf_stamp(uint32_t kind)
+{
+	if (!s_gf) return;
+	const uint32_t f = s_gfFrame % kGfFrames;
+	uint32_t& n = s_gfCount[f];
+	if (n >= kGfStamps) return;
+	s_gfKind[f][n] = uint8_t(kind);
+	uint64_t* slot = s_gfStamp + f * kGfStamps + n++;
+	if (kind) GX2SampleBottomGPUCycle(slot);
+	else GX2SampleTopGPUCycle(slot);
+}
+
+void gf_collect(uint32_t f)
+{
+	GfResult r = {};
+	const uint32_t n = s_gfCount[f];
+	s_gfCount[f] = 0;
+	if (!n) return;
+	uint64_t* st = s_gfStamp + f * kGfStamps;
+	DCInvalidateRange(st, n * sizeof(uint64_t));
+	for (uint32_t i = 0; i < n; ++i) {
+		if (!st[i]) {
+			memset(st, 0, n * sizeof(uint64_t));
+			DCFlushRange(st, n * sizeof(uint64_t));
+			return;
+		}
+	}
+	r.ready = true;
+	uint64_t cursor = 0, top = 0;
+	for (uint32_t i = 0; i < n; ++i) {
+		const uint32_t kind = s_gfKind[f][i];
+		const uint64_t t = st[i];
+		if (!kind) {
+			if (cursor && t > cursor) r.idle += t - cursor;
+			top = t;
+			cursor = t;
+			continue;
+		}
+		if (top && t > top) {
+			if (kind == 7) r.scanGap += t - top;
+			if (kind == 6) r.swapGap += t - top;
+		}
+		if (t > cursor) {
+			const uint64_t cost = t - cursor;
+			if (kind == 1) r.lists += cost;
+			if (kind == 5) r.draws += cost;
+			if (kind == 7) r.scan += cost;
+			if (kind == 6) r.swap += cost;
+		}
+		cursor = t;
+		top = 0;
+	}
+	s_gfResult = r;
+	memset(st, 0, n * sizeof(uint64_t));
+	DCFlushRange(st, n * sizeof(uint64_t));
+}
+
+uint64_t gf_x001ms(uint64_t cycles) { return cycles / 270; }
+} // namespace
+
+extern "C" void sms_wiiu_gpuframe_stamp(int kind)
+{
+	if (s_gf && (kind == 0 || kind == 1 || kind == 5 || kind == 6 || kind == 7))
+		gf_stamp(uint32_t(kind));
+}
+
 /* Where a presented frame waits: FinishRender ends with GX2DrawDone (the GPU
  * finishing the frame), BeginRender waits for the next vsync. */
 static int64_t s_presentFinish, s_presentBegin;
@@ -578,8 +671,10 @@ static uint32_t s_presentFrames;
 static void present_finish_pipelined(void)
 {
 	sms_wiiu_d1_note_present_core();
+	sms_wiiu_gpuframe_stamp(6);
 	GX2SwapScanBuffers();
 	GX2Flush();
+	sms_wiiu_gpuframe_stamp(6);
 	static bool s_enabled;
 	if (!s_enabled) {
 		GX2SetTVEnable(TRUE);
@@ -765,9 +860,24 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	sms_wiiu_frame_split_gpu_begin();
 #endif
 	const int64_t t0 = wut_OSGetTime_stub();
+	if (s_gf)
+		sms_wiiu_gpuframe_stamp(5);
 	sms_wiiu_gx2_target_present();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
 	else WHBGfxFinishRender();
+	if (s_gf) {
+		++s_gfFrame;
+		gf_collect(s_gfFrame % kGfFrames);
+		const uint32_t p = s_gfFrame;
+		if (p <= 120 || p % 30 == 0) {
+			const GfResult& r = s_gfResult;
+			port_log("SMS Wii U: [gpuframe] busy by kind p=%u x0.01ms lists=%llu draws=%llu scan=%llu swap=%llu idle=%llu scanGap=%llu swapGap=%llu ready=%u\n",
+			         unsigned(p), (unsigned long long)gf_x001ms(r.lists), (unsigned long long)gf_x001ms(r.draws),
+			         (unsigned long long)gf_x001ms(r.scan), (unsigned long long)gf_x001ms(r.swap),
+			         (unsigned long long)gf_x001ms(r.idle), (unsigned long long)gf_x001ms(r.scanGap),
+			         (unsigned long long)gf_x001ms(r.swapGap), r.ready ? 1u : 0u);
+		}
+	}
 	const int64_t t1 = wut_OSGetTime_stub();
 	sms_wiiu_d1_present_line();
 	drc_register_scan_buffer();
