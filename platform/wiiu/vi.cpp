@@ -10,6 +10,7 @@ extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 #include <whb/proc.h>
 #include <gx2/event.h>
 #include <gx2/state.h>
+#include <gx2/swap.h>
 #include <whb/log.h>
 
 #include <cstdint>
@@ -131,11 +132,29 @@ void sms_wiiu_frame_boundary(void)
 		GX2Flush();
 		const uint64_t target = GX2GetLastSubmittedTimeStamp();
 		const int64_t start = sms_wiiu_native_time();
-		int logged = 0;
+		int logged = 0, kicks = 0;
+		uint64_t lastRetired = GX2GetRetiredTimeStamp();
+		int64_t lastProgress = start;
 		while (GX2GetRetiredTimeStamp() < target) {
-			const int second = (int)((sms_wiiu_native_time() - start) / 62156250);
+			const int64_t now = sms_wiiu_native_time();
+			const int second = (int)((now - start) / 62156250);
 			if (second >= 15)
 				break;
+			/* In play the GPU retired about one frame per queued swap, and
+			 * with no further swaps it never moved again (2026-10-30, every
+			 * Galaxy exit): queue an empty swap after 0.3 s without progress. */
+			const uint64_t retired = GX2GetRetiredTimeStamp();
+			if (retired != lastRetired) {
+				lastRetired = retired;
+				lastProgress = now;
+			} else if (now - lastProgress > 62156250 / 10 * 3 && kicks < 50) {
+				GX2SwapScanBuffers();
+				GX2Flush();
+				++kicks;
+				lastProgress = now;
+				WHBLogPrintf("SMS Wii U: exit drain: kick %d (empty swap) retired=%llu", kicks,
+				             (unsigned long long)retired);
+			}
 			if (second > logged) {
 				logged = second;
 				uint32_t swaps = 0, flips = 0;
@@ -147,9 +166,9 @@ void sms_wiiu_frame_boundary(void)
 			}
 			sms_wiiu_native_sleep_ticks(62156250 / 100);
 		}
-		WHBLogPrintf("SMS Wii U: exit drain: %s retired=%llu of %llu; asking for the Menu",
+		WHBLogPrintf("SMS Wii U: exit drain: %s retired=%llu of %llu after %d kicks; asking for the Menu",
 		             GX2GetRetiredTimeStamp() >= target ? "done" : "GPU STUCK",
-		             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned long long)target);
+		             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned long long)target, kicks);
 		SYSLaunchMenu();
 #else
 		GX2DrawDone();
