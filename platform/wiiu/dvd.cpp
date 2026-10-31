@@ -308,6 +308,21 @@ int find_entry(const char* path)
 	return -1;
 }
 
+/* find_entry, but starting just after `hint` and wrapping: the pack index and
+ * the FST are both path-sorted, so the next record is usually the next entry. */
+int find_entry_from(const char* path, uint32_t hint)
+{
+	char normalized[kMaxPath];
+	if (!normalize_path(path, normalized, sizeof(normalized)) || !s_entry_count)
+		return -1;
+	for (uint32_t n = 0; n < s_entry_count; ++n) {
+		const uint32_t i = (hint + 1 + n) % s_entry_count;
+		if (equal_ci(normalized, s_entries[i].path))
+			return static_cast<int>(i);
+	}
+	return -1;
+}
+
 bool load_pack()
 {
 	char pack_path[192];
@@ -346,14 +361,39 @@ bool load_pack()
 	    std::fseek(pack, 32, SEEK_SET) != 0)
 		return failed();
 
+	/* The index is ~7000 tiny fields: read it through the pack slot's window
+	 * in big chunks instead of one unbuffered SD read per field (~3 s). */
+	uint8_t* const chunk = s_read_ahead[kPackCacheSlot];
+	size_t chunk_length = 0, chunk_position = 0;
+	auto read_index = [&](void* dst, size_t length) -> size_t {
+		uint8_t* out = static_cast<uint8_t*>(dst);
+		size_t done = 0;
+		while (done < length) {
+			if (chunk_position == chunk_length) {
+				chunk_length = std::fread(chunk, 1, kReadAheadSize, pack);
+				chunk_position = 0;
+				if (!chunk_length)
+					break;
+			}
+			size_t take = chunk_length - chunk_position;
+			if (take > length - done)
+				take = length - done;
+			std::memcpy(out + done, chunk + chunk_position, take);
+			chunk_position += take;
+			done += take;
+		}
+		return done;
+	};
+
 	std::memset(s_pack_entries, 0, sizeof(s_pack_entries));
 	const uint32_t index_end = 32 + index_size;
 	uint32_t index_position = 32;
 	uint32_t mapped = 0;
+	uint32_t hint = 0;
 	for (uint32_t i = 0; i < count; ++i) {
 		uint8_t record_header[4];
 		if (index_position + sizeof(record_header) > index_end ||
-		    std::fread(record_header, 1, sizeof(record_header), pack) !=
+		    read_index(record_header, sizeof(record_header)) !=
 		        sizeof(record_header))
 			return failed();
 		index_position += sizeof(record_header);
@@ -363,12 +403,12 @@ bool load_pack()
 		    path_length + 8 > index_end - index_position)
 			return failed();
 		char path[kMaxPath];
-		if (std::fread(path, 1, path_length, pack) != path_length)
+		if (read_index(path, path_length) != path_length)
 			return failed();
 		path[path_length] = '\0';
 		index_position += path_length;
 		uint8_t location[8];
-		if (std::fread(location, 1, sizeof(location), pack) != sizeof(location))
+		if (read_index(location, sizeof(location)) != sizeof(location))
 			return failed();
 		index_position += sizeof(location);
 		const uint32_t offset = be32(location);
@@ -376,7 +416,9 @@ bool load_pack()
 		if ((offset & 63u) != 0 || offset < data_offset ||
 		    offset > s_pack_file_size || size > s_pack_file_size - offset)
 			return failed();
-		const int entry = find_entry(path);
+		const int entry = find_entry_from(path, hint);
+		if (entry >= 0)
+			hint = static_cast<uint32_t>(entry);
 		if (entry >= 0 && !s_entries[entry].directory) {
 			if (s_pack_entries[entry].valid || s_entries[entry].size != size)
 				return failed();
