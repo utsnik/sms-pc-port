@@ -497,6 +497,8 @@ struct TextureEntry {
     GX2Texture packLinear;
     GX2Texture packTiled;
     GX2Texture packFallback;
+    GX2Texture textiledLinear;
+    bool textiledPending = false;
     uint32_t packLevelBytes[16] = {};
     uint32_t packLevelDone;
     uint64_t packStagingBytes;
@@ -3889,6 +3891,7 @@ static const float kArbitraryMipThreshold = 14.0f;
 // inside a frame (flushBatch), before applyState/setTevShader re-apply state.
 static void rebindTvTarget();
 static bool s_retileTextures = true;
+static bool s_textiledMarker;
 static uint32_t s_whiteFillLogs;
 static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
     if (level >= tiled.surface.mipLevels) return false;
@@ -3906,7 +3909,9 @@ static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level)
 static void retileTexture(GX2Texture& texture) {
     // The producer worker records draw state; resource-copy work remains on
     // the service core so the worker never issues an unordered retile.
-    if (!s_retileTextures || runningUnderCemu() || (s_gx2ProdEnabled && OSGetCoreId() != 1)) return;
+    if ((!s_retileTextures && !s_textiledMarker) ||
+        (!s_textiledMarker && runningUnderCemu()) ||
+        (s_gx2ProdEnabled && OSGetCoreId() != 1)) return;
     GX2Surface& linear = texture.surface;
     GX2Texture tiled = texture;
     GX2Surface& t = tiled.surface;
@@ -3937,6 +3942,66 @@ static void retileTexture(GX2Texture& texture) {
     deferFree(linear.image);
     deferFree(linear.mipmaps);
     texture = tiled;
+}
+
+// A gx2prod worker may discover a game texture while it is recording a
+// display list.  The worker can prepare the allocations, but the copy itself
+// must be an ordered service operation on core 1.  Keep the linear source in
+// the entry until that operation has run; the draw binds the tiled destination
+// immediately, and the service callback retires the source behind the frame
+// timestamp just like the direct path above.
+static void textiledTextureService(void* opaque) {
+    TextureEntry& e = *static_cast<TextureEntry*>(opaque);
+    if (!e.textiledPending) return;
+    GX2Texture& linear = e.textiledLinear;
+    GX2Texture& tiled = e.texture;
+    for (uint32_t level = 0; level < tiled.surface.mipLevels; ++level)
+        retileTexture(linear, tiled, level);
+    rebindTvTarget();
+    deferFree(linear.surface.image);
+    deferFree(linear.surface.mipmaps);
+    std::memset(&e.textiledLinear, 0, sizeof e.textiledLinear);
+    e.textiledPending = false;
+}
+
+static bool textiledTexture(TextureEntry& e) {
+    if ((!s_retileTextures && !s_textiledMarker) ||
+        (!s_textiledMarker && runningUnderCemu())) return false;
+    if (s_gx2ProdEnabled && OSGetCoreId() != 1) {
+        GX2Texture tiled = e.texture;
+        GX2Surface& t = tiled.surface;
+        t.tileMode = GX2_TILE_MODE_DEFAULT;
+        t.swizzle = 0;
+        t.image = nullptr;
+        t.mipmaps = nullptr;
+        GX2CalcSurfaceSizeAndAlignment(&t);
+        t.image = alignedZero(t.alignment, t.imageSize);
+        if (!t.image) return false;
+        if (t.mipLevels > 1) {
+            t.mipmaps = alignedZero(t.alignment, t.mipmapSize);
+            if (!t.mipmaps) {
+                MEMFreeToDefaultHeap(t.image);
+                return false;
+            }
+        }
+        DCFlushRange(t.image, t.imageSize);
+        if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
+        GX2InitTextureRegs(&tiled);
+        e.textiledLinear = e.texture;
+        e.texture = tiled;
+        e.textiledPending = true;
+        if (!gx2prod::enqueueService(textiledTextureService, &e)) {
+            MEMFreeToDefaultHeap(e.texture.surface.image);
+            MEMFreeToDefaultHeap(e.texture.surface.mipmaps);
+            e.texture = e.textiledLinear;
+            std::memset(&e.textiledLinear, 0, sizeof e.textiledLinear);
+            e.textiledPending = false;
+            return false;
+        }
+        return true;
+    }
+    retileTexture(e.texture);
+    return e.texture.surface.tileMode == GX2_TILE_MODE_DEFAULT;
 }
 
 static TextureEntry* getTexture(int map) {
@@ -4086,7 +4151,7 @@ static TextureEntry* getTexture(int map) {
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
     sms_wiiu_d4_event(D4_UPLOAD);
     if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
-    retileTexture(e.texture);
+    textiledTexture(e);
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
     e.valid = true;
     if (texturePackEnabled()) {
@@ -5076,6 +5141,8 @@ void rendererInit(float) {
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
+    s_textiledMarker = sdMarkerPresent("textiled");
+    WHBLogPrintf("SMS Wii U: [textiled] marker=%s", s_textiledMarker ? "on" : "off");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
     g_dlPromoteFirst = sdMarkerPresent("dlpromotefirst");
