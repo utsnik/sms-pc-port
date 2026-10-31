@@ -69,6 +69,8 @@ struct Table {
 
 alignas(64) uint8_t s_alarm[0x80];
 Table s_tables[2];
+alignas(64) uint8_t s_walarm[0x80];
+Table s_wtables[2];
 // PCs known to be inside a leaf function, learned by report(); 0 = empty.
 uint32_t s_leafPc[kLeafSlots];
 
@@ -150,6 +152,9 @@ void* s_mainThread;  // an OSThread starts with its OSContext
 volatile uint32_t s_frameTicks;  // frame boundaries seen, for the hang check
 bool s_running;
 WutTime s_lastReport;
+void* s_workerThread;
+volatile uint32_t s_wactive;
+bool s_wrunning;
 
 #if defined(PORT_GAME_SMG)
 constexpr uint32_t kFrameSplitWindow = 60;
@@ -360,12 +365,11 @@ void split_audio_end()
 }
 #endif
 
-void on_alarm(void*, void* context)
+void sample(Table& t, void* mainThread, void* context)
 {
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
-	Table& t = s_tables[s_active & 1];
 	++t.samples;
-	if (context == s_mainThread) {
+	if (context == mainThread) {
 		++t.main;
 		count_inclusive(t, static_cast<const uint8_t*>(context));
 	}
@@ -382,6 +386,9 @@ void on_alarm(void*, void* context)
 	}
 	++t.dropped;
 }
+
+void on_alarm(void*, void* context) { sample(s_tables[s_active & 1], s_mainThread, context); }
+void on_walarm(void*, void* context) { sample(s_wtables[s_wactive & 1], s_workerThread, context); }
 
 // Leaves whose samples are worth charging to their callers.
 bool leaf_name(const char* name)
@@ -541,6 +548,25 @@ void report(Table& t)
 	std::memset(&t, 0, sizeof(t));
 }
 
+void report_worker(Table& t)
+{
+	port_log("[wprof] samples=%u dropped=%u thread=%p\n",
+	         (unsigned)t.samples, (unsigned)t.dropped, s_workerThread);
+	for (int rank = 0; rank < 12; ++rank) {
+		uint32_t best = kSlots;
+		for (uint32_t i = 0; i < kSlots; ++i)
+			if (t.pc[i] && (best == kSlots || t.count[i] > t.count[best])) best = i;
+		if (best == kSlots) break;
+		char name[64] = {};
+		wut_OSGetSymbolName(t.pc[best], name, sizeof(name));
+		port_log("[wprof] %2d %5.1f pct %5u %s\n", rank,
+		         t.samples ? 100.0f * t.count[best] / t.samples : 0.0f,
+		         (unsigned)t.count[best], short_name(name));
+		t.count[best] = 0;
+	}
+	std::memset(&t, 0, sizeof(t));
+}
+
 } // namespace
 
 #if defined(PORT_GAME_SMG)
@@ -589,6 +615,26 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	const uint32_t done = s_active & 1;
 	s_active = done ^ 1;
 	report(s_tables[done]);
+	if (s_wrunning) {
+		const uint32_t wdone = s_wactive & 1;
+		s_wactive = wdone ^ 1;
+		report_worker(s_wtables[wdone]);
+	}
+}
+
+/* Called by the producer thread after it has entered the port heap scope.  The
+ * alarm is created here so sampling follows the worker's CPU rather than the
+ * game thread's CPU. */
+extern "C" void sms_wiiu_profiler_worker_start(void)
+{
+	if (s_wrunning || !sms_wiiu_sd_marker("workerprof")) return;
+	std::memset(s_wtables, 0, sizeof(s_wtables));
+	s_workerThread = wut_OSGetCurrentThread();
+	wut_OSCreateAlarm(s_walarm);
+	s_wrunning = wut_OSSetPeriodicAlarm(s_walarm, wut_OSGetTime() + kPeriod,
+	                                    kPeriod, on_walarm) != 0;
+	port_log("[wprof] worker sampler %s on thread %p\n",
+	         s_wrunning ? "on" : "failed", s_workerThread);
 }
 
 /* Hang report, from another thread (the audio pacer's 10 s stats): when the
@@ -652,6 +698,10 @@ extern "C" void sms_wiiu_hang_check(void)
 /* Every exit path cancels the alarm, or it fires into an unmapped process. */
 extern "C" void sms_wiiu_profiler_stop(void)
 {
+	if (s_wrunning) {
+		wut_OSCancelAlarm(s_walarm);
+		s_wrunning = false;
+	}
 	if (!s_running) return;
 	wut_OSCancelAlarm(s_alarm);
 	s_running = false;
