@@ -1,3 +1,6 @@
+#ifdef TARGET_WIIU
+extern "C" void port_log(const char*, ...);
+#endif
 #include "Game/Map/FileSelectItem.hpp"
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/LiveActor/PartsModel.hpp"
@@ -464,6 +467,10 @@ void FileSelectItem::updatePointing() {
         }
     }
 
+#ifdef TARGET_WIIU
+    if (MR::testDPDMenuPadDecideTrigger())
+        port_log("[smg-fs] decide trigger: invalidate=%d pointing=%d\n", mIsInvalidateSelect, _144);
+#endif
     if (!mIsInvalidateSelect && _144 && MR::testDPDMenuPadDecideTrigger()) {
         if (mDelegator != nullptr) {
             mDelegator->notify(this, 1);

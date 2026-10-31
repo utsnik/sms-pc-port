@@ -588,6 +588,9 @@ void fill_status(KPADStatus& status)
 
     status.hold = hold;
     status.trig = hold & ~s_previous_hold;
+    if (status.trig && s_script_count)
+        port_log("[smg-input] trig 0x%x field %u pointer=%d\n", (unsigned)status.trig,
+                 (unsigned)field, pointer != nullptr);
     status.release = s_previous_hold & ~hold;
     s_previous_hold = hold;
     status.acc.x = 0.0f;
