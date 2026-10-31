@@ -801,9 +801,12 @@ static uint32_t s_gx2DlUsed[kVertexArenas];
 // sat idle waiting for commands, not time it spent drawing.
 extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
 extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
+extern "C" uint32_t sms_wiiu_vsync_event_count(void);
 static constexpr uint32_t kGpuStamps = 1024;
+enum GpuKind { GPU_DRAW, GPU_EFBCOPY, GPU_CLEAR, GPU_PRESENT, GPU_OTHER, GPU_KIND_COUNT };
 struct GpuDrawInfo {
-    uint32_t verts, stages, texMask, blend, zmode, texW, texH, area, drawNo;
+    uint32_t kind, verts, stages, texMask, blend, zmode, texW, texH, area, drawNo;
+    uint32_t rtW, rtH, srcW, srcH, dstW, dstH, srcFmt, dstFmt;
 };
 static uint64_t* s_gpuStamps[3];
 static uint64_t* s_gpuTopStamps[3];
@@ -811,12 +814,21 @@ static GpuDrawInfo* s_gpuInfo[3];
 static uint32_t s_gpuCount[3];
 static uint64_t s_gpuTotal, s_gpuIdle;
 static uint32_t s_gpuFrames;
-struct GpuTop { uint64_t cost, idle; GpuDrawInfo info; };
+static uint64_t s_gpuBusy[GPU_KIND_COUNT];
+static uint32_t s_gpuKindCount[GPU_KIND_COUNT];
+struct GpuTop { uint64_t cost, idle, busy; GpuDrawInfo info; };
 static GpuTop s_gpuTop[8];
 static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
 static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the [gpu] report
+static GpuDrawInfo gpuInfo(uint32_t kind) { GpuDrawInfo i = {}; i.kind = kind; return i; }
+static GpuDrawInfo gpuCopyInfo(uint32_t kind, const GX2Surface& src, const GX2Surface& dst) {
+    GpuDrawInfo i = gpuInfo(kind);
+    i.srcW = src.width; i.srcH = src.height; i.dstW = dst.width; i.dstH = dst.height;
+    i.srcFmt = src.format; i.dstFmt = dst.format;
+    return i;
+}
 static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
     if (!s_gpuDiag) return;
     if (!s_gpuStamps[arena]) {
@@ -834,6 +846,9 @@ static void gpuStamp(uint32_t arena, const GpuDrawInfo* info) {
     GX2SampleTopGPUCycle(&s_gpuTopStamps[arena][n]);
     GX2SampleBottomGPUCycle(&s_gpuStamps[arena][n]);
     ++n;
+}
+static void gpuStampSurface(uint32_t kind, const GX2Surface& src, const GX2Surface& dst) {
+    if (s_gpuDiag) { GpuDrawInfo i = gpuCopyInfo(kind, src, dst); gpuStamp(s_vertexArenaIndex, &i); }
 }
 
 static void gpuCollect(uint32_t arena) {
@@ -853,37 +868,54 @@ static void gpuCollect(uint32_t arena) {
         if (st[i] <= st[i - 1]) continue;
         const uint64_t cost = st[i] - st[i - 1];
         const uint64_t idle = top[i] > st[i - 1] ? std::min(top[i] - st[i - 1], cost) : 0;
+        const uint64_t busy = cost - idle;
+        const uint32_t kind = s_gpuInfo[arena][i].kind < GPU_KIND_COUNT ? s_gpuInfo[arena][i].kind : GPU_OTHER;
         s_gpuIdle += idle;
+        s_gpuBusy[kind] += busy;
+        ++s_gpuKindCount[kind];
         int slot = -1;
         for (int k = 0; k < 8; ++k)
-            if (slot < 0 || s_gpuTop[k].cost < s_gpuTop[slot].cost) slot = k;
-        if (cost > s_gpuTop[slot].cost) s_gpuTop[slot] = {cost, idle, s_gpuInfo[arena][i]};
+            if (slot < 0 || s_gpuTop[k].busy < s_gpuTop[slot].busy) slot = k;
+        if (busy > s_gpuTop[slot].busy) s_gpuTop[slot] = {cost, idle, busy, s_gpuInfo[arena][i]};
     }
 }
 
 static void gpuReport() {
     if (!s_gpuFrames) return;
-    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u idle=%u busy=%u timer-rate=%u/s (top single draws over the window follow)",
+    WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u idle=%u busy=%u drawBusy=%u/%u efbcopyBusy=%u/%u clearBusy=%u/%u presentBusy=%u/%u otherBusy=%u/%u timer-rate=%u/s",
                  (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames), (unsigned)(s_gpuIdle / s_gpuFrames),
                  (unsigned)((s_gpuTotal - std::min(s_gpuIdle, s_gpuTotal)) / s_gpuFrames),
+                 (unsigned)(s_gpuBusy[GPU_DRAW] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_DRAW] / s_gpuFrames),
+                 (unsigned)(s_gpuBusy[GPU_EFBCOPY] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_EFBCOPY] / s_gpuFrames),
+                 (unsigned)(s_gpuBusy[GPU_CLEAR] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_CLEAR] / s_gpuFrames),
+                 (unsigned)(s_gpuBusy[GPU_PRESENT] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_PRESENT] / s_gpuFrames),
+                 (unsigned)(s_gpuBusy[GPU_OTHER] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_OTHER] / s_gpuFrames),
                  s_rateTime1 > s_rateTime0
                      ? (unsigned)((s_rateStamp1 - s_rateStamp0) * 1000ull / OSTicksToMilliseconds(s_rateTime1 - s_rateTime0))
                      : 0u);
     for (int r = 0; r < 8; ++r) {
         int best = -1;
         for (int k = 0; k < 8; ++k)
-            if (s_gpuTop[k].cost && (best < 0 || s_gpuTop[k].cost > s_gpuTop[best].cost)) best = k;
+            if (s_gpuTop[k].busy && (best < 0 || s_gpuTop[k].busy > s_gpuTop[best].busy)) best = k;
         if (best < 0) break;
         const GpuDrawInfo& d = s_gpuTop[best].info;
-        WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u idle=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u",
-                     r, (unsigned)s_gpuTop[best].cost, (unsigned)s_gpuTop[best].idle, (unsigned)d.drawNo, (unsigned)d.verts, (unsigned)d.stages,
-                     (unsigned)d.texMask, (unsigned)d.texW, (unsigned)d.texH, (unsigned)d.blend, (unsigned)d.zmode,
-                     (unsigned)d.area);
-        s_gpuTop[best].cost = 0;
+        if (d.kind == GPU_DRAW)
+            WHBLogPrintf("SMS Wii U: [gpu] %d kind=draw busy=%u cycles=%u idle=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u rt=%ux%u",
+                         r, (unsigned)s_gpuTop[best].busy, (unsigned)s_gpuTop[best].cost, (unsigned)s_gpuTop[best].idle,
+                         (unsigned)d.drawNo, (unsigned)d.verts, (unsigned)d.stages, (unsigned)d.texMask, (unsigned)d.texW,
+                         (unsigned)d.texH, (unsigned)d.blend, (unsigned)d.zmode, (unsigned)d.area, (unsigned)d.rtW, (unsigned)d.rtH);
+        else
+            WHBLogPrintf("SMS Wii U: [gpu] %d kind=%s busy=%u cycles=%u idle=%u src=%ux%u/%u dst=%ux%u/%u",
+                         r, d.kind == GPU_EFBCOPY ? "efbcopy" : d.kind == GPU_CLEAR ? "clear" : d.kind == GPU_PRESENT ? "present" : "other",
+                         (unsigned)s_gpuTop[best].busy, (unsigned)s_gpuTop[best].cost, (unsigned)s_gpuTop[best].idle,
+                         (unsigned)d.srcW, (unsigned)d.srcH, (unsigned)d.srcFmt, (unsigned)d.dstW, (unsigned)d.dstH, (unsigned)d.dstFmt);
+        s_gpuTop[best].busy = 0;
     }
     memset(s_gpuTop, 0, sizeof(s_gpuTop));
     s_gpuTotal = 0;
     s_gpuIdle = 0;
+    memset(s_gpuBusy, 0, sizeof(s_gpuBusy));
+    memset(s_gpuKindCount, 0, sizeof(s_gpuKindCount));
     s_gpuFrames = 0;
 }
 
@@ -3724,12 +3756,14 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     }
     if (cemu) {
         GX2CopySurface(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0); invalidateVertexUniforms();
+        gpuStampSurface(GPU_EFBCOPY, cb->surface, e->tex.texture.surface);
     } else {
         GX2Rect source = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
         GX2Point destination = {0, 0};
         GX2CopySurfaceEx(&cb->surface, 0, 0, &e->tex.texture.surface, 0, 0, 1,
                         &source, &destination);
         invalidateVertexUniforms();
+        gpuStampSurface(GPU_EFBCOPY, cb->surface, e->tex.texture.surface);
     }
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, e->tex.texture.surface.image,
                   e->tex.texture.surface.imageSize);
@@ -3789,6 +3823,7 @@ static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level)
     if (level >= tiled.surface.mipLevels) return false;
     sms_wiiu_d4_event(D4_RETile);
     GX2CopySurface(&linear.surface, level, 0, &tiled.surface, level, 0); invalidateVertexUniforms();
+    gpuStampSurface(GPU_EFBCOPY, linear.surface, tiled.surface);
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tiled.surface.image, tiled.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tiled.surface.image, tiled.surface.imageSize);
     if (tiled.surface.mipmaps) {
@@ -4236,19 +4271,23 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
     if (!s_renderOwn) {
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
+        if (s_gpuDiag) { GpuDrawInfo i = gpuInfo(GPU_CLEAR); gpuStamp(s_vertexArenaIndex, &i); }
         return;
     }
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     GX2ClearColor(&s_renderColour, 0.0f, 0.0f, 0.0f, 1.0f); invalidateVertexUniforms();
+    if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, s_renderColour.surface, s_renderColour.surface);
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
     if (s_d7NoSwap) return;
     if (!s_noScanTv) {
         GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+        if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
     }
     if (!s_noScanDrc) {
         GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+        if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
     }
 }
 
@@ -5354,6 +5393,8 @@ static inline OSTime stageLap(OSTime& acc, OSTime t) {
 }
 static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfCompact, s_perfFrames;
 static uint32_t s_perfGpuDraws, s_perfCpuDraws, s_perfGpuVerts, s_perfCpuVerts;
+static uint32_t s_perfLastVsync, s_perfVsyncHist[4];
+static bool s_perfHaveVsync;
 struct PerfScope {
 #if defined(PORT_GAME_SMG)
     bool enabled;
@@ -5514,6 +5555,7 @@ void flushBatch() {
             ++s_drawsThisFrame;
             if (s_gpuDiag) {
                 GpuDrawInfo info = {};
+                info.kind = GPU_DRAW; info.rtW = uint32_t(s_tvW); info.rtH = uint32_t(s_tvH);
                 info.verts = pend.nidx;
                 info.stages = tevKey.stages;
                 info.texMask = tevTextureMask(tevKey);
@@ -5733,6 +5775,7 @@ void flushBatch() {
     {
         if (s_gpuDiag) {
             GpuDrawInfo info = {};
+            info.kind = GPU_DRAW; info.rtW = uint32_t(s_tvW); info.rtH = uint32_t(s_tvH);
             info.verts = uint32_t(s_batch.indices.size());
             info.stages = tevPath ? tevKey.stages : 0;
             info.texMask = tevTextureMask(tevKey);
@@ -5912,6 +5955,7 @@ static void producerCopyService(void* opaque) {
         else
             GX2CopySurfaceEx(&r.copy.source, 0, 0, &r.copy.destination, 0, 0, 1,
                              &r.copy.sourceRect, &r.copy.destinationPoint);
+        gpuStampSurface(GPU_EFBCOPY, r.copy.source, r.copy.destination);
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, r.copy.destination.image,
                       r.copy.destination.imageSize);
         GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.copy.destination.image,
@@ -5924,10 +5968,12 @@ static void producerCopyService(void* opaque) {
         GX2ClearColor(renderColour(), float(r.clearAr & 255) / 255.0f,
                       float((r.clearGb >> 8) & 255) / 255.0f, float(r.clearGb & 255) / 255.0f,
                       ((r.pe & 7) == 1) ? float((r.clearAr >> 8) & 255) / 255.0f : 1.0f);
+        if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderColour()->surface, renderColour()->surface);
     }
     if ((r.zmode >> 4) & 1)
         GX2ClearDepthStencilEx(renderDepth(), float(r.clearZ & 0xffffff) / 16777215.0f, 0,
                                GX2_CLEAR_FLAGS_DEPTH);
+    if ((r.zmode >> 4) & 1 && s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderDepth()->surface, renderDepth()->surface);
     rebindTvTarget();
 }
 
@@ -6011,10 +6057,12 @@ void executeCopy(uint32_t ctrl) {
         GX2ClearColor(renderColour(), float(ar & 255) / 255.0f, float((gb >> 8) & 255) / 255.0f,
                       float(gb & 255) / 255.0f,
                       ((g.bp[BP_PE_CONTROL] & 7) == 1) ? float((ar >> 8) & 255) / 255.0f : 1.0f);
+        if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderColour()->surface, renderColour()->surface);
     }
     if ((g.bp[BP_ZMODE] >> 4) & 1)
         GX2ClearDepthStencilEx(renderDepth(), float(z & 0xffffff) / 16777215.0f, 0,
                                GX2_CLEAR_FLAGS_DEPTH);
+    if ((g.bp[BP_ZMODE] >> 4) & 1 && s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderDepth()->surface, renderDepth()->surface);
     rebindTvTarget();
 }
 void markXfMemDirty() {
@@ -6102,6 +6150,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         }
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
         GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
+        gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSurface);
         rebindTvTarget();
         GX2Flush();
         s_peekStamp = GX2GetLastSubmittedTimeStamp();
@@ -6112,8 +6161,9 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
     GX2DrawDone();
     GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
+    gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSurface);
     GX2DrawDone();
-    if (cemu) GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms();
+    if (cemu) { GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms(); gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSpecial); }
     rebindTvTarget();
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
     sms_wiiu_d4_event(D4_READBACK);
@@ -6234,8 +6284,10 @@ uint32_t peekZ(int x, int y) {
         GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
         sms_wiiu_d4_event(D4_DEPTH_COPY);
         GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
+        gpuStampSurface(GPU_EFBCOPY, db->surface, s_tiled);
         sms_wiiu_d4_event(D4_DEPTH_COPY);
         GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
+        gpuStampSurface(GPU_EFBCOPY, s_tiled, s_linear);
         rebindTvTarget();
         GX2Flush();
         const bool had = s_queued;
@@ -6315,12 +6367,14 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH); invalidateVertexUniforms();
+    if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderDepth()->surface, renderDepth()->surface);
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     updateTarget();
     if (s_frameClearPending) {
         GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]); invalidateVertexUniforms();
+        if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderColour()->surface, renderColour()->surface);
         s_frameClearPending = false;
         GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
         GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
@@ -6377,11 +6431,18 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     const OSTime perfNow = OSGetTime();
     if (s_perfLastEnd) s_perfWall += perfNow - s_perfLastEnd;
     s_perfLastEnd = perfNow;
+    const uint32_t vsync = sms_wiiu_vsync_event_count();
+    if (s_perfHaveVsync) {
+        const uint32_t interval = std::min(vsync - s_perfLastVsync, 4u);
+        ++s_perfVsyncHist[interval ? interval - 1 : 3];
+    }
+    s_perfLastVsync = vsync;
+    s_perfHaveVsync = true;
     if (++s_perfFrames == 30) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -6390,7 +6451,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
-                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)(s_perfDlUploads / 30), (unsigned)s_perfDlDecoded,
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)s_perfVsyncHist[0], (unsigned)s_perfVsyncHist[1], (unsigned)s_perfVsyncHist[2], (unsigned)s_perfVsyncHist[3], (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)(s_perfDlUploads / 30), (unsigned)s_perfDlDecoded,
                      (unsigned)dlcache.hits, (unsigned)dlcache.variantHits, (unsigned)dlcache.misses, (unsigned)dlcache.evictions,
                      (unsigned)(dlcache.arenaPromotionAttempts / 30),
                      (unsigned)(s_perfDlArenaHitVerts / 30), (unsigned)(s_perfDlArenaHitDraws / 30),
@@ -6436,6 +6497,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             g_dlTicks = 0;
         }
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
+        memset(s_perfVsyncHist, 0, sizeof(s_perfVsyncHist));
         static uint32_t s_gpuReportEvery;
         if (++s_gpuReportEvery >= 4) { s_gpuReportEvery = 0; gpuReport(); }
         s_vertexFenceWait = 0;
