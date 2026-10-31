@@ -182,7 +182,7 @@ struct HostVertex {
     HostVertex() {}   // left uninitialised: the loader writes every field
 };
 
-enum PrimClass { PRIM_TRIS, PRIM_LINES, PRIM_POINTS };
+enum PrimClass { PRIM_TRIS, PRIM_QUADS, PRIM_QUAD_STRIP, PRIM_LINES, PRIM_POINTS };
 
 // ---------------------------------------------------------------- renderer (gx_render.cpp)
 void rendererInit(float efbScale);

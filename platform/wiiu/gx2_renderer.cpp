@@ -50,6 +50,7 @@
 #endif
 
 #include <gx2/draw.h>
+#include <gx2/display.h>
 #include <gx2/swap.h>
 #include <gx2/clear.h>
 #include <gx2/event.h>
@@ -105,6 +106,8 @@ uint32_t g_displayFrames = 0;
 // present; fencepoll = poll the arena fence for up to 3 s instead of
 // GX2WaitTimeStamp; forcepres = the d6 forced present segment.
 static bool s_d7NoSwap, s_d7FencePoll, s_d6Force;
+static bool s_tv720Marker;
+static bool s_nativeQuads;
 extern "C" int sms_wiiu_d7_noswap(void) { return s_d7NoSwap ? 1 : 0; }
 extern "C" int sms_wiiu_d6_force(void) { return s_d6Force ? 1 : 0; }
 struct D4Segment {
@@ -5144,6 +5147,27 @@ static void vertexSelfCheckDraw(const VertexKey& key, const TevKey& tevKey, bool
 void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
+    s_tv720Marker = sdMarkerPresent("tv720");
+    s_nativeQuads = sdMarkerPresent("quads");
+    WHBLogPrintf("SMS Wii U: [tv720] marker=%s", s_tv720Marker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [quads] marker=%s", s_nativeQuads ? "on" : "off");
+    if (s_tv720Marker) {
+        kRenderW = 1280;
+        kRenderH = 720;
+        GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+        uint32_t scanSize = 0, scanUnk = 0;
+        GX2CalcTVSize(GX2_TV_RENDER_MODE_WIDE_720P, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8,
+                      GX2_BUFFERING_MODE_DOUBLE, &scanSize, &scanUnk);
+        if (tv && tv->surface.image && scanSize <= tv->surface.imageSize) {
+            GX2SetTVBuffer(tv->surface.image, scanSize, GX2_TV_RENDER_MODE_WIDE_720P,
+                           GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, GX2_BUFFERING_MODE_DOUBLE);
+            WHBLogPrintf("SMS Wii U: [tv720] TV scan buffer=1280x720 bytes=%u (WHB allocation=%u)",
+                         unsigned(scanSize), unsigned(tv->surface.imageSize));
+        } else {
+            WHBLogPrintf("SMS Wii U: [tv720] TV scan buffer setup skipped size=%u allocation=%u",
+                         unsigned(scanSize), unsigned(tv ? tv->surface.imageSize : 0));
+        }
+    }
     texturePackInit();
     if (texturePackEnabled()) {
         uint64_t cap = 128u << 20;
@@ -5263,13 +5287,23 @@ void onStateChange() {
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
 }
 
-PrimClass primClass(uint8_t op) { return op >= 0xb8 ? PRIM_POINTS : op >= 0xa8 ? PRIM_LINES : PRIM_TRIS; }
+PrimClass primClass(uint8_t op) {
+    if (s_nativeQuads) {
+        if ((op & 0xf8) == 0x80) return PRIM_QUADS;
+        if ((op & 0xf8) == 0x88) return PRIM_QUAD_STRIP;
+    }
+    return op >= 0xb8 ? PRIM_POINTS : op >= 0xa8 ? PRIM_LINES : PRIM_TRIS;
+}
 
 static uint32_t primitiveIndicesLocal(uint8_t op, uint32_t n, uint32_t base, uint32_t* out) {
     uint32_t* start = out;
     auto tri = [&](uint32_t a, uint32_t b, uint32_t c) { *out++ = base + a; *out++ = base + b; *out++ = base + c; };
     switch (op & 0xf8) {
     case 0x80: case 0x88:
+        if (s_nativeQuads) {
+            for (uint32_t i = 0; i < n; ++i) *out++ = base + i;
+            break;
+        }
         for (uint32_t i = 0; i + 3 < n; i += 4) { tri(i, i + 1, i + 2); tri(i, i + 2, i + 3); }
         break;
     case 0x90: for (uint32_t i = 0; i + 2 < n; i += 3) tri(i, i + 1, i + 2); break;
@@ -5353,7 +5387,7 @@ static uint32_t s_perfDlImmBypassVerts, s_perfDlImmBypassDraws;
 static uint32_t s_perfDlImmDirectVerts, s_perfDlImmDirectDraws;
 // arenaUpload's arguments, for the store appendArena makes right after it.
 static struct { const uint8_t* verts; const uint32_t* idx; } s_dlStash;
-static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; } s_dlPending;
+static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; PrimClass cls; } s_dlPending;
 
 static void matrixDefaults(uint8_t out[9]) {
     const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
@@ -5464,10 +5498,12 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& c
     const uint32_t* idx = stored ? reinterpret_cast<const uint32_t*>(s_dlArena + ref.iOff)
                                  : (s_dlStash.verts == verts ? s_dlStash.idx : nullptr);
     if (!idx) return;  // not reached: arenaUpload always precedes an unstored run
-    const bool usable = cls == PRIM_TRIS && (stored ? ref.key == matrixDefaultsKey()
-                                                     : dlArenaStore(ref, fmt, stride, n, verts, idx, nidx));
+    const bool nativeQuad = cls == PRIM_QUADS || cls == PRIM_QUAD_STRIP;
+    const bool usable = (cls == PRIM_TRIS || (s_nativeQuads && nativeQuad)) &&
+                        (stored ? ref.key == matrixDefaultsKey()
+                                : dlArenaStore(ref, fmt, stride, n, verts, idx, nidx));
     if (!usable) {
-        if (cls != PRIM_TRIS) noteDlHitFallback(kDlPerfNonTriangle, n, 1);
+        if (cls != PRIM_TRIS && !nativeQuad) noteDlHitFallback(kDlPerfNonTriangle, n, 1);
         else if (!stored) noteDlHitFallback(kDlPerfGeneration, n, 1);
         else noteDlHitFallback(kDlPerfMatrixKey, n, 1);
         ++s_perfDlDecoded;
@@ -5476,7 +5512,7 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& c
     }
     if (!s_batch.indices.empty()) flushBatch();
     s_batch.cls = cls; s_batch.fmt = fmt; s_batch.stride = stride;
-    s_dlPending = {&ref, n, nidx, verts};
+    s_dlPending = {&ref, n, nidx, verts, cls};
     flushBatch();
 }
 
@@ -5660,6 +5696,16 @@ static void prepareDrawState(const TevKey& tevKey, TevShader* tevShader, FixedSh
     stageLap(s_stXfu, t);
 }
 
+static GX2PrimitiveMode primitiveMode(PrimClass cls) {
+    switch (cls) {
+    case PRIM_QUADS: return GX2_PRIMITIVE_MODE_QUADS;
+    case PRIM_QUAD_STRIP: return GX2_PRIMITIVE_MODE_QUAD_STRIP;
+    case PRIM_LINES: return GX2_PRIMITIVE_MODE_LINES;
+    case PRIM_POINTS: return GX2_PRIMITIVE_MODE_POINTS;
+    default: return GX2_PRIMITIVE_MODE_TRIANGLES;
+    }
+}
+
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
     if (s_batch.indices.empty() && !s_dlPending.ref) return;
@@ -5777,13 +5823,13 @@ void flushBatch() {
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
-                if (!s_d8NoDraw) GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
                 ++s_gx2DlOpenDraws;
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
-                if (!s_d8NoDraw) GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
             }
             if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();
@@ -5980,8 +6026,7 @@ void flushBatch() {
         GX2SetAttribBuffer(1, 32, 0, block + compactDefOff);
     }
     GX2SetAttribBuffer(0, vboBytes, compact ? vertexStride : gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
-    const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
-                                  s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
+    const GX2PrimitiveMode mode = primitiveMode(s_batch.cls);
     const bool bracket = SMS_GX2_VX_BRACKET && gpuPath && !vertex->bracketed;
     if (bracket) {
         // Debug: name each generated program before its first draw and wait
