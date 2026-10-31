@@ -5751,7 +5751,8 @@ void onStateChange() {
 PrimClass primClass(uint8_t op) {
     if (s_nativeQuads) {
         if ((op & 0xf8) == 0x80) return PRIM_QUADS;
-        if ((op & 0xf8) == 0x88) return PRIM_QUAD_STRIP;
+        // 0x88 is GX_QUADS2, not a strip: GX has no quad strip and Dolphin draws QUADS2 as quads.
+        if ((op & 0xf8) == 0x88) return PRIM_QUADS;
     }
     return op >= 0xb8 ? PRIM_POINTS : op >= 0xa8 ? PRIM_LINES : PRIM_TRIS;
 }
@@ -5762,7 +5763,10 @@ static uint32_t primitiveIndicesLocal(uint8_t op, uint32_t n, uint32_t base, uin
     switch (op & 0xf8) {
     case 0x80: case 0x88:
         if (s_nativeQuads) {
-            for (uint32_t i = 0; i < n; ++i) *out++ = base + i;
+            // Whole quads only, as the triangle path: a partial quad would
+            // shift every later quad merged into the same batch.
+            for (uint32_t i = 0; i + 3 < n; i += 4)
+                for (uint32_t k = 0; k < 4; ++k) *out++ = base + i + k;
             break;
         }
         for (uint32_t i = 0; i + 3 < n; i += 4) { tri(i, i + 1, i + 2); tri(i, i + 2, i + 3); }
