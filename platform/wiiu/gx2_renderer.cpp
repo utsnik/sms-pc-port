@@ -286,6 +286,9 @@ struct TevKey {
     uint32_t earlyZ;   // d49: KILL_ENABLE only for shaders that emit KILL
 #endif
     uint32_t uniformMode; // 0: register file, 1: kcache/uniform blocks
+    uint32_t folded;      // 1: foldRegs/foldKreg are stable material values
+    uint32_t foldRegs[8]; // raw BP_TEV_REG words, part of folded shader identity
+    uint32_t foldKreg[8]; // raw konst registers, part of folded shader identity
 };
 
 struct TevShader {
@@ -296,6 +299,7 @@ struct TevShader {
     GX2SamplerVar samplers[8];
     void* psProgram;
     uint32_t textureMask;
+    uint32_t foldedStages;
 };
 
 struct VertexKey {
@@ -590,16 +594,35 @@ static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles 
 static bool s_gpuDiag;  // SD marker "perfdiag": GPU timestamps and command-stream counters
 static bool s_uniblock; // SD marker "uniblock": generated shaders use uniform blocks
 static bool s_shaderModeBlock;
+static bool s_tevFold;  // SD marker "tevfold": fold stable TEV inputs into generated code
+static constexpr uint32_t kTevFoldVariantCap = 8;
 
 struct CmdCounters {
     uint32_t vsUniDw, psUniDw, vsUniCalls, psUniCalls;
     uint32_t shaderSw, fetchSw, texBinds, samplerBinds, attrBinds, draws;
     uint32_t dlCalls, dlBytes;
+    uint32_t tevFoldStages, tevFoldHits, tevFoldFallbacks;
 };
+static uint32_t s_perfTevFoldStages, s_perfTevFoldHits, s_perfTevFoldFallbacks;
 // Core 1 calls lists; gx2prod records their contents on its worker core.
 // Each core writes only its own slot, and the report reads after kWaitPresent.
 static CmdCounters s_cmdByCore[2];
 static inline CmdCounters& cmdCounters() { return s_cmdByCore[OSGetCoreId() == 1 ? 0 : 1]; }
+static void noteTevFoldStages(uint32_t count) {
+    if (!s_gpuDiag) return;
+    cmdCounters().tevFoldStages += count;
+    s_perfTevFoldStages += count;
+}
+static void noteTevFoldHit() {
+    if (!s_gpuDiag) return;
+    ++cmdCounters().tevFoldHits;
+    ++s_perfTevFoldHits;
+}
+static void noteTevFoldFallback() {
+    if (!s_gpuDiag) return;
+    ++cmdCounters().tevFoldFallbacks;
+    ++s_perfTevFoldFallbacks;
+}
 
 enum UniformRingBlock { kUniformXfBlock, kUniformLiveBlock, kUniformTevBlock, kUniformBlockCount };
 static void* uniformBlockCopy(UniformRingBlock block, const void* data, uint32_t size);
@@ -1357,6 +1380,13 @@ static TevKey currentTevKey() {
         k.swap[t] = (g.bp[BP_TEV_KSEL + 2 * t] & 15) |
                     ((g.bp[BP_TEV_KSEL + 2 * t + 1] & 15) << 4);
     k.alphaCompare = g.bp[BP_ALPHACOMPARE];
+    if (s_tevFold) {
+        k.folded = 1;
+        for (uint32_t i = 0; i < 8; ++i) {
+            k.foldRegs[i] = g.bp[BP_TEV_REG + i];
+            k.foldKreg[i] = g.kreg[i];
+        }
+    }
     const uint32_t numInd = tevNumInd(k);
     if (numInd) {
         for (uint32_t s = 0; s < k.stages; ++s) k.ind[s] = g.bp[BP_IND_CMD + s] & 0x1fffff;
@@ -1431,6 +1461,9 @@ struct TevSource {
     uint32_t chan;
 };
 
+static bool tevKeyFolded(const TevKey& k) { return s_tevFold && k.folded; }
+static TevSource tevFoldKonst(const TevKey& k, uint32_t sel, uint32_t chan);
+
 static TevSource tevFixed(uint32_t value) {
     // Uniform vectors 8..15 hold the fixed TEV constants.  Keeping these in
     // the same constant file as TEVREG/KONST makes every numeric input a
@@ -1440,6 +1473,10 @@ static TevSource tevFixed(uint32_t value) {
 
 static TevSource tevKonst(const TevKey& k, uint32_t sel, uint32_t chan, bool alpha = false) {
     if (sel < 8) return tevFixed(sel);
+    if (tevKeyFolded(k)) {
+        if (sel >= 12 && sel < 16) return tevFoldKonst(k, sel, chan);
+        if (sel >= 16) return tevFoldKonst(k, sel, (sel - 16) >> 2);
+    }
     if (sel >= 12 && sel < 16) return {_GX2_C(4 + sel - 12), chan};
     if (sel >= 16) return {_GX2_C(4 + (sel & 3)), (sel - 16) >> 2};
     return tevFixed(12);
@@ -1498,6 +1535,7 @@ struct TevAlloc {
     uint32_t stage;        // a stage's staged result
     uint32_t t[4];         // temporaries
     uint32_t k[4];         // constant-file copies
+    uint32_t fold[12];     // folded TEVREG (full/low) and KONST vectors
     uint32_t ind[4];       // indirect lookup results
     uint32_t icoord[4];    // indirect lookup coordinates
 #if defined(PORT_GAME_SMG)
@@ -1517,12 +1555,20 @@ struct TevAlloc {
 };
 static TevAlloc s_ra;
 
+static TevSource tevFoldReg(const TevKey&, uint32_t reg, uint32_t part, uint32_t channel, bool masked) {
+    return {_R(s_ra.fold[(masked ? 4 : 0) + reg]), part ? uint32_t(_w) : channel};
+}
+static TevSource tevFoldKonst(const TevKey&, uint32_t sel, uint32_t chan) {
+    return {_R(s_ra.fold[8 + (sel >= 16 ? (sel & 3) : sel - 12)]), chan};
+}
+
 struct TevStageCtx {
     const TevKey* key;
     uint32_t stage;
     int texStage;   // the stage whose texture TEXC/TEXA read (-1: none yet)
     int bumpStage;  // the stage that last set the bump alpha (-1: none, 0)
 };
+static bool tevRegWrittenBefore(const TevKey& key, uint32_t stage, uint32_t reg, uint32_t part);
 
 // Where a stage reads TEV register r's colour (p = 0) or alpha (p = 1) part:
 // as D (the whole register) and as A/B/C (its low 8 bits). A part no earlier
@@ -1549,6 +1595,8 @@ static TevSource tevColorSource(const TevStageCtx& cx, uint32_t sel, uint32_t ch
     const uint32_t stage = cx.stage;
     if (sel < 8) {
         const uint32_t r = sel >> 1, part = sel & 1;
+        if (tevKeyFolded(k) && !tevRegWrittenBefore(k, stage, r, part))
+            return tevFoldReg(k, r, part, channel, masked);
         return {masked ? s_view.masked[r][part] : s_view.full[r][part], part ? uint32_t(_w) : channel};
     }
     const uint32_t order = k.order[stage];
@@ -1571,7 +1619,10 @@ static TevSource tevColorSource(const TevStageCtx& cx, uint32_t sel, uint32_t ch
 static TevSource tevAlphaSource(const TevStageCtx& cx, uint32_t sel, bool masked) {
     const TevKey& k = *cx.key;
     const uint32_t stage = cx.stage;
-    if (sel < 4) return {masked ? s_view.masked[sel][1] : s_view.full[sel][1], _w};
+    if (sel < 4) {
+        if (tevKeyFolded(k) && !tevRegWrittenBefore(k, stage, sel, 1)) return tevFoldReg(k, sel, 1, _w, masked);
+        return {masked ? s_view.masked[sel][1] : s_view.full[sel][1], _w};
+    }
     const uint32_t order = k.order[stage];
     const uint32_t rasTable = k.alphaEnv[stage] & 3;
     if (sel == 4) {
@@ -2707,7 +2758,18 @@ static VertexProgram* vertexShaderForKey(const VertexKey& key) {
 static const int kTevK8[8] = {255, 223, 191, 159, 127, 95, 63, 31};
 
 // The value of a selector known when the shader is generated, or -1.
-static int tevSelValue(const TevKey& k, uint32_t stage, uint32_t sel, bool alpha) {
+static int tevSelValue(const TevKey& k, uint32_t stage, uint32_t sel, bool alpha, bool d,
+                       const bool written[4][2]) {
+    if (tevKeyFolded(k)) {
+        // Alpha selectors address the packed register's high 11-bit field.
+        // Colour selectors vary by output component, so their folded source
+        // is still emitted below, but range analysis keeps the conservative
+        // vector-wide bounds used by the default generator.
+        if (alpha && sel < 4 && !written[sel][1]) {
+            const int value = tevSext11((k.foldRegs[2 * sel] >> 12) & 0x7ff);
+            return d ? value : (value & 255);
+        }
+    }
     if (!alpha) {
         if (sel == 15) return 0;
         if (sel == 12) return 255;
@@ -2744,9 +2806,14 @@ struct TevPlan {
     int lo[16][4][2], hi[16][4][2];
     bool mask[16][4];        // stage s makes the 8-bit copy of register r
     bool regWritten[4], maskUsed[4], anyCompare;
+    bool dead[16];           // no later stage or final output observes this stage
     bool outMask;            // the output needs its low 8 bits taken
 };
 static TevPlan s_plan;
+
+static bool tevRegWrittenBefore(const TevKey&, uint32_t stage, uint32_t reg, uint32_t part) {
+    return s_plan.written[stage][reg][part];
+}
 
 static void tevAnalyze(const TevKey& key) {
     TevPlan& pl = s_plan;
@@ -2770,8 +2837,10 @@ static void tevAnalyze(const TevKey& key) {
             else { t.a = (e >> 13) & 7; t.b = (e >> 10) & 7; t.c = (e >> 7) & 7; t.d = (e >> 4) & 7; }
             t.bias = (e >> 16) & 3; t.op = (e >> 18) & 1; t.clamp = ((e >> 19) & 1) != 0; t.scale = (e >> 20) & 3;
             t.compare = t.bias == 3;
-            const int av = tevSelValue(key, s, t.a, alpha), bv = tevSelValue(key, s, t.b, alpha);
-            const int cv = tevSelValue(key, s, t.c, alpha), dv = tevSelValue(key, s, t.d, alpha);
+            const int av = tevSelValue(key, s, t.a, alpha, false, written);
+            const int bv = tevSelValue(key, s, t.b, alpha, false, written);
+            const int cv = tevSelValue(key, s, t.c, alpha, false, written);
+            const int dv = tevSelValue(key, s, t.d, alpha, true, written);
             // A register selector: its register and part.
             auto reg = [&](uint32_t sel, uint32_t* r, uint32_t* part) {
                 if (!alpha) { if (sel >= 8) return false; *r = sel >> 1; *part = sel & 1; return true; }
@@ -2841,6 +2910,64 @@ static void tevAnalyze(const TevKey& key) {
         lastColor = cd; lastAlpha = ad;
     }
     pl.outMask = lo[lastColor][0] < 0 || hi[lastColor][0] > 255 || lo[lastAlpha][1] < 0 || hi[lastAlpha][1] > 255;
+    if (!tevKeyFolded(key)) return;
+
+    // Walk backwards to remove stages whose destination is never observed.
+    // Texture and indirect stages are retained conservatively: their fetches
+    // can establish the implicit TEXC/bump state consumed by a later stage.
+    bool live[4][2] = {};
+    live[lastColor][0] = true;
+    live[lastAlpha][1] = true;
+    for (int s = int(key.stages) - 1; s >= 0; --s) {
+        const uint32_t ce = key.colorEnv[s], ae = key.alphaEnv[s];
+        const uint32_t cd = (ce >> 22) & 3, ad = (ae >> 22) & 3;
+        const bool hasTexture = ((key.order[s] >> 6) & 1) != 0;
+        const bool hasIndirect = key.ind[s] != 0;
+        if (!live[cd][0] && !live[ad][1] && !hasTexture && !hasIndirect) {
+            pl.dead[s] = true;
+            continue;
+        }
+        live[cd][0] = live[ad][1] = false;
+        const uint32_t cs[4] = {(ce >> 12) & 15, (ce >> 8) & 15, (ce >> 4) & 15, ce & 15};
+        const uint32_t as[4] = {(ae >> 13) & 7, (ae >> 10) & 7, (ae >> 7) & 7, (ae >> 4) & 7};
+        for (uint32_t sel : cs) if (sel < 8) live[sel >> 1][sel & 1] = true;
+        for (uint32_t sel : as) if (sel < 4) live[sel][1] = true;
+    }
+    memset(pl.regWritten, 0, sizeof(pl.regWritten));
+    memset(pl.maskUsed, 0, sizeof(pl.maskUsed));
+    pl.anyCompare = false;
+    for (uint32_t s = 0; s < key.stages; ++s) {
+        if (pl.dead[s]) continue;
+        pl.regWritten[(key.colorEnv[s] >> 22) & 3] = true;
+        pl.regWritten[(key.alphaEnv[s] >> 22) & 3] = true;
+        if (pl.part[s][0].compare || pl.part[s][1].compare) pl.anyCompare = true;
+        for (uint32_t r = 0; r < 4; ++r) if (pl.mask[s][r]) pl.maskUsed[r] = true;
+    }
+}
+
+static uint32_t tevFoldedStageCount(const TevKey& key) {
+    if (!tevKeyFolded(key)) return 0;
+    uint32_t count = 0;
+    for (uint32_t s = 0; s < key.stages; ++s) {
+        if (s_plan.dead[s]) continue;
+        const uint32_t ce = key.colorEnv[s], ae = key.alphaEnv[s];
+        const uint32_t cs[4] = {(ce >> 12) & 15, (ce >> 8) & 15, (ce >> 4) & 15, ce & 15};
+        const uint32_t as[4] = {(ae >> 13) & 7, (ae >> 10) & 7, (ae >> 7) & 7, (ae >> 4) & 7};
+        bool folded = false;
+        for (uint32_t sel : cs) {
+            if (sel < 8 && !tevRegWrittenBefore(key, s, sel >> 1, sel & 1)) folded = true;
+            if (sel == 14 && (key.ksel[s] & 31) >= 12) folded = true;
+        }
+        for (uint32_t sel : as) {
+            if (sel < 4 && !tevRegWrittenBefore(key, s, sel, 1)) folded = true;
+            if (sel == 6) {
+                const uint32_t ka = (key.ksel[s] >> 5) & 31;
+                if (ka >= 12 && ka < 32) folded = true;
+            }
+        }
+        if (folded) ++count;
+    }
+    return count;
 }
 
 // The register views of stage s (see TevViews).
@@ -3263,6 +3390,7 @@ static bool tevAluClauses(std::vector<uint64_t>& program, size_t& cf, size_t off
     }
     return true;
 }
+static void tevEmitLiteral(std::vector<uint64_t>& program, uint64_t op, float value);
 // TEX clauses of at most 8 fetches (the CF count field).
 static void tevTexClauses(std::vector<uint64_t>& program, size_t& cf, size_t offset, uint32_t count) {
     for (uint32_t at = 0; at < count; at += 8) {
@@ -3288,9 +3416,11 @@ static bool initTevPixel(TevShader& shader) {
     // ---- register allocation ----
     TevAlloc& ra = s_ra;
     memset(&ra, 0xff, sizeof(ra));
+    tevAnalyze(key);
     bool useCoord[8] = {}, useRas[2] = {}, anyInd = false, anyFb = false;
     for (uint32_t i = 0; i < numInd; ++i) useCoord[(key.iref >> (6 * i + 3)) & 7] = true;
     for (uint32_t stage = 0; stage < key.stages; ++stage) {
+        if (s_plan.dead[stage]) continue;
         const uint32_t order = key.order[stage], ce = key.colorEnv[stage], ae = key.alphaEnv[stage];
         if ((order >> 6) & 1) useCoord[(order >> 3) & 7] = true;
         if (indStage(stage)) { anyInd = true; if ((key.ind[stage] >> 20) & 1) anyFb = true; }
@@ -3324,12 +3454,14 @@ static bool initTevPixel(TevShader& shader) {
     auto coordDeadAfter = [&](uint32_t stage) {
         const uint32_t coord = (key.order[stage] >> 3) & 7;
         for (uint32_t s = 0; s < key.stages; ++s) {
+            if (s_plan.dead[s]) continue;
             if (!((key.order[s] >> 6) & 1) || ((key.order[s] >> 3) & 7) != coord) continue;
             if (indStage(s) || s > stage) return false;
         }
         return true;
     };
     for (uint32_t stage = 0; stage < key.stages; ++stage) {
+        if (s_plan.dead[stage]) continue;
         if ((key.order[stage] >> 6) & 1) {
             if (!indStage(stage) && coordDeadAfter(stage)) ra.tex[stage] = ra.coord[(key.order[stage] >> 3) & 7];
             else ra.tex[stage] = next++;
@@ -3342,10 +3474,10 @@ static bool initTevPixel(TevShader& shader) {
     if (anyInd) ra.prevTc = next++;
     // Registers: only those a stage writes (an unwritten one is read from
     // the uniforms), and 8-bit copies only where a value can exceed 0..255.
-    tevAnalyze(key);
     bool anyMask = s_plan.outMask;
     for (uint32_t r = 0; r < 4; ++r) if (s_plan.regWritten[r]) ra.reg[r] = next++;
     for (uint32_t r = 0; r < 4; ++r) if (s_plan.maskUsed[r]) { ra.mask[r] = next++; anyMask = true; }
+    if (tevKeyFolded(key)) for (uint32_t i = 0; i < 12; ++i) ra.fold[i] = next++;
     ra.stage = next++;
     const uint32_t temps = (anyMask || s_plan.anyCompare || anyInd) ? 4 : 3;
     for (uint32_t i = 0; i < temps; ++i) ra.t[i] = next++;
@@ -3382,6 +3514,7 @@ static bool initTevPixel(TevShader& shader) {
         ++tex1Count;
     }
     for (uint32_t stage = 0; stage < key.stages; ++stage) {
+        if (s_plan.dead[stage]) continue;
         const uint32_t order = key.order[stage];
         if (!((order >> 6) & 1) || indStage(stage)) continue;
         const uint32_t map = order & 7, coord = (order >> 3) & 7;
@@ -3405,10 +3538,11 @@ static bool initTevPixel(TevShader& shader) {
             flush();
         }
         for (uint32_t stage = 0; stage < key.stages; ++stage)
-            if (indStage(stage)) tevEmitIndirectStage(program, key, stage);
+            if (!s_plan.dead[stage] && indStage(stage)) tevEmitIndirectStage(program, key, stage);
         indCount = program.size() - indOffset;
         tex2Offset = program.size();
         for (uint32_t stage = 0; stage < key.stages; ++stage) {
+            if (s_plan.dead[stage]) continue;
             if (!indStage(stage)) continue;
             const uint32_t map = key.order[stage] & 7;
             uint64_t sample[2] = {TEX_SAMPLE(_R(ra.tex[stage]), _x, _y, _z, _w, _R(ra.scoord[stage]), _x, _y, _0, _x, map, map)};
@@ -3425,6 +3559,31 @@ static bool initTevPixel(TevShader& shader) {
     }
 
     // ---- TEV ----
+    const size_t foldOffset = program.size();
+    size_t foldCount = 0;
+    if (tevKeyFolded(key)) {
+        for (uint32_t r = 0; r < 4; ++r) {
+            const uint32_t even = key.foldRegs[2 * r], odd = key.foldRegs[2 * r + 1];
+            const float full[4] = {float(tevSext11(even & 0x7ff)), float(tevSext11((odd >> 12) & 0x7ff)),
+                                   float(tevSext11(odd & 0x7ff)), float(tevSext11((even >> 12) & 0x7ff))};
+            for (uint32_t ch = 0; ch < 4; ++ch) {
+                tevEmitLiteral(program, ALU_MOV(_R(ra.fold[r]), ch, ALU_SRC_LITERAL, _x), full[ch]);
+                tevEmitLiteral(program, ALU_MOV(_R(ra.fold[4 + r]), ch, ALU_SRC_LITERAL, _x),
+                               float(int(full[ch]) & 255));
+                ++foldCount; ++foldCount;
+            }
+        }
+        for (uint32_t r = 0; r < 4; ++r) {
+            const uint32_t even = key.foldKreg[2 * r], odd = key.foldKreg[2 * r + 1];
+            const float value[4] = {float(even & 0xff), float((odd >> 12) & 0xff),
+                                    float(odd & 0xff), float((even >> 12) & 0xff)};
+            for (uint32_t ch = 0; ch < 4; ++ch) {
+                tevEmitLiteral(program, ALU_MOV(_R(ra.fold[8 + r]), ch, ALU_SRC_LITERAL, _x), value[ch]);
+                ++foldCount;
+            }
+        }
+        foldCount = program.size() - foldOffset;
+    }
     const size_t aluOffset = program.size();
     // Texels and raster colours to 0..255 integers (genFS texi: round(clamp(c) * 255)).
     // The raster colours are interpolated from 0..255 / 255 vertex values, so
@@ -3443,6 +3602,7 @@ static bool initTevPixel(TevShader& shader) {
     uint32_t lastColor = 0, lastAlpha = 0;
     int texStage = -1, bumpStage = -1;
     for (uint32_t stage = 0; stage < key.stages; ++stage) {
+        if (s_plan.dead[stage]) continue;
         const uint32_t ce = key.colorEnv[stage], ae = key.alphaEnv[stage];
         if ((key.order[stage] >> 6) & 1) texStage = int(stage);
         if (indStage(stage) && ((key.ind[stage] >> 7) & 3)) bumpStage = int(stage);
@@ -3565,6 +3725,8 @@ static bool initTevPixel(TevShader& shader) {
     if (tex1Count) tevTexClauses(program, cf, tex1Offset, tex1Count);
     if (indCount && !tevAluClauses(program, cf, indOffset, indCount)) return false;
     if (tex2Count) tevTexClauses(program, cf, tex2Offset, tex2Count);
+    if (cf + foldCount / 2 > kCfSlots) return false;
+    for (size_t at = 0; at < foldCount; at += 2) program[cf++] = ALU(foldOffset + at, 2);
     if (!tevAluClauses(program, cf, aluOffset, aluCount)) return false;
     // The alpha compare (with its literal thresholds) is a few slots, one clause.
     if (compareCount > 128) return false;
@@ -3657,9 +3819,45 @@ static bool initTevPixel(TevShader& shader) {
     return true;
 }
 
-static TevShader* tevShaderForKey(const TevKey& key) {
+static TevKey tevUnfoldedKey(const TevKey& key) {
+    TevKey base = key;
+    base.folded = 0;
+    memset(base.foldRegs, 0, sizeof(base.foldRegs));
+    memset(base.foldKreg, 0, sizeof(base.foldKreg));
+    return base;
+}
+
+static bool tevSameFoldBase(const TevKey& a, const TevKey& b) {
+    const TevKey aa = tevUnfoldedKey(a), bb = tevUnfoldedKey(b);
+    return !memcmp(&aa, &bb, sizeof(aa));
+}
+
+static TevShader* tevShaderForKey(const TevKey& requested) {
+    TevKey key = requested;
     const uint32_t hash = shaderKeyHash(key);
-    if (TevShader* hit = s_tevShaderIndex.find(key, hash)) return hit;
+    if (TevShader* hit = s_tevShaderIndex.find(key, hash)) {
+        if (key.folded) noteTevFoldHit();
+        return hit;
+    }
+    if (s_tevShaderIndex.full)
+        for (TevShader* shader : s_tevShaders)
+            if (!memcmp(&shader->key, &key, sizeof(key))) {
+                if (key.folded) noteTevFoldHit();
+                return shader;
+            }
+    if (key.folded) {
+        uint32_t variants = 0;
+        for (TevShader* shader : s_tevShaders)
+            if (shader->key.folded && tevSameFoldBase(shader->key, key)) ++variants;
+        if (variants >= kTevFoldVariantCap) {
+            WHBLogPrintf("SMS Wii U: [tevfold] base variants=%u cap=%u fallback=unfolded",
+                         unsigned(variants), unsigned(kTevFoldVariantCap));
+            noteTevFoldFallback();
+            key = tevUnfoldedKey(key);
+        }
+    }
+    const uint32_t actualHash = shaderKeyHash(key);
+    if (TevShader* hit = s_tevShaderIndex.find(key, actualHash)) return hit;
     if (s_tevShaderIndex.full)
         for (TevShader* shader : s_tevShaders)
             if (!memcmp(&shader->key, &key, sizeof(key))) return shader;
@@ -3671,8 +3869,10 @@ static TevShader* tevShaderForKey(const TevKey& key) {
         delete shader;
         return nullptr;
     }
+    shader->foldedStages = tevFoldedStageCount(key);
+    noteTevFoldStages(shader->foldedStages);
     s_tevShaders.push_back(shader);
-    s_tevShaderIndex.insert(shader, hash);
+    s_tevShaderIndex.insert(shader, actualHash);
     WHBLogPrintf("SMS Wii U: generated TEV pixel shader stages=%u tex=%02x gprs=%u groups=%u bytes=%u cache=%u",
                  (unsigned)key.stages, (unsigned)shader->textureMask, (unsigned)s_ra.count,
                  (unsigned)s_tevGroups, (unsigned)shader->pixel.size, (unsigned)s_tevShaders.size());
@@ -5481,6 +5681,9 @@ void rendererInit(float) {
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_uniblock = sdMarkerPresent("uniblock");
+    s_tevFold = sdMarkerPresent("tevfold");
+    WHBLogPrintf("SMS Wii U: [tevfold] marker=%s cap=%u", s_tevFold ? "on" : "off",
+                 unsigned(kTevFoldVariantCap));
     WHBLogPrintf("SMS Wii U: [uniblock] marker=%s", s_uniblock ? "on" : "off");
     // Compact packed vertices are the default; the marker keeps a raw A/B path.
     s_compactVx = !sdMarkerPresent("nocompactvx");
@@ -7038,7 +7241,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -7068,7 +7271,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
-                     (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall);
+                     (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
+                     unsigned(s_perfTevFoldStages / 30), unsigned(s_perfTevFoldHits / 30),
+                     unsigned(s_perfTevFoldFallbacks / 30));
         if (s_gpuDiag) {
             CmdCounters cmd = s_cmdByCore[0];
             const CmdCounters& worker = s_cmdByCore[1];
@@ -7078,14 +7283,19 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             cmd.texBinds += worker.texBinds; cmd.samplerBinds += worker.samplerBinds;
             cmd.attrBinds += worker.attrBinds; cmd.draws += worker.draws;
             cmd.dlCalls += worker.dlCalls; cmd.dlBytes += worker.dlBytes;
-            WHBLogPrintf("SMS Wii U: [cmd] per-frame vsUniDw=%u psUniDw=%u vsUniCalls=%u psUniCalls=%u shaderSw=%u fetchSw=%u texBinds=%u samplerBinds=%u attrBinds=%u draws=%u dlCalls=%u dlBytes=%u",
+            cmd.tevFoldStages += worker.tevFoldStages; cmd.tevFoldHits += worker.tevFoldHits;
+            cmd.tevFoldFallbacks += worker.tevFoldFallbacks;
+            WHBLogPrintf("SMS Wii U: [cmd] per-frame vsUniDw=%u psUniDw=%u vsUniCalls=%u psUniCalls=%u shaderSw=%u fetchSw=%u texBinds=%u samplerBinds=%u attrBinds=%u draws=%u dlCalls=%u dlBytes=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u",
                          unsigned(cmd.vsUniDw / 30), unsigned(cmd.psUniDw / 30),
                          unsigned(cmd.vsUniCalls / 30), unsigned(cmd.psUniCalls / 30),
                          unsigned(cmd.shaderSw / 30), unsigned(cmd.fetchSw / 30),
                          unsigned(cmd.texBinds / 30), unsigned(cmd.samplerBinds / 30),
                          unsigned(cmd.attrBinds / 30), unsigned(cmd.draws / 30),
-                         unsigned(cmd.dlCalls / 30), unsigned(cmd.dlBytes / 30));
+                         unsigned(cmd.dlCalls / 30), unsigned(cmd.dlBytes / 30),
+                         unsigned(cmd.tevFoldStages / 30), unsigned(cmd.tevFoldHits / 30),
+                         unsigned(cmd.tevFoldFallbacks / 30));
             memset(s_cmdByCore, 0, sizeof(s_cmdByCore));
+            s_perfTevFoldStages = s_perfTevFoldHits = s_perfTevFoldFallbacks = 0;
         }
         if ((g_displayFrames + 1) % 300 == 0) {
             WHBLogPrintf("SMS Wii U: [dlhash] frame=%u per-frame calls=%u periodic=%u always=%u oorList=%u oorArray=%u stampedList=%u stampedArray=%u kbytes=%u nohash=%d",
