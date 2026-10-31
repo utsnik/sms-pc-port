@@ -28,6 +28,8 @@
 #endif
 #include <coreinit/thread.h>
 #include <coreinit/memdefaultheap.h>
+#include <coreinit/memexpheap.h>
+#include <coreinit/memheap.h>
 /* Small GX2 host for the shared GX register decoder.
  *
  * The decoder still sees the original GameCube BP/CP/XF stream.  This file is
@@ -195,6 +197,11 @@ static bool s_ready;
 static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
+#if defined(PORT_GAME_SMG)
+static bool s_earlyZMarker;
+static bool s_hizMarker;
+static bool s_peek2Marker;
+#endif
 bool g_dlPromoteFirst = false;
 bool g_dlIgnoreExternal = false;
 bool g_dlNoHash = false;
@@ -271,6 +278,7 @@ struct TevKey {
     uint32_t iref;     // BP_RAS1_IREF (zero without indirect stages)
 #if defined(PORT_GAME_SMG)
     uint32_t ztex2;    // BP_ZTEX2: format and GX_ZT_* operation
+    uint32_t earlyZ;   // d49: KILL_ENABLE only for shaders that emit KILL
 #endif
 };
 
@@ -1248,6 +1256,7 @@ static TevKey currentTevKey() {
 #if defined(PORT_GAME_SMG)
     const uint32_t ztex2 = g.bp[BP_ZTEX2] & 0xf;
     if ((ztex2 >> 2) & 3) k.ztex2 = ztex2;
+    k.earlyZ = s_earlyZMarker ? 1u : 0u;
 #endif
     return k;
 }
@@ -3344,7 +3353,13 @@ static bool initTevPixel(TevShader& shader) {
     shader.pixel.regs.cb_shader_mask = 0xf;
     shader.pixel.regs.cb_shader_control = 1;
 #if defined(PORT_GAME_SMG)
-    shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6) | (ztexExport ? 1u : 0u);
+    // KILL_ENABLE prevents early-Z writes.  The old path conservatively set
+    // it for every generated shader; d49 can advertise the real KILL use so
+    // shaders without alpha discard can keep early-Z.  Z exports retain the
+    // existing early-Z-then-late-Z ordering and Z export enable bit.
+    const bool killEnable = !key.earlyZ || killed;
+    shader.pixel.regs.db_shader_control = (1u << 4) | (killEnable ? (1u << 6) : 0u) |
+                                          (ztexExport ? 1u : 0u);
 #else
     shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6);
 #endif
@@ -4278,6 +4293,40 @@ static GX2DepthBuffer s_renderDepth;
 static bool s_renderOwn, s_renderTried;
 static bool s_noScanTv, s_noScanDrc;
 
+#if defined(PORT_GAME_SMG)
+// WUT exposes depth/stencil clear bits, while Cafe also accepts bit 2 to
+// clear the depth buffer's HiZ metadata alongside the depth surface.
+static constexpr uint32_t kGX2ClearFlagsHiZ = 1u << 2;
+
+static GX2ClearFlags renderDepthClearFlags() {
+    const uint32_t flags = uint32_t(GX2_CLEAR_FLAGS_DEPTH) |
+                           ((s_renderDepth.hiZPtr && s_hizMarker) ? kGX2ClearFlagsHiZ : 0u);
+    return static_cast<GX2ClearFlags>(flags);
+}
+
+static void* allocRenderHiZ(GX2DepthBuffer* tvDepth, uint32_t size, uint32_t alignment,
+                            const char** source) {
+    MEMHeapHandle heap = MEMFindContainHeap(tvDepth->surface.image);
+    if (heap && heap->tag == MEM_EXPANDED_HEAP_TAG) {
+        void* ptr = MEMAllocFromExpHeapEx(heap, size, int(alignment));
+        if (ptr) {
+            *source = "MEM1";
+            return ptr;
+        }
+    }
+    void* ptr = MEMAllocFromDefaultHeapEx(size, int(alignment));
+    if (ptr)
+        WHBLogPrintf("SMS Wii U: [hiz] MEM1/WHB frame heap unavailable; using default heap size=%u align=%u",
+                     unsigned(size), unsigned(alignment));
+    *source = "default";
+    return ptr;
+}
+#else
+static GX2ClearFlags renderDepthClearFlags() {
+    return GX2_CLEAR_FLAGS_DEPTH;
+}
+#endif
+
 static void initRenderTarget() {
     if (s_renderTried) return;
     s_renderTried = true;
@@ -4306,7 +4355,30 @@ static void initRenderTarget() {
     if (!fits) return;
     c.image = tv->surface.image;
     d.image = td->surface.image;
+#if defined(PORT_GAME_SMG)
+    if (s_hizMarker) {
+        uint32_t hiZSize = 0, hiZAlignment = 0;
+        GX2CalcDepthBufferHiZInfo(&s_renderDepth, &hiZSize, &hiZAlignment);
+        const char* source = "none";
+        s_renderDepth.hiZPtr = allocRenderHiZ(td, hiZSize, hiZAlignment, &source);
+        s_renderDepth.hiZSize = s_renderDepth.hiZPtr ? hiZSize : 0;
+        if (s_renderDepth.hiZPtr) {
+            memset(s_renderDepth.hiZPtr, 0, hiZSize);
+            DCFlushRange(s_renderDepth.hiZPtr, hiZSize);
+            GX2InitDepthBufferHiZEnable(&s_renderDepth, TRUE);
+            WHBLogPrintf("SMS Wii U: [hiz] enabled size=%u align=%u heap=%s",
+                         unsigned(hiZSize), unsigned(hiZAlignment), source);
+        } else {
+            WHBLogPrintf("SMS Wii U: [hiz] allocation failed size=%u align=%u; disabled",
+                         unsigned(hiZSize), unsigned(hiZAlignment));
+        }
+    } else {
+        s_renderDepth.hiZPtr = nullptr;
+        s_renderDepth.hiZSize = 0;
+    }
+#else
     s_renderDepth.hiZPtr = nullptr;
+#endif
     GX2InitColorBufferRegs(&s_renderColour);
     GX2InitDepthBufferRegs(&s_renderDepth);
     s_renderOwn = true;
@@ -5012,6 +5084,16 @@ void rendererInit(float) {
     // d43: track write stamps over the whole 0x10000000-0x1fffffff user range (RPX data, game arena, MEM1 copy,
     // system heap), not just the arena: display lists outside it were hashed on every call (~9 MB/frame).
     if (sdMarkerPresent("stampwide")) GXPC_SetWriteStampWindow(reinterpret_cast<void*>(uintptr_t(0x10000000u)));
+#if defined(PORT_GAME_SMG)
+    // d49 switches are read once here so shader generation, depth setup, and
+    // peek scheduling cannot observe a changing SD card during a run.
+    s_earlyZMarker = sdMarkerPresent("earlyz");
+    s_hizMarker = sdMarkerPresent("hiz");
+    s_peek2Marker = sdMarkerPresent("peek2");
+    WHBLogPrintf("SMS Wii U: [earlyz] marker=%s", s_earlyZMarker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [hiz] marker=%s", s_hizMarker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [peek2] marker=%s", s_peek2Marker ? "on" : "off");
+#endif
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2ProdMarker = sdMarkerPresent("gx2prod");
@@ -6028,7 +6110,7 @@ static void producerCopyService(void* opaque) {
     }
     if ((r.zmode >> 4) & 1)
         GX2ClearDepthStencilEx(renderDepth(), float(r.clearZ & 0xffffff) / 16777215.0f, 0,
-                               GX2_CLEAR_FLAGS_DEPTH);
+                               renderDepthClearFlags());
     if ((r.zmode >> 4) & 1 && s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderDepth()->surface, renderDepth()->surface);
     rebindTvTarget();
 }
@@ -6117,7 +6199,7 @@ void executeCopy(uint32_t ctrl) {
     }
     if ((g.bp[BP_ZMODE] >> 4) & 1)
         GX2ClearDepthStencilEx(renderDepth(), float(z & 0xffffff) / 16777215.0f, 0,
-                               GX2_CLEAR_FLAGS_DEPTH);
+                               renderDepthClearFlags());
     if ((g.bp[BP_ZMODE] >> 4) & 1 && s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderDepth()->surface, renderDepth()->surface);
     rebindTvTarget();
 }
@@ -6273,15 +6355,22 @@ static void debugPixelTrace(uint32_t draw) {
 // The depth target converts into a tiled FLOAT_R32 texture, then copies into a
 // LINEAR_ALIGNED one the CPU reads.  Asynchronous like the colour peek: the
 // first peek of a frame answers from the previous frame's snapshot and queues
-// this frame's, and later peeks in the frame reuse that snapshot.  Under Cemu
+// this frame's, and later peeks in the frame reuse that snapshot. With d49's
+// peek2 marker, only every second displayed frame queues the conversion/copy
+// and skipped frames reuse the last completed snapshot. Under Cemu
 // (whose copies never reach guest memory) and with the SD marker "nopeekz" it
 // stays the old far-plane answer.
 extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
                                                       uint32_t dstSlice);
-static uint32_t s_peekZFrame = ~0u;  // the frame whose depth snapshot is queued
+static uint32_t s_peekZFrame = ~0u;  // the frame whose depth snapshot is queued/reused
 // d45: only the first GXPeekZ of a frame issues GPU work (the snapshot copy); the others read CPU memory, so in
 // producer mode they need not drain the worker (17 lens-flare peeks a frame each waited for it).
-bool peekZNeedsSync() { return s_peekZFrame != g_displayFrames; }
+bool peekZNeedsSync() {
+#if defined(PORT_GAME_SMG)
+    if (s_peek2Marker && (g_displayFrames & 1)) return false;
+#endif
+    return s_peekZFrame != g_displayFrames;
+}
 uint32_t peekZ(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
     dlCacheExternalStateChanged();
@@ -6297,14 +6386,15 @@ uint32_t peekZ(int x, int y) {
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
         db->surface.format != GX2_SURFACE_FORMAT_FLOAT_R32 || db->surface.aa != GX2_AA_MODE1X)
         return 0xffffff;
-    static GX2Surface s_tiled, s_linear;
-    static bool s_ready2, s_queued;
+    static GX2Surface s_tiled, s_linear, s_snapshot;
+    static bool s_ready2, s_queued, s_completed;
     static uint64_t s_stamp;
     uint32_t& s_frame = s_peekZFrame;
     if (s_ready2 && (s_linear.width != db->surface.width || s_linear.height != db->surface.height)) {
         MEMFreeToDefaultHeap(s_tiled.image);
         MEMFreeToDefaultHeap(s_linear.image);
-        s_ready2 = s_queued = false;
+        MEMFreeToDefaultHeap(s_snapshot.image);
+        s_ready2 = s_queued = s_completed = false;
     }
     if (!s_ready2) {
         memset(&s_tiled, 0, sizeof(s_tiled));
@@ -6323,40 +6413,61 @@ uint32_t peekZ(int x, int y) {
         GX2CalcSurfaceSizeAndAlignment(&s_linear);
         s_tiled.image = alignedZero(s_tiled.alignment, s_tiled.imageSize);
         s_linear.image = s_tiled.image ? alignedZero(s_linear.alignment, s_linear.imageSize) : nullptr;
-        if (!s_linear.image) {
+        s_snapshot = s_linear;
+        s_snapshot.image = s_linear.image ? alignedZero(s_linear.alignment, s_linear.imageSize) : nullptr;
+        if (!s_linear.image || !s_snapshot.image) {
             if (s_tiled.image) MEMFreeToDefaultHeap(s_tiled.image);
+            if (s_linear.image) MEMFreeToDefaultHeap(s_linear.image);
+            if (s_snapshot.image) MEMFreeToDefaultHeap(s_snapshot.image);
             s_enabled = 0;
             WHBLogPrintf("SMS Wii U: GXPeekZ: out of memory, stub from now on");
             return 0xffffff;
         }
         DCFlushRange(s_tiled.image, s_tiled.imageSize);
         DCFlushRange(s_linear.image, s_linear.imageSize);
+        DCFlushRange(s_snapshot.image, s_snapshot.imageSize);
         s_ready2 = true;
     }
     if (s_frame != g_displayFrames) {
-        // First peek of this frame: the previous snapshot is a frame old (done
-        // long ago); this frame's is queued without waiting for it.
-        if (s_queued) GX2WaitTimeStamp(s_stamp);
-        GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
-        sms_wiiu_d4_event(D4_DEPTH_COPY);
-        GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
-        gpuStampSurface(GPU_EFBCOPY, db->surface, s_tiled);
-        sms_wiiu_d4_event(D4_DEPTH_COPY);
-        GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
-        gpuStampSurface(GPU_EFBCOPY, s_tiled, s_linear);
-        rebindTvTarget();
-        GX2Flush();
-        const bool had = s_queued;
-        s_stamp = GX2GetLastSubmittedTimeStamp();
-        s_queued = true;
+        const bool queue =
+#if defined(PORT_GAME_SMG)
+            !s_peek2Marker || !(g_displayFrames & 1);
+#else
+            true;
+#endif
         s_frame = g_displayFrames;
-        if (!had) return 0xffffff;
+        if (!queue) {
+            // d49: odd displayed frames reuse the last completed snapshot;
+            // never read the linear target while the even-frame copy is in flight.
+            if (!s_completed) return 0xffffff;
+        } else {
+            // The previous snapshot is complete before it is replaced by this
+            // frame's queued copy.  Its contents remain valid on skipped frames.
+            if (s_queued) {
+                GX2WaitTimeStamp(s_stamp);
+                DCInvalidateRange(s_linear.image, s_linear.imageSize);
+                memcpy(s_snapshot.image, s_linear.image, s_linear.imageSize);
+                s_completed = true;
+            }
+            GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
+            sms_wiiu_d4_event(D4_DEPTH_COPY);
+            GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
+            gpuStampSurface(GPU_EFBCOPY, db->surface, s_tiled);
+            sms_wiiu_d4_event(D4_DEPTH_COPY);
+            GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
+            gpuStampSurface(GPU_EFBCOPY, s_tiled, s_linear);
+            rebindTvTarget();
+            GX2Flush();
+            s_stamp = GX2GetLastSubmittedTimeStamp();
+            s_queued = true;
+            if (!s_completed) return 0xffffff;
+        }
     }
     uint32_t px = uint32_t(s_gameOffsetX + (float(x) + 0.5f) * s_gameScaleX);
     uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScaleY);
     if (px >= s_linear.width) px = s_linear.width - 1;
     if (py >= s_linear.height) py = s_linear.height - 1;
-    uint8_t* texel = static_cast<uint8_t*>(s_linear.image) + (size_t(py) * s_linear.pitch + px) * 4;
+    uint8_t* texel = static_cast<uint8_t*>(s_snapshot.image) + (size_t(py) * s_snapshot.pitch + px) * 4;
     sms_wiiu_d4_event(D4_READBACK);
     DCInvalidateRange(texel, 4);  // only the line read: the GPU rewrote it since
     float d;
@@ -6422,7 +6533,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetShaderModeEx(GX2_SHADER_MODE_UNIFORM_REGISTER, 64, 64, 0, 0, 184, 192);
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
-    GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH); invalidateVertexUniforms();
+    GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, renderDepthClearFlags()); invalidateVertexUniforms();
     if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderDepth()->surface, renderDepth()->surface);
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
