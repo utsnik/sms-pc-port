@@ -108,8 +108,10 @@ uint32_t g_displayFrames = 0;
 static bool s_d7NoSwap, s_d7FencePoll, s_d6Force;
 static bool s_tv720Marker;
 static bool s_nativeQuads;
+static bool s_pipe1Marker;
 extern "C" int sms_wiiu_d7_noswap(void) { return s_d7NoSwap ? 1 : 0; }
 extern "C" int sms_wiiu_d6_force(void) { return s_d6Force ? 1 : 0; }
+extern "C" int sms_wiiu_pipe1_enabled(void) { return s_pipe1Marker ? 1 : 0; }
 struct D4Segment {
     uint64_t ts;
     uint32_t frame, firstVerts, firstStages, firstBlend, firstTexmask;
@@ -808,6 +810,10 @@ static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static uint32_t s_vertexFenceDiagCount;
 static bool s_vertexArenaInvalidated;
+static uint8_t* s_pipe1DlArena[2];
+static OSTime s_pipe1DlArenaFence[2];
+static uint32_t s_pipe1DlArenaUsed[2];
+static uint32_t s_pipe1DlArenaSlot;
 static bool s_gx2ProdEnabled;
 static bool s_gx2ProdMarker;
 static bool s_gx2ProdCore2;
@@ -1100,6 +1106,8 @@ static void beginVertexArena() {
 
 static void endVertexArena() {
     s_vertexArenaFence[s_vertexArenaIndex] = GX2GetLastSubmittedTimeStamp();
+    if (s_pipe1Marker)
+        s_pipe1DlArenaFence[s_pipe1DlArenaSlot] = s_vertexArenaFence[s_vertexArenaIndex];
 }
 
 static float* allocVertices(uint32_t bytes) {
@@ -5236,10 +5244,12 @@ void rendererInit(float) {
     s_d7NoSwap = sdMarkerPresent("noswap");
     s_d7FencePoll = sdMarkerPresent("fencepoll");
     s_d6Force = sdMarkerPresent("forcepres");
+    s_pipe1Marker = sdMarkerPresent("pipe1");
     s_d8NoDraw = sdMarkerPresent("nodraw");
     s_d8NoTex = sdMarkerPresent("notex");
     WHBLogPrintf("[d8m] nodraw=%d notex=%d", int(s_d8NoDraw), int(s_d8NoTex));
     WHBLogPrintf("[d7m] noswap=%d fencepoll=%d forcepres=%d", int(s_d7NoSwap), int(s_d7FencePoll), int(s_d6Force));
+    WHBLogPrintf("[pipe1] marker=%s", s_pipe1Marker ? "on" : "off");
     WHBLogPrintf("[d3m] noscantv=%u noscandrc=%u", s_noScanTv ? 1u : 0u, s_noScanDrc ? 1u : 0u);
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
@@ -5389,6 +5399,13 @@ static uint32_t s_perfDlImmDirectVerts, s_perfDlImmDirectDraws;
 static struct { const uint8_t* verts; const uint32_t* idx; } s_dlStash;
 static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; PrimClass cls; } s_dlPending;
 
+static uint8_t*& dlArena() {
+    return s_pipe1Marker ? s_pipe1DlArena[s_pipe1DlArenaSlot] : s_dlArena;
+}
+static uint32_t& dlArenaUsed() {
+    return s_pipe1Marker ? s_pipe1DlArenaUsed[s_pipe1DlArenaSlot] : s_dlArenaUsed;
+}
+
 static void matrixDefaults(uint8_t out[9]) {
     const uint32_t ma = g.xfReg[XFR_MATIDX_A], mb = g.xfReg[XFR_MATIDX_B];
     for (int i = 0; i < 5; ++i) out[i] = uint8_t((ma >> (6 * i)) & 63);
@@ -5405,22 +5422,34 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     const uint32_t ioff = (vbytes + 255) & ~255u;
     const uint32_t total = (ioff + nidx * 4 + 255) & ~255u;  // 256-aligned: no GPU cache line spans two runs
     if (total > kDlArenaBytes / 4) return false;
-    if (!s_dlArena) {
+    if (!dlArena()) {
         const uint32_t freeBefore = sms_wiiu_heap_free();
-        s_dlArena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
-        port_log("SMS Wii U: display-list arena %p (%u bytes), system free %u -> %u\n", s_dlArena,
+        dlArena() = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
+        port_log("SMS Wii U: display-list arena %p (%u bytes), system free %u -> %u\n", dlArena(),
                  kDlArenaBytes, freeBefore, sms_wiiu_heap_free());
-        if (!s_dlArena) return false;
-        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
+        if (!dlArena()) return false;
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, dlArena(), kDlArenaBytes);
     }
-    if (s_dlArenaUsed + total > kDlArenaBytes) {
+    if (dlArenaUsed() + total > kDlArenaBytes) {
         // Every stored run goes: let the GPU finish reading them first.
-        if (!s_gx2ProdEnabled) GX2DrawDone();
-        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
-        s_dlArenaUsed = 0;
+        if (s_pipe1Marker) {
+            const uint32_t next = (s_pipe1DlArenaSlot + 1) % 2;
+            if (s_pipe1DlArenaFence[next])
+                GX2WaitTimeStamp(s_pipe1DlArenaFence[next]);
+            s_pipe1DlArenaSlot = next;
+            dlArenaUsed() = 0;
+            if (!dlArena())
+                dlArena() = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kDlArenaBytes, 256));
+            if (!dlArena()) return false;
+        } else {
+            if (!s_gx2ProdEnabled) GX2DrawDone();
+            GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, dlArena(), kDlArenaBytes);
+            dlArenaUsed() = 0;
+        }
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, dlArena(), kDlArenaBytes);
         if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
     }
-    uint8_t* base = s_dlArena + s_dlArenaUsed;
+    uint8_t* base = dlArena() + dlArenaUsed();
     for (uint32_t off = 0; off < ioff; off += 32)
         __asm__ volatile("dcbz 0,%0" : : "r"(base + off) : "memory");
     uint8_t defaults[9];
@@ -5432,10 +5461,10 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     for (uint32_t i = 0; i < nidx; ++i) ib[i] = idx[i] < n ? idx[i] : n;
     DCFlushRange(base, total);
     ref.gen = s_dlArenaGen;
-    ref.baseVertex = int32_t(s_dlArenaUsed);  // byte offset of the run's vertices
-    ref.iOff = s_dlArenaUsed + ioff;
+    ref.baseVertex = int32_t(dlArenaUsed());  // byte offset of the run's vertices
+    ref.iOff = dlArenaUsed() + ioff;
     ref.key = matrixDefaultsKey();
-    s_dlArenaUsed += total;
+    dlArenaUsed() += total;
     ++s_perfDlUploads;
     return true;
 }
@@ -5495,7 +5524,7 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& c
     // The cache's own run record: this backend keeps its stored form there.
     ArenaRef& ref = const_cast<ArenaRef&>(cref);
     const bool stored = ref.gen == s_dlArenaGen;
-    const uint32_t* idx = stored ? reinterpret_cast<const uint32_t*>(s_dlArena + ref.iOff)
+    const uint32_t* idx = stored ? reinterpret_cast<const uint32_t*>(dlArena() + ref.iOff)
                                  : (s_dlStash.verts == verts ? s_dlStash.idx : nullptr);
     if (!idx) return;  // not reached: arenaUpload always precedes an unstored run
     const bool nativeQuad = cls == PRIM_QUADS || cls == PRIM_QUAD_STRIP;
@@ -5801,7 +5830,7 @@ void flushBatch() {
     if (s_dlPending.ref) {
         const auto pend = s_dlPending;
         s_dlPending = {};
-        const uint32_t* storedIdx = reinterpret_cast<const uint32_t*>(s_dlArena + pend.ref->iOff);
+        const uint32_t* storedIdx = reinterpret_cast<const uint32_t*>(dlArena() + pend.ref->iOff);
         if (gpuPath && vertex->stride == kRawVertexStride) {
             noteDlArenaDirect(pend.n, 1);
             bool listReady = s_gx2DlEnabled && gx2DlOpenForDraw();
@@ -5822,13 +5851,13 @@ void flushBatch() {
             sms_wiiu_d4_draw(pend.nidx, tevKey.stages, g.bp[BP_CMODE0], tevTextureMask(tevKey));
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
-                                   s_dlArena + pend.ref->baseVertex);
+                                   dlArena() + pend.ref->baseVertex);
                 if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
                 ++s_gx2DlOpenDraws;
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
-                                   s_dlArena + pend.ref->baseVertex);
+                                   dlArena() + pend.ref->baseVertex);
                 if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
             }

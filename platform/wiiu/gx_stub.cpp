@@ -63,6 +63,8 @@ extern "C" int sms_wiiu_gx2_renderer_init(void);
 extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" const GX2Surface* sms_wiiu_render_surface(void);
+extern "C" int sms_wiiu_pipe1_enabled(void);
+extern "C" uint32_t sms_wiiu_vsync_event_count(void);
 extern "C" void sms_wiiu_dvd_pump(void);
 extern "C" void gxs_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
 extern "C" void* gxs_default_thread(uint32_t core) __asm__("OSGetDefaultThread");
@@ -460,7 +462,10 @@ void present_diagnostics()
 	take_shots(p);
 	if (!(p == 2 || p == 120 || p == 1800 || p == 3600 || p % 18000 == 0))
 		return;
-	GX2DrawDone(); /* the reads below assume a finished frame */
+	if (sms_wiiu_pipe1_enabled())
+		GX2WaitTimeStamp(GX2GetLastSubmittedTimeStamp());
+	else
+		GX2DrawDone(); /* the reads below assume a finished frame */
 	sms_wiiu_d4_submit_at("done", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 	sms_wiiu_d4_event(D4_READBACK);
 	uint32_t swaps = 0, flips = 0;
@@ -600,6 +605,29 @@ static uint32_t s_presentFrames;
  * safe. */
 extern "C" int sms_wiiu_d7_noswap(void);
 extern "C" int sms_wiiu_d6_force(void);
+static uint64_t s_pipe1FrameFence[2];
+static uint32_t s_pipe1Frames;
+static OSTime s_pipe1GpuWait, s_pipe1FlipWait, s_pipe1VsyncWait;
+static uint32_t s_pipe1GpuWaits, s_pipe1FlipWaits, s_pipe1VsyncWaits;
+
+static void pipe1_wait_previous_frame(void)
+{
+	if (!sms_wiiu_pipe1_enabled() || s_pipe1Frames < 2)
+		return;
+	const uint64_t fence = s_pipe1FrameFence[(s_pipe1Frames - 2) & 1];
+	if (!fence)
+		return;
+	const OSTime t0 = wut_OSGetTime_stub();
+	const BOOL rc = GX2WaitTimeStamp(fence);
+	const OSTime elapsed = wut_OSGetTime_stub() - t0;
+	s_pipe1GpuWait += elapsed;
+	++s_pipe1GpuWaits;
+	if (!rc)
+		port_log("[pipe1] GPU fence wait failed fence=%llu retired=%llu submitted=%llu",
+		         (unsigned long long)fence, (unsigned long long)GX2GetRetiredTimeStamp(),
+		         (unsigned long long)GX2GetLastSubmittedTimeStamp());
+}
+
 static void present_finish_pipelined(void)
 {
 	static uint32_t s_d5sCalls;
@@ -632,6 +660,10 @@ static void present_finish_pipelined(void)
 	}
 	if (d5s) afterFlush = submitted;
 	sms_wiiu_d4_submit_at("flush", 's', __LINE__, submitted);
+	if (sms_wiiu_pipe1_enabled()) {
+		s_pipe1FrameFence[s_pipe1Frames & 1] = submitted;
+		++s_pipe1Frames;
+	}
 	if (d5s) {
 		WHBLogPrintf("[d5s] before=%llu afterSwap=%llu afterFlush=%llu",
 		             (unsigned long long)before, (unsigned long long)afterSwap,
@@ -647,17 +679,28 @@ static void present_finish_pipelined(void)
 }
 static void present_begin_pipelined(void)
 {
+	pipe1_wait_previous_frame();
+	const OSTime flipStart = wut_OSGetTime_stub();
+	const uint32_t vsyncStart = sms_wiiu_vsync_event_count();
+	bool waitedForFlip = false;
 	for (uint32_t wait = 0;; ++wait) {
 		uint32_t swaps = 0, flips = 0;
 		OSTime lastFlip = 0, lastVsync = 0;
 		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
 		if (flips + 1 >= swaps)
 			break;
+		waitedForFlip = true;
 		if (wait >= 10) {
 			port_log("[present] wait for swap timed out (swaps=%u flips=%u)\n", unsigned(swaps), unsigned(flips));
 			break;
 		}
 		GX2WaitForVsync();
+	}
+	if (sms_wiiu_pipe1_enabled() && waitedForFlip) {
+		s_pipe1FlipWait += wut_OSGetTime_stub() - flipStart;
+		++s_pipe1FlipWaits;
+		s_pipe1VsyncWait += OSTime(sms_wiiu_vsync_event_count() - vsyncStart);
+		++s_pipe1VsyncWaits;
 	}
 	GX2SetContextState(WHBGfxGetTVContextState());
 	sms_wiiu_d4_event(D4_CONTEXT);
@@ -889,7 +932,16 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		const int64_t tick100us = (248625000 / 4) / 10000;
 		port_log("SMS Wii U: [present] per-frame x0.1ms finish(GPU drain)=%u beginRender(vsync)=%u\n",
 		         unsigned(s_presentFinish / 30 / tick100us), unsigned(s_presentBegin / 30 / tick100us));
+		if (sms_wiiu_pipe1_enabled())
+			port_log("SMS Wii U: [pipe1] per-frame x0.1ms gpuWait=%u flipWait=%u vsyncWait=%u gpuWaits=%u flipWaits=%u vsyncWaits=%u\n",
+			         unsigned(s_pipe1GpuWait / 30 / tick100us),
+			         unsigned(s_pipe1FlipWait / 30 / tick100us),
+			         unsigned(s_pipe1VsyncWait / 30 / tick100us),
+			         unsigned(s_pipe1GpuWaits), unsigned(s_pipe1FlipWaits),
+			         unsigned(s_pipe1VsyncWaits));
 		s_presentFinish = s_presentBegin = 0;
+		s_pipe1GpuWait = s_pipe1FlipWait = s_pipe1VsyncWait = 0;
+		s_pipe1GpuWaits = s_pipe1FlipWaits = s_pipe1VsyncWaits = 0;
 		s_presentFrames = 0;
 	}
 	sms_wiiu_gx2_texture_pack_pump();
