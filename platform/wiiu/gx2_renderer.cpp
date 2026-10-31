@@ -285,12 +285,14 @@ struct TevKey {
     uint32_t ztex2;    // BP_ZTEX2: format and GX_ZT_* operation
     uint32_t earlyZ;   // d49: KILL_ENABLE only for shaders that emit KILL
 #endif
+    uint32_t uniformMode; // 0: register file, 1: kcache/uniform blocks
 };
 
 struct TevShader {
     TevKey key;
     GX2PixelShader pixel;
     GX2UniformVar uniform;
+    GX2UniformBlock uniformBlocks[1];
     GX2SamplerVar samplers[8];
     void* psProgram;
     uint32_t textureMask;
@@ -309,8 +311,9 @@ struct VertexKey {
     uint32_t dualTex;
     uint32_t postTex[8];
     uint32_t projectionOrtho;
+    uint32_t uniformMode;       // keeps register/block shader caches distinct
 };
-static constexpr uint32_t kVertexKeyLayoutVersion = 1;
+static constexpr uint32_t kVertexKeyLayoutVersion = 2;
 
 /*
  * GPU-transform ABI.  The raw stream deliberately uses only formats already
@@ -351,6 +354,7 @@ struct VertexProgram {
     GX2FetchShader fetch;
     GX2AttribStream attrs[RAW_ATTR_COUNT];
     GX2AttribVar attribVars[RAW_ATTR_COUNT];
+    GX2UniformBlock uniformBlocks[2];
     void* vsProgram;
     void* fetchProgram;
     uint32_t stride;
@@ -584,6 +588,8 @@ static bool s_noVtxLiveCache, s_noBindCache, s_noXfUniformCache;
 static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets, 5 = 3 plus GX2DrawDone per draw
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 static bool s_gpuDiag;  // SD marker "perfdiag": GPU timestamps and command-stream counters
+static bool s_uniblock; // SD marker "uniblock": generated shaders use uniform blocks
+static bool s_shaderModeBlock;
 
 struct CmdCounters {
     uint32_t vsUniDw, psUniDw, vsUniCalls, psUniCalls;
@@ -594,6 +600,9 @@ struct CmdCounters {
 // Each core writes only its own slot, and the report reads after kWaitPresent.
 static CmdCounters s_cmdByCore[2];
 static inline CmdCounters& cmdCounters() { return s_cmdByCore[OSGetCoreId() == 1 ? 0 : 1]; }
+
+enum UniformRingBlock { kUniformXfBlock, kUniformLiveBlock, kUniformTevBlock, kUniformBlockCount };
+static void* uniformBlockCopy(UniformRingBlock block, const void* data, uint32_t size);
 
 // A GX2 call made while a display list is open is counted when recorded,
 // not again when that list is replayed. dlCalls/dlBytes count actual calls.
@@ -606,6 +615,16 @@ static inline CmdCounters& cmdCounters() { return s_cmdByCore[OSGetCoreId() == 1
     const uint32_t cmdWords = (count); \
     if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.psUniCalls; cmd.psUniDw += cmdWords; } \
     ::GX2SetPixelUniformReg(offset, cmdWords, data); \
+} while (0)
+#define GX2SetVertexUniformBlock(location, size, data) do { \
+    const uint32_t cmdBytes = (size); \
+    if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.vsUniCalls; cmd.vsUniDw += (cmdBytes + 3) / 4; } \
+    ::GX2SetVertexUniformBlock(location, cmdBytes, data); \
+} while (0)
+#define GX2SetPixelUniformBlock(location, size, data) do { \
+    const uint32_t cmdBytes = (size); \
+    if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.psUniCalls; cmd.psUniDw += (cmdBytes + 3) / 4; } \
+    ::GX2SetPixelUniformBlock(location, cmdBytes, data); \
 } while (0)
 #define GX2SetVertexShader(...) do { if (s_gpuDiag) ++cmdCounters().shaderSw; ::GX2SetVertexShader(__VA_ARGS__); } while (0)
 #define GX2SetPixelShader(...) do { if (s_gpuDiag) ++cmdCounters().shaderSw; ::GX2SetPixelShader(__VA_ARGS__); } while (0)
@@ -713,6 +732,7 @@ static void disablePerDrawCaches() {
  */
 static void uploadXfUniformRanges() {
     if (!s_xfMemoryDirty) return;
+    bool changedAny = !s_xfUniformValid;
     if (!s_xfUniformValid) memset(s_xfShadow, 0xff, sizeof(s_xfShadow));
     // Only the words writeXF changed since the last upload need comparing;
     // the whole XF memory was scanned on most draws.
@@ -736,13 +756,14 @@ static void uploadXfUniformRanges() {
             if (!changed) {
                 if (first != ~0u) {
                     const uint32_t count = last - first + 1;
-                    GX2SetVertexUniformReg(first * 4, count * 4, &s_xfUniform[first * 4]);
+                    if (!s_uniblock) GX2SetVertexUniformReg(first * 4, count * 4, &s_xfUniform[first * 4]);
                     ++s_xfUploadCalls;
                     s_xfUploadRegs += count;
                     first = ~0u;
                 }
                 continue;
             }
+            changedAny = true;
             if (first == ~0u) first = dst;
             last = dst;
             if (segment.source == 0x600 && (src & 15) == 0) {
@@ -766,10 +787,14 @@ static void uploadXfUniformRanges() {
         }
         if (first != ~0u) {
             const uint32_t count = last - first + 1;
-            GX2SetVertexUniformReg(first * 4, count * 4, &s_xfUniform[first * 4]);
+            if (!s_uniblock) GX2SetVertexUniformReg(first * 4, count * 4, &s_xfUniform[first * 4]);
             ++s_xfUploadCalls;
             s_xfUploadRegs += count;
         }
+    }
+    if (s_uniblock && changedAny) {
+        void* block = uniformBlockCopy(kUniformXfBlock, s_xfUniform, sizeof(s_xfUniform));
+        if (block) GX2SetVertexUniformBlock(0, sizeof(s_xfUniform), block);
     }
     s_xfUniformValid = true;
     s_xfMemoryDirty = false;
@@ -810,6 +835,15 @@ static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static uint32_t s_vertexFenceDiagCount;
 static bool s_vertexArenaInvalidated;
+static constexpr uint32_t kUniformRingBytes = 16u << 20;
+struct UniformRingCache {
+    uint8_t* data;
+    uint32_t size;
+    bool valid;
+};
+static uint8_t* s_uniformRing[kVertexArenas];
+static uint32_t s_uniformRingUsed[kVertexArenas];
+static UniformRingCache s_uniformRingCache[kVertexArenas][kUniformBlockCount];
 static uint8_t* s_pipe1DlArena[2];
 static OSTime s_pipe1DlArenaFence[2];
 static uint32_t s_pipe1DlArenaUsed[2];
@@ -1047,6 +1081,8 @@ static void deferFree(void* p) {
 static void beginVertexArena() {
     s_vertexArenaIndex = (s_vertexArenaIndex + 1) % kVertexArenas;
     s_vertexArenaUsed = 0;
+    s_uniformRingUsed[s_vertexArenaIndex] = 0;
+    memset(s_uniformRingCache[s_vertexArenaIndex], 0, sizeof(s_uniformRingCache[s_vertexArenaIndex]));
     s_vertexArenaInvalidated = false;
     if (s_vertexArenaFence[s_vertexArenaIndex]) {
         const OSTime t0 = OSGetTime();
@@ -1127,6 +1163,35 @@ static float* allocVertices(uint32_t bytes) {
     float* p = reinterpret_cast<float*>(arena + s_vertexArenaUsed);
     s_vertexArenaUsed = (s_vertexArenaUsed + bytes + 255) & ~255u;
     return p;
+}
+
+static void* uniformBlockCopy(UniformRingBlock block, const void* data, uint32_t size) {
+    UniformRingCache& cache = s_uniformRingCache[s_vertexArenaIndex][block];
+    if (cache.valid && cache.size == size && !memcmp(cache.data, data, size)) return cache.data;
+    uint8_t*& ring = s_uniformRing[s_vertexArenaIndex];
+    if (!ring) ring = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kUniformRingBytes, 256));
+    if (!ring) return nullptr;
+    const uint32_t alloc = (size + 255) & ~255u;
+    if (s_uniformRingUsed[s_vertexArenaIndex] + alloc > kUniformRingBytes) {
+        // The ring is frame-owned.  In producer mode waiting here would deadlock
+        // the worker, so leave the draw to the caller's normal allocation fallback.
+        return nullptr;
+    }
+    uint8_t* dst = ring + s_uniformRingUsed[s_vertexArenaIndex];
+    s_uniformRingUsed[s_vertexArenaIndex] += alloc;
+    memset(dst, 0, alloc);
+    memcpy(dst, data, size);
+    DCFlushRange(dst, alloc);
+    GX2Invalidate(GX2_INVALIDATE_MODE_UNIFORM_BLOCK, dst, alloc);
+    cache = {dst, size, true};
+    return dst;
+}
+
+static void setGeneratedShaderMode(bool block) {
+    if (!s_uniblock || s_shaderModeBlock == block) return;
+    GX2SetShaderModeEx(block ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER,
+                       64, 64, 0, 0, 184, 192);
+    s_shaderModeBlock = block;
 }
 
 static void destroyShader(FixedShader& shader) {
@@ -1279,6 +1344,7 @@ static uint32_t tevNumInd(const TevKey& k) {
 static TevKey currentTevKey() {
     TevKey k;
     memset(&k, 0, sizeof(k));
+    k.uniformMode = s_uniblock ? 1u : 0u;
     k.genmode = g.bp[BP_GENMODE] & ((15u << 10) | (7u << 16));
     k.stages = ((g.bp[BP_GENMODE] >> 10) & 15) + 1;
     for (uint32_t s = 0; s < k.stages; ++s) {
@@ -1308,6 +1374,7 @@ static VertexKey currentVertexKey(bool tevOutput, int fixedCoord, bool fixedText
     VertexKey k;
     memset(&k, 0, sizeof(k));
     k.layoutVersion = kVertexKeyLayoutVersion;
+    k.uniformMode = s_uniblock ? 1u : 0u;
     k.outputMode = tevOutput ? 0 : 1;
     k.fixedCoord = uint32_t(fixedCoord < 0 ? 0 : fixedCoord);
     k.fixedTextured = fixedTextured ? 1 : 0;
@@ -2029,6 +2096,124 @@ static bool vertexBuildAluClauses(std::vector<uint64_t>& alu,
     return !clauses.empty();
 }
 
+struct UniformClauseWindow {
+    uint32_t binding, address, mode;
+    bool used, indexed;
+};
+struct UniformClauseLayout {
+    UniformClauseWindow window[2];
+    bool extended;
+};
+
+// A register-mode Cn source names a vec4 directly.  In block mode Latte's
+// kcache selector names a byte offset inside one of two 16-byte cache lines;
+// the channel field remains the x/y/z/w selector.  Keep the conversion here,
+// next to the clause builder, so the generator's Cn notation stays readable.
+static bool blockConstantInfo(uint32_t selector, bool vertex, uint32_t& binding, uint32_t& line) {
+    if (selector < ALU_SRC_CONST_FILE_BASE || selector >= ALU_SRC_CONST_FILE_BASE + 256) return false;
+    uint32_t reg = selector - ALU_SRC_CONST_FILE_BASE;
+    if (vertex) {
+        binding = reg >= kXfUniformRegs ? 1u : 0u;
+        if (binding) reg -= kXfUniformRegs;
+    } else binding = 0;
+    line = reg;
+    return true;
+}
+
+static bool blockWindowContains(const UniformClauseWindow& w, uint32_t line) {
+    return w.used && (w.mode == 3 || line == w.address || (w.mode == 2 && line == w.address + 1));
+}
+
+static bool blockClauseAdd(UniformClauseLayout& layout, uint32_t binding, uint32_t line, bool indexed) {
+    for (UniformClauseWindow& w : layout.window) {
+        if (!w.used || w.binding != binding) continue;
+        if (indexed) {
+            if (w.mode != 3) w.address = std::min(w.address, line);
+            w.mode = 3;
+            w.indexed = true;
+            layout.extended = true;
+            return true;
+        }
+        if (blockWindowContains(w, line)) return true;
+        if (w.mode == 1 && line == w.address + 1) { w.mode = 2; return true; }
+        if (w.mode == 1 && line + 1 == w.address) { w.address = line; w.mode = 2; return true; }
+    }
+    for (UniformClauseWindow& w : layout.window) {
+        if (w.used) continue;
+        w = {binding, line, indexed ? 3u : 1u, true, indexed};
+        layout.extended = layout.extended || indexed;
+        return true;
+    }
+    return false;
+}
+
+static bool blockClauseLayout(const std::vector<uint64_t>& alu, size_t offset, size_t count,
+                              bool vertex, UniformClauseLayout& layout) {
+    memset(&layout, 0, sizeof(layout));
+    for (size_t i = 0; i < count; ++i) {
+        const uint32_t word0 = __builtin_bswap32(uint32_t(alu[offset + i] >> 32));
+        const uint32_t word1 = __builtin_bswap32(uint32_t(alu[offset + i]));
+        const uint32_t selectors[3] = {word0 & 0x1ff, (word0 >> 13) & 0x1ff, word1 & 0x1ff};
+        const bool rel[3] = {(word0 >> 9) & 1, (word0 >> 22) & 1,
+                             ((word1 >> 15) & 7) != 0 && ((word1 >> 9) & 1)};
+        const bool hasThird = ((word1 >> 15) & 7) != 0;
+        for (uint32_t src = 0; src < 3; ++src) {
+            if (src == 2 && !hasThird) continue;
+            uint32_t binding, line;
+            if (blockConstantInfo(selectors[src], vertex, binding, line) &&
+                !blockClauseAdd(layout, binding, line, rel[src])) return false;
+        }
+    }
+    return true;
+}
+
+static bool blockRewriteSource(uint32_t& word, uint32_t selector, uint32_t shift, bool vertex,
+                               const UniformClauseLayout& layout) {
+    uint32_t binding, line;
+    if (!blockConstantInfo(selector, vertex, binding, line)) return true;
+    const UniformClauseWindow* found = nullptr;
+    for (const UniformClauseWindow& w : layout.window)
+        if (w.binding == binding && blockWindowContains(w, line)) { found = &w; break; }
+    if (!found) return false;
+    const int32_t delta = int32_t(line) - int32_t(found->address);
+    const int32_t rewritten = 0x80 + delta * 16 + (found == &layout.window[1] ? 0x20 : 0);
+    if (rewritten < 0 || rewritten > 0x1ff) return false;
+    word = (word & ~(0x1ffu << shift)) | (uint32_t(rewritten) << shift);
+    return true;
+}
+
+static bool blockRewriteClause(std::vector<uint64_t>& alu, size_t offset, size_t count,
+                               bool vertex, const UniformClauseLayout& layout) {
+    for (size_t i = 0; i < count; ++i) {
+        uint32_t word0 = __builtin_bswap32(uint32_t(alu[offset + i] >> 32));
+        uint32_t word1 = __builtin_bswap32(uint32_t(alu[offset + i]));
+        const bool hasThird = ((word1 >> 15) & 7) != 0;
+        if (!blockRewriteSource(word0, word0 & 0x1ff, 0, vertex, layout) ||
+            !blockRewriteSource(word0, (word0 >> 13) & 0x1ff, 13, vertex, layout) ||
+            (hasThird && !blockRewriteSource(word1, word1 & 0x1ff, 0, vertex, layout))) return false;
+        alu[offset + i] = to_QWORD(to_LE(word0), to_LE(word1));
+    }
+    return true;
+}
+
+static uint64_t blockAluHeader(uint32_t addr, uint32_t count, const UniformClauseLayout& layout) {
+    const uint32_t bank0 = layout.window[0].used ? layout.window[0].binding : 0;
+    const uint32_t bank1 = layout.window[1].used ? layout.window[1].binding : 0;
+    const uint32_t mode0 = layout.window[0].used ? layout.window[0].mode : 0;
+    const uint32_t mode1 = layout.window[1].used ? layout.window[1].mode : 0;
+    const uint32_t addr0 = layout.window[0].used ? layout.window[0].address : 0;
+    const uint32_t addr1 = layout.window[1].used ? layout.window[1].address : 0;
+    return to_QWORD(CF_ALU_WORD0(addr, bank0, bank1, mode0),
+                    CF_ALU_WORD1(mode1, addr0, addr1, count - 1, 0, CF_INST_ALU));
+}
+
+static uint64_t blockAluExtended(const UniformClauseLayout& layout) {
+    const uint32_t index0 = layout.window[0].indexed ? 1u : 0u;
+    const uint32_t index1 = layout.window[1].indexed ? 1u : 0u;
+    return to_QWORD(CF_ALU_EXT_WORD0(index0, index1, 0, 0, 0, 0, 0),
+                    CF_ALU_EXT_WORD1(0, 0, 0, CF_INST_ALU_EXT));
+}
+
 static bool initVertexProgram(VertexProgram& shader) {
     s_vertexRejectReason = "unknown";
     if (!vertexKeySupported(shader.key)) {
@@ -2041,7 +2226,7 @@ static bool initVertexProgram(VertexProgram& shader) {
     // Only the uniform registers a program names statically are valid for
     // it, so matrices reached through AR read stale values otherwise.  Name
     // every XF vector under Cemu or when explicitly enabled for hardware.
-    if (runningUnderCemu() || s_vertexNameXf) {
+    if (!s_uniblock && (runningUnderCemu() || s_vertexNameXf)) {
         for (uint32_t r = 0; r < kXfUniformRegs; ++r)
             vertexEmit(alu, {ALU_MOV(_R(57), _x, _GX2_C(r), _x)});
     } else if (s_vertexOneXf) {
@@ -2283,14 +2468,38 @@ static bool initVertexProgram(VertexProgram& shader) {
         exports.push_back(EXP(PARAM(8), _R(29), _x, _y, _z, _w) NO_BARRIER);
         exports.push_back(EXP_DONE(PARAM(9), _R(30), _x, _y, _z, _w) END_OF_PROGRAM);
     }
-    const size_t cfCount = 1 + clauses + exports.size();
+    std::vector<UniformClauseLayout> blockLayouts(clauses);
+    size_t blockExtra = 0;
+    if (s_uniblock) {
+        for (size_t clause = 0; clause < clauses; ++clause) {
+            if (!blockClauseLayout(alu, aluClauses[clause].offset, aluClauses[clause].count, true,
+                                   blockLayouts[clause])) {
+                s_vertexRejectReason = "uniform-block-kcache-window";
+                return false;
+            }
+            blockExtra += blockLayouts[clause].extended ? 1 : 0;
+        }
+    }
+    const size_t cfCount = 1 + clauses + blockExtra + exports.size();
     const size_t aluOffset = (cfCount + 1) & ~size_t(1);
     std::vector<uint64_t> program(aluOffset, 0);
     program[0] = CALL_FS NO_BARRIER;
-    for (size_t clause = 0; clause < clauses; ++clause)
-        program[1 + clause] = ALU(aluOffset + aluClauses[clause].offset,
-                                  aluClauses[clause].count);
-    for (size_t i = 0; i < exports.size(); ++i) program[1 + clauses + i] = exports[i];
+    size_t cf = 1;
+    for (size_t clause = 0; clause < clauses; ++clause) {
+        if (s_uniblock) {
+            if (!blockRewriteClause(alu, aluClauses[clause].offset, aluClauses[clause].count,
+                                    true, blockLayouts[clause])) {
+                s_vertexRejectReason = "uniform-block-kcache-source";
+                return false;
+            }
+            if (blockLayouts[clause].extended) program[cf++] = blockAluExtended(blockLayouts[clause]);
+            program[cf++] = blockAluHeader(aluOffset + aluClauses[clause].offset,
+                                           aluClauses[clause].count, blockLayouts[clause]);
+        } else {
+            program[cf++] = ALU(aluOffset + aluClauses[clause].offset, aluClauses[clause].count);
+        }
+    }
+    for (size_t i = 0; i < exports.size(); ++i) program[cf++] = exports[i];
     program.insert(program.end(), alu.begin(), alu.end());
     const size_t bytes = program.size() * sizeof(uint64_t);
     shader.vsProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, bytes);
@@ -2317,7 +2526,13 @@ static bool initVertexProgram(VertexProgram& shader) {
     shader.vertex.regs.vgt_hos_reuse_depth = 16;
     shader.vertex.size = uint32_t(bytes);
     shader.vertex.program = shader.vsProgram;
-    shader.vertex.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
+    shader.vertex.mode = s_uniblock ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER;
+    if (s_uniblock) {
+        shader.uniformBlocks[0] = {"xf_constants", 0, kXfUniformRegs * 16};
+        shader.uniformBlocks[1] = {"live_constants", 1, kVtxLiveRegs * 16};
+        shader.vertex.uniformBlockCount = 2;
+        shader.vertex.uniformBlocks = shader.uniformBlocks;
+    }
     shader.vertex.attribVarCount = RAW_ATTR_COUNT;
     shader.vertex.attribVars = shader.attribVars;
 
@@ -3035,7 +3250,15 @@ static bool tevAluClauses(std::vector<uint64_t>& program, size_t& cf, size_t off
         size_t n = count - at < 128 ? count - at : 128;
         while (n > 0 && at + n < count && !(program[offset + at + n - 1] & to_QWORD(to_LE(1ull << 31), 0))) --n;
         if (n == 0) return false;
-        program[cf++] = ALU(offset + at, n);
+        if (s_uniblock) {
+            UniformClauseLayout layout;
+            if (!blockClauseLayout(program, offset + at, n, false, layout) ||
+                !blockRewriteClause(program, offset + at, n, false, layout)) return false;
+            if (layout.extended) program[cf++] = blockAluExtended(layout);
+            program[cf++] = blockAluHeader(offset + at, n, layout);
+        } else {
+            program[cf++] = ALU(offset + at, n);
+        }
         at += n;
     }
     return true;
@@ -3050,8 +3273,8 @@ static void tevTexClauses(std::vector<uint64_t>& program, size_t& cf, size_t off
 
 static bool initTevPixel(TevShader& shader) {
     s_tevGroups = 0;
-    std::vector<uint64_t> program(40, 0);
-    const size_t kCfSlots = 40;
+    const size_t kCfSlots = 128;
+    std::vector<uint64_t> program(kCfSlots, 0);
     const TevKey& key = shader.key;
     const uint32_t numInd = tevNumInd(key);
 #if defined(PORT_GAME_SMG)
@@ -3350,7 +3573,15 @@ static bool initTevPixel(TevShader& shader) {
 #else
     if (cf + 2 > kCfSlots) return false;
 #endif
-    program[cf++] = ALU(compareOffset, compareCount);
+    if (s_uniblock) {
+        UniformClauseLayout layout;
+        if (!blockClauseLayout(program, compareOffset, compareCount, false, layout) ||
+            !blockRewriteClause(program, compareOffset, compareCount, false, layout)) return false;
+        if (layout.extended) program[cf++] = blockAluExtended(layout);
+        program[cf++] = blockAluHeader(compareOffset, compareCount, layout);
+    } else {
+        program[cf++] = ALU(compareOffset, compareCount);
+    }
 #if defined(PORT_GAME_SMG)
     if (ztexExport) program[cf++] = EXP(PIX_Z, _R(ra.t[0]), _x, _0, _0, _0);
 #endif
@@ -3408,7 +3639,12 @@ static bool initTevPixel(TevShader& shader) {
 #endif
     shader.pixel.size = uint32_t(programSize);
     shader.pixel.program = shader.psProgram;
-    shader.pixel.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
+    shader.pixel.mode = s_uniblock ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER;
+    if (s_uniblock) {
+        shader.uniformBlocks[0] = {"tev_constants", 0, kTevUniforms * 16};
+        shader.pixel.uniformBlockCount = 1;
+        shader.pixel.uniformBlocks = shader.uniformBlocks;
+    }
     shader.uniform = {"tev_params", GX2_SHADER_VAR_TYPE_FLOAT4, kTevUniforms, 0, -1};
     shader.pixel.uniformVars = &shader.uniform;
     shader.pixel.uniformVarCount = 1;
@@ -3583,7 +3819,12 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     // Only the changed vectors, in coalesced runs (a full upload was 47
     // registers per draw; most of them are constants).
     float* const s_tevPixelShadow = s_tevPixelShadowPtr();
-    if (!s_tevPixelValid && s_padUniforms == 4) {
+    if (s_uniblock) {
+        void* block = uniformBlockCopy(kUniformTevBlock, params, sizeof(params));
+        if (block) GX2SetPixelUniformBlock(0, sizeof(params), block);
+        memcpy(s_tevPixelShadow, params, sizeof(params));
+        s_tevPixelValid = true;
+    } else if (!s_tevPixelValid && s_padUniforms == 4) {
         // Shot A/B mode 4: a full upload in 4-vector packets.
         for (uint32_t r = 0; r < kTevUniforms; r += 4)
             GX2SetPixelUniformReg(4 * r, 4 * std::min<uint32_t>(4, kTevUniforms - r), &params[4 * r]);
@@ -3606,8 +3847,8 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
     }  // !sameInputs
     // C128-C174 are read by no shader: the same 47 vectors a full upload
     // sends, so mode 2 matches its command volume without changing any input.
-    if (s_padUniforms == 2) GX2SetPixelUniformReg(4 * 128, kTevUniforms * 4, s_tevPixelShadowPtr());
-    if (s_padUniforms == 3 || s_padUniforms == 5)
+    if (!s_uniblock && s_padUniforms == 2) GX2SetPixelUniformReg(4 * 128, kTevUniforms * 4, s_tevPixelShadowPtr());
+    if (!s_uniblock && (s_padUniforms == 3 || s_padUniforms == 5))
         for (uint32_t r = 0; r < kTevUniforms; ++r) GX2SetPixelUniformReg(4 * (128 + r), 4, s_tevPixelShadowPtr() + 4 * r);
     for (uint32_t map = 0; map < 8; ++map) {
         if (!(shader.textureMask & (1u << map)) || !textures[map]) continue;
@@ -4968,7 +5209,12 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
     if (s_vtxLiveValid && !memcmp(s_vtxLive, s_vtxLiveShadow, sizeof(s_vtxLiveShadow))) return;
     memcpy(s_vtxLiveShadow, s_vtxLive, sizeof(s_vtxLiveShadow));
     s_vtxLiveValid = true;
-    GX2SetVertexUniformReg(kVtxLiveBase * 4, kVtxLiveRegs * 4, s_vtxLive);
+    if (s_uniblock) {
+        void* block = uniformBlockCopy(kUniformLiveBlock, s_vtxLive, sizeof(s_vtxLive));
+        if (block) GX2SetVertexUniformBlock(1, sizeof(s_vtxLive), block);
+    } else {
+        GX2SetVertexUniformReg(kVtxLiveBase * 4, kVtxLiveRegs * 4, s_vtxLive);
+    }
 }
 
 static void transformTev(const HostVertex& in, float* out, const TevKey& key, TextureEntry* const* textures) {
@@ -5234,6 +5480,8 @@ void rendererInit(float) {
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    s_uniblock = sdMarkerPresent("uniblock");
+    WHBLogPrintf("SMS Wii U: [uniblock] marker=%s", s_uniblock ? "on" : "off");
     // Compact packed vertices are the default; the marker keeps a raw A/B path.
     s_compactVx = !sdMarkerPresent("nocompactvx");
     if (!s_compactVx)
@@ -5713,6 +5961,7 @@ static void prepareDrawState(const TevKey& tevKey, TevShader* tevShader, FixedSh
                              TextureEntry* const* tevTextures, TextureEntry* texture, VertexProgram* vertex,
                              bool gpuPath) {
     OSTime t = g_perfStages ? OSGetTime() : 0;
+    setGeneratedShaderMode(s_uniblock && gpuPath && tevShader != nullptr);
     applyState();
     t = stageLap(s_stState, t);
     if (tevShader) setTevShader(*tevShader, tevTextures, gpuPath ? vertex : nullptr);
@@ -6710,6 +6959,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     // (Cemu does not enforce it).  64 + 184 keeps the default 248 total; the
     // TEV pixel shaders need 44.  Set inside the TV context so it is shadowed.
     GX2SetShaderModeEx(GX2_SHADER_MODE_UNIFORM_REGISTER, 64, 64, 0, 0, 184, 192);
+    s_shaderModeBlock = false;
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     GX2ClearDepthStencilEx(renderDepth(), 1.0f, 0, renderDepthClearFlags()); invalidateVertexUniforms();

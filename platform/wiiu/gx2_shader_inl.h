@@ -24,6 +24,11 @@
 #define CF_ALU_WORD1(kcacheMode1, kcacheAddr0, kcacheAddr1, count, altConst, inst) \
     to_LE(kcacheMode1 | (kcacheAddr0 << 2) | (kcacheAddr1 << 10) | \
           (count << 18) | (altConst << 25) | (inst << 26) | (1 << 31))
+#define CF_ALU_EXT_WORD0(index0, index1, index2, index3, bank2, bank3, mode2) \
+    to_LE((index0 << 4) | (index1 << 6) | (index2 << 8) | (index3 << 10) | \
+          (bank2 << 22) | (bank3 << 26) | (mode2 << 30))
+#define CF_ALU_EXT_WORD1(mode3, addr2, addr3, inst) \
+    to_LE(mode3 | (addr2 << 2) | (addr3 << 10) | (inst << 26) | (1 << 31))
 #define CF_EXP_WORD0(dstReg_and_type, srcReg, srcRel, indexGpr, elemSize) \
     to_LE(dstReg_and_type | (srcReg << 15) | (srcRel << 22) | \
           (indexGpr << 23) | (elemSize << 30))
@@ -196,6 +201,7 @@
 
 #define CF_INST_TEX 0x01
 #define CF_INST_ALU 0x08
+#define CF_INST_ALU_EXT 0x0c
 #define CF_INST_CALL_FS 0x13
 #define CF_INST_EXP_DONE 0x28
 #define CF_COND_ACTIVE 0x0
