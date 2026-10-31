@@ -93,6 +93,11 @@ static uint32_t textureCacheEntryCount();
 static void resetTargetScissor();
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
+bool gx2DecodeTextureDirect(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
+                            const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out,
+                            uint32_t pitch);
+void gx2DecodeTextureR8(const uint8_t* src, uint32_t w, uint32_t h,
+                        uint8_t* out, uint32_t pitch);
 
 enum WorkerTimingOp {
     kWorkerTextureMiss,
@@ -1070,6 +1075,8 @@ static bool s_gx2ProdMarker;
 static int s_peekTokenMode;  // 0 prod6 ("peekprod6"), 1 token snapshots (default), 2 "peekcmp" (see peekToken)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
+static bool s_texSplit, s_texDirect, s_texR8;
+static uint32_t s_texSplitLogs;
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
 static constexpr uint32_t kGx2DlReserveBytes = 512u << 10;
@@ -3193,6 +3200,10 @@ static FILE* debugFile() {
 
 static uint64_t debugDecodedHash(const TextureEntry* texture) {
     if (!texture || !texture->valid || !texture->texture.surface.image) return 0;
+    // The diagnostic reader is deliberately RGBA8-only.  Native R8 uploads
+    // have one byte per texel and may also be retiled, so treating them as a
+    // four-byte linear image would read unrelated bytes from the surface.
+    if (texture->texture.surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8) return 0;
     const uint32_t w = texture->width, h = texture->height;
     const uint32_t pitch = texture->texture.surface.pitch ? texture->texture.surface.pitch : w;
     const uint32_t n = std::min<uint32_t>(64, w * h);
@@ -3899,7 +3910,14 @@ static TextureEntry* getTexture(int map) {
         e.texture.surface.mipLevels = n;
         genFrom = 1;
     }
-    e.texture.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    // Keep native R8 uploads out of the generated-mip path: the downsample
+    // and arbitrary-mip probes below intentionally operate on RGBA8 scratch.
+    // A wrapped single-level texture therefore keeps the established RGBA8
+    // path when automip has expanded it.
+    const bool r8Upload = s_texR8 && fmt == 1 && levels == 1 && genFrom == 0;
+    const uint32_t bytesPerTexel = r8Upload ? 1 : 4;
+    e.texture.surface.format = r8Upload ? GX2_SURFACE_FORMAT_UNORM_R8
+                                        : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.texture.surface.aa = GX2_AA_MODE1X;
     e.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&e.texture.surface);
@@ -3919,7 +3937,7 @@ static TextureEntry* getTexture(int map) {
             mipPitch[l] = (lw + 63) & ~63u;
             mipOffset[l] = l == 1 ? 0 : surf.mipLevelOffset[l - 1];
             if (mipOffset[l] < end) agrees = false;
-            end = mipOffset[l] + mipPitch[l] * lh * 4;
+            end = mipOffset[l] + mipPitch[l] * lh * bytesPerTexel;
         }
         if (agrees && end > surf.mipmapSize) agrees = false;
         if (!agrees) {
@@ -3936,8 +3954,16 @@ static TextureEntry* getTexture(int map) {
     }
     e.texture.viewNumMips = surf.mipLevels;
     e.texture.viewNumSlices = 1;
-    e.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
-    surf.image = alignedZero(surf.alignment, surf.imageSize);
+    e.texture.compMap = r8Upload
+        ? GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R)
+        : GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    const bool fullIntensityTiles = (fmt == 0 && !(w & 7) && !(h & 7)) ||
+                                    (fmt == 1 && !(w & 7) && !(h & 3));
+    const bool directRgba = s_texDirect && !r8Upload && levels == 1 &&
+                            surf.mipLevels == 1 && surf.pitch == w && fullIntensityTiles;
+    surf.image = directRgba
+        ? MEMAllocFromDefaultHeapEx(uint32_t(surf.imageSize), int(surf.alignment))
+        : alignedZero(surf.alignment, surf.imageSize);
     if (!surf.image) return nullptr;
     if (surf.mipLevels > 1) {
         surf.mipmaps = alignedZero(surf.alignment, surf.mipmapSize);
@@ -3970,18 +3996,21 @@ static TextureEntry* getTexture(int map) {
         e.checkedFrame = g_displayFrames;
         e.dataHash = xxh64(source, srcBytes, 0);
     }
-    uint8_t* rgba = readable ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
+    uint8_t* rgba = readable && !directRgba && !r8Upload
+        ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     uint8_t* prev = (readable && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     allocationTiming.setCacheEntries(static_cast<uint32_t>(s_textures.size()));
     allocationTiming.finish();
-    if (!rgba || (surf.mipLevels > 1 && !prev)) {
+    const bool scratchFailure = (!directRgba && !r8Upload && !rgba) ||
+                                (surf.mipLevels > 1 && !prev);
+    if (!readable || scratchFailure) {
         if (s_whiteFillLogs < 40) {
             ++s_whiteFillLogs;
             WHBLogPrintf("SMS Wii U: white-fill source=%08x gxFormat=%u width=%u height=%u mipLevels=%u unreadable=%u allocationFailure=%u requestedBytes=%u",
                          (unsigned)a0, (unsigned)fmt, (unsigned)w, (unsigned)h, (unsigned)surf.mipLevels,
                          readable ? 0u : 1u, readable ? 1u : 0u,
-                         (unsigned)(w * h * 4 * (surf.mipLevels > 1 ? 2 : 1)));
+                         (unsigned)(w * h * bytesPerTexel * (surf.mipLevels > 1 ? 2 : 1)));
         }
         memset(surf.image, 0xff, surf.imageSize);
         if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
@@ -3990,23 +4019,50 @@ static TextureEntry* getTexture(int map) {
         const uint8_t* src = source;
         float mipDiff = 0.0f;
         uint32_t pw = w, ph = h;
+        const bool splitTiming = s_texSplit && w >= 320 && h >= 224 && s_texSplitLogs < 60;
+        uint32_t splitDecodeUs = 0, splitCopyUs = 0;
         WorkerOpTimer decodeTiming(kWorkerTextureDecode, textureInfo,
                                    static_cast<uint32_t>(s_textures.size()));
         for (uint32_t l = 0; l < surf.mipLevels; ++l) {
             const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
             const bool generated = genFrom && l >= genFrom;
-            if (generated) boxDownsample(prev, pw, ph, rgba, lw, lh);
-            else gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
-            uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
-                                  : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
-            for (uint32_t y = 0; y < lh; ++y)
-                memcpy(dst + size_t(y) * mipPitch[l] * 4, rgba + size_t(y) * lw * 4, size_t(lw) * 4);
+            const bool direct = l == 0 && directRgba;
+            const bool directR8 = l == 0 && r8Upload;
+            if (generated) {
+                boxDownsample(prev, pw, ph, rgba, lw, lh);
+            } else {
+                const OSTime decodeStart = splitTiming ? OSGetTime() : 0;
+                if (direct) gx2DecodeTextureDirect(src, fmt, lw, lh, tlutPtr, tlutFmt,
+                                                   static_cast<uint8_t*>(surf.image), surf.pitch);
+                else if (directR8) gx2DecodeTextureR8(src, lw, lh, static_cast<uint8_t*>(surf.image), surf.pitch);
+                else gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
+                if (splitTiming)
+                    splitDecodeUs += uint32_t(OSTicksToMicroseconds(OSGetTime() - decodeStart));
+            }
+            if (!direct && !directR8) {
+                uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
+                                      : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
+                const uint32_t rowBytes = lw * bytesPerTexel;
+                const OSTime copyStart = splitTiming ? OSGetTime() : 0;
+                for (uint32_t y = 0; y < lh; ++y)
+                    memcpy(dst + size_t(y) * mipPitch[l] * bytesPerTexel,
+                           rgba + size_t(y) * rowBytes, rowBytes);
+                if (splitTiming)
+                    splitCopyUs += uint32_t(OSTicksToMicroseconds(OSGetTime() - copyStart));
+            }
             if (l > 0 && !generated) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
             if (prev) std::swap(prev, rgba);
             pw = lw; ph = lh;
             if (!generated) src += texLevelBytes(fmt, lw, lh);
         }
         decodeTiming.finish();
+        if (splitTiming) {
+            ++s_texSplitLogs;
+            WHBLogPrintf("SMS Wii U: [texsplit] %ux%u fmt=%u levels=%u decodeUs=%u rowCopyUs=%u direct=%u r8=%u",
+                         (unsigned)w, (unsigned)h, (unsigned)fmt, (unsigned)surf.mipLevels,
+                         (unsigned)splitDecodeUs, (unsigned)splitCopyUs,
+                         directRgba ? 1u : 0u, r8Upload ? 1u : 0u);
+        }
         e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
     }
     if (rgba) MEMFreeToDefaultHeap(rgba);
@@ -4054,6 +4110,11 @@ static void packFreeLoading(TextureEntry& e) {
 // image: one RGBA8 image leaked per THP movie plane per frame. Free them so
 // getTexture can reuse the slot.
 static void packReleaseRetired(TextureEntry& e) {
+    if (e.packState == 3 && e.packFallback.surface.format == GX2_SURFACE_FORMAT_UNORM_R8) {
+        deferFree(e.packFallback.surface.image);
+        deferFree(e.packFallback.surface.mipmaps);
+        std::memset(&e.packFallback, 0, sizeof e.packFallback);
+    }
     packFreeLoading(e);
     deferFree(e.texture.surface.image);
     deferFree(e.texture.surface.mipmaps);
@@ -5312,6 +5373,9 @@ void rendererInit(float) {
     s_autoMipPack = !sdMarkerPresent("automipnopack");
     s_depthSkip = !sdMarkerPresent("nodepthskip");
     s_texRecheck = !sdMarkerPresent("notexrecheck");
+    s_texSplit = sdMarkerPresent("texsplit");
+    s_texDirect = sdMarkerPresent("texdirect");
+    s_texR8 = sdMarkerPresent("texr8");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;

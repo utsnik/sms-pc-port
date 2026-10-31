@@ -54,6 +54,14 @@ static const uint8_t kTileW[16] = {8, 8, 8, 4, 4, 4, 4, 0, 8, 8, 4, 0, 0, 0, 8, 
 static const uint8_t kTileH[16] = {8, 4, 4, 4, 4, 4, 4, 0, 8, 4, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileBytes[16] = {32, 32, 32, 32, 32, 32, 64, 0, 32, 32, 32, 0, 0, 0, 32, 0};
 
+static inline void zeroDestinationLine(uint8_t* dst) {
+#ifdef __PPC__
+    __asm__ volatile("dcbz 0,%0" : : "r"(dst) : "memory");
+#else
+    (void)dst;
+#endif
+}
+
 static void palette(const uint8_t* tlut, uint32_t tlutFmt, uint32_t idx, uint8_t* o) {
     if (!tlut) {
         o[0] = o[1] = o[2] = 255;
@@ -214,6 +222,78 @@ void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                 break;
             }
             p += kTileBytes[fmt];
+        }
+    }
+}
+
+// Direct upload for the two intensity formats.  The caller only selects this
+// for complete tiles and a surface whose pitch is exactly the logical width;
+// keeping the restriction here makes the cache-line zeroing contract explicit
+// and prevents a partial tile from leaving an uninitialized edge.
+bool gx2DecodeTextureDirect(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
+                            const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out,
+                            uint32_t pitch) {
+    (void)tlut;
+    (void)tlutFmt;
+    fmt &= 15;
+    const uint32_t th = fmt == 0 ? 8 : fmt == 1 ? 4 : 0;
+    if (!src || !out || (fmt != 0 && fmt != 1) || !w || !h || pitch < w ||
+        (w & 7) || (h % th) != 0)
+        return false;
+
+    const uint32_t cols = w / 8, rows = h / th;
+    const uint8_t* p = src;
+    for (uint32_t ty = 0; ty < rows; ++ty) {
+        for (uint32_t tx = 0; tx < cols; ++tx) {
+            uint8_t* dst = out + (size_t(ty * th) * pitch + tx * 8) * 4;
+            if (fmt == 0) {
+                for (uint32_t r = 0; r < 8; ++r) {
+                    uint32_t* line = reinterpret_cast<uint32_t*>(dst + size_t(r) * pitch * 4);
+                    zeroDestinationLine(reinterpret_cast<uint8_t*>(line));
+                    for (uint32_t q = 0; q < 4; ++q) {
+                        const uint8_t b = p[r * 4 + q];
+                        const uint32_t hi = uint32_t(b >> 4) * 17 * 0x01010101u;
+                        const uint32_t lo = uint32_t(b & 15) * 17 * 0x01010101u;
+                        line[q * 2] = hi;
+                        line[q * 2 + 1] = lo;
+                    }
+                }
+                p += kTileBytes[0];
+            } else {
+                for (uint32_t r = 0; r < 4; ++r) {
+                    uint32_t* line = reinterpret_cast<uint32_t*>(dst + size_t(r) * pitch * 4);
+                    zeroDestinationLine(reinterpret_cast<uint8_t*>(line));
+                    for (uint32_t q = 0; q < 8; ++q)
+                        line[q] = uint32_t(p[r * 8 + q]) * 0x01010101u;
+                }
+                p += kTileBytes[1];
+            }
+        }
+    }
+    return true;
+}
+
+// I8 has the same source tiles as the regular decoder, but GX2's R8 surface
+// only needs one byte per texel.  This writes the calculated surface pitch and
+// never creates an intermediate RGBA image.
+void gx2DecodeTextureR8(const uint8_t* src, uint32_t w, uint32_t h,
+                        uint8_t* out, uint32_t pitch) {
+    if (!src || !out || !w || !h || pitch < w) return;
+    const uint32_t cols = (w + 7) / 8, rows = (h + 3) / 4;
+    const uint8_t* p = src;
+    for (uint32_t ty = 0; ty < rows; ++ty) {
+        for (uint32_t tx = 0; tx < cols; ++tx) {
+            const uint32_t x0 = tx * 8, y0 = ty * 4;
+            if (x0 + 8 <= w && y0 + 4 <= h) {
+                for (uint32_t r = 0; r < 4; ++r)
+                    memcpy(out + size_t(y0 + r) * pitch + x0, p + r * 8, 8);
+            } else {
+                for (uint32_t r = 0; r < 4; ++r)
+                    for (uint32_t q = 0; q < 8; ++q)
+                        if (x0 + q < w && y0 + r < h)
+                            out[size_t(y0 + r) * pitch + x0 + q] = p[r * 8 + q];
+            }
+            p += kTileBytes[1];
         }
     }
 }

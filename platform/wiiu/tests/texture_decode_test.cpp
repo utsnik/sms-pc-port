@@ -9,6 +9,11 @@
 namespace gx {
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
+bool gx2DecodeTextureDirect(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
+                            const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out,
+                            uint32_t pitch);
+void gx2DecodeTextureR8(const uint8_t* src, uint32_t w, uint32_t h,
+                        uint8_t* out, uint32_t pitch);
 }
 
 static const uint8_t kTileW[16] = {8, 8, 8, 4, 4, 4, 4, 0, 8, 8, 4, 0, 0, 0, 8, 0};
@@ -84,6 +89,44 @@ int main() {
             }
             ++cases;
         }
+    }
+
+    for (uint32_t fmt : {0u, 1u}) {
+        const uint32_t w = 640, h = 448;
+        const size_t bytes = size_t(w / kTileW[fmt]) * (h / kTileH[fmt]) * kTileBytes[fmt];
+        const uint32_t pitch = w + 13;
+        std::vector<uint8_t> src(bytes), expected(size_t(w) * h * 4), actual(size_t(pitch) * h * 4, 0xa5);
+        for (uint8_t& byte : src) byte = uint8_t(random());
+        oldDecode(src.data(), fmt, w, h, expected.data());
+        if (!gx::gx2DecodeTextureDirect(src.data(), fmt, w, h, nullptr, 0, actual.data(), pitch)) {
+            fprintf(stderr, "FAIL direct rejected fmt=%u\n", fmt);
+            return 1;
+        }
+        for (uint32_t y = 0; y < h; ++y)
+            if (memcmp(actual.data() + size_t(y) * pitch * 4, expected.data() + size_t(y) * w * 4, w * 4)) {
+                fprintf(stderr, "FAIL direct bytes fmt=%u\n", fmt);
+                return 1;
+            }
+        ++cases;
+    }
+
+    for (const auto& size : sizes) {
+        const uint32_t w = size[0], h = size[1], fmt = 1;
+        const size_t bytes = size_t((w + 7) / 8) * ((h + 3) / 4) * kTileBytes[fmt];
+        const uint32_t pitch = w + 11;
+        std::vector<uint8_t> src(bytes), expected(size_t(w) * h * 4), actual(size_t(pitch) * h, 0xa5);
+        for (uint8_t& byte : src) byte = uint8_t(random());
+        oldDecode(src.data(), fmt, w, h, expected.data());
+        gx::gx2DecodeTextureR8(src.data(), w, h, actual.data(), pitch);
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) {
+                const uint8_t value = expected[(size_t(y) * w + x) * 4];
+                if (actual[size_t(y) * pitch + x] != value) {
+                    fprintf(stderr, "FAIL R8 bytes size=%ux%u at=%u,%u\n", w, h, x, y);
+                    return 1;
+                }
+            }
+        ++cases;
     }
 
     const uint32_t w = 640, h = 448, fmt = 1;
