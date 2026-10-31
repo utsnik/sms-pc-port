@@ -189,6 +189,7 @@ static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
 bool g_dlPromoteFirst = false;
+bool g_dlIgnoreExternal = false;
 // This is separate from the vertex/index arena above.  The GX2 command-list
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
@@ -4894,6 +4895,7 @@ void rendererInit(float) {
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
     g_dlPromoteFirst = sdMarkerPresent("dlpromotefirst");
+    g_dlIgnoreExternal = sdMarkerPresent("dlnoexternal");
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");

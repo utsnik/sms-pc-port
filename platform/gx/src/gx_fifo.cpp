@@ -1399,7 +1399,7 @@ static DlMissField dlStateFirstMismatch(const DlEntry& e, uint32_t size) {
         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
             return kDlMissArray;
     if (e.ztex2 != g.bp[BP_ZTEX2] || e.ztexBias != g.bp[BP_ZTEX_BIAS]) return kDlMissZtex;
-    if (e.externalState != g_dlExternalState) return kDlMissExternal;
+    if (!g_dlIgnoreExternal && e.externalState != g_dlExternalState) return kDlMissExternal;
     return kDlMissFieldCount;
 }
 

@@ -211,6 +211,7 @@ void noteDlArenaDirect(uint32_t vertices, uint32_t draws);
 void noteDlMiss(uint32_t vertices, uint32_t draws);
 void noteDlImmediate(DlImmediateContext context, uint32_t vertices, uint32_t draws);
 extern bool g_dlPromoteFirst;
+extern bool g_dlIgnoreExternal;  // SD marker "dlnoexternal": EFB copies/clears/peeks keep cached lists
 bool rendererReady();
 void releaseGlThread();  // gx_platform.cpp, for GXPC_Shutdown
 // Display-list arena: a GL buffer holding the vertices and indices of cached
