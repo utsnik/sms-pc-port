@@ -27,9 +27,9 @@
 #include <gx2/state.h>
 extern "C" void sms_wiiu_gx2_target_begin(void);
 extern "C" void sms_wiiu_gx2_target_present(void);
-extern "C" __attribute__((weak)) int sms_wiiu_dynres_enabled(void) { return 0; }
-extern "C" __attribute__((weak)) void sms_wiiu_dynres_gpu_frame(uint32_t) {}
-extern "C" __attribute__((weak)) void sms_wiiu_dynres_shutdown(void) {}
+extern "C" int sms_wiiu_dynres_enabled(void);
+extern "C" void sms_wiiu_dynres_gpu_frame(uint32_t busy_us);
+extern "C" void sms_wiiu_dynres_shutdown(void);
 #include <gx2/surface.h>
 #include <gx2/swap.h>
 #include <gx2/texture.h>

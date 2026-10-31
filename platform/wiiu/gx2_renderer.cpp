@@ -4322,6 +4322,92 @@ static void initRenderTarget() {
     s_renderOwn = true;
 }
 
+// Dynamic resolution (wiiu-dynres, docs/superpowers/specs/2026-10-31-wiiu-dynres-design.md):
+// GPU busy time per frame (gx_stub.cpp's frame stamps) picks the render size
+// per stage.  During a visit the size only steps down; the size to remember
+// (one step up at most) is decided when the visit ends and kept in
+// <app root>dynres.txt.  SD marker nodynres restores the fixed per-scene sizes
+// below; it is also off for any res* marker or a TV buffer under 1080 lines.
+#include "third_party/wiiu-dynres/dynres.h"
+#include "third_party/wiiu-dynres/dynres_store.h"
+extern "C" const char* sms_wiiu_app_root(void);
+extern "C" int sms_wiiu_sd_marker(const char* name);
+static const uint16_t kDynresLines[] = {1080, 900, 810};
+static dynres_ctx s_dynres;
+static dynres_store s_dynresStore;
+static int s_dynresState = -1;           // -1 unread, 0 off, 1 on
+static bool s_dynresNoDefault;           // SD marker dynresnodefault (test switch)
+static char s_dynresPending[DYNRES_NAME_MAX];
+static volatile uint32_t s_dynresPendingSeq;
+static uint32_t s_dynresSeenSeq;
+static char s_dynresStage[DYNRES_NAME_MAX];
+static volatile uint32_t s_dynresLines;  // the size in use, 0 before the first stage
+
+static void dynresPath(char* out, size_t n) { std::snprintf(out, n, "%sdynres.txt", sms_wiiu_app_root()); }
+
+extern "C" int sms_wiiu_dynres_enabled(void) {
+    if (s_dynresState < 0) {
+        const bool off = sms_wiiu_sd_marker("nodynres") || sms_wiiu_sd_marker("res900") ||
+                         sms_wiiu_sd_marker("res810") || sms_wiiu_sd_marker("res720") || sms_wiiu_sd_marker("res480");
+        s_dynresState = off ? 0 : 1;
+        if (s_dynresState) {
+            dynres_config cfg;
+            dynres_default_config(&cfg, kDynresLines, 3, 33333);
+            if (dynres_init(&s_dynres, &cfg) != 0) s_dynresState = 0;
+        }
+        if (s_dynresState) {
+            char path[256];
+            dynresPath(path, sizeof(path));
+            const int n = dynres_store_load(&s_dynresStore, path);
+            s_dynresNoDefault = sms_wiiu_sd_marker("dynresnodefault") != 0;
+            WHBLogPrintf("SMS Wii U: [dynres] on, %d remembered stage(s)%s", n, s_dynresNoDefault ? ", no defaults" : "");
+        } else {
+            WHBLogPrintf("SMS Wii U: [dynres] off (nodynres or a res* marker)");
+        }
+    }
+    return s_dynresState == 1;
+}
+
+static int dynresDefault(const char* stage) {
+    if (s_dynresNoDefault) return 0;
+    if (strncmp(stage, "dolpic", 6) == 0 && stage[6] >= '0' && stage[6] <= '9') return 900;
+    if (strncmp(stage, "coronaBoss", 10) == 0) return 810;
+    return 0;
+}
+
+static void dynresEndVisit() {
+    if (!s_dynres.active || !s_dynresStage[0]) return;
+    const unsigned heaviest = s_dynres.heaviest_us, measured = s_dynres.measured;
+    const int keep = dynres_end_stage(&s_dynres);
+    const int changed = keep > 0 ? dynres_store_set(&s_dynresStore, s_dynresStage, keep) : 0;
+    bool saved = false;
+    if (changed == 1) {
+        char path[256];
+        dynresPath(path, sizeof(path));
+        saved = dynres_store_save(&s_dynresStore, path) == 0;
+    }
+    WHBLogPrintf("SMS Wii U: [dynres] %s end %u heaviest=%u.%ums measured=%u -> remember %d%s", s_dynresStage,
+                 (unsigned)dynres_lines(&s_dynres), heaviest / 1000, heaviest % 1000 / 100, measured, keep,
+                 changed == 1 ? (saved ? " (saved)" : " (SAVE FAILED)") : " (unchanged)");
+}
+
+// Core 1, at present: one frame's GPU busy time, read four frames late.
+extern "C" void sms_wiiu_dynres_gpu_frame(uint32_t busy_us) {
+    if (s_dynresState != 1 || !s_dynres.active) return;
+    const uint16_t before = dynres_lines(&s_dynres);
+    dynres_frame(&s_dynres, busy_us);
+    const uint16_t after = dynres_lines(&s_dynres);
+    if (after != before) {
+        s_dynresLines = after;
+        WHBLogPrintf("SMS Wii U: [dynres] %s down %u->%u avg=%u.%ums", s_dynresStage, (unsigned)before, (unsigned)after,
+                     (unsigned)(s_dynres.last_avg_us / 1000), (unsigned)(s_dynres.last_avg_us % 1000 / 100));
+    }
+}
+
+extern "C" void sms_wiiu_dynres_shutdown(void) {
+    if (s_dynresState == 1) dynresEndVisit();
+}
+
 // Per-scene render size: the Corona boss arena is fill-bound at 1080p (fire
 // particles, the bath's metaball drops and two full-screen copy passes: about
 // 40 ms of GPU time a frame at 625 MHz), so it renders at 810 lines and present
@@ -4346,11 +4432,33 @@ extern "C" void sms_wiiu_gx2_scene_archive(const char* name) {
     s_sceneRenderH = s_sceneResOff ? 0u
         : strncmp(name, "coronaBoss", 10) == 0 ? (s_sceneRes900 ? 900u : 810u)
         : plaza ? 900u : 0u;
+    if (sms_wiiu_dynres_enabled()) {
+        size_t k = 0;
+        for (; k + 4 < n && k + 1 < sizeof(s_dynresPending); ++k) s_dynresPending[k] = name[k];  // drop ".szs"
+        s_dynresPending[k] = 0;
+        OSMemoryBarrier();
+        ++s_dynresPendingSeq;
+    }
 }
 static void applySceneRenderSize() {
     if (!s_renderOwn) return;
     uint32_t w = kRenderW, h = kRenderH;
-    const uint32_t want = s_sceneRenderH ? drawnLines(s_sceneRenderH) : 0u;
+    // Dynres only at the default 1080-line target; any other size keeps today's behaviour.
+    const bool dyn = kRenderH == drawnLines(1080) && sms_wiiu_dynres_enabled();
+    if (dyn && s_dynresPendingSeq != s_dynresSeenSeq) {
+        s_dynresSeenSeq = s_dynresPendingSeq;
+        OSMemoryBarrier();
+        dynresEndVisit();
+        std::memcpy(s_dynresStage, s_dynresPending, sizeof(s_dynresStage));
+        const int remembered = dynres_store_get(&s_dynresStore, s_dynresStage);
+        const int def = dynresDefault(s_dynresStage);
+        dynres_begin_stage(&s_dynres, remembered, def);
+        s_dynresLines = dynres_lines(&s_dynres);
+        WHBLogPrintf("SMS Wii U: [dynres] %s begin %u (%s)", s_dynresStage, (unsigned)s_dynresLines,
+                     remembered ? "remembered" : def ? "default" : "full");
+    }
+    const uint32_t sceneLines = dyn ? s_dynresLines : s_sceneRenderH;
+    const uint32_t want = sceneLines ? drawnLines(sceneLines) : 0u;
     if (want && want < kRenderH) { h = want; w = wideWidth(want); }
     GX2Surface& c = s_renderColour.surface;
     if (c.width == w && c.height == h) return;

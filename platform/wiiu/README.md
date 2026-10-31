@@ -71,3 +71,10 @@ create an empty file named `4x3` in the app folder:
 ```text
 sd:/wiiu/apps/sms/4x3
 ```
+
+- `nodynres`: turn off dynamic resolution. By default each stage starts at the
+  largest render size it has held without frame drops (remembered in
+  `dynres.txt` in the app folder; delete that file to start over), steps down
+  during play if the GPU falls behind, and steps up one size on a later visit
+  when there was room. With `nodynres` the old fixed sizes apply: Delfino
+  Plaza 900 lines, the Corona boss 810, everything else 1080.
