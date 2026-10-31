@@ -1,5 +1,6 @@
 #include "port_heap.h"
 #include "runtime.h"
+#include "gx2_producer_worker.h"
 #include <cstdio>
 #ifndef SMS_GX2_ASYNC_PEEK
 #define SMS_GX2_ASYNC_PEEK 1
@@ -81,11 +82,16 @@
 #include <vector>
 
 extern "C" void sms_wiiu_d1_note_draw_core(void);
+extern "C" void sms_wiiu_gx2prod_reset_draw_sync_jobs(void);
 
 namespace gx {
 
 static GX2ColorBuffer* renderColour();
 static GX2DepthBuffer* renderDepth();
+static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
+static void gx2ProdBoundary(uint32_t kind);
+static void gx2ProdCallList(void* list, uint32_t bytes);
+static void gx2DlClose();
 void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                       const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
 
@@ -758,6 +764,9 @@ static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static uint32_t s_vertexFenceDiagCount;
 static bool s_vertexArenaInvalidated;
+static bool s_gx2ProdEnabled;
+static bool s_gx2ProdMarker;
+static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
@@ -887,6 +896,10 @@ static uint32_t s_deferredFreeCount;
 static void deferFree(void* p) {
     if (!p) return;
     if (s_deferredFreeCount == 256) {
+        if (s_gx2ProdEnabled) {
+            WHBLogPrintf("SMS Wii U: [gx2prod] deferred-free queue full; retaining resources");
+            return;
+        }
         GX2DrawDone();
         for (uint32_t i = 0; i < s_deferredFreeCount; ++i) MEMFreeToDefaultHeap(s_deferredFree[i].p);
         s_deferredFreeCount = 0;
@@ -967,7 +980,7 @@ static float* allocVertices(uint32_t bytes) {
         s_vertexArenaInvalidated = true;
     }
     if (s_vertexArenaUsed + bytes > kVertexArenaBytes) {
-        GX2DrawDone();
+        if (!s_gx2ProdEnabled) GX2DrawDone();
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, arena, kVertexArenaBytes);
         s_vertexArenaUsed = 0;
         ++s_vertexArenaOverflows;
@@ -3785,7 +3798,9 @@ static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level)
     return true;
 }
 static void retileTexture(GX2Texture& texture) {
-    if (!s_retileTextures || runningUnderCemu()) return;
+    // The producer worker records draw state; resource-copy work remains on
+    // the service core so the worker never issues an unordered retile.
+    if (!s_retileTextures || runningUnderCemu() || (s_gx2ProdEnabled && OSGetCoreId() != 1)) return;
     GX2Surface& linear = texture.surface;
     GX2Texture tiled = texture;
     GX2Surface& t = tiled.surface;
@@ -4904,7 +4919,12 @@ void rendererInit(float) {
     if (sdMarkerPresent("stampwide")) GXPC_SetWriteStampWindow(reinterpret_cast<void*>(uintptr_t(0x10000000u)));
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
-    s_gx2DlEnabled = sdMarkerPresent("gx2dl");
+    s_gx2ProdMarker = sdMarkerPresent("gx2prod");
+    s_gx2ProdCore2 = sdMarkerPresent("gx2core2");
+    // gx2prod owns the complete worker-side list path; it implies the
+    // hardware display-list emitter, while the old gx2dl marker remains an
+    // independent opt-in for the single-threaded path.
+    s_gx2DlEnabled = sdMarkerPresent("gx2dl") || s_gx2ProdMarker;
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
@@ -4941,8 +4961,24 @@ void rendererInit(float) {
     WHBLogPrintf("SMS Wii U: [gx2dl] marker=%s fallback=%s core-init=%u dlvariants=%s",
                  s_gx2DlEnabled ? "on" : "off", s_gx2DlFallback ? "on" : "off", (unsigned)s_perfDlCoreInit,
                  g_dlVariantsEnabled ? "on" : "off");
+    if (s_gx2ProdMarker)
+        WHBLogPrintf("SMS Wii U: [gx2prod] requested worker core=%u (gx2core2=%s)",
+                     s_gx2ProdCore2 ? 2u : 0u, s_gx2ProdCore2 ? "on" : "off");
     s_ready = initShaders();
     if (!s_ready) WHBLogPrintf("SMS Wii U: GX2 shader setup failed");
+    if (s_ready && s_gx2ProdMarker) {
+        syncProducerState();
+        gx2prod::Hooks hooks = {gx2ProdConsume, gx2ProdBoundary, nullptr};
+        if (gx2prod::start(hooks, s_gx2ProdCore2)) {
+            gx2prod::bind_service(gx2ProdCallList);
+            setProducerMode(true);
+            s_gx2ProdEnabled = true;
+            WHBLogPrintf("SMS Wii U: [gx2prod] worker started core=%u",
+                         s_gx2ProdCore2 ? 2u : 0u);
+        } else {
+            WHBLogPrintf("SMS Wii U: [gx2prod] worker start failed; marker path disabled");
+        }
+    }
 }
 
 float efbScale() { return 1.0f; }
@@ -5071,7 +5107,7 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
     }
     if (s_dlArenaUsed + total > kDlArenaBytes) {
         // Every stored run goes: let the GPU finish reading them first.
-        GX2DrawDone();
+        if (!s_gx2ProdEnabled) GX2DrawDone();
         GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, s_dlArena, kDlArenaBytes);
         s_dlArenaUsed = 0;
         if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
@@ -5182,11 +5218,32 @@ static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, 
 static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
 static bool s_gx2DlRecording;
 
+static void gx2ProdCallList(void* list, uint32_t bytes) {
+    if (OSGetCoreId() != 1)
+        WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());
+    GX2DirectCallDisplayList(list, bytes);
+    ++s_perfDlCalled;
+    s_perfDlCoreCall = OSGetCoreId();
+}
+
+static void gx2ProdConsume(const uint8_t* bytes, uint32_t size) {
+    SMS_PORT_HEAP_SCOPE();
+    producerConsume(bytes, size);
+}
+static void gx2ProdBoundary(uint32_t kind) {
+    SMS_PORT_HEAP_SCOPE();
+    producerBoundary(kind);
+    // The barrier must follow the completed list service record.
+    gx2DlClose();
+}
+
 static bool gx2DlBegin(void** outList) {
     if (!s_gx2DlEnabled) return false;
-    if (OSGetCoreId() != 1) {
+    const unsigned core = (unsigned)OSGetCoreId();
+    if ((!s_gx2ProdEnabled && core != 1) || (s_gx2ProdEnabled && core == 1)) {
         ++s_perfDlForbidden;
-        WHBLogPrintf("SMS Wii U: [gx2dl] recorder on unexpected core=%u", (unsigned)OSGetCoreId());
+        WHBLogPrintf("SMS Wii U: [gx2dl] recorder on unexpected core=%u prod=%u", core,
+                     s_gx2ProdEnabled ? 1u : 0u);
     }
     uint8_t*& arena = s_gx2DlArena[s_vertexArenaIndex];
     if (!arena) arena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kGx2DlArenaBytes, 256));
@@ -5230,11 +5287,17 @@ static bool gx2DlEndCall(void* list) {
     }
     DCFlushRange(list, bytes);
     ++s_perfDlRecorded;
-    ++s_perfDlCalled;
     s_perfDlBytes += bytes;
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
-    s_perfDlCoreCall = OSGetCoreId();
-    GX2DirectCallDisplayList(list, bytes);
+    if (s_gx2ProdEnabled) {
+        if (!gx2prod::enqueue_list(list, bytes)) {
+            ++s_perfDlOverflows;
+            WHBLogPrintf("SMS Wii U: [gx2prod] list queue overflow; sequence stopped");
+            return false;
+        }
+    } else {
+        gx2ProdCallList(list, bytes);
+    }
     sms_wiiu_d4_submit_at("list", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)());
     return true;
 }
@@ -5243,6 +5306,9 @@ static void* s_gx2DlOpen;
 static uint32_t s_gx2DlOpenDraws;
 
 static void gx2DlClose() {
+    // Core 1 services are ordered between worker-produced lists.  They must
+    // not close the list currently being assembled on the producer core.
+    if (s_gx2ProdEnabled && OSGetCoreId() == 1) return;
     if (!s_gx2DlOpen) return;
     void* list = s_gx2DlOpen;
     s_gx2DlOpen = nullptr;
@@ -5252,6 +5318,7 @@ static void gx2DlClose() {
 }
 
 static void gx2DlSplit(int reason) {
+    if (s_gx2ProdEnabled && OSGetCoreId() == 1) return;
     if (!s_gx2DlOpen) return;
     switch (reason) {
     case kDlSplitCopy: ++s_perfDlSplitsCopy; break;
@@ -5330,6 +5397,17 @@ void flushBatch() {
         ~FrameSplitBatchScope() { sms_wiiu_frame_split_gx_end(); }
     } frameSplitBatchScope;
 #endif
+    // Open the worker's GX2 list before texture materialisation, arena uploads,
+    // or shader/state setup. Those operations all emit packets that must stay
+    // ordered with the draw on the worker's list.
+    if (s_gx2ProdEnabled && !gx2DlOpenForDraw()) {
+        static unsigned s_noListLogs;
+        if (s_noListLogs++ < 8)
+            WHBLogPrintf("SMS Wii U: [gx2prod] no list for batch; dropped");
+        s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+        s_dlPending = {};
+        return;
+    }
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
     disablePerDrawCaches();
@@ -5431,7 +5509,7 @@ void flushBatch() {
                 if (!s_d8NoDraw) GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
             }
-            if (s_padUniforms == 5) GX2DrawDone();
+            if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();
             sms_wiiu_d1_note_draw_core();
             ++s_drawsThisFrame;
             if (s_gpuDiag) {
@@ -5645,9 +5723,9 @@ void flushBatch() {
     } else {
         if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
     }
-    if (s_padUniforms == 5) GX2DrawDone();  // diagnostic fence stays outside a list
+    if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();  // diagnostic fence stays outside a list
     if (bracket) {
-        GX2DrawDone();
+        if (!s_gx2ProdEnabled) GX2DrawDone();
         WHBLogPrintf("SMS Wii U: [vxbracket] done");
     }
     sms_wiiu_d1_note_draw_core();
@@ -5700,9 +5778,193 @@ static void rebindTvTarget() {
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
 }
+
+// Resolve the copy cache on the producer worker.  Core 1 receives only these
+// value-owned GX2 operands; it must not discover or allocate a cache entry
+// after the worker has already recorded later draws that sample it.
+struct ProducerResolvedCopy {
+    GX2Surface source, destination;
+    GX2Rect sourceRect;
+    GX2Point destinationPoint;
+    void* retiredImage;
+    bool ready, fullSurface;
+};
+
+static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, uint32_t y,
+                                                uint32_t w, uint32_t h, bool half,
+                                                uint32_t fmt, uint32_t pe) {
+    ProducerResolvedCopy result = {};
+    ++s_perfCopies;
+    ++s_copyGeneration;
+    GX2ColorBuffer* cb = renderColour();
+    if (!dest || !cb || !w || !h) return result;
+    const uint32_t tx = uint32_t(s_gameOffsetX + float(x) * s_gameScaleX);
+    const uint32_t ty = uint32_t(float(y) * s_gameScaleY);
+    uint32_t tw = uint32_t(float(w) * s_gameScaleX);
+    uint32_t th = uint32_t(float(h) * s_gameScaleY);
+    if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
+    if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
+    if (ty + th > cb->surface.height) th = cb->surface.height - ty;
+    if (!tw || !th) return result;
+
+    CopyEntry* e = nullptr;
+    for (CopyEntry& c : copyCache())
+        if (c.dest == dest) { e = &c; break; }
+    const bool cemu = runningUnderCemu();
+    const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
+    const uint32_t logicalW = half ? (w + 1) / 2 : w;
+    const uint32_t logicalH = half ? (h + 1) / 2 : h;
+    const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
+    if (e && (e->tex.texture.surface.width != copyW ||
+              e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
+        result.retiredImage = e->tex.texture.surface.image;
+        e->tex.valid = false;
+    }
+    if (!e) {
+        copyCache().push_back(CopyEntry());
+        e = &copyCache().back();
+        e->dest = dest;
+    }
+    e->tex.source = static_cast<const uint8_t*>(dest);
+    e->tex.fmt = fmt;
+    e->tex.width = logicalW;
+    e->tex.height = logicalH;
+    e->sourceX = cemu ? tx : 0; e->sourceY = cemu ? ty : 0;
+    e->sourceW = cemu ? tw : 0; e->sourceH = cemu ? th : 0;
+    if (!e->tex.valid) {
+        TextureEntry& t = e->tex;
+        memset(&t.texture, 0, sizeof(t.texture));
+        t.width = logicalW; t.height = logicalH;
+        t.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
+        t.texture.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        t.texture.surface.width = copyW;
+        t.texture.surface.height = copyH;
+        t.texture.surface.depth = 1;
+        t.texture.surface.mipLevels = 1;
+        t.texture.surface.format = cb->surface.format;
+        t.texture.surface.aa = GX2_AA_MODE1X;
+        t.texture.surface.tileMode = GX2_TILE_MODE_DEFAULT;
+        t.texture.viewNumMips = 1;
+        t.texture.viewNumSlices = 1;
+        t.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G,
+                                         GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+        GX2CalcSurfaceSizeAndAlignment(&t.texture.surface);
+        t.texture.surface.image = alignedZero(t.texture.surface.alignment,
+                                              t.texture.surface.imageSize);
+        if (!t.texture.surface.image) return result;
+        DCFlushRange(t.texture.surface.image, t.texture.surface.imageSize);
+        GX2InitTextureRegs(&t.texture);
+        t.valid = true;
+    }
+    const uint32_t a = (pe & 7) == 1 ? GX2_SQ_SEL_A : GX2_SQ_SEL_1;
+    const uint32_t R = GX2_SQ_SEL_R, G = GX2_SQ_SEL_G, B = GX2_SQ_SEL_B;
+    uint32_t compMap;
+    switch (fmt) {
+    case 0: case 8: compMap = GX2_COMP_MAP(R, R, R, R); break;
+    case 2: case 3: compMap = GX2_COMP_MAP(R, R, R, a); break;
+    case 4: compMap = GX2_COMP_MAP(R, G, B, GX2_SQ_SEL_1); break;
+    case 7: compMap = GX2_COMP_MAP(a, a, a, a); break;
+    case 9: compMap = GX2_COMP_MAP(G, G, G, G); break;
+    case 10: compMap = GX2_COMP_MAP(B, B, B, B); break;
+    case 11: compMap = GX2_COMP_MAP(G, G, G, R); break;
+    case 12: compMap = GX2_COMP_MAP(B, B, B, G); break;
+    default: compMap = GX2_COMP_MAP(R, G, B, a); break;
+    }
+    if (e->tex.texture.compMap != compMap) {
+        e->tex.texture.compMap = compMap;
+        GX2InitTextureRegs(&e->tex.texture);
+    }
+    result.source = cb->surface;
+    result.destination = e->tex.texture.surface;
+    result.fullSurface = cemu;
+    result.sourceRect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
+    result.destinationPoint = {0, 0};
+    result.ready = true;
+    return result;
+}
+
+struct ProducerCopyRequest {
+    ProducerResolvedCopy copy;
+    uint32_t ctrl, src, size, clearAr, clearGb, clearZ, cmode, pe, zmode;
+};
+static ProducerCopyRequest s_producerCopies[64];
+static uint32_t s_producerCopyWrite;
+
+static void producerCopyService(void* opaque) {
+    ProducerCopyRequest& r = *static_cast<ProducerCopyRequest*>(opaque);
+    const bool clear = (r.ctrl >> 11) & 1, disp = (r.ctrl >> 14) & 1;
+    const uint32_t x = r.src & 0x3ff, y = (r.src >> 10) & 0x3ff;
+    const uint32_t w = (r.size & 0x3ff) + 1, h = ((r.size >> 10) & 0x3ff) + 1;
+    if (disp) {
+        if (clear) {
+            s_frameClear[0] = float(r.clearAr & 255) / 255.0f;
+            s_frameClear[1] = float((r.clearGb >> 8) & 255) / 255.0f;
+            s_frameClear[2] = float(r.clearGb & 255) / 255.0f;
+            s_frameClear[3] = ((r.pe & 7) == 1) ? float((r.clearAr >> 8) & 255) / 255.0f : 1.0f;
+            s_frameClearPending = ((r.cmode >> 3) & 1) != 0;
+        }
+        return;
+    }
+    if (!s_frameActive || !ProcUIInForeground()) return;
+    if (r.copy.ready) {
+        if (r.copy.fullSurface)
+            GX2CopySurface(&r.copy.source, 0, 0, &r.copy.destination, 0, 0);
+        else
+            GX2CopySurfaceEx(&r.copy.source, 0, 0, &r.copy.destination, 0, 0, 1,
+                             &r.copy.sourceRect, &r.copy.destinationPoint);
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, r.copy.destination.image,
+                      r.copy.destination.imageSize);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.copy.destination.image,
+                      r.copy.destination.imageSize);
+    }
+    rebindTvTarget();
+    if (!clear) return;
+    if ((r.cmode >> 3) & 1) {
+        ++s_perfClears;
+        GX2ClearColor(renderColour(), float(r.clearAr & 255) / 255.0f,
+                      float((r.clearGb >> 8) & 255) / 255.0f, float(r.clearGb & 255) / 255.0f,
+                      ((r.pe & 7) == 1) ? float((r.clearAr >> 8) & 255) / 255.0f : 1.0f);
+    }
+    if ((r.zmode >> 4) & 1)
+        GX2ClearDepthStencilEx(renderDepth(), float(r.clearZ & 0xffffff) / 16777215.0f, 0,
+                               GX2_CLEAR_FLAGS_DEPTH);
+    rebindTvTarget();
+}
+
 void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
     flushBatch();
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) {
+        // A copy is an ordered GPU boundary: finish the worker's list before
+        // core 1 performs the copy/clear service, then let later commands
+        // open a fresh list after that service record.
+        gx2DlSplit(kDlSplitCopy);
+        if (s_producerCopyWrite >= sizeof(s_producerCopies) / sizeof(s_producerCopies[0])) {
+            WHBLogPrintf("SMS Wii U: [gx2prod] service queue overflow at copy");
+            return;
+        }
+        ProducerCopyRequest& r = s_producerCopies[s_producerCopyWrite++];
+        r.ctrl = ctrl;
+        r.src = g.bp[BP_COPY_SRC_TL]; r.size = g.bp[BP_COPY_SRC_WH];
+        r.clearAr = g.bp[BP_CLEAR_AR]; r.clearGb = g.bp[BP_CLEAR_GB]; r.clearZ = g.bp[BP_CLEAR_Z];
+        r.cmode = g.bp[BP_CMODE0]; r.pe = g.bp[BP_PE_CONTROL]; r.zmode = g.bp[BP_ZMODE];
+        const uint32_t x = r.src & 0x3ff, y = (r.src >> 10) & 0x3ff;
+        const uint32_t w = (r.size & 0x3ff) + 1, h = ((r.size >> 10) & 0x3ff) + 1;
+        const uint32_t fmt = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7);
+        debugCopy((ctrl >> 14) & 1, x, y, w, h, g.copyDest, ctrl);
+        if (!((ctrl >> 14) & 1) && s_frameActive && ProcUIInForeground()) {
+            r.copy = resolveProducerCopy(g.copyDest, x, y, w, h,
+                                         (ctrl >> 9) & 1, fmt, r.pe);
+            // Copy/rebind/clear invalidate the worker's shadowed GX2 state;
+            // the next recorded list restores it before drawing.
+            invalidateVertexUniforms();
+        }
+        if (!gx2prod::enqueueService(producerCopyService, &r))
+            WHBLogPrintf("SMS Wii U: [gx2prod] service queue rejected copy");
+        return;
+    }
+#endif
     const bool clear = (ctrl >> 11) & 1, disp = (ctrl >> 14) & 1;
     const uint32_t src = g.bp[BP_COPY_SRC_TL], size = g.bp[BP_COPY_SRC_WH];
     const uint32_t x = src & 0x3ff, y = (src >> 10) & 0x3ff;
@@ -5869,7 +6131,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
 
 uint32_t peekColor(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
-    flushBatch();
+    if (!s_gx2ProdEnabled) flushBatch();
     if (x < 0 || y < 0) return 0;
     const int point[1][2] = {{x, y}};
     uint32_t c = 0;
@@ -5920,7 +6182,7 @@ uint32_t peekZ(int x, int y) {
     }
     if (!s_enabled || x < 0 || y < 0) return 0xffffff;
     sms_wiiu_d4_event(D4_PEEK);
-    flushBatch();
+    if (!s_gx2ProdEnabled) flushBatch();
     GX2DepthBuffer* db = renderDepth();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
         db->surface.format != GX2_SURFACE_FORMAT_FLOAT_R32 || db->surface.aa != GX2_AA_MODE1X)
@@ -6015,6 +6277,14 @@ extern "C" int sms_wiiu_gx2_display_list_enabled(void) {
 }
 
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
+    if (s_gx2ProdEnabled) {
+        gx2prod::wait(gx2prod::kWaitPresent);
+        gx2prod::service();
+        gx2prod::stop();
+        setProducerMode(false);
+        s_gx2ProdEnabled = false;
+        WHBLogPrintf("SMS Wii U: [gx2prod] worker stopped");
+    }
     texturePackShutdown();
 }
 /* Shot A/B (SMS_SHOTS_ABA): forces the nodiff path for whole frames from the
@@ -6071,12 +6341,27 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
 // Sunshine runs at 30 fps and waits two retraces per game frame; presenting at
 // the second one showed a freshly cleared, empty frame half the time.
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void) {
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) return 1;
+#endif
     if (!s_batch.indices.empty()) return 1;
     return s_drawsThisFrame != 0;
 }
 extern "C" void sms_wiiu_gx2_renderer_end(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_frameActive) return;
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) {
+        gx2prod::wait(gx2prod::kWaitPresent);
+        gx2prod::service();
+        for (uint32_t i = 0; i < s_producerCopyWrite; ++i) {
+            deferFree(s_producerCopies[i].copy.retiredImage);
+            s_producerCopies[i].copy.retiredImage = nullptr;
+        }
+        s_producerCopyWrite = 0;
+        sms_wiiu_gx2prod_reset_draw_sync_jobs();
+    } else
+#endif
     flushBatch();
     GX2Flush();
     endVertexArena();
@@ -6176,6 +6461,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     s_frameActive = false;
     s_drawsThisFrame = 0;
     ++g_displayFrames;
+    gx2prod::note_frame(g_displayFrames);
 }
 
 } // namespace gx

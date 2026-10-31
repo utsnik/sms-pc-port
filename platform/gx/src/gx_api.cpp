@@ -4,6 +4,9 @@
 // agree bit for bit.
 #include "gx_internal.h"
 #include "sms_gx/gx_pc.h"
+#ifdef __WIIU__
+#include "../../wiiu/gx2_producer_worker.h"
+#endif
 
 #include <dolphin/gx.h>
 
@@ -26,7 +29,27 @@ bool rendererReady();
 static bool s_recording = false;
 static uint8_t* s_dlBegin = nullptr;
 static uint32_t s_dlSize = 0;
-static State& apiState() { return s_recording ? gProducer : g; }
+#ifdef __WIIU__
+// Producer mode: state the same-thread path writes straight into g goes
+// through the stream instead (see ProducerHostKind).
+static inline bool hostState() { return producerMode() && !s_recording; }
+static inline uint32_t hostPtr(const void* p) { return uint32_t(reinterpret_cast<uintptr_t>(p)); }
+static inline uint32_t hostFloat(float f) { uint32_t v; memcpy(&v, &f, sizeof v); return v; }
+#endif
+static inline bool forceVtxState() {
+#ifdef __WIIU__
+    return producerMode() && !s_recording;
+#else
+    return false;
+#endif
+}
+static State& apiState() {
+#ifdef __WIIU__
+    return (s_recording || producerMode()) ? gProducer : g;
+#else
+    return s_recording ? gProducer : g;
+#endif
+}
 
 // Keep the API side of a display-list recording independent from the state
 // consumed by gx_fifo.cpp.  Outside recording apiState() is the consumer, so
@@ -47,6 +70,14 @@ static void apiBP(uint32_t reg, uint32_t data) {
         GXPC_Write32(v);
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        shadowBP(v);
+        GXPC_Write8(0x61);
+        GXPC_Write32(v);
+        return;
+    }
+#endif
     writeBP(v);
 }
 static void bpField(uint32_t reg, int size, int shift, uint32_t v) { apiBP(reg, setField(GX_STATE.bp[reg], size, shift, v)); }
@@ -59,6 +90,15 @@ static void apiCP(uint8_t reg, uint32_t v) {
         GXPC_Write32(v);
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        shadowCP(reg, v);
+        GXPC_Write8(0x08);
+        GXPC_Write8(reg);
+        GXPC_Write32(v);
+        return;
+    }
+#endif
     writeCP(reg, v);
 }
 
@@ -70,6 +110,15 @@ static void apiXF(uint16_t addr, uint32_t n, const uint32_t* w) {
         for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        shadowXF(addr, n, w);
+        GXPC_Write8(0x10);
+        GXPC_Write32(((n - 1) << 16) | addr);
+        for (uint32_t i = 0; i < n; i++) GXPC_Write32(w[i]);
+        return;
+    }
+#endif
     writeXF(addr, n, w);
 }
 static void apiXF1(uint16_t addr, uint32_t v) { apiXF(addr, 1, &v); }
@@ -236,7 +285,12 @@ GXFifoObj* GXInit(void* base, u32 size) {
 }
 
 void GXSetMisc(GXMiscToken, u32) {}
-void GXFlush(void) { drainCommandStream(); flushBatch(); }
+void GXFlush(void) {
+#ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wake(); return; }
+#endif
+    drainCommandStream(); flushBatch();
+}
 void GXResetWriteGatherPipe(void) {}
 void GXAbortFrame(void) {}
 BOOL IsWriteGatherBufferEmpty(void) { return pipeIdle(); }
@@ -245,14 +299,40 @@ void GXSetDrawSync(u16 token) {
     apiBP(BP_PE_TOKEN_INT, 0x480000 | token);  // writes 0x48 with token
     apiBP(BP_PE_TOKEN, token);
 }
-u16 GXReadDrawSync(void) { drainCommandStream(); return GX_STATE.drawSyncToken; }
+u16 GXReadDrawSync(void) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitDrawSync);
+    else
+#endif
+    drainCommandStream();
+    return GX_STATE.drawSyncToken;
+}
 void GXSetDrawDone(void) {
     apiBP(BP_DRAWDONE, 2);
+#ifdef __WIIU__
+    if (producerMode()) {
+        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+        if (s_drawDoneCb) s_drawDoneCb();
+        return;
+    }
+#endif
     drainCommandStream();
     if (s_drawDoneCb) s_drawDoneCb();
 }
-void GXWaitDrawDone(void) { drainCommandStream(); flushBatch(); }
+void GXWaitDrawDone(void) {
+#ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitDrawDone); return; }
+#endif
+    drainCommandStream(); flushBatch();
+}
 void GXDrawDone(void) {
+#ifdef __WIIU__
+    if (producerMode()) {
+        ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+        if (s_drawDoneCb) s_drawDoneCb();
+        return;
+    }
+#endif
     drainCommandStream();
     flushBatch();
     if (s_drawDoneCb) s_drawDoneCb();
@@ -340,6 +420,10 @@ void GXRestoreWriteGatherPipe(void) { setPipeRedirect(nullptr); }
 
 // ================================================================== display lists
 void GXBeginDisplayList(void* list, u32 size) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+    else
+#endif
     flushBatch();
     // The producer starts from the last consumed state.  All API read-modify-
     // writes during the recording then stay in gProducer until the list is
@@ -366,6 +450,14 @@ void GXCallDisplayList(void* list, u32 nbytes) {
         GXPC_Write32(uint32_t(nbytes));
         return;
     }
+#ifdef __WIIU__
+    if (producerMode()) {
+        // A full host pointer: ptrToPhys/physToPtr do not round-trip on Wii U.
+        producerHostState(kHostCallDlPtr, 0, hostPtr(list));
+        producerHostState(kHostCallDlSize, 0, uint32_t(nbytes));
+        return;
+    }
+#endif
     callDisplayList(static_cast<const uint8_t*>(list), uint32_t(nbytes));
 }
 
@@ -380,8 +472,12 @@ void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
     else if (attr == GX_VA_CLR0) lo = setField(lo, 2, 13, t);
     else if (attr == GX_VA_CLR1) lo = setField(lo, 2, 15, t);
     else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) hi = setField(hi, 2, 2 * (attr - GX_VA_TEX0), t);
-    if (lo != GX_STATE.cpVcdLo) apiCP(CP_VCD_LO, lo);
-    if (hi != GX_STATE.cpVcdHi) apiCP(CP_VCD_HI, hi);
+    // In producer mode called display lists change the worker's VCD but not
+    // the shadow (as on the GameCube, whose SDK writes dirty state again), so
+    // a "same as the shadow" write is not redundant there.
+    const bool always = forceVtxState();
+    if (always || lo != GX_STATE.cpVcdLo) apiCP(CP_VCD_LO, lo);
+    if (always || hi != GX_STATE.cpVcdHi) apiCP(CP_VCD_HI, hi);
 }
 void GXSetVtxDescv(const GXVtxDescList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
@@ -435,9 +531,10 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
     default: break;
     }
     A |= 1u << 30;
-    if (A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
-    if (B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
-    if (C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
+    const bool always = forceVtxState();
+    if (always || A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
+    if (always || B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
+    if (always || C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
 }
 void GXSetVtxAttrFmtv(GXVtxFmt fmt, const GXVtxAttrFmtList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);
@@ -486,6 +583,14 @@ void GXSetArray(GXAttr attr, const void* base, u8 stride) {
         apiCP(uint8_t(CP_ARRAY_STRIDE + slot), stride);
         return;
     }
+#ifdef __WIIU__
+    if (hostState()) {
+        producerHostState(kHostArrayBase, uint8_t(slot), hostPtr(base));
+        producerHostState(kHostArrayStride, uint8_t(slot), stride);
+        producerHostState(kHostArrayBE, uint8_t(slot), GX_STATE.arrayBigEndian[slot]);
+        return;
+    }
+#endif
     g_arrayGen++;
 }
 void GXInvalidateVtxCache(void) {}
@@ -552,6 +657,9 @@ void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
 
 void GXSetLineWidth(u8 width, GXTexOffset off) {
     GX_STATE.lineWidth = width;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostLineWidth, 0, width);
+#endif
     uint32_t r = setField(GX_STATE.bp[BP_LPSIZE], 8, 0, width);
     apiBP(BP_LPSIZE, setField(r, 3, 16, off));
 }
@@ -561,6 +669,9 @@ void GXGetLineWidth(u8* width, GXTexOffset* off) {
 }
 void GXSetPointSize(u8 size, GXTexOffset off) {
     GX_STATE.pointSize = size;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostPointSize, 0, size);
+#endif
     uint32_t r = setField(GX_STATE.bp[BP_LPSIZE], 8, 8, size);
     apiBP(BP_LPSIZE, setField(r, 3, 19, off));
 }
@@ -574,6 +685,9 @@ void GXEnableTexOffsets(GXTexCoordID coord, u8 line, u8 point) {
 }
 void GXSetCullMode(GXCullMode mode) {
     GX_STATE.cullMode = mode;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostCull, 0, uint32_t(mode));
+#endif
     uint32_t hw = mode == GX_CULL_FRONT ? 2 : mode == GX_CULL_BACK ? 1 : uint32_t(mode);
     bpField(BP_GENMODE, 2, 14, hw);
 }
@@ -662,6 +776,10 @@ void GXSetViewportJitter(f32 left, f32 top, f32 wd, f32 ht, f32 nearz, f32 farz,
     GX_STATE.viewport[3] = ht;
     GX_STATE.viewport[4] = nearz;
     GX_STATE.viewport[5] = farz;
+#ifdef __WIIU__
+    if (hostState())
+        for (int i = 0; i < 6; i++) producerHostState(kHostViewport, uint8_t(i), hostFloat(GX_STATE.viewport[i]));
+#endif
     float v[6];
     v[0] = wd * 0.5f;
     v[1] = -ht * 0.5f;
@@ -681,6 +799,10 @@ void GXSetScissor(u32 left, u32 top, u32 wd, u32 ht) {
     GX_STATE.scissor[1] = uint32_t(top);
     GX_STATE.scissor[2] = uint32_t(wd);
     GX_STATE.scissor[3] = uint32_t(ht);
+#ifdef __WIIU__
+    if (hostState())
+        for (int i = 0; i < 4; i++) producerHostState(kHostScissor, uint8_t(i), GX_STATE.scissor[i]);
+#endif
     uint32_t tl = setField(0, 11, 0, uint32_t(top) + 342);
     tl = setField(tl, 11, 12, uint32_t(left) + 342);
     uint32_t br = setField(0, 11, 0, uint32_t(top + ht) + 341);
@@ -1120,8 +1242,22 @@ void GXPokeDstAlpha(GXBool, u8) {}
 void GXPokeDither(GXBool) {}
 void GXPokeZMode(GXBool, GXCompare, GXBool) {}
 void GXPokeARGB(u16, u16, u32) {}
-void GXPeekARGB(u16 x, u16 y, u32* color) { drainCommandStream(); *color = peekColor(x, y); }
-void GXPeekZ(u16 x, u16 y, u32* z) { drainCommandStream(); *z = peekZ(x, y); }
+void GXPeekARGB(u16 x, u16 y, u32* color) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    else
+#endif
+    drainCommandStream();
+    *color = peekColor(x, y);
+}
+void GXPeekZ(u16 x, u16 y, u32* z) {
+#ifdef __WIIU__
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    else
+#endif
+    drainCommandStream();
+    *z = peekZ(x, y);
+}
 void GXPokeZ(u16, u16, u32) {}
 u32 GXCompressZ16(u32 z24, GXZFmt16) { return z24 >> 8; }
 u32 GXDecompressZ16(u32 z16, GXZFmt16) { return z16 << 8; }
@@ -1192,6 +1328,9 @@ static void doCopy(void* dest, GXBool clear, bool disp) {
     // the renderer needs the host pointer; commands carry a physical address
     apiBP(BP_COPY_DST, ptrToPhys(dest) >> 5);
     if (!s_recording) GX_STATE.copyDest = dest;  // keep the full host pointer (64-bit hosts)
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostCopyDest, 0, hostPtr(dest));
+#endif
     uint32_t ctrl = disp ? s_dispCtrl : s_texCtrl;
     ctrl = setField(ctrl, 1, 11, clear);
     ctrl = setField(ctrl, 1, 14, disp);
@@ -1351,6 +1490,9 @@ void GXLoadTexObjPreLoaded(GXTexObj* obj, GXTexRegion*, GXTexMapID id) {
         apiBP(bpTexReg(BP_TX_TLUT, map), ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | fmt << 10);
     }
     if (!s_recording) GX_STATE.texImage[map] = static_cast<const uint8_t*>(static_cast<const void*>(t->image));
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostTexImage, uint8_t(map), hostPtr(t->image));
+#endif
 }
 void GXLoadTexObj(GXTexObj* obj, GXTexMapID id) {
     if (s_texRegionCb) s_texRegionCb(obj, id);
@@ -1377,6 +1519,16 @@ void GXLoadTlut(GXTlutObj* obj, u32 name) {
     uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
     uint32_t bytes = uint32_t(t->entries) * 2;
     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
+#ifdef __WIIU__
+    if (hostState()) {
+        // The worker flushes its batch and copies the palette in stream order.
+        if (t->data) memcpy(GX_STATE.tlutMem + off, t->data, bytes);
+        producerHostState(kHostTlutPtr, 0, hostPtr(t->data));
+        producerHostState(kHostTlutOffset, 0, off);
+        producerHostState(kHostTlutLoad, 0, bytes);
+        return;
+    }
+#endif
     onStateChange();
     if (t->data) memcpy(GX_STATE.tlutMem + off, t->data, bytes);
 }
@@ -1400,6 +1552,9 @@ void GXInitTlutRegion(GXTlutRegion* region, u32 addr, GXTlutSize size) {
 }
 void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
 void GXInvalidateTexAll(void) {
+#ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+#endif
     flushBatch();
     textureInvalidateAll();
 }
@@ -1417,6 +1572,9 @@ void GXPreLoadEntireTexture(GXTexObj*, GXTexRegion*) {}
 void GXSetTexCoordScaleManually(GXTexCoordID coord, u8 enable, u16 ss, u16 ts) {
     if (coord >= 8) return;
     GX_STATE.tcManual[coord] = enable != 0;
+#ifdef __WIIU__
+    if (hostState()) producerHostState(kHostTcManual, uint8_t(coord), enable != 0);
+#endif
     if (enable) {
         bpField(BP_SU_SSIZE + 2 * coord, 16, 0, ss - 1u);
         bpField(BP_SU_SSIZE + 2 * coord + 1, 16, 0, ts - 1u);
