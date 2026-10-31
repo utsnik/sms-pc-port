@@ -2211,6 +2211,92 @@ static bool initVertexProgram(VertexProgram& shader) {
     return true;
 }
 
+// Compact vertices (on unless SD marker "nocompactvx"): a decoded batch goes
+// to the GPU in its packed form instead of one 132-byte HostVertex per vertex.
+// The fetch shader follows the GX format: absent attributes use component
+// selects, while matrix indices of a format without VF_MTX come from one
+// constant attribute element in buffer 1.  The generated vertex programs read
+// the same 13 locations as the raw HostVertex fetch ABI.
+static bool s_compactVx;
+struct CompactFetch {
+    uint32_t fmt;
+    bool ok;
+    GX2FetchShader fetch;
+    GX2AttribStream attrs[RAW_ATTR_COUNT];
+};
+static CompactFetch s_compactFetch[64];
+static uint32_t s_compactFetchCount;
+
+static GX2FetchShader* compactFetchFor(uint32_t fmt) {
+    for (uint32_t i = 0; i < s_compactFetchCount; ++i)
+        if (s_compactFetch[i].fmt == fmt) return s_compactFetch[i].ok ? &s_compactFetch[i].fetch : nullptr;
+    if (s_compactFetchCount == sizeof(s_compactFetch) / sizeof(s_compactFetch[0])) return nullptr;
+    CompactFetch& c = s_compactFetch[s_compactFetchCount++];
+    c.fmt = fmt;
+    c.ok = false;
+    const VtxFmtLayout& l = vtxFmtLayout(fmt);
+    const GX2AttribFormat f3 = GX2_ATTRIB_FORMAT_FLOAT_32_32_32, f2 = GX2_ATTRIB_FORMAT_FLOAT_32_32,
+                          f4 = GX2_ATTRIB_FORMAT_FLOAT_32_32_32_32, u8x4 = GX2_ATTRIB_FORMAT_UNORM_8_8_8_8,
+                          idx = GX2AttribFormat(GX2_ATTRIB_FLAG_SCALED | GX2_ATTRIB_TYPE_8_8_8_8);
+    const uint32_t xyzw = GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_W);
+    const uint32_t zero = GX2_COMP_MAP(GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_0);
+    auto set = [&](uint32_t i, uint32_t buffer, uint32_t offset, GX2AttribFormat format, uint32_t mask) {
+        GX2AttribStream& a = c.attrs[i];
+        a.location = i;
+        a.buffer = buffer;
+        a.offset = offset;
+        a.format = format;
+        a.type = GX2_ATTRIB_INDEX_PER_VERTEX;
+        a.aluDivisor = 0;
+        a.mask = mask;
+        a.endianSwap = GX2_ENDIAN_SWAP_DEFAULT;
+    };
+    set(RAW_ATTR_POS, 0, 0, f3, GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_Z, GX2_SQ_SEL_1));
+    if (fmt & VF_NRM) set(RAW_ATTR_NRM, 0, l.nrm, f3, xyzw);
+    else set(RAW_ATTR_NRM, 0, 0, f3, GX2_COMP_MAP(GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_1, GX2_SQ_SEL_0));
+    const bool nbt = (fmt & VF_NRM) && (fmt & VF_NBT);
+    set(RAW_ATTR_BIN, 0, nbt ? l.nrm + 12 : 0, f3, nbt ? xyzw : zero);
+    set(RAW_ATTR_TAN, 0, nbt ? l.nrm + 24 : 0, f3, nbt ? xyzw : zero);
+    for (uint32_t ch = 0; ch < 2; ++ch) {
+        if (fmt & (VF_CLR0 << ch)) set(RAW_ATTR_CLR0 + ch, 0, l.clr[ch], u8x4, xyzw);
+        else set(RAW_ATTR_CLR0 + ch, 0, 0, u8x4,
+                GX2_COMP_MAP(GX2_SQ_SEL_1, GX2_SQ_SEL_1, GX2_SQ_SEL_1, GX2_SQ_SEL_1));
+    }
+    for (uint32_t pair = 0; pair < 4; ++pair) {
+        const uint32_t t0 = pair * 2, t1 = t0 + 1;
+        const bool h0 = fmt & (VF_TEX0 << t0), h1 = fmt & (VF_TEX0 << t1);
+        const uint32_t at = RAW_ATTR_TEX01 + pair;
+        if (h0 && h1) {
+            if (l.tex[t1] != l.tex[t0] + 8) return nullptr;
+            set(at, 0, l.tex[t0], f4, xyzw);
+        } else if (h0) {
+            set(at, 0, l.tex[t0], f2,
+                GX2_COMP_MAP(GX2_SQ_SEL_X, GX2_SQ_SEL_Y, GX2_SQ_SEL_0, GX2_SQ_SEL_0));
+        } else if (h1) {
+            set(at, 0, l.tex[t1], f2,
+                GX2_COMP_MAP(GX2_SQ_SEL_0, GX2_SQ_SEL_0, GX2_SQ_SEL_X, GX2_SQ_SEL_Y));
+        } else {
+            set(at, 0, 0, f2, zero);
+        }
+    }
+    for (uint32_t group = 0; group < 3; ++group) {
+        if (fmt & VF_MTX) set(RAW_ATTR_MTX0 + group, 0, l.mtx + group * 4, idx, xyzw);
+        else set(RAW_ATTR_MTX0 + group, 1, group * 4, idx, xyzw);
+    }
+    c.fetch.size = GX2CalcFetchShaderSizeEx(RAW_ATTR_COUNT, GX2_FETCH_SHADER_TESSELLATION_NONE,
+                                            GX2_TESSELLATION_MODE_DISCRETE);
+    void* program = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, c.fetch.size);
+    if (!program) return nullptr;
+    c.fetch.program = program;
+    GX2InitFetchShaderEx(&c.fetch, static_cast<uint8_t*>(program), RAW_ATTR_COUNT, c.attrs,
+                         GX2_FETCH_SHADER_TESSELLATION_NONE, GX2_TESSELLATION_MODE_DISCRETE);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, program, c.fetch.size);
+    c.ok = true;
+    WHBLogPrintf("SMS Wii U: [compactvx] fetch shader for fmt %08x stride %u (%u formats)",
+                 (unsigned)fmt, (unsigned)l.stride, (unsigned)s_compactFetchCount);
+    return &c.fetch;
+}
+
 static ShaderKeyIndex<VertexProgram> s_vertexProgramIndex;
 
 static VertexProgram* vertexShaderForKey(const VertexKey& key) {
@@ -4812,6 +4898,10 @@ void rendererInit(float) {
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    // Compact packed vertices are the default; the marker keeps a raw A/B path.
+    s_compactVx = !sdMarkerPresent("nocompactvx");
+    if (!s_compactVx)
+        WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
     s_noScanTv = sdMarkerPresent("noscantv");
     s_noScanDrc = sdMarkerPresent("noscandrc");
     s_aspect43 = sdMarkerPresent("aspect43");
@@ -5133,7 +5223,7 @@ static inline OSTime stageLap(OSTime& acc, OSTime t) {
     acc += now - t;
     return now;
 }
-static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfFrames;
+static uint32_t s_perfDraws, s_perfVerts, s_perfUnique, s_perfCompact, s_perfFrames;
 static uint32_t s_perfGpuDraws, s_perfCpuDraws, s_perfGpuVerts, s_perfCpuVerts;
 struct PerfScope {
 #if defined(PORT_GAME_SMG)
@@ -5307,11 +5397,16 @@ void flushBatch() {
     // vertices, one zeroed slot for out-of-range indices and the index list
     // share ONE arena block: an overflow between two allocations would recycle
     // the vertices before their draw is submitted.
+    GX2FetchShader* compact = s_compactVx && gpuPath && !s_vertexSelfCheck && !SMS_GX2_VX_ORACLE && s_batch.stride
+                                  ? compactFetchFor(s_batch.fmt) : nullptr;
     const size_t vertexFloats = gpuPath ? kRawVertexFloats : (tevPath ? 28 : (useTex ? 10 : 8));
-    const uint32_t vertexStride = gpuPath ? kRawVertexStride : uint32_t(vertexFloats * sizeof(float));
+    const uint32_t vertexStride = compact ? s_batch.stride :
+                                  gpuPath ? kRawVertexStride : uint32_t(vertexFloats * sizeof(float));
     const size_t vertexCount = s_batch.stride ? s_batch.vertices.size() / s_batch.stride : 0;
     const uint32_t indexCount = uint32_t(s_batch.indices.size());
-    const uint32_t vboBytes = uint32_t((vertexCount + 1) * vertexStride);
+    // The packed vertices, a zeroed sentinel, then the default matrix indices.
+    const uint32_t compactDefOff = compact ? (uint32_t((vertexCount + 1) * vertexStride) + 31) & ~31u : 0;
+    const uint32_t vboBytes = compact ? compactDefOff + 32 : uint32_t((vertexCount + 1) * vertexStride);
     const uint32_t iboOffset = (vboBytes + 255) & ~255u;
     const uint32_t blockBytes = iboOffset + indexCount * uint32_t(sizeof(uint32_t));
     uint8_t* block = reinterpret_cast<uint8_t*>(allocVertices(blockBytes));
@@ -5321,7 +5416,9 @@ void flushBatch() {
     }
     float* vbo = reinterpret_cast<float*>(block);
     uint32_t* ibo = reinterpret_cast<uint32_t*>(block + iboOffset);
-    if (gpuPath) {
+    if (compact) {
+        // Written whole below.
+    } else if (gpuPath) {
         // Zero the vertex lines in cache without reading MEM2: the decoder
         // writes every vertex here, and cold write-allocate fills were the
         // top CPU cost.  Covers the sentinel slot too.  block is 256-aligned.
@@ -5345,6 +5442,18 @@ void flushBatch() {
     const uint8_t defaults[9] = {uint8_t(ma & 63), uint8_t((ma >> 6) & 63), uint8_t((ma >> 12) & 63),
                                  uint8_t((ma >> 18) & 63), uint8_t((ma >> 24) & 63), uint8_t(mb & 63),
                                  uint8_t((mb >> 6) & 63), uint8_t((mb >> 12) & 63), uint8_t((mb >> 18) & 63)};
+    if (compact) {
+        memcpy(block, s_batch.vertices.data(), vertexCount * vertexStride);
+        memset(block + vertexCount * vertexStride, 0, vertexStride);
+        memset(block + compactDefOff, 0, 32);
+        memcpy(block + compactDefOff, defaults, sizeof(defaults));
+        for (uint32_t i = 0; i < indexCount; ++i) {
+            const uint32_t index = s_batch.indices[i];
+            ibo[i] = index < vertexCount ? index : uint32_t(vertexCount);
+        }
+        s_perfUnique += uint32_t(vertexCount);
+        ++s_perfCompact;
+    } else {
     for (uint32_t i = 0; i < indexCount; ++i) {
         const uint32_t index = s_batch.indices[i];
         if (index >= vertexCount) {
@@ -5387,6 +5496,7 @@ void flushBatch() {
                 haveFirst = true;
             }
         }
+    }
     }
 #if defined(PORT_GAME_SMG)
     if (g_perfStages) s_perfXform += OSGetTime() - perfXform0;
@@ -5444,7 +5554,12 @@ void flushBatch() {
     } else if (listReady) {
         prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
     }
-    GX2SetAttribBuffer(0, vboBytes, gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
+    if (compact) {
+        GX2SetFetchShader(compact);
+        s_boundFetch = compact;
+        GX2SetAttribBuffer(1, 32, 0, block + compactDefOff);
+    }
+    GX2SetAttribBuffer(0, vboBytes, compact ? vertexStride : gpuPath ? vertex->stride : (tevPath ? vertexStride : shader.stride), vbo);
     const GX2PrimitiveMode mode = s_batch.cls == PRIM_LINES ? GX2_PRIMITIVE_MODE_LINES :
                                   s_batch.cls == PRIM_POINTS ? GX2_PRIMITIVE_MODE_POINTS : GX2_PRIMITIVE_MODE_TRIANGLES;
     const bool bracket = SMS_GX2_VX_BRACKET && gpuPath && !vertex->bracketed;
@@ -5913,9 +6028,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotions=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotions=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
-                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
+                     (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
                      (unsigned)(s_perfGpuVerts / 30), (unsigned)(s_perfCpuVerts / 30),
                      (unsigned)s_vertexRejected,
@@ -5949,7 +6064,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfDlFallbacks = s_perfDlForbidden = s_perfDlOverflows = s_perfDlBadAlignment = 0;
         s_perfDlSplitsCopy = s_perfDlSplitsClear = s_perfDlSplitsContext = s_perfDlSplitsFrame = 0;
         s_perfDlCoreRecord = s_perfDlCoreCall = 0;
-        s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
+        s_perfDraws = s_perfVerts = s_perfUnique = s_perfCompact = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
     }
 #if defined(PORT_GAME_SMG)
