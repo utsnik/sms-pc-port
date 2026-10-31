@@ -44,6 +44,7 @@
 #include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
+#include "gx2_texture.h"
 #include "gx2_texture_pack.h"
 #if defined(PORT_GAME_SMG)
 #include "gx2_ztex.h"
@@ -98,9 +99,6 @@ static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
 static void gx2ProdBoundary(uint32_t kind);
 static void gx2ProdCallList(void* list, uint32_t bytes);
 static void gx2DlClose();
-void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
-                      const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
-
 uint32_t g_displayFrames = 0;
 // A fixed CPU ring retains submissions from the first sixty game frames.
 // The pending record describes work since the previous submission, including
@@ -506,6 +504,13 @@ struct TextureEntry {
     const uint8_t* source = nullptr;
     uint32_t fmt = 0, width = 0, height = 0, tlut = 0, tlutFmt = 0, levels = 1;
     bool arbitraryMips = false;
+    uint32_t sourceBytes = 0;
+    uint32_t checkedGeneration = 0;
+    uint32_t checkedClock = 0;
+    uint32_t checkedFrame = 0;
+    uint64_t dataHash = 0;
+    uint64_t tlutHash = 0;
+    bool hashAlways = false;
     GX2Texture texture;
     GX2Sampler sampler;
     bool valid = false;
@@ -546,6 +551,8 @@ static std::deque<TextureEntry>& textureCache() {
     return *s_textureObject;
 }
 #define s_textures (textureCache())
+static uint32_t s_textureGeneration = 1;
+static uint32_t s_texNativeCounts[16];
 // source address -> newest entry for it; every bind looked through all entries.
 static unsigned char s_textureIndexStorage[sizeof(std::unordered_map<const uint8_t*, uint32_t>)]
     __attribute__((aligned(8)));
@@ -670,6 +677,7 @@ static void* uniformBlockCopy(UniformRingBlock block, const void* data, uint32_t
 struct BoundPixelTexture {
     const void* image; const void* mipmaps;
     uint32_t texRegs[5], samplerRegs[3];
+    uint32_t compMap;
     bool valid;
 };
 static BoundPixelTexture s_boundPixelTex[8];
@@ -719,10 +727,12 @@ static void bindPixelTexture(GX2Texture* texture, GX2Sampler* sampler, uint32_t 
     if (s_d8NoTex) texture = d8DummyTexture();
     BoundPixelTexture& b = s_boundPixelTex[unit];
     if (!b.valid || b.image != texture->surface.image || b.mipmaps != texture->surface.mipmaps ||
+        b.compMap != texture->compMap ||
         memcmp(b.texRegs, texture->regs, sizeof(b.texRegs))) {
         GX2SetPixelTexture(texture, unit);
         b.image = texture->surface.image;
         b.mipmaps = texture->surface.mipmaps;
+        b.compMap = texture->compMap;
         memcpy(b.texRegs, texture->regs, sizeof(b.texRegs));
     }
     if (!b.valid || memcmp(b.samplerRegs, sampler->regs, sizeof(b.samplerRegs))) {
@@ -4380,6 +4390,7 @@ static const float kArbitraryMipThreshold = 14.0f;
 static void rebindTvTarget();
 static bool s_retileTextures = true;
 static bool s_textiledMarker;
+static bool s_texNative;
 static uint32_t s_whiteFillLogs;
 static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
     if (level >= tiled.surface.mipLevels) return false;
@@ -4492,6 +4503,55 @@ static bool textiledTexture(TextureEntry& e) {
     return e.texture.surface.tileMode == GX2_TILE_MODE_DEFAULT;
 }
 
+static GX2SurfaceFormat nativeSurfaceFormat(uint32_t fmt) {
+    switch (fmt & 15) {
+    case 0:
+    case 1: return GX2_SURFACE_FORMAT_UNORM_R8;
+    case 2:
+    case 3: return GX2_SURFACE_FORMAT_UNORM_R8_G8;
+    case 4: return GX2_SURFACE_FORMAT_UNORM_R5_G6_B5;
+    case 14: return GX2_SURFACE_FORMAT_UNORM_BC1;
+    default: return GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    }
+}
+
+static uint32_t nativeCompMap(uint32_t fmt) {
+    const uint32_t R = GX2_SQ_SEL_R, G = GX2_SQ_SEL_G, B = GX2_SQ_SEL_B, A = GX2_SQ_SEL_A;
+    switch (fmt & 15) {
+    case 0:
+    case 1: return GX2_COMP_MAP(R, R, R, R);
+    case 2:
+    case 3: return GX2_COMP_MAP(R, R, R, G);
+    case 4: return GX2_COMP_MAP(R, G, B, GX2_SQ_SEL_1);
+    case 14: return GX2_COMP_MAP(R, G, B, A);
+    default: return GX2_COMP_MAP(R, G, B, A);
+    }
+}
+
+static uint32_t nativeLevelRowBytes(uint32_t fmt, uint32_t width) {
+    switch (fmt & 15) {
+    case 0:
+    case 1: return width;
+    case 2:
+    case 3:
+    case 4: return width * 2;
+    case 14: return ((width + 3) / 4) * 8;
+    default: return width * 4;
+    }
+}
+
+static uint32_t nativeLevelPitchBytes(const GX2Surface& surface, uint32_t fmt) {
+    switch (fmt & 15) {
+    case 0:
+    case 1: return surface.pitch;
+    case 2:
+    case 3:
+    case 4: return surface.pitch * 2;
+    case 14: return surface.pitch * 8;
+    default: return surface.pitch * 4;
+    }
+}
+
 static TextureEntry* getTexture(int map) {
     const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
     const uint32_t mode1 = g.bp[bpTexReg(BP_TX_MODE1, map)];
@@ -4509,6 +4569,9 @@ static TextureEntry* getTexture(int map) {
         return c;
     }
     const uint32_t levels = textureLevels(mode0, mode1, w, h);
+    uint32_t cacheSourceBytes = 0;
+    for (uint32_t l = 0; l < levels; ++l)
+        cacheSourceBytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
     auto& index = textureIndex();
     const auto head = index.find(source);
     const uint32_t first = head == index.end() ? UINT32_MAX : head->second;
@@ -4516,6 +4579,31 @@ static TextureEntry* getTexture(int map) {
         TextureEntry& e = s_textures[i];
         if (e.valid && e.fmt == fmt && e.width == w && e.height == h &&
             e.tlut == tlut && e.tlutFmt == tlutFmt && e.levels == levels) {
+            if (e.checkedGeneration != s_textureGeneration) {
+                e.checkedGeneration = s_textureGeneration;
+                const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + cacheSourceBytes;
+                const bool readable = source && cacheSourceBytes && a1 > a0 &&
+                    ((a0 >= 0x10000000u && a1 <= 0x50000000u) ||
+                     (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
+                const bool mayHaveChanged = !trustWriteStamps() || e.sourceBytes != cacheSourceBytes ||
+                    !unwrittenSince(source, cacheSourceBytes, e.checkedClock) ||
+                    g_displayFrames - e.checkedFrame >= kRecheckFrames;
+                if (readable && mayHaveChanged) {
+                    const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
+                    const uint64_t dataHash = xxh64(source, cacheSourceBytes, 0);
+                    const uint64_t tlutHash = tlutPtr ? xxh64(tlutPtr, 512, 0) : 0;
+                    if (dataHash != e.dataHash || tlutHash != e.tlutHash) {
+                        deferFree(e.texture.surface.image);
+                        deferFree(e.texture.surface.mipmaps);
+                        e.valid = false;
+                        continue;
+                    }
+                    e.dataHash = dataHash;
+                    e.tlutHash = tlutHash;
+                    e.checkedClock = writeClock();
+                    e.checkedFrame = g_displayFrames;
+                }
+            }
             if (e.packState == 3 && e.packTouchedFrame != g_displayFrames) {
                 e.packTouchedFrame = g_displayFrames;
                 e.packLruHint = s_packLru.touchHint(e.packRequestId, g_displayFrames, e.packLruHint);
@@ -4539,29 +4627,30 @@ static TextureEntry* getTexture(int map) {
     e.texture.surface.height = h;
     e.texture.surface.depth = 1;
     e.texture.surface.mipLevels = levels;
-    e.texture.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    const bool native = s_texNative && gx2NativeTextureFormat(fmt);
+    if (native) ++s_texNativeCounts[fmt & 15];
+    e.texture.surface.format = native ? nativeSurfaceFormat(fmt) : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.texture.surface.aa = GX2_AA_MODE1X;
     e.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&e.texture.surface);
-    // Level l (l >= 1) is at mipPtr + offset, offset 0 for level 1 and
-    // mipLevelOffset[l - 1] after it; a LINEAR_ALIGNED 32-bit level's pitch is
-    // its width aligned to 64 texels. Keep only level 0 if GX2's layout does
-    // not agree with that.
     GX2Surface& surf = e.texture.surface;
-    uint32_t mipOffset[12] = {};
-    uint32_t mipPitch[12] = {};
-    mipPitch[0] = surf.pitch;
+    uint32_t mipOffset[13] = {};
+    uint32_t mipPitchBytes[13] = {};
+    mipPitchBytes[0] = nativeLevelPitchBytes(surf, native ? fmt : 6);
     if (surf.mipLevels > 1) {
-        bool agrees = surf.pitch == ((w + 63) & ~63u);
-        uint32_t end = 0;
-        for (uint32_t l = 1; l < surf.mipLevels && agrees; ++l) {
+        bool agrees = true;
+        for (uint32_t l = 1; l < surf.mipLevels; ++l) {
             const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
-            mipPitch[l] = (lw + 63) & ~63u;
             mipOffset[l] = l == 1 ? 0 : surf.mipLevelOffset[l - 1];
-            if (mipOffset[l] < end) agrees = false;
-            end = mipOffset[l] + mipPitch[l] * lh * 4;
+            GX2Surface level = surf;
+            level.width = lw; level.height = lh; level.mipLevels = 1;
+            level.image = nullptr; level.mipmaps = nullptr;
+            GX2CalcSurfaceSizeAndAlignment(&level);
+            mipPitchBytes[l] = nativeLevelPitchBytes(level, native ? fmt : 6);
+            const uint32_t next = l + 1 < surf.mipLevels ? surf.mipLevelOffset[l] : surf.mipmapSize;
+            const uint32_t rowCount = native && fmt == 14 ? (lh + 3) / 4 : lh;
+            if (next < mipOffset[l] || mipPitchBytes[l] * rowCount > next - mipOffset[l]) agrees = false;
         }
-        if (agrees && end > surf.mipmapSize) agrees = false;
         if (!agrees) {
             static bool logged;
             if (!logged) {
@@ -4572,11 +4661,13 @@ static TextureEntry* getTexture(int map) {
             }
             surf.mipLevels = 1;
             GX2CalcSurfaceSizeAndAlignment(&surf);
+            mipPitchBytes[0] = nativeLevelPitchBytes(surf, native ? fmt : 6);
         }
     }
     e.texture.viewNumMips = surf.mipLevels;
     e.texture.viewNumSlices = 1;
-    e.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    e.texture.compMap = native ? nativeCompMap(fmt) : GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G,
+                                                                    GX2_SQ_SEL_B, GX2_SQ_SEL_A);
     surf.image = alignedZero(surf.alignment, surf.imageSize);
     if (!surf.image) return nullptr;
     if (surf.mipLevels > 1) {
@@ -4602,10 +4693,16 @@ static TextureEntry* getTexture(int map) {
     const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
     const bool readable = source && srcBytes && a1 > a0 &&
         ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
-    uint8_t* rgba = readable ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
-    uint8_t* prev = (readable && surf.mipLevels > 1)
+    e.sourceBytes = srcBytes;
+    e.checkedGeneration = s_textureGeneration;
+    e.checkedClock = writeClock();
+    e.checkedFrame = g_displayFrames;
+    uint8_t* rgba = readable && !native ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
+    uint8_t* nativeData = readable && native
+        ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(gx2NativeTextureBytes(fmt, w, h), 64)) : nullptr;
+    uint8_t* prev = (readable && !native && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
-    if (!rgba || (surf.mipLevels > 1 && !prev)) {
+    if ((!native && !rgba) || (native && !nativeData) || (!native && surf.mipLevels > 1 && !prev)) {
         if (s_whiteFillLogs < 40) {
             ++s_whiteFillLogs;
             WHBLogPrintf("SMS Wii U: white-fill source=%08x gxFormat=%u width=%u height=%u mipLevels=%u unreadable=%u allocationFailure=%u requestedBytes=%u",
@@ -4613,28 +4710,51 @@ static TextureEntry* getTexture(int map) {
                          readable ? 0u : 1u, readable ? 1u : 0u,
                          (unsigned)(w * h * 4 * (surf.mipLevels > 1 ? 2 : 1)));
         }
-        memset(surf.image, 0xff, surf.imageSize);
-        if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
+        if (native && fmt == 14) {
+            auto fill = [](void* p, uint32_t bytes) {
+                uint8_t* b = static_cast<uint8_t*>(p);
+                memset(b, 0, bytes);
+                for (uint32_t i = 0; i + 8 <= bytes; i += 8) {
+                    b[i + 0] = b[i + 1] = b[i + 2] = b[i + 3] = 0xff;
+                }
+            };
+            fill(surf.image, surf.imageSize);
+            if (surf.mipmaps) fill(surf.mipmaps, surf.mipmapSize);
+        } else {
+            memset(surf.image, 0xff, surf.imageSize);
+            if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
+        }
     } else {
         const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
+        e.dataHash = xxh64(source, srcBytes, 0);
+        e.tlutHash = tlutPtr ? xxh64(tlutPtr, 512, 0) : 0;
         const uint8_t* src = source;
         float mipDiff = 0.0f;
         uint32_t pw = w, ph = h;
         for (uint32_t l = 0; l < surf.mipLevels; ++l) {
             const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
-            gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
+            if (native) gx2ConvertTextureNative(src, fmt, lw, lh, nativeData);
+            else gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
             uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
                                   : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
-            for (uint32_t y = 0; y < lh; ++y)
-                memcpy(dst + size_t(y) * mipPitch[l] * 4, rgba + size_t(y) * lw * 4, size_t(lw) * 4);
-            if (l > 0) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
-            if (prev) std::swap(prev, rgba);
+            if (native) {
+                const uint32_t rowBytes = nativeLevelRowBytes(fmt, lw);
+                const uint32_t rowCount = fmt == 14 ? (lh + 3) / 4 : lh;
+                for (uint32_t y = 0; y < rowCount; ++y)
+                    memcpy(dst + size_t(y) * mipPitchBytes[l], nativeData + size_t(y) * rowBytes, rowBytes);
+            } else {
+                for (uint32_t y = 0; y < lh; ++y)
+                    memcpy(dst + size_t(y) * mipPitchBytes[l], rgba + size_t(y) * lw * 4, size_t(lw) * 4);
+                if (l > 0) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
+                if (prev) std::swap(prev, rgba);
+            }
             pw = lw; ph = lh;
             src += texLevelBytes(fmt, lw, lh);
         }
         e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
     }
     if (rgba) MEMFreeToDefaultHeap(rgba);
+    if (nativeData) MEMFreeToDefaultHeap(nativeData);
     if (prev) MEMFreeToDefaultHeap(prev);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
     sms_wiiu_d4_event(D4_UPLOAD);
@@ -5657,6 +5777,8 @@ void rendererInit(float) {
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
     s_textiledMarker = sdMarkerPresent("textiled");
+    s_texNative = sdMarkerPresent("texnative");
+    WHBLogPrintf("SMS Wii U: [texnative] marker=%s", s_texNative ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [textiled] marker=%s", s_textiledMarker ? "on" : "off");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
@@ -7202,9 +7324,9 @@ uint32_t peekZ(int x, int y) {
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
 
-void textureInvalidateAll() {}
-void textureInvalidateRange(const void*, uint32_t) {}
-void textureCpuWrote(const void*, uint32_t) {}
+void textureInvalidateAll() { ++s_textureGeneration; }
+void textureInvalidateRange(const void*, uint32_t) { ++s_textureGeneration; }
+void textureCpuWrote(const void*, uint32_t) { ++s_textureGeneration; }
 
 void* physToPtr(uint32_t);
 uint32_t ptrToPhys(const void*);
@@ -7348,7 +7470,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -7380,7 +7502,10 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
                      unsigned(s_perfTevFoldStages / 30), unsigned(s_perfTevFoldHits / 30),
-                     unsigned(s_perfTevFoldFallbacks / 30));
+                     unsigned(s_perfTevFoldFallbacks / 30), s_texNative ? 1u : 0u,
+                     unsigned(s_texNativeCounts[0]), unsigned(s_texNativeCounts[1]),
+                     unsigned(s_texNativeCounts[2]), unsigned(s_texNativeCounts[3]),
+                     unsigned(s_texNativeCounts[4]), unsigned(s_texNativeCounts[14]));
         if (s_gpuDiag) {
             CmdCounters cmd = s_cmdByCore[0];
             const CmdCounters& worker = s_cmdByCore[1];

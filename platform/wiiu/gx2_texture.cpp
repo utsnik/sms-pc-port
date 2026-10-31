@@ -1,15 +1,13 @@
-/* GameCube texture decode shared by the GX2 upload path.
- *
- * The layout and conversion are intentionally the same as the PC GX decoder:
- * GX2 receives ordinary row-major RGBA8, so no Latte tiling is needed for the
- * first renderer stage.  This also keeps palette and CMPR behaviour in one
- * well-tested place while the host upload code remains platform-specific.
- */
+/* GameCube texture decode shared by the GX2 upload path.  The fallback decoder
+ * produces ordinary row-major RGBA8; the opt-in native converter below keeps
+ * the six formats that GX2 can sample directly in compact row-major texel or
+ * BC1-block order before the renderer applies GX2's pitch and tiling. */
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
 
 #include "../gx/src/gx_texture_pack_common.h"
+#include "gx2_texture.h"
 
 namespace gx {
 
@@ -166,6 +164,93 @@ void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                 break;
             }
             p += kTileBytes[fmt];
+        }
+    }
+}
+
+bool gx2NativeTextureFormat(uint32_t fmt) {
+    switch (fmt & 15) {
+    case 0:  // I4
+    case 1:  // I8
+    case 2:  // IA4
+    case 3:  // IA8
+    case 4:  // RGB565
+    case 14: // CMPR
+        return true;
+    default:
+        return false;
+    }
+}
+
+uint32_t gx2NativeTextureBytes(uint32_t fmt, uint32_t w, uint32_t h) {
+    fmt &= 15;
+    switch (fmt) {
+    case 0:
+    case 1:
+        return w * h;
+    case 2:
+    case 3:
+    case 4:
+        return w * h * 2;
+    case 14:
+        return ((w + 3) / 4) * ((h + 3) / 4) * 8;
+    default:
+        return 0;
+    }
+}
+
+static inline uint8_t reverseBc1Row(uint8_t v) {
+    return uint8_t(((v >> 6) & 3) | ((v >> 2) & 0x0c) |
+                   ((v << 2) & 0x30) | ((v << 6) & 0xc0));
+}
+
+void gx2ConvertTextureNative(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
+                             uint8_t* out) {
+    fmt &= 15;
+    if (!src || !out || !gx2NativeTextureFormat(fmt)) return;
+    if (fmt == 14) {
+        const uint32_t tileCols = (w + 7) / 8, tileRows = (h + 7) / 8;
+        const uint32_t blockCols = (w + 3) / 4;
+        for (uint32_t ty = 0; ty < tileRows; ++ty) {
+            for (uint32_t tx = 0; tx < tileCols; ++tx) {
+                const uint8_t* tile = src + (size_t(ty) * tileCols + tx) * 32;
+                for (uint32_t sb = 0; sb < 4; ++sb) {
+                    const uint8_t* in = tile + sb * 8;
+                    const uint32_t bx = tx * 2 + (sb & 1), by = ty * 2 + (sb >> 1);
+                    if (bx >= blockCols || by >= (h + 3) / 4) continue;
+                    uint8_t* block = out + (size_t(by) * blockCols + bx) * 8;
+                    block[0] = in[1]; block[1] = in[0];
+                    block[2] = in[3]; block[3] = in[2];
+                    for (uint32_t row = 0; row < 4; ++row)
+                        block[4 + row] = reverseBc1Row(in[4 + row]);
+                }
+            }
+        }
+        return;
+    }
+
+    const uint32_t tw = kTileW[fmt], th = kTileH[fmt], tileBytes = kTileBytes[fmt];
+    const uint32_t cols = (w + tw - 1) / tw, rows = (h + th - 1) / th;
+    const uint32_t outBytes = (fmt == 0 || fmt == 1) ? 1 : 2;
+    const uint8_t* p = src;
+    for (uint32_t ty = 0; ty < rows; ++ty) {
+        for (uint32_t tx = 0; tx < cols; ++tx) {
+            const uint32_t x0 = tx * tw, y0 = ty * th;
+            const uint32_t count = tw * th;
+            for (uint32_t i = 0; i < count; ++i) {
+                const uint32_t x = x0 + (i % tw), y = y0 + (i / tw);
+                if (x >= w || y >= h) continue;
+                uint8_t* d = out + (size_t(y) * w + x) * outBytes;
+                switch (fmt) {
+                case 0: d[0] = uint8_t(((p[i >> 1] >> ((i & 1) ? 0 : 4)) & 15) * 17); break;
+                case 1: d[0] = p[i]; break;
+                case 2: d[0] = uint8_t((p[i] & 15) * 17); d[1] = uint8_t((p[i] >> 4) * 17); break;
+                case 3: d[0] = p[2 * i + 1]; d[1] = p[2 * i]; break;
+                case 4: d[0] = p[2 * i + 1]; d[1] = p[2 * i]; break;
+                default: break;
+                }
+            }
+            p += tileBytes;
         }
     }
 }

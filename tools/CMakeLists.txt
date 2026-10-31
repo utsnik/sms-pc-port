@@ -36,3 +36,11 @@ add_executable(gx2_texture_pack_runtime_test
 target_include_directories(gx2_texture_pack_runtime_test PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../platform/wiiu")
 add_test(NAME gx2_texture_pack_runtime_test COMMAND gx2_texture_pack_runtime_test)
+
+add_executable(gx2_texture_native_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/../platform/gx/tests/gx2_texture_native_test.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../platform/wiiu/gx2_texture.cpp")
+target_include_directories(gx2_texture_native_test PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../platform/gx/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../platform/wiiu")
+add_test(NAME gx2_texture_native_test COMMAND gx2_texture_native_test)
