@@ -672,7 +672,7 @@ void gf_collect(uint32_t f)
 			s_gfSpan += span;
 			s_gfIdle += idle;
 			if (span > s_gfSpanMax) s_gfSpanMax = span;
-			 s_gfStamps += n;
+			s_gfStamps += n;
 			++s_gfFrames;
 			sms_wiiu_dynres_gpu_frame(uint32_t((span - (idle < span ? idle : span)) / 27));
 		}
