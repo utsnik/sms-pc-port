@@ -1,3 +1,6 @@
+#ifdef TARGET_WIIU
+extern "C" void port_log(const char*, ...);
+#endif
 #include "Game/System/WPadButton.hpp"
 #include "Game/System/WPad.hpp"
 
@@ -25,6 +28,12 @@ void WPadButton::update() {
     }
 
     mRepeat = mTrigger;
+#ifdef TARGET_WIIU
+    if (pStatus->trig)
+        port_log("[smg-pad] chan=%p trig=%x mTrigger=%x mHold=%x hold=%x err=%d\n", (void*)mPad,
+                 (unsigned)pStatus->trig, (unsigned)mTrigger, (unsigned)mHold, (unsigned)pStatus->hold,
+                 (int)pStatus->wpad_err);
+#endif
 
     if ((pStatus->hold & KPAD_BUTTON_RPT) != 0) {
         mRepeat |= mHold;
