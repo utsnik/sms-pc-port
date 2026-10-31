@@ -6386,7 +6386,12 @@ uint32_t peekZ(int x, int y) {
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
         db->surface.format != GX2_SURFACE_FORMAT_FLOAT_R32 || db->surface.aa != GX2_AA_MODE1X)
         return 0xffffff;
+    // Two linear targets used in turn: the GPU copies into one while peeks
+    // read the last completed one, so no CPU copy and no read of a target
+    // the GPU is still writing.
     static GX2Surface s_tiled, s_linear, s_snapshot;
+    static GX2Surface* s_write = &s_linear;
+    static GX2Surface* s_read = &s_snapshot;
     static bool s_ready2, s_queued, s_completed;
     static uint64_t s_stamp;
     uint32_t& s_frame = s_peekZFrame;
@@ -6395,6 +6400,7 @@ uint32_t peekZ(int x, int y) {
         MEMFreeToDefaultHeap(s_linear.image);
         MEMFreeToDefaultHeap(s_snapshot.image);
         s_ready2 = s_queued = s_completed = false;
+        s_write = &s_linear; s_read = &s_snapshot;
     }
     if (!s_ready2) {
         memset(&s_tiled, 0, sizeof(s_tiled));
@@ -6445,8 +6451,9 @@ uint32_t peekZ(int x, int y) {
             // frame's queued copy.  Its contents remain valid on skipped frames.
             if (s_queued) {
                 GX2WaitTimeStamp(s_stamp);
-                DCInvalidateRange(s_linear.image, s_linear.imageSize);
-                memcpy(s_snapshot.image, s_linear.image, s_linear.imageSize);
+                GX2Surface* done = s_write;
+                s_write = s_read;
+                s_read = done;
                 s_completed = true;
             }
             GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
@@ -6454,8 +6461,8 @@ uint32_t peekZ(int x, int y) {
             GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
             gpuStampSurface(GPU_EFBCOPY, db->surface, s_tiled);
             sms_wiiu_d4_event(D4_DEPTH_COPY);
-            GX2CopySurface(&s_tiled, 0, 0, &s_linear, 0, 0); invalidateVertexUniforms();
-            gpuStampSurface(GPU_EFBCOPY, s_tiled, s_linear);
+            GX2CopySurface(&s_tiled, 0, 0, s_write, 0, 0); invalidateVertexUniforms();
+            gpuStampSurface(GPU_EFBCOPY, s_tiled, *s_write);
             rebindTvTarget();
             GX2Flush();
             s_stamp = GX2GetLastSubmittedTimeStamp();
@@ -6467,7 +6474,7 @@ uint32_t peekZ(int x, int y) {
     uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScaleY);
     if (px >= s_linear.width) px = s_linear.width - 1;
     if (py >= s_linear.height) py = s_linear.height - 1;
-    uint8_t* texel = static_cast<uint8_t*>(s_snapshot.image) + (size_t(py) * s_snapshot.pitch + px) * 4;
+    uint8_t* texel = static_cast<uint8_t*>(s_read->image) + (size_t(py) * s_read->pitch + px) * 4;
     sms_wiiu_d4_event(D4_READBACK);
     DCInvalidateRange(texel, 4);  // only the line read: the GPU rewrote it since
     float d;
