@@ -5374,10 +5374,11 @@ void rendererInit(float) {
     s_depthSkip = !sdMarkerPresent("nodepthskip");
     s_texRecheck = !sdMarkerPresent("notexrecheck");
     s_texSplit = sdMarkerPresent("texsplit");
-    s_texDirect = sdMarkerPresent("texdirect");
+    s_texDirect = !sdMarkerPresent("notexdirect");
     s_texR8 = sdMarkerPresent("texr8");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
+    WHBLogPrintf("SMS Wii U: direct texture uploads %s (SD marker notexdirect)", s_texDirect ? "on" : "off");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
