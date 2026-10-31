@@ -1252,8 +1252,9 @@ void GXPeekARGB(u16 x, u16 y, u32* color) {
 }
 void GXPeekZ(u16 x, u16 y, u32* z) {
 #ifdef __WIIU__
-    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
-    else
+    if (producerMode()) {
+        if (peekZNeedsSync()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    } else
 #endif
     drainCommandStream();
     *z = peekZ(x, y);

@@ -6172,6 +6172,10 @@ static void debugPixelTrace(uint32_t draw) {
 // stays the old far-plane answer.
 extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
                                                       uint32_t dstSlice);
+static uint32_t s_peekZFrame = ~0u;  // the frame whose depth snapshot is queued
+// d45: only the first GXPeekZ of a frame issues GPU work (the snapshot copy); the others read CPU memory, so in
+// producer mode they need not drain the worker (17 lens-flare peeks a frame each waited for it).
+bool peekZNeedsSync() { return s_peekZFrame != g_displayFrames; }
 uint32_t peekZ(int x, int y) {
     SMS_PORT_HEAP_SCOPE();
     dlCacheExternalStateChanged();
@@ -6190,7 +6194,7 @@ uint32_t peekZ(int x, int y) {
     static GX2Surface s_tiled, s_linear;
     static bool s_ready2, s_queued;
     static uint64_t s_stamp;
-    static uint32_t s_frame = ~0u;
+    uint32_t& s_frame = s_peekZFrame;
     if (s_ready2 && (s_linear.width != db->surface.width || s_linear.height != db->surface.height)) {
         MEMFreeToDefaultHeap(s_tiled.image);
         MEMFreeToDefaultHeap(s_linear.image);
