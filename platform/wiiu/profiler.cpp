@@ -16,9 +16,13 @@
  * The game's SDK has its own OSAlarm, so coreinit is bound by symbol name. */
 #include "runtime.h"
 
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
+#include <netinet/in.h>
+#include <sys/socket.h>
 
 namespace {
 
@@ -349,6 +353,117 @@ void report(Table& t, const char* tag, void* mainThread)
 	std::memset(&t, 0, sizeof(t));
 }
 
+
+/* Hang watchdog: a thread on core 2 that watches the frame boundary. The
+ * audio pacer's 10 s stats ran the hang check, but in the pause hang
+ * (2026-10-31) the pacer stopped with the main thread and nothing was logged
+ * at all. After 5 s without a frame it lists every thread on coreinit's
+ * active list through its own UDP socket (port_log also writes the SD log
+ * file, whose lock a hung thread may hold), and again 5 s later: a thread
+ * whose consumed core time grew in between is spinning. */
+struct WdThread { unsigned char bytes[0x6a0]; } __attribute__((aligned(32)));
+extern "C" {
+int wut_OSCreateThread(WdThread*, int (*)(int, const char**), int32_t, char*, void*, uint32_t, int32_t, uint8_t) __asm__("OSCreateThread");
+int32_t wut_OSResumeThread(WdThread*) __asm__("OSResumeThread");
+void wut_OSSleepTicks(int64_t) __asm__("OSSleepTicks");
+}
+constexpr uint32_t kActiveNext = 0x38C, kActivePrev = 0x390;  // OSThread::activeLink
+constexpr uint32_t kHangSeconds = 5;
+WdThread s_wdThread;
+alignas(32) uint8_t s_wdStack[0x4000];
+int s_wdSock = -1;
+sockaddr_in s_wdAddr;
+
+bool wd_readable(uint32_t a, uint32_t bytes) {
+	return (a >= 0x10000000u && a + bytes <= 0x50000000u) || (a >= 0xF4000000u && a + bytes <= 0xF6000000u);
+}
+uint32_t wd_word(uint32_t a) { return *reinterpret_cast<const volatile uint32_t*>(a); }
+
+void wd_send(const char* fmt, ...) {
+	char line[300];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = std::vsnprintf(line, sizeof(line), fmt, ap);
+	va_end(ap);
+	if (n <= 0 || s_wdSock < 0) return;
+	if (n >= int(sizeof(line))) n = sizeof(line) - 1;
+	sendto(s_wdSock, line, n, 0, reinterpret_cast<sockaddr*>(&s_wdAddr), sizeof(s_wdAddr));
+}
+
+void wd_report(int round) {
+	uint32_t t = reinterpret_cast<uint32_t>(s_mainThread);
+	if (!wd_readable(t, 0x6a0)) return;
+	for (int i = 0; i < 64; ++i) {  // to the head of the list
+		const uint32_t prev = wd_word(t + kActivePrev);
+		if (!wd_readable(prev, 0x6a0)) break;
+		t = prev;
+	}
+	char pcs[48], lrs[48], name[32];
+	for (int i = 0; i < 64 && wd_readable(t, 0x6a0); ++i) {
+		const uint8_t* th = reinterpret_cast<const uint8_t*>(t);
+		const uint32_t pc = wd_word(t + kSrr0Offset), lr = wd_word(t + kLrOffset);
+		pcs[0] = lrs[0] = name[0] = 0;
+		wut_OSGetSymbolName(pc, pcs, sizeof(pcs));
+		wut_OSGetSymbolName(lr, lrs, sizeof(lrs));
+		const uint32_t np = wd_word(t + 0x5C0);
+		if (np >= 0x01000000u && np < 0x50000000u) std::snprintf(name, sizeof(name), "%s", reinterpret_cast<const char*>(np));
+		const uint64_t ns = *reinterpret_cast<const volatile uint64_t*>(t + 0x600);
+		wd_send("SMS Wii U: [hangwd] r%d %s%08x '%s' st=%x aff=%x prio=%d susp=%d pc=%08x %s lr=%08x %s q=%08x mx=%08x ms=%u\n",
+		        round, t == reinterpret_cast<uint32_t>(s_mainThread) ? "MAIN " : "", (unsigned)t, name,
+		        th[0x324], th[0x325] & 7, (int)wd_word(t + 0x32C), (int)wd_word(t + 0x328), (unsigned)pc, pcs,
+		        (unsigned)lr, lrs, (unsigned)wd_word(t + 0x35C), (unsigned)wd_word(t + 0x378), (unsigned)(ns / 1000000u));
+		t = wd_word(t + kActiveNext);
+	}
+	// The main thread's stack, from its saved context.
+	uint32_t sp = wd_word(reinterpret_cast<uint32_t>(s_mainThread) + kSpOffset);
+	for (int depth = 0; depth < 16 && wd_readable(sp, 8) && !(sp & 3); ++depth) {
+		const uint32_t next = wd_word(sp);
+		if (next <= sp || !wd_readable(next, 8)) break;
+		const uint32_t ret = wd_word(next + 4);
+		pcs[0] = 0;
+		wut_OSGetSymbolName(ret, pcs, sizeof(pcs));
+		wd_send("SMS Wii U: [hangwd] r%d main #%d %08x %s\n", round, depth, (unsigned)ret, pcs);
+		sp = next;
+	}
+}
+
+int wd_main(int, const char**) {
+	s_wdSock = socket(AF_INET, SOCK_DGRAM, 0);
+	int on = 1;
+	setsockopt(s_wdSock, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+	std::memset(&s_wdAddr, 0, sizeof(s_wdAddr));
+	s_wdAddr.sin_family = AF_INET;
+	s_wdAddr.sin_port = 4405;  // big-endian: network order already
+	s_wdAddr.sin_addr.s_addr = INADDR_BROADCAST;
+	wd_send("SMS Wii U: [hangwd] armed (no frame for %u s = report)\n", (unsigned)kHangSeconds);
+	uint32_t last = s_frameTicks, idle = 0;
+	for (;;) {
+		wut_OSSleepTicks(kTimerHz);
+		const uint32_t ticks = s_frameTicks;
+		if (ticks != last) {
+			if (idle >= kHangSeconds) wd_send("SMS Wii U: [hangwd] frames again after %u s\n", (unsigned)idle);
+			last = ticks;
+			idle = 0;
+			continue;
+		}
+		++idle;
+		if (idle == kHangSeconds || idle == 2 * kHangSeconds) {
+			wd_send("SMS Wii U: [hangwd] no frame for %u s (frame %u)\n", (unsigned)idle, (unsigned)ticks);
+			wd_report(idle == kHangSeconds ? 1 : 2);
+		}
+	}
+	return 0;
+}
+
+void wd_start() {
+	static bool s_started;
+	if (s_started) return;
+	s_started = true;
+	const bool ok = wut_OSCreateThread(&s_wdThread, wd_main, 0, nullptr, s_wdStack + sizeof(s_wdStack),
+	                                   sizeof(s_wdStack), 8, 1u << 2) != 0;
+	if (ok) wut_OSResumeThread(&s_wdThread);
+	port_log("[hangwd] watchdog thread %s\n", ok ? "started on core 2" : "FAILED");
+}
 } // namespace
 
 /* Called from the frame boundary on the main thread: starts the sampler the
@@ -364,6 +479,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	static int s_enabled = -1;
 	if (s_enabled < 0) {
 		s_mainThread = wut_OSGetCurrentThread(); // the hang check needs it either way
+		wd_start();
 		s_enabled = sms_wiiu_sd_marker("perfdiag") || sms_wiiu_sd_marker("cpuprof");
 		port_log("[prof] sampler %s (SD marker perfdiag or cpuprof)\n", s_enabled ? "on" : "off");
 	}
