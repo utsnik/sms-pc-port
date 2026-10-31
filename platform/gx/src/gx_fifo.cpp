@@ -1260,7 +1260,7 @@ FILE* traceFile();
 // Lists are compared by hash at least this often (texture data: kRecheckFrames).
 enum { kDlRecheckFrames = 30 };
 // Recordings kept per list address, one per state it is drawn under.
-enum { kDlVariants = 4 };
+enum { kDlVariants = 16 };  // Galaxy: 4 thrashed in PeachCastleGarden (misses == evictions)
 
 static bool dlCacheEnabled() {
     static int on = -1;
