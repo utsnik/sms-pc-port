@@ -206,6 +206,7 @@ const TexturePackEntry* texturePackLookup(const TexturePackKey& key);
 bool texturePackReadChunk(uint64_t offset, uint32_t bytes, void* out);
 bool texturePackEnqueue(const TexturePackRequest& request);
 bool texturePackPopResult(TexturePackResult* result);
+bool texturePackResultsPending();
 bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk);
 void texturePackReleaseUploadChunk();
 void texturePackGetStats(TexturePackStats* stats);

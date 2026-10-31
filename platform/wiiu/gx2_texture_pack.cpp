@@ -70,9 +70,15 @@ static WutMessage s_workerSlots[kTexturePackMaxQueue] __attribute__((aligned(32)
 static uint8_t s_workerStack[0x10000] __attribute__((aligned(32)));
 static bool s_workerStarted;
 static volatile bool s_workerStop;
-static uint8_t s_staging[kTexturePackMaxChunk] __attribute__((aligned(64)));
-static TexturePackUploadChunk s_chunk;
-static volatile bool s_chunkReady;
+/* A ring of staging slots, so the worker reads ahead while the render thread
+ * uploads. With one slot the worker waited for each chunk to be taken, so the
+ * pump got at most one chunk a frame, and a small texture cost a whole frame:
+ * about 1-3 MB/s, HD textures popping in seconds after a stage started. */
+static const uint32_t kStagingSlots = 6;
+static uint8_t s_staging[kStagingSlots][kTexturePackMaxChunk] __attribute__((aligned(64)));
+static TexturePackUploadChunk s_chunks[kStagingSlots];
+static volatile uint32_t s_chunkRead;   // render thread
+static volatile uint32_t s_chunkWrite;  // worker
 
 static uint16_t get16(const uint8_t* p) { return uint16_t(uint16_t(p[0]) << 8 | p[1]); }
 static uint32_t get32(const uint8_t* p) {
@@ -148,11 +154,19 @@ static void publishResult(const TexturePackResult& result) {
     s_resultWrite = write + 1;
 }
 
-static void publishChunk(const TexturePackUploadChunk& chunk) {
-    s_chunk = chunk;
+// The next free staging slot, waiting while the render thread holds them all.
+static uint8_t* acquireStaging() {
+    while (s_chunkWrite - s_chunkRead >= kStagingSlots && !s_workerStop) wut_OSSleepTicks(62156250 / 1000); // about 1 ms
     __sync_synchronize();
-    s_chunkReady = true;
-    while (s_chunkReady && !s_workerStop) wut_OSSleepTicks(62156250 / 1000); // about 1 ms
+    return s_staging[s_chunkWrite % kStagingSlots];
+}
+
+static void publishChunk(const TexturePackUploadChunk& chunk) {
+    if (s_workerStop) return;
+    const uint32_t write = s_chunkWrite;
+    s_chunks[write % kStagingSlots] = chunk;
+    __sync_synchronize();
+    s_chunkWrite = write + 1;
 }
 
 static void matchRequest(const TexturePackRequest& request) {
@@ -203,9 +217,11 @@ static void matchRequest(const TexturePackRequest& request) {
             const uint32_t bytesToRead = std::min<uint32_t>(kTexturePackMaxChunk, source.rgbaSize - offset);
             TexturePackUploadChunk chunk = {};
             chunk.requestId = request.requestId; chunk.level = level; chunk.offset = offset;
-            chunk.bytes = bytesToRead; chunk.data = s_staging; chunk.entry = entry;
+            uint8_t* staging = acquireStaging();
+            if (s_workerStop) return;
+            chunk.bytes = bytesToRead; chunk.data = staging; chunk.entry = entry;
             chunk.last = offset + bytesToRead == source.rgbaSize;
-            chunk.ok = readAt(source.rgbaOffset + offset, s_staging, bytesToRead);
+            chunk.ok = readAt(source.rgbaOffset + offset, staging, bytesToRead);
             publishChunk(chunk);
             if (!chunk.ok) return;
             offset += bytesToRead;
@@ -316,7 +332,7 @@ bool texturePackInit() {
     MEMFreeToDefaultHeap(table);
     s_state.enabled = true;
     s_workerStop = false;
-    s_chunkReady = false;
+    s_chunkRead = s_chunkWrite = 0;
     s_resultRead = s_resultWrite = 0;
     s_requests.clear();
     wut_OSInitMessageQueue(&s_workerWake, s_workerSlots, kTexturePackMaxQueue);
@@ -357,7 +373,7 @@ void texturePackShutdown() {
     if (s_state.file) std::fclose(s_state.file);
     s_state.file = nullptr; freeIndex(); std::memset(&s_state, 0, sizeof s_state);
     s_requests.clear(); s_resultRead = s_resultWrite = 0;
-    s_chunkReady = false;
+    s_chunkRead = s_chunkWrite = 0;
 }
 bool texturePackEnabled() { return s_state.enabled; }
 uint32_t texturePackMaxDimension() { return s_state.maxDimension; }
@@ -385,16 +401,19 @@ bool texturePackPopResult(TexturePackResult* result) {
     return true;
 }
 
+bool texturePackResultsPending() { return s_resultRead != s_resultWrite; }
+
 bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk) {
-    if (!chunk || !s_chunkReady) return false;
+    const uint32_t read = s_chunkRead;
+    if (!chunk || read == s_chunkWrite) return false;
     __sync_synchronize();
-    *chunk = s_chunk;
+    *chunk = s_chunks[read % kStagingSlots];
     return true;
 }
 
 void texturePackReleaseUploadChunk() {
     __sync_synchronize();
-    s_chunkReady = false;
+    if (s_chunkRead != s_chunkWrite) s_chunkRead = s_chunkRead + 1;
 }
 
 void texturePackGetStats(TexturePackStats* stats) {

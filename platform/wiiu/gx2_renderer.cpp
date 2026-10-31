@@ -4207,8 +4207,12 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     TexturePackUploadChunk chunk;
     WorkerOpTimer uploadTiming(kWorkerPackUpload);
     while (texturePackPopUploadChunk(&chunk)) {
-        if (!budget.consume(chunk.bytes)) break;
         TextureEntry* e = packTextureForRequest(chunk.requestId);
+        // The worker reads ahead now (a ring of staging slots), so a texture's
+        // chunks can arrive while its result still waits behind the 8 results a
+        // frame: leave them queued until packStart has run, or they fall back.
+        if (e && e->valid && e->packState == 1 && !e->packEntry && texturePackResultsPending()) break;
+        if (!budget.consume(chunk.bytes)) break;
         if (e) {
             const WorkerTextureInfo info = {
                 static_cast<uint32_t>(reinterpret_cast<uintptr_t>(e->source)), e->fmt,
