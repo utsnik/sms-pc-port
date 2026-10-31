@@ -86,11 +86,14 @@
 
 extern "C" void sms_wiiu_d1_note_draw_core(void);
 extern "C" void sms_wiiu_gx2prod_reset_draw_sync_jobs(void);
+extern "C" void sms_wiiu_present_finish_pipelined_service(void);
 
 namespace gx {
 
 static GX2ColorBuffer* renderColour();
 static GX2DepthBuffer* renderDepth();
+static bool queueProducerPresent();
+static uint32_t& producerDrawCounter();
 static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
 static void gx2ProdBoundary(uint32_t kind);
 static void gx2ProdCallList(void* list, uint32_t bytes);
@@ -109,9 +112,13 @@ static bool s_d7NoSwap, s_d7FencePoll, s_d6Force;
 static bool s_tv720Marker;
 static bool s_nativeQuads;
 static bool s_pipe1Marker;
+static bool s_pipe2Marker;
+static bool s_gx2ProdEnabled;
 extern "C" int sms_wiiu_d7_noswap(void) { return s_d7NoSwap ? 1 : 0; }
 extern "C" int sms_wiiu_d6_force(void) { return s_d6Force ? 1 : 0; }
 extern "C" int sms_wiiu_pipe1_enabled(void) { return s_pipe1Marker ? 1 : 0; }
+extern "C" int sms_wiiu_pipe2_enabled(void) { return s_pipe2Marker && s_gx2ProdEnabled ? 1 : 0; }
+extern "C" int sms_wiiu_pipe2_present_queued(void);
 struct D4Segment {
     uint64_t ts;
     uint32_t frame, firstVerts, firstStages, firstBlend, firstTexmask;
@@ -871,7 +878,6 @@ static uint8_t* s_pipe1DlArena[2];
 static OSTime s_pipe1DlArenaFence[2];
 static uint32_t s_pipe1DlArenaUsed[2];
 static uint32_t s_pipe1DlArenaSlot;
-static bool s_gx2ProdEnabled;
 static bool s_gx2ProdMarker;
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
@@ -4955,6 +4961,7 @@ extern "C" void sms_wiiu_gx2_target_begin(void) {
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
 }
 extern "C" void sms_wiiu_gx2_target_present(void) {
+    if (queueProducerPresent()) return;
     if (s_d7NoSwap) return;
     if (!s_noScanTv) {
         GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
@@ -5696,11 +5703,13 @@ void rendererInit(float) {
     s_d7FencePoll = sdMarkerPresent("fencepoll");
     s_d6Force = sdMarkerPresent("forcepres");
     s_pipe1Marker = sdMarkerPresent("pipe1");
+    s_pipe2Marker = sdMarkerPresent("pipe2");
     s_d8NoDraw = sdMarkerPresent("nodraw");
     s_d8NoTex = sdMarkerPresent("notex");
     WHBLogPrintf("[d8m] nodraw=%d notex=%d", int(s_d8NoDraw), int(s_d8NoTex));
     WHBLogPrintf("[d7m] noswap=%d fencepoll=%d forcepres=%d", int(s_d7NoSwap), int(s_d7FencePoll), int(s_d6Force));
     WHBLogPrintf("[pipe1] marker=%s", s_pipe1Marker ? "on" : "off");
+    WHBLogPrintf("[pipe2] marker=%s", s_pipe2Marker ? "on" : "off");
     WHBLogPrintf("[d3m] noscantv=%u noscandrc=%u", s_noScanTv ? 1u : 0u, s_noScanDrc ? 1u : 0u);
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
@@ -6319,7 +6328,7 @@ void flushBatch() {
             }
             if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();
             sms_wiiu_d1_note_draw_core();
-            ++s_drawsThisFrame;
+            ++producerDrawCounter();
             if (s_gpuDiag) {
                 GpuDrawInfo info = {};
                 info.kind = GPU_DRAW; info.rtW = uint32_t(s_tvW); info.rtH = uint32_t(s_tvH);
@@ -6537,7 +6546,7 @@ void flushBatch() {
         WHBLogPrintf("SMS Wii U: [vxbracket] done");
     }
     sms_wiiu_d1_note_draw_core();
-    ++s_drawsThisFrame;
+    ++producerDrawCounter();
     {
         if (s_gpuDiag) {
             GpuDrawInfo info = {};
@@ -6696,8 +6705,87 @@ struct ProducerCopyRequest {
     ProducerResolvedCopy copy;
     uint32_t ctrl, src, size, clearAr, clearGb, clearZ, cmode, pe, zmode;
 };
-static ProducerCopyRequest s_producerCopies[64];
-static uint32_t s_producerCopyWrite;
+struct ProducerFrameState {
+    ProducerCopyRequest copies[64];
+    uint32_t copyWrite;
+    uint32_t slot;
+    uint32_t draws;
+};
+static ProducerFrameState s_producerFrames[2] = {{{}, 0, 0, 0}, {{}, 0, 1, 0}};
+static uint32_t s_producerRecordFrame;
+static uint32_t s_producerWorkerFrame;
+static bool s_pipe2PresentQueued;
+static bool s_pipe2FrameStarted;
+
+static ProducerFrameState& producerFrameForWorker() {
+    return s_producerFrames[s_producerWorkerFrame];
+}
+
+static ProducerFrameState& producerFrameForRecord() {
+    return s_producerFrames[s_producerRecordFrame];
+}
+
+static uint32_t& producerDrawCounter() {
+    return sms_wiiu_pipe2_enabled() ? producerFrameForWorker().draws : s_drawsThisFrame;
+}
+
+static void producerPresentService(void* opaque) {
+    ProducerFrameState& frame = *static_cast<ProducerFrameState*>(opaque);
+    if (!s_d7NoSwap) {
+        if (!s_noScanTv) {
+            GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+            if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
+        }
+        if (!s_noScanDrc) {
+            GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+            if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
+        }
+    }
+    sms_wiiu_present_finish_pipelined_service();
+    if (s_frameClearPending) {
+        GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]); invalidateVertexUniforms();
+        if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderColour()->surface, renderColour()->surface);
+        s_frameClearPending = false;
+        GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
+        GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(renderDepth());
+    }
+    for (uint32_t i = 0; i < frame.copyWrite; ++i) {
+        deferFree(frame.copies[i].copy.retiredImage);
+        frame.copies[i].copy.retiredImage = nullptr;
+    }
+    frame.copyWrite = 0;
+    sms_wiiu_gx2prod_reset_draw_sync_jobs();
+    endVertexArena();
+    if (s_pipe1Marker) {
+        const uint32_t next = (s_pipe1DlArenaSlot + 1) & 1;
+        if (s_pipe1DlArenaFence[next])
+            GX2WaitTimeStamp(s_pipe1DlArenaFence[next]);
+        s_pipe1DlArenaSlot = next;
+        s_pipe1DlArenaUsed[next] = 0;
+        if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
+    }
+    beginVertexArena();
+    s_producerWorkerFrame = (frame.slot + 1) & 1;
+    s_pipe2PresentQueued = false;
+}
+
+static bool queueProducerPresent() {
+    if (!sms_wiiu_pipe2_enabled()) return false;
+    if (s_pipe2PresentQueued) return true;
+    gx2prod::waitPending(gx2prod::kWaitEndFrame);
+        ProducerFrameState& frame = producerFrameForRecord();
+    if (!gx2prod::queueBoundary(gx2prod::kWaitEndFrame, producerPresentService, &frame)) {
+        WHBLogPrintf("SMS Wii U: [pipe2] end-of-frame boundary rejected");
+        return false;
+    }
+    s_pipe2PresentQueued = true;
+    return true;
+}
+
+extern "C" int sms_wiiu_pipe2_present_queued(void) {
+    return s_pipe2PresentQueued ? 1 : 0;
+}
 
 static void producerCopyService(void* opaque) {
     ProducerCopyRequest& r = *static_cast<ProducerCopyRequest*>(opaque);
@@ -6714,7 +6802,7 @@ static void producerCopyService(void* opaque) {
         }
         return;
     }
-    if (!s_frameActive || !ProcUIInForeground()) return;
+    if ((!s_frameActive && !sms_wiiu_pipe2_enabled()) || !ProcUIInForeground()) return;
     if (r.copy.ready) {
         if (r.copy.fullSurface)
             GX2CopySurface(&r.copy.source, 0, 0, &r.copy.destination, 0, 0);
@@ -6752,11 +6840,12 @@ void executeCopy(uint32_t ctrl) {
         // core 1 performs the copy/clear service, then let later commands
         // open a fresh list after that service record.
         gx2DlSplit(kDlSplitCopy);
-        if (s_producerCopyWrite >= sizeof(s_producerCopies) / sizeof(s_producerCopies[0])) {
+        ProducerFrameState& frame = producerFrameForWorker();
+        if (frame.copyWrite >= sizeof(frame.copies) / sizeof(frame.copies[0])) {
             WHBLogPrintf("SMS Wii U: [gx2prod] service queue overflow at copy");
             return;
         }
-        ProducerCopyRequest& r = s_producerCopies[s_producerCopyWrite++];
+        ProducerCopyRequest& r = frame.copies[frame.copyWrite++];
         r.ctrl = ctrl;
         r.src = g.bp[BP_COPY_SRC_TL]; r.size = g.bp[BP_COPY_SRC_WH];
         r.clearAr = g.bp[BP_CLEAR_AR]; r.clearGb = g.bp[BP_CLEAR_GB]; r.clearZ = g.bp[BP_CLEAR_Z];
@@ -6765,7 +6854,7 @@ void executeCopy(uint32_t ctrl) {
         const uint32_t w = (r.size & 0x3ff) + 1, h = ((r.size >> 10) & 0x3ff) + 1;
         const uint32_t fmt = ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7);
         debugCopy((ctrl >> 14) & 1, x, y, w, h, g.copyDest, ctrl);
-        if (!((ctrl >> 14) & 1) && s_frameActive && ProcUIInForeground()) {
+        if (!((ctrl >> 14) & 1) && (s_frameActive || sms_wiiu_pipe2_enabled()) && ProcUIInForeground()) {
             r.copy = resolveProducerCopy(g.copyDest, x, y, w, h,
                                          (ctrl >> 9) & 1, fmt, r.pe);
             // Copy/rebind/clear invalidate the worker's shadowed GX2 state;
@@ -7136,6 +7225,8 @@ extern "C" int sms_wiiu_gx2_display_list_enabled(void) {
 
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
     if (s_gx2ProdEnabled) {
+        if (sms_wiiu_pipe2_enabled())
+            gx2prod::waitPending(gx2prod::kWaitEndFrame);
         gx2prod::wait(gx2prod::kWaitPresent);
         gx2prod::service();
         gx2prod::stop();
@@ -7159,7 +7250,20 @@ extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
     if (!s_ready || !ProcUIInForeground()) return;
-    beginVertexArena();
+    if (sms_wiiu_pipe2_enabled()) {
+        if (!s_pipe2FrameStarted) {
+            beginVertexArena();
+            s_pipe2FrameStarted = true;
+            producerFrameForRecord().copyWrite = 0;
+            producerFrameForRecord().draws = 0;
+        } else {
+            s_producerRecordFrame = (s_producerRecordFrame + 1) & 1;
+            s_producerFrames[s_producerRecordFrame].copyWrite = 0;
+            s_producerFrames[s_producerRecordFrame].draws = 0;
+        }
+    } else {
+        beginVertexArena();
+    }
     GX2SetContextState(WHBGfxGetTVContextState()); invalidateVertexUniforms();
     // The generated vertex programs use up to R60; the default split gives
     // vertex shaders 48 GPRs and asking for more hangs the GPU on hardware
@@ -7175,7 +7279,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     updateTarget();
-    if (s_frameClearPending) {
+    if (s_frameClearPending && !sms_wiiu_pipe2_enabled()) {
         GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]); invalidateVertexUniforms();
         if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderColour()->surface, renderColour()->surface);
         s_frameClearPending = false;
@@ -7213,19 +7317,18 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     if (!s_frameActive) return;
 #ifdef __WIIU__
     if (s_gx2ProdEnabled) {
-        gx2prod::wait(gx2prod::kWaitPresent);
-        gx2prod::service();
-        for (uint32_t i = 0; i < s_producerCopyWrite; ++i) {
-            deferFree(s_producerCopies[i].copy.retiredImage);
-            s_producerCopies[i].copy.retiredImage = nullptr;
+        if (!sms_wiiu_pipe2_enabled()) {
+            gx2prod::wait(gx2prod::kWaitPresent);
+            gx2prod::service();
+            sms_wiiu_gx2prod_reset_draw_sync_jobs();
         }
-        s_producerCopyWrite = 0;
-        sms_wiiu_gx2prod_reset_draw_sync_jobs();
     } else
 #endif
     flushBatch();
-    GX2Flush();
-    endVertexArena();
+    if (!sms_wiiu_pipe2_enabled()) {
+        GX2Flush();
+        endVertexArena();
+    }
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
 #if defined(PORT_GAME_SMG)
@@ -7352,8 +7455,10 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
 #if defined(PORT_GAME_SMG)
     }
 #endif
-    s_frameActive = false;
-    s_drawsThisFrame = 0;
+    if (!sms_wiiu_pipe2_enabled())
+        s_frameActive = false;
+    if (!sms_wiiu_pipe2_enabled())
+        s_drawsThisFrame = 0;
     ++g_displayFrames;
     gx2prod::note_frame(g_displayFrames);
 }

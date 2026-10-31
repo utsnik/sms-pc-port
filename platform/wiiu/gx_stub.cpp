@@ -64,6 +64,8 @@ extern "C" int sms_wiiu_gx2_display_list_enabled(void);
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" const GX2Surface* sms_wiiu_render_surface(void);
 extern "C" int sms_wiiu_pipe1_enabled(void);
+extern "C" int sms_wiiu_pipe2_enabled(void);
+extern "C" int sms_wiiu_pipe2_present_queued(void);
 extern "C" uint32_t sms_wiiu_vsync_event_count(void);
 extern "C" void sms_wiiu_dvd_pump(void);
 extern "C" void gxs_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -677,6 +679,10 @@ static void present_finish_pipelined(void)
 		s_enabled = true;
 	}
 }
+extern "C" void sms_wiiu_present_finish_pipelined_service(void)
+{
+	present_finish_pipelined();
+}
 static void present_begin_pipelined(void)
 {
 	pipe1_wait_previous_frame();
@@ -911,8 +917,9 @@ extern "C" void sms_wiiu_gfx_frame(void)
 #endif
 	const int64_t t0 = wut_OSGetTime_stub();
 	sms_wiiu_gx2_target_present();
-	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
-	else {
+	if (SMS_WIIU_PIPELINED_PRESENT) {
+		if (!sms_wiiu_pipe2_present_queued()) present_finish_pipelined();
+	} else if (!sms_wiiu_pipe2_present_queued()) {
 		WHBGfxFinishRender();
 		sms_wiiu_d4_submit_at("whb-finish", 's', __LINE__, GX2GetLastSubmittedTimeStamp());
 	}

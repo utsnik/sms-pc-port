@@ -68,8 +68,11 @@ static volatile uint32_t s_serviceWrite;
 static volatile uint32_t s_requestId;
 static volatile uint32_t s_requestTarget;
 static volatile uint32_t s_requestKind;
+static ServiceFn s_requestFn;
+static void* s_requestArg;
 static volatile uint32_t s_workerHandled;
 static volatile uint32_t s_serviceDone;
+static volatile uint32_t s_pendingRequest;
 static volatile uint32_t s_stopRequested;
 static bool s_started;
 static uint32_t s_wokenAt;
@@ -159,12 +162,25 @@ static void drainWorker() {
 
         if (request != s_workerHandled && reached(target, s_requestTarget)) {
             const uint32_t kind = s_requestKind;
+            const ServiceFn fn = s_requestFn;
+            void* const arg = s_requestArg;
             s_hooks.boundary(kind);
+            if (fn) {
+                ServiceRecord operation = {SERVICE_CALLBACK, 0, nullptr, 0, fn, arg};
+                if (!pushService(operation, true)) return;
+            }
             ServiceRecord barrier = {SERVICE_BARRIER, request, nullptr, 0,
                                      nullptr, nullptr};
             if (!pushService(barrier, true)) return;
             releaseBarrier();
             s_workerHandled = request;
+            /* A frame operation is the handoff between two renderer states.
+             * Do not parse the next frame until core 1 has replayed the
+             * operation and performed its resource rotation. */
+            if (kind == WAIT_END_FRAME) {
+                while (!reached(s_serviceDone, request) && !s_stopRequested)
+                    wut_OSSleepTicks(62156250 / 20000);
+            }
         }
         add(&s_totals.workerBusyMicros, microsSince(busyStart));
 
@@ -219,7 +235,10 @@ bool start(const Hooks& hooks, bool core2) {
     s_byteRead = s_byteWrite = 0;
     s_serviceRead = s_serviceWrite = 0;
     s_requestId = s_workerHandled = s_serviceDone = 0;
+    s_pendingRequest = 0;
     s_requestTarget = s_requestKind = 0;
+    s_requestFn = nullptr;
+    s_requestArg = nullptr;
     s_stopRequested = 0;
     s_wokenAt = 0;
     s_appendFailureLogged = s_serviceFailureLogged = false;
@@ -252,6 +271,7 @@ bool enabled() { return s_started; }
 void set_flush_hook(void (*fn)()) { s_flushHook = fn; }
 
 static void serviceImpl(bool allowNested);
+void waitPending(uint32_t kind);
 
 bool append(const uint8_t* bytes, uint32_t size) {
     if (!s_started || !bytes || !size) return false;
@@ -313,6 +333,8 @@ void wake() {
 
 void wait(uint32_t kind) {
     if (!s_started) return;
+    if (s_pendingRequest)
+        waitPending(kind);
     if (s_flushHook) s_flushHook();
     const OSTime startTime = OSGetTime();
     const uint32_t request = s_requestId + 1;
@@ -326,6 +348,36 @@ void wait(uint32_t kind) {
         if (!reached(s_serviceDone, request))
             wut_OSSleepTicks(62156250 / 20000); // about 50 us
     }
+    if (kind < WAIT_KIND_COUNT)
+        add(&s_totals.waitMicros[kind], microsSince(startTime));
+}
+
+bool queueBoundary(uint32_t kind, ServiceFn fn, void* arg) {
+    if (!s_started || !fn || s_pendingRequest)
+        return false;
+    if (s_flushHook) s_flushHook();
+    const uint32_t request = s_requestId + 1;
+    s_requestTarget = s_byteWrite;
+    s_requestKind = kind;
+    s_requestFn = fn;
+    s_requestArg = arg;
+    releaseBarrier();
+    s_requestId = request;
+    s_pendingRequest = request;
+    wakeWorker();
+    return true;
+}
+
+void waitPending(uint32_t kind) {
+    if (!s_started || !s_pendingRequest) return;
+    const OSTime startTime = OSGetTime();
+    const uint32_t request = s_pendingRequest;
+    while (!reached(s_serviceDone, request)) {
+        serviceImpl(true);
+        if (!reached(s_serviceDone, request))
+            wut_OSSleepTicks(62156250 / 20000);
+    }
+    s_pendingRequest = 0;
     if (kind < WAIT_KIND_COUNT)
         add(&s_totals.waitMicros[kind], microsSince(startTime));
 }
@@ -448,18 +500,18 @@ Counters counters() {
 void note_frame(uint32_t frame) {
     if (!frame || frame % 30 || frame == s_lastLogFrame) return;
     if (!s_started) {
-        port_log("SMS Wii U: [prod] frame=%u mode=0 core=0 us/30 append=0 waitPeek=0 waitDrawsync=0 waitDrawdone=0 waitPresent=0 worker=0 replay=0 queueHigh=0 segments=0 lists=0 appendFail=0 serviceFail=0\n",
+        port_log("SMS Wii U: [prod] frame=%u mode=0 core=0 us/30 append=0 waitPeek=0 waitDrawsync=0 waitDrawdone=0 waitPresent=0 waitEnd=0 worker=0 replay=0 queueHigh=0 segments=0 lists=0 appendFail=0 serviceFail=0\n",
                  frame);
         s_lastLogFrame = frame;
         return;
     }
     const Counters now = counters();
     const Counters d = delta(now, s_lastLog);
-    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u appendFail=%u serviceFail=%u\n",
+    port_log("SMS Wii U: [prod] frame=%u mode=%u core=%u us/30 append=%u waitPeek=%u waitDrawsync=%u waitDrawdone=%u waitPresent=%u waitEnd=%u worker=%u replay=%u queueHigh=%u segments=%u lists=%u appendFail=%u serviceFail=%u\n",
              frame, now.mode, now.workerCore, d.producerAppendMicros,
              d.waitMicros[WAIT_PEEK], d.waitMicros[WAIT_DRAWSYNC],
              d.waitMicros[WAIT_DRAWDONE], d.waitMicros[WAIT_PRESENT_DRAIN],
-             d.workerBusyMicros, d.core1ReplayMicros,
+             d.waitMicros[WAIT_END_FRAME], d.workerBusyMicros, d.core1ReplayMicros,
              now.queueHighWaterBytes, d.segments, d.listsCalled,
              d.appendFailures, d.serviceFailures);
     s_lastLog = now;

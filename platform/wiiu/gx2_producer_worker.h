@@ -10,14 +10,16 @@ enum WaitKind {
     WAIT_DRAWSYNC = 1,
     WAIT_DRAWDONE = 2,
     WAIT_PRESENT_DRAIN = 3,
-    WAIT_KIND_COUNT = 4,
-    WAIT_FLUSH = 4,
-    BOUNDARY_STOP = 5,
+    WAIT_END_FRAME = 4,
+    WAIT_KIND_COUNT = 5,
+    WAIT_FLUSH = 5,
+    BOUNDARY_STOP = 6,
 
     kWaitPeek = WAIT_PEEK,
     kWaitDrawSync = WAIT_DRAWSYNC,
     kWaitDrawDone = WAIT_DRAWDONE,
     kWaitPresent = WAIT_PRESENT_DRAIN,
+    kWaitEndFrame = WAIT_END_FRAME,
     kWaitFlush = WAIT_FLUSH
 };
 
@@ -62,6 +64,12 @@ void set_flush_hook(void (*fn)());
  * returns.  In particular kWaitFlush and kWaitPresent cannot leave a
  * completed display-list call queued on the worker side. */
 void wait(uint32_t kind);
+/* Queue a frame boundary and an ordered core-1 operation without waiting.
+ * The worker pauses after that boundary until the operation has completed,
+ * so the next frame may be recorded but is not replayed early. */
+bool queueBoundary(uint32_t kind, ServiceFn fn, void* arg);
+/* Wait for the most recently queued boundary operation. */
+void waitPending(uint32_t kind);
 void service();
 void stop();
 
