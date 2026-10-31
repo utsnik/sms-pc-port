@@ -1292,6 +1292,12 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
     s_stats.vertices += n;
 }
 
+bool g_dlPromoteFirst = false;
+void noteDlHitFallback(DlPerfFallback, uint32_t, uint32_t) {}
+void noteDlArenaDirect(uint32_t, uint32_t) {}
+void noteDlMiss(uint32_t, uint32_t) {}
+void noteDlImmediate(uint32_t, uint32_t) {}
+
 // ------------------------------------------------------------------ display-list arena
 // Cached display-list runs (gx_fifo.cpp) are stored once in the arena, the
 // part of the stream buffer after its ring (so batches draw them through the

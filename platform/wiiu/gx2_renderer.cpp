@@ -188,6 +188,7 @@ static bool s_ready;
 static bool s_frameActive;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
+bool g_dlPromoteFirst = false;
 // This is separate from the vertex/index arena above.  The GX2 command-list
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
@@ -4892,6 +4893,7 @@ void rendererInit(float) {
     s_retileTextures = !sdMarkerPresent("noretile");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
+    g_dlPromoteFirst = sdMarkerPresent("dlpromotefirst");
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
@@ -5021,6 +5023,14 @@ static uint8_t* s_dlArena;
 static uint32_t s_dlArenaUsed;
 static uint32_t s_dlArenaGen = 1;
 static uint32_t s_perfDlDraws, s_perfDlUploads, s_perfDlDecoded;
+static uint32_t s_perfDlArenaHitVerts, s_perfDlArenaHitDraws;
+static uint32_t s_perfDlNonTriangleVerts, s_perfDlNonTriangleDraws;
+static uint32_t s_perfDlMatrixKeyVerts, s_perfDlMatrixKeyDraws;
+static uint32_t s_perfDlGenerationVerts, s_perfDlGenerationDraws;
+static uint32_t s_perfDlUnwarmedVerts, s_perfDlUnwarmedDraws;
+static uint32_t s_perfDlCompactVerts, s_perfDlCompactDraws;
+static uint32_t s_perfDlMissVerts, s_perfDlMissDraws;
+static uint32_t s_perfDlImmediateVerts, s_perfDlImmediateDraws;
 // arenaUpload's arguments, for the store appendArena makes right after it.
 static struct { const uint8_t* verts; const uint32_t* idx; } s_dlStash;
 static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; } s_dlPending;
@@ -5078,6 +5088,27 @@ static bool dlArenaStore(ArenaRef& ref, uint32_t fmt, uint32_t stride, uint32_t 
 
 bool arenaEnabled() { return s_gpuXfEnabled && s_dlArenaEnabled; }
 uint32_t arenaGeneration() { return s_dlArenaGen; }
+static void addDlPerf(uint32_t& verts, uint32_t& draws, uint32_t n, uint32_t d) {
+    verts += n; draws += d;
+}
+void noteDlHitFallback(DlPerfFallback why, uint32_t vertices, uint32_t draws) {
+    switch (why) {
+    case kDlPerfNonTriangle: addDlPerf(s_perfDlNonTriangleVerts, s_perfDlNonTriangleDraws, vertices, draws); break;
+    case kDlPerfMatrixKey: addDlPerf(s_perfDlMatrixKeyVerts, s_perfDlMatrixKeyDraws, vertices, draws); break;
+    case kDlPerfGeneration: addDlPerf(s_perfDlGenerationVerts, s_perfDlGenerationDraws, vertices, draws); break;
+    case kDlPerfUnwarmed: addDlPerf(s_perfDlUnwarmedVerts, s_perfDlUnwarmedDraws, vertices, draws); break;
+    case kDlPerfCompact: addDlPerf(s_perfDlCompactVerts, s_perfDlCompactDraws, vertices, draws); break;
+    }
+}
+void noteDlArenaDirect(uint32_t vertices, uint32_t draws) {
+    addDlPerf(s_perfDlArenaHitVerts, s_perfDlArenaHitDraws, vertices, draws);
+}
+void noteDlMiss(uint32_t vertices, uint32_t draws) {
+    addDlPerf(s_perfDlMissVerts, s_perfDlMissDraws, vertices, draws);
+}
+void noteDlImmediate(uint32_t vertices, uint32_t draws) {
+    addDlPerf(s_perfDlImmediateVerts, s_perfDlImmediateDraws, vertices, draws);
+}
 bool arenaUpload(const uint8_t* verts, uint32_t, uint32_t, const uint32_t* idx, uint32_t, ArenaRef& out) {
     // The decode needs the run's format and matrix registers, which only
     // appendArena (called next, for this run) has; it stores the run.
@@ -5098,6 +5129,9 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& c
     const bool usable = cls == PRIM_TRIS && (stored ? ref.key == matrixDefaultsKey()
                                                      : dlArenaStore(ref, fmt, stride, n, verts, idx, nidx));
     if (!usable) {
+        if (cls != PRIM_TRIS) noteDlHitFallback(kDlPerfNonTriangle, n, 1);
+        else if (!stored) noteDlHitFallback(kDlPerfGeneration, n, 1);
+        else noteDlHitFallback(kDlPerfMatrixKey, n, 1);
         ++s_perfDlDecoded;
         appendDecoded(cls, fmt, stride, verts, n, idx, nidx);
         return;
@@ -5340,6 +5374,7 @@ void flushBatch() {
         s_dlPending = {};
         const uint32_t* storedIdx = reinterpret_cast<const uint32_t*>(s_dlArena + pend.ref->iOff);
         if (gpuPath && vertex->stride == kRawVertexStride) {
+            noteDlArenaDirect(pend.n, 1);
             bool listReady = s_gx2DlEnabled && gx2DlOpenForDraw();
             if (s_gx2DlEnabled && !listReady) {
                 if (!s_gx2DlFallback) {
@@ -5385,6 +5420,7 @@ void flushBatch() {
             }
             return;
         }
+        noteDlHitFallback(kDlPerfUnwarmed, pend.n, 1);
         // Not on the generated program (its first, priming draw, or the fixed
         // path): decode the run like any other batch.
         s_batch.vertices.assign(pend.verts, pend.verts + size_t(pend.n) * s_batch.stride);
@@ -6028,7 +6064,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotions=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmediateVerts=%u dlImmediateDraws=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -6037,9 +6073,17 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
-                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)s_perfDlUploads, (unsigned)s_perfDlDecoded,
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)(s_perfDlUploads / 30), (unsigned)s_perfDlDecoded,
                      (unsigned)dlcache.hits, (unsigned)dlcache.variantHits, (unsigned)dlcache.misses, (unsigned)dlcache.evictions,
-                     (unsigned)dlcache.arenaPromotions,
+                     (unsigned)(dlcache.arenaPromotionAttempts / 30),
+                     (unsigned)(s_perfDlArenaHitVerts / 30), (unsigned)(s_perfDlArenaHitDraws / 30),
+                     (unsigned)(s_perfDlNonTriangleVerts / 30), (unsigned)(s_perfDlNonTriangleDraws / 30),
+                     (unsigned)(s_perfDlMatrixKeyVerts / 30), (unsigned)(s_perfDlMatrixKeyDraws / 30),
+                     (unsigned)(s_perfDlGenerationVerts / 30), (unsigned)(s_perfDlGenerationDraws / 30),
+                     (unsigned)(s_perfDlUnwarmedVerts / 30), (unsigned)(s_perfDlUnwarmedDraws / 30),
+                     (unsigned)(s_perfDlCompactVerts / 30), (unsigned)(s_perfDlCompactDraws / 30),
+                     (unsigned)(s_perfDlMissVerts / 30), (unsigned)(s_perfDlMissDraws / 30),
+                     (unsigned)(s_perfDlImmediateVerts / 30), (unsigned)(s_perfDlImmediateDraws / 30),
                      s_gx2DlEnabled ? 1 : 0, (unsigned)s_perfDlRecorded, (unsigned)s_perfDlCalled, (unsigned)s_perfDlBytes,
                      (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
@@ -6060,6 +6104,14 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfWall = s_perfFlush = s_perfTex = s_perfXform = 0;
         g_dlReplayIdx = 0;
         s_perfDlDraws = s_perfDlUploads = s_perfDlDecoded = 0;
+        s_perfDlArenaHitVerts = s_perfDlArenaHitDraws = 0;
+        s_perfDlNonTriangleVerts = s_perfDlNonTriangleDraws = 0;
+        s_perfDlMatrixKeyVerts = s_perfDlMatrixKeyDraws = 0;
+        s_perfDlGenerationVerts = s_perfDlGenerationDraws = 0;
+        s_perfDlUnwarmedVerts = s_perfDlUnwarmedDraws = 0;
+        s_perfDlCompactVerts = s_perfDlCompactDraws = 0;
+        s_perfDlMissVerts = s_perfDlMissDraws = 0;
+        s_perfDlImmediateVerts = s_perfDlImmediateDraws = 0;
         s_perfDlRecorded = s_perfDlCalled = s_perfDlBytes = s_perfDlMaxBytes = 0;
         s_perfDlFallbacks = s_perfDlForbidden = s_perfDlOverflows = s_perfDlBadAlignment = 0;
         s_perfDlSplitsCopy = s_perfDlSplitsClear = s_perfDlSplitsContext = s_perfDlSplitsFrame = 0;

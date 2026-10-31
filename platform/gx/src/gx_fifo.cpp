@@ -258,7 +258,7 @@ uint32_t g_arrayGen = 1;
 bool g_dlVariantsEnabled = true;
 uint32_t g_dlExternalState = 1;
 
-static uint32_t s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotions;
+static uint32_t s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotionAttempts;
 
 void dlCacheExternalStateChanged() {
     ++g_dlExternalState;
@@ -266,8 +266,8 @@ void dlCacheExternalStateChanged() {
 }
 
 void dlCacheTakeStats(DlCacheStats& out) {
-    out = {s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotions};
-    s_dlHits = s_dlVariantHits = s_dlMisses = s_dlEvictions = s_dlArenaPromotions = 0;
+    out = {s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotionAttempts};
+    s_dlHits = s_dlVariantHits = s_dlMisses = s_dlEvictions = s_dlArenaPromotionAttempts = 0;
 }
 
 void resetState() {
@@ -1024,6 +1024,7 @@ static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t 
     for (int k = 0; k < nops; k++) ops[k].fn(ops[k], p, L.size, out, stride, count);
     primitiveEnd(opcode, count);
     if (s_dlRec) dlRecordPrimitive(opcode, p, count, vat, S, out);
+    else noteDlImmediate(count, 1);
     return p + size_t(count) * L.size;
 }
 
@@ -1467,14 +1468,16 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         for (DlRun& r : e.runs) {
             const uint32_t nidx = uint32_t(r.idx.size());
             bool useArena = arena && nidx && r.arena.gen == arenaGeneration();
-            if (arena && nidx && !useArena && head.misses == 0 && e.hits > 0) {
+            if (arena && nidx && !useArena && head.misses == 0 && (g_dlPromoteFirst || e.hits > 0)) {
+                ++s_dlArenaPromotionAttempts;
                 useArena = arenaUpload(r.verts.data(), r.nverts, r.stride, r.idx.data(), nidx, r.arena);
-                if (useArena) ++s_dlArenaPromotions;
             }
             if (useArena)
                 appendArena(r.cls, r.fmt, r.stride, r.arena, r.nverts, nidx, r.verts.data());
-            else
+            else {
+                noteDlHitFallback(kDlPerfCompact, r.nverts, 1);
                 appendDecoded(r.cls, r.fmt, r.stride, r.verts.data(), r.nverts, r.idx.data(), nidx);
+            }
         }
         s_vertsLoaded += e.verts;
         for (const DlRun& r : e.runs) g_dlReplayIdx += uint32_t(r.idx.size());
@@ -1576,6 +1579,7 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
     uint32_t need = 0;
     uint32_t used = parse(data, size, &need);
     s_dlRec = nullptr;
+    noteDlMiss(e.verts, uint32_t(e.runs.size()));
     if (used < size) logmsg("display list ends inside a command (%u of %u bytes used)", used, size);
     if (s_dlRecFail || used < size) {  // not only draws: kept if it only sets state
         e.runs.clear();

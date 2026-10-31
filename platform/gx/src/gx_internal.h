@@ -200,6 +200,13 @@ uint32_t primitiveIndices(uint8_t opcode, uint32_t count, uint32_t base, uint32_
 // relative to the first one, as primitiveBegin/primitiveEnd would have.
 void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* verts, uint32_t count,
                    const uint32_t* idx, uint32_t nidx);
+enum DlPerfFallback { kDlPerfNonTriangle, kDlPerfMatrixKey, kDlPerfGeneration,
+                      kDlPerfUnwarmed, kDlPerfCompact };
+void noteDlHitFallback(DlPerfFallback why, uint32_t vertices, uint32_t draws);
+void noteDlArenaDirect(uint32_t vertices, uint32_t draws);
+void noteDlMiss(uint32_t vertices, uint32_t draws);
+void noteDlImmediate(uint32_t vertices, uint32_t draws);
+extern bool g_dlPromoteFirst;
 bool rendererReady();
 void releaseGlThread();  // gx_platform.cpp, for GXPC_Shutdown
 // Display-list arena: a GL buffer holding the vertices and indices of cached
@@ -226,7 +233,7 @@ void executeCopy(uint32_t execReg);
 void markXfMemDirty();
 void dlCacheExternalStateChanged();
 struct DlCacheStats {
-    uint32_t hits, variantHits, misses, evictions, arenaPromotions;
+    uint32_t hits, variantHits, misses, evictions, arenaPromotionAttempts;
 };
 void dlCacheTakeStats(DlCacheStats& out);
 // XF memory words changed since the backend last consumed them (inclusive;
