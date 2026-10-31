@@ -818,11 +818,48 @@ static uint64_t s_gpuBusy[GPU_KIND_COUNT];
 static uint32_t s_gpuKindCount[GPU_KIND_COUNT];
 struct GpuTop { uint64_t cost, idle, busy; GpuDrawInfo info; };
 static GpuTop s_gpuTop[8];
+struct GpuSig {
+    bool used;
+    uint32_t kind, vertsBucket, stages, texMask, texW, texH, blend, zmode, rtW, rtH;
+    uint64_t busy, area;
+    uint32_t count;
+};
+static GpuSig s_gpuSigs[256];
 static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
 static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the [gpu] report
 static GpuDrawInfo gpuInfo(uint32_t kind) { GpuDrawInfo i = {}; i.kind = kind; return i; }
+static uint32_t gpuVertsBucket(uint32_t verts) {
+    return verts <= 6 ? 0 : verts <= 64 ? 1 : verts <= 1024 ? 2 : 3;
+}
+static uint32_t gpuSigHash(const GpuDrawInfo& d) {
+    uint32_t h = 2166136261u;
+    const uint32_t key[] = {d.kind, gpuVertsBucket(d.verts), d.stages, d.texMask, d.texW, d.texH,
+                            d.blend, d.zmode, d.rtW, d.rtH};
+    for (uint32_t v : key) { h ^= v; h *= 16777619u; }
+    return h;
+}
+static void gpuAddSignature(const GpuDrawInfo& d, uint64_t busy) {
+    const uint32_t bucket = gpuVertsBucket(d.verts);
+    const uint32_t hash = gpuSigHash(d);
+    for (uint32_t probe = 0; probe < 256; ++probe) {
+        GpuSig& s = s_gpuSigs[(hash + probe) & 255];
+        if (!s.used) {
+            s = {true, d.kind, bucket, d.stages, d.texMask, d.texW, d.texH, d.blend, d.zmode,
+                 d.rtW, d.rtH, busy, d.area, 1};
+            return;
+        }
+        if (s.kind == d.kind && s.vertsBucket == bucket && s.stages == d.stages && s.texMask == d.texMask &&
+            s.texW == d.texW && s.texH == d.texH && s.blend == d.blend && s.zmode == d.zmode &&
+            s.rtW == d.rtW && s.rtH == d.rtH) {
+            s.busy += busy;
+            s.area += d.area;
+            ++s.count;
+            return;
+        }
+    }
+}
 static GpuDrawInfo gpuCopyInfo(uint32_t kind, const GX2Surface& src, const GX2Surface& dst) {
     GpuDrawInfo i = gpuInfo(kind);
     i.srcW = src.width; i.srcH = src.height; i.dstW = dst.width; i.dstH = dst.height;
@@ -859,20 +896,22 @@ static void gpuCollect(uint32_t arena) {
     DCInvalidateRange(s_gpuTopStamps[arena], n * 8);
     const uint64_t* st = s_gpuStamps[arena];
     const uint64_t* top = s_gpuTopStamps[arena];
-    if (st[n - 1] > st[0]) s_gpuTotal += st[n - 1] - st[0];
     // Timer rate check: first stamps of the window's frames against OSTime.
     if (!s_gpuFrames) { s_rateStamp0 = st[0]; s_rateTime0 = OSGetTime(); }
     s_rateStamp1 = st[0]; s_rateTime1 = OSGetTime();
     ++s_gpuFrames;
     for (uint32_t i = 1; i < n; ++i) {
-        if (st[i] <= st[i - 1]) continue;
+        if (!st[i] || !top[i] || !st[i - 1] || st[i] <= st[i - 1]) continue;
         const uint64_t cost = st[i] - st[i - 1];
+        if (cost > 50000000ull) continue;
         const uint64_t idle = top[i] > st[i - 1] ? std::min(top[i] - st[i - 1], cost) : 0;
         const uint64_t busy = cost - idle;
         const uint32_t kind = s_gpuInfo[arena][i].kind < GPU_KIND_COUNT ? s_gpuInfo[arena][i].kind : GPU_OTHER;
+        s_gpuTotal += idle + busy;
         s_gpuIdle += idle;
         s_gpuBusy[kind] += busy;
         ++s_gpuKindCount[kind];
+        if (kind == GPU_DRAW) gpuAddSignature(s_gpuInfo[arena][i], busy);
         int slot = -1;
         for (int k = 0; k < 8; ++k)
             if (slot < 0 || s_gpuTop[k].busy < s_gpuTop[slot].busy) slot = k;
@@ -882,9 +921,11 @@ static void gpuCollect(uint32_t arena) {
 
 static void gpuReport() {
     if (!s_gpuFrames) return;
+    uint64_t busyTotal = 0;
+    for (uint32_t k = 0; k < GPU_KIND_COUNT; ++k) busyTotal += s_gpuBusy[k];
     WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u idle=%u busy=%u drawBusy=%u/%u efbcopyBusy=%u/%u clearBusy=%u/%u presentBusy=%u/%u otherBusy=%u/%u timer-rate=%u/s",
                  (unsigned)s_gpuFrames, (unsigned)(s_gpuTotal / s_gpuFrames), (unsigned)(s_gpuIdle / s_gpuFrames),
-                 (unsigned)((s_gpuTotal - std::min(s_gpuIdle, s_gpuTotal)) / s_gpuFrames),
+                 (unsigned)(busyTotal / s_gpuFrames),
                  (unsigned)(s_gpuBusy[GPU_DRAW] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_DRAW] / s_gpuFrames),
                  (unsigned)(s_gpuBusy[GPU_EFBCOPY] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_EFBCOPY] / s_gpuFrames),
                  (unsigned)(s_gpuBusy[GPU_CLEAR] / s_gpuFrames), (unsigned)(s_gpuKindCount[GPU_CLEAR] / s_gpuFrames),
@@ -911,11 +952,26 @@ static void gpuReport() {
                          (unsigned)d.srcW, (unsigned)d.srcH, (unsigned)d.srcFmt, (unsigned)d.dstW, (unsigned)d.dstH, (unsigned)d.dstFmt);
         s_gpuTop[best].busy = 0;
     }
+    static const char* const bucketName[] = {"1-6", "7-64", "65-1024", "1025+"};
+    for (int r = 0; r < 16; ++r) {
+        int best = -1;
+        for (int k = 0; k < 256; ++k)
+            if (s_gpuSigs[k].used && s_gpuSigs[k].busy && (best < 0 || s_gpuSigs[k].busy > s_gpuSigs[best].busy)) best = k;
+        if (best < 0) break;
+        const GpuSig& s = s_gpuSigs[best];
+        WHBLogPrintf("SMS Wii U: [gpusig] %d busy=%u/frame count=%u/frame avgBusy=%u kind=draw verts=%s stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x rt=%ux%u area=%u",
+                     r, (unsigned)(s.busy / s_gpuFrames), (unsigned)(s.count / s_gpuFrames),
+                     (unsigned)(s.count ? s.busy / s.count : 0), bucketName[s.vertsBucket],
+                     (unsigned)s.stages, (unsigned)s.texMask, (unsigned)s.texW, (unsigned)s.texH,
+                     (unsigned)s.blend, (unsigned)s.zmode, (unsigned)s.rtW, (unsigned)s.rtH, (unsigned)s.area);
+        s_gpuSigs[best].busy = 0;
+    }
     memset(s_gpuTop, 0, sizeof(s_gpuTop));
     s_gpuTotal = 0;
     s_gpuIdle = 0;
     memset(s_gpuBusy, 0, sizeof(s_gpuBusy));
     memset(s_gpuKindCount, 0, sizeof(s_gpuKindCount));
+    memset(s_gpuSigs, 0, sizeof(s_gpuSigs));
     s_gpuFrames = 0;
 }
 
