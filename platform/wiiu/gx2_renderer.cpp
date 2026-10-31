@@ -4339,7 +4339,13 @@ extern "C" void sms_wiiu_gx2_scene_archive(const char* name) {
         s_sceneResOff = sdMarkerPresent("nosceneres");
         s_sceneRes900 = sdMarkerPresent("sceneres900");
     }
-    s_sceneRenderH = !s_sceneResOff && strncmp(name, "coronaBoss", 10) == 0 ? (s_sceneRes900 ? 900u : 810u) : 0u;
+    // Delfino Plaza (dolpic0..dolpic9, not the dolpic_ex courses) is GPU-bound too:
+    // about 31 ms of a 33.3 ms frame on the scripted route at 1008 lines and
+    // 545 MHz, 37-40 ms in heavier views, so it renders at 900.
+    const bool plaza = strncmp(name, "dolpic", 6) == 0 && name[6] >= '0' && name[6] <= '9';
+    s_sceneRenderH = s_sceneResOff ? 0u
+        : strncmp(name, "coronaBoss", 10) == 0 ? (s_sceneRes900 ? 900u : 810u)
+        : plaza ? 900u : 0u;
 }
 static void applySceneRenderSize() {
     if (!s_renderOwn) return;
