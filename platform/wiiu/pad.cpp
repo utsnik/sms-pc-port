@@ -320,6 +320,13 @@ BOOL PADInit(void)
  * Wii Remotes 2-4. A channel with no new sample keeps its last state. */
 void sms_wiiu_input_poll(void)
 {
+#if defined(PORT_GAME_SMG)
+	/* Galaxy reads the Wii Remote through KPAD itself (games/smg input.cpp)
+	 * and never calls PADRead. Polling here consumed the one-frame KPAD
+	 * trigger (and VPAD samples) before WPadHolder's read, so A never reached
+	 * File Select or any other trigger-driven menu. */
+	return;
+#endif
 	if (!s_initialized)
 		return;
 	uint32_t connected = 0;
