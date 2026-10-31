@@ -279,6 +279,7 @@ static bool s_ready;
 static bool s_frameActive;
 static bool s_grassCpuMarker;
 static bool s_grassShaderReady;
+static bool s_earlyZMarker;
 static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
 static uint32_t s_dlArenaLimit = 32u << 20;  // SD marker "dlarenasmall": 8 MiB, so Plaza wraps (test)
@@ -356,6 +357,7 @@ struct TevKey {
     uint32_t ind[16];  // BP_IND_CMD per stage (zero without indirect stages)
     uint32_t iref;     // BP_RAS1_IREF (zero without indirect stages)
     uint32_t projMask; // texgens with projective (stq) output: divide by w per pixel
+    uint32_t earlyZ;   // KILL_ENABLE only for shaders that emit KILL
 };
 
 struct TevShader {
@@ -1514,6 +1516,7 @@ static TevKey currentTevKey() {
     const uint32_t numTexGens = std::min<uint32_t>(g.xfReg[XFR_NUMTEXGENS] & 15, 8);
     for (uint32_t c = 0; c < numTexGens; ++c)
         if ((g.xfReg[XFR_TEXGEN + c] >> 1) & 1) k.projMask |= 1u << c;
+    k.earlyZ = s_earlyZMarker ? 1u : 0u;
     return k;
 }
 
@@ -2919,7 +2922,8 @@ static bool initTevPixel(TevShader& shader) {
     for (uint32_t i = 0; i < ra.inputs; ++i) shader.pixel.regs.spi_ps_input_cntls[i] = ra.semantic[i] | 0x100;
     shader.pixel.regs.cb_shader_mask = 0xf;
     shader.pixel.regs.cb_shader_control = 1;
-    shader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6);
+    const bool killEnable = !key.earlyZ || killed;
+    shader.pixel.regs.db_shader_control = (1u << 4) | (killEnable ? (1u << 6) : 0u);
     shader.pixel.size = uint32_t(programSize);
     shader.pixel.program = shader.psProgram;
     shader.pixel.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
@@ -5346,6 +5350,8 @@ void rendererInit(float) {
     updateWideTarget();
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     if (sdMarkerPresent("dlarenasmall")) s_dlArenaLimit = 8u << 20;
+    s_earlyZMarker = sdMarkerPresent("earlyz");
+    WHBLogPrintf("SMS Wii U: [earlyz] marker=%s", s_earlyZMarker ? "on" : "off");
     // Both Stage 1 paths default on.  Read their opt-out markers exactly once;
     // the legacy gx2dl/gx2prod markers are intentionally ignored.
     s_gx2DlEnabled = !sdMarkerPresent("nogx2dl");
