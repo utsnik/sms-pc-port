@@ -243,6 +243,9 @@ struct DlCacheStats {
     uint32_t stateVcd, stateVat, stateMatA, stateMatB, stateArray, stateZtex, stateExternal;
 };
 void dlCacheTakeStats(DlCacheStats& out);
+struct DlHashStats { uint32_t calls, periodic, always, oorList, oorArray, stampedList, stampedArray; uint64_t bytes; };
+extern DlHashStats g_dlHash;  // d42: dlReusable hashes by cause, reset by the renderer's report
+extern bool g_dlNoHash;       // SD marker "dlnohash" (diagnostic only)
 struct DlMissReport {
     const void* address;
     uint32_t size, variants, misses;

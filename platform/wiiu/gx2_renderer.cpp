@@ -190,6 +190,7 @@ static bool s_gpuXfEnabled = true;
 static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display-list cache off
 bool g_dlPromoteFirst = false;
 bool g_dlIgnoreExternal = false;
+bool g_dlNoHash = false;
 // This is separate from the vertex/index arena above.  The GX2 command-list
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
@@ -4896,6 +4897,7 @@ void rendererInit(float) {
     g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
     g_dlPromoteFirst = sdMarkerPresent("dlpromotefirst");
     g_dlIgnoreExternal = sdMarkerPresent("dlnoexternal");
+    g_dlNoHash = sdMarkerPresent("dlnohash");
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
@@ -6118,6 +6120,12 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall);
         if ((g_displayFrames + 1) % 300 == 0) {
+            WHBLogPrintf("SMS Wii U: [dlhash] frame=%u per-frame calls=%u periodic=%u always=%u oorList=%u oorArray=%u stampedList=%u stampedArray=%u kbytes=%u nohash=%d",
+                         unsigned(g_displayFrames + 1), unsigned(g_dlHash.calls / 300), unsigned(g_dlHash.periodic / 300),
+                         unsigned(g_dlHash.always / 300), unsigned(g_dlHash.oorList / 300), unsigned(g_dlHash.oorArray / 300),
+                         unsigned(g_dlHash.stampedList / 300), unsigned(g_dlHash.stampedArray / 300),
+                         unsigned(g_dlHash.bytes / 300 / 1024), g_dlNoHash ? 1 : 0);
+            g_dlHash = DlHashStats{};
             DlMissReport missWindow[8]{};
             const uint32_t missWindowCount = dlCacheTakeMissWindow(missWindow, 8);
             for (uint32_t i = 0; i < missWindowCount; ++i)

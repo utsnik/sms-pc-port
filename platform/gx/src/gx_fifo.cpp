@@ -1419,12 +1419,34 @@ static bool dlAnyVariantStateMatches(const DlEntry& head, uint32_t size) {
     return false;
 }
 
+DlHashStats g_dlHash;
+static bool stampTracked(const void* p, size_t n) {
+    uintptr_t a = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_stampBase);
+    const uintptr_t span = uintptr_t(kStampPages) << kStampShift;
+    return a < span && a + n <= span;
+}
 static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
     if (!dlStateMatches(e, size)) return false;
     bool unwritten = trustWriteStamps() && !e.hashAlways && unwrittenSince(data, size, e.checkedClock);
     for (size_t i = 0; unwritten && i < e.arrays.size(); i++)
         unwritten = unwrittenSince(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo, e.checkedClock);
     if (unwritten && g_displayFrames - e.checkedFrame < kDlRecheckFrames) return true;
+    // d42: why this hit hashes (first matching cause), and how many bytes.
+    ++g_dlHash.calls;
+    if (unwritten) ++g_dlHash.periodic;
+    else if (!trustWriteStamps() || e.hashAlways) ++g_dlHash.always;
+    else {
+        bool oor = !stampTracked(data, size), oorArr = false;
+        for (size_t i = 0; !oor && !oorArr && i < e.arrays.size(); i++)
+            oorArr = !stampTracked(e.arrays[i].base + e.arrays[i].lo, e.arrays[i].hi - e.arrays[i].lo);
+        if (oor) ++g_dlHash.oorList;
+        else if (oorArr) ++g_dlHash.oorArray;
+        else if (!unwrittenSince(data, size, e.checkedClock)) ++g_dlHash.stampedList;
+        else ++g_dlHash.stampedArray;
+    }
+    g_dlHash.bytes += size;
+    for (size_t i = 0; i < e.arrays.size(); i++) g_dlHash.bytes += e.arrays[i].hi - e.arrays[i].lo;
+    if (g_dlNoHash) return true;  // SD marker dlnohash: UNSAFE upper bound, trusts every recording
     uint32_t clock = writeClock();
     bool same = hashBytes(data, size) == e.hash;
     for (size_t i = 0; same && i < e.arrays.size(); i++)

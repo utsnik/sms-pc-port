@@ -1294,6 +1294,7 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
 
 bool g_dlPromoteFirst = false;
 bool g_dlIgnoreExternal = false;
+bool g_dlNoHash = false;
 void noteDlHitFallback(DlPerfFallback, uint32_t, uint32_t) {}
 void noteDlArenaDirect(uint32_t, uint32_t) {}
 void noteDlMiss(uint32_t, uint32_t) {}
