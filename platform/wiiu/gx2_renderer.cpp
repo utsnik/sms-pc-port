@@ -6507,6 +6507,7 @@ struct ProducerCopyRequest {
     bool active;
     bool clear;
     bool clearColourEnabled;
+    bool clearAlphaEnabled;  // RGBA6 with alpha update on: the clear writes alpha too
     bool clearDepthEnabled;
 };
 static ProducerCopyRequest s_producerCopies[64];
@@ -6517,9 +6518,59 @@ static ProducerCopyRequest s_producerCopies[64];
 // so a scratch colour buffer the rectangle's size is cleared (only when the
 // colour changes) and copied into place.  Depth still clears the whole buffer.
 // Off under Cemu, whose GX2CopySurfaceEx handles only full-surface copies.
+// The copy writes all four channels, so it serves only clears that write
+// alpha (RGBA6 with alpha update on).  Any other clear must keep the alpha
+// already in the buffer, as GX and the PC renderer do: rectClearQuad draws it
+// instead, with an RGB channel mask.  The Airstrip shadow volumes blend by
+// that alpha, and a copy that set it to 1.0 inside the 256x256 shadow-texture
+// copy's rectangle drew their box faces navy at the crates and the boat.
 struct RectClearScratch { GX2ColorBuffer cb; float colour[4]; bool cleared; };
 static RectClearScratch s_rectScratch[8];
-static uint32_t s_rectScratchCount, s_rectClears, s_rectFallbacks, s_copyClearColour, s_copyClearDepth, s_copyClearTotal;
+static uint32_t s_rectScratchCount, s_rectClears, s_rectQuads, s_rectFallbacks, s_copyClearColour, s_copyClearDepth, s_copyClearTotal;
+
+struct RectClearVertex { float position[4]; float colour[4]; };  // s_untextured's layout (stride 32)
+static constexpr uint32_t kRectQuadSlots = 256;  // ~80 frames of clears before a slot is reused
+static RectClearVertex* s_rectQuadRing;
+static uint32_t s_rectQuadNext;
+
+// A full-target quad through s_untextured, scissored to the rectangle: depth
+// and blending off, alpha written only when asked.  The worker re-emits its
+// shaders and state after every copy service (executeCopy invalidates them).
+static bool rectClearQuad(const GX2Rect& rect, const float colour[4], bool alpha) {
+    if (!s_rectQuadRing) {
+        s_rectQuadRing = static_cast<RectClearVertex*>(
+            alignedZero(GX2_VERTEX_BUFFER_ALIGNMENT, sizeof(RectClearVertex) * 6 * kRectQuadSlots));
+        if (!s_rectQuadRing) return false;
+    }
+    RectClearVertex* v = s_rectQuadRing + (s_rectQuadNext++ % kRectQuadSlots) * 6;
+    static const float kCorner[6][2] = {{-1, -1}, {1, -1}, {1, 1}, {-1, -1}, {1, 1}, {-1, 1}};
+    for (int i = 0; i < 6; ++i) {
+        v[i].position[0] = kCorner[i][0]; v[i].position[1] = kCorner[i][1];
+        v[i].position[2] = 0.5f; v[i].position[3] = 1.0f;
+        memcpy(v[i].colour, colour, sizeof(v[i].colour));
+    }
+    DCFlushRange(v, sizeof(RectClearVertex) * 6);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, v, sizeof(RectClearVertex) * 6);
+    GX2SetFetchShader(&s_untextured.fetch);
+    GX2SetVertexShader(&s_untextured.vertex);
+    GX2SetPixelShader(&s_untextured.pixel);
+    static const float windowParams[4] = {1, 0, 0, 0};
+    GX2SetPixelUniformReg(s_untextured.pixel.uniformVars[0].offset, 4, windowParams);
+    GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
+    GX2SetScissor(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+    GX2SetDepthOnlyControl(FALSE, FALSE, GX2_COMPARE_FUNC_ALWAYS);
+    GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
+    GX2SetPolygonControl(GX2_FRONT_FACE_CW, FALSE, FALSE, FALSE,
+                         GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE, FALSE, FALSE, FALSE);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, 0x00, FALSE, TRUE);
+    GX2SetTargetChannelMasks(GX2ChannelMask(GX2_CHANNEL_MASK_RGB | (alpha ? GX2_CHANNEL_MASK_A : 0)),
+                             (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
+                             (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0);
+    GX2SetAttribBuffer(0, sizeof(RectClearVertex) * 6, sizeof(RectClearVertex), v);
+    GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 0, 1);
+    ++s_rectQuads;
+    return true;
+}
 
 static bool rectClearColour(const GX2Rect& rect, const float colour[4]) {
     GX2ColorBuffer* target = renderColour();
@@ -6598,7 +6649,9 @@ static void producerCopyService(void* opaque) {
                       r.clearRect.bottom - r.clearRect.top);
     if (r.clearColourEnabled) {
         ++s_copyClearColour;
-        if (!s_rectClear || !rectClearColour(r.clearRect, r.clearColour)) {
+        const bool rectDone = s_rectClear && (r.clearAlphaEnabled ? rectClearColour(r.clearRect, r.clearColour)
+                                                                  : rectClearQuad(r.clearRect, r.clearColour, false));
+        if (!rectDone) {
             if (s_rectClear) ++s_rectFallbacks;
             GX2ClearColor(renderColour(), r.clearColour[0], r.clearColour[1],
                           r.clearColour[2], r.clearColour[3]);
@@ -6612,9 +6665,9 @@ static void producerCopyService(void* opaque) {
     }
     rebindTvTarget(false);
     if (s_copyClearTotal % 600 == 0)
-        WHBLogPrintf("SMS Wii U: [efb] copy clears=%u colour=%u depth=%u depthSkipped=%u rect=%u fallback=%u (rectclear %s)",
+        WHBLogPrintf("SMS Wii U: [efb] copy clears=%u colour=%u depth=%u depthSkipped=%u rect=%u quad=%u fallback=%u (rectclear %s)",
                      unsigned(s_copyClearTotal), unsigned(s_copyClearColour), unsigned(s_copyClearDepth),
-                     unsigned(s_depthClearsSkipped), unsigned(s_rectClears), unsigned(s_rectFallbacks),
+                     unsigned(s_depthClearsSkipped), unsigned(s_rectClears), unsigned(s_rectQuads), unsigned(s_rectFallbacks),
                      s_rectClear ? "on" : "off");
 }
 
@@ -6640,6 +6693,7 @@ void executeCopy(uint32_t ctrl) {
         r.display = (ctrl >> 14) & 1;
         r.clear = (ctrl >> 11) & 1;
         r.clearColourEnabled = ((g.bp[BP_CMODE0] >> 3) & 1) != 0;
+        r.clearAlphaEnabled = (g.bp[BP_PE_CONTROL] & 7) == 1 && ((g.bp[BP_CMODE0] >> 4) & 1) != 0;
         r.clearDepthEnabled = ((g.bp[BP_ZMODE] >> 4) & 1) != 0;
         r.clearColour[0] = float(ar & 255) / 255.0f;
         r.clearColour[1] = float((gb >> 8) & 255) / 255.0f;
