@@ -41,6 +41,15 @@ static inline void ia8(uint16_t v, uint8_t* o) {
     o[3] = uint8_t(v >> 8);
 }
 
+static inline uint32_t grayAlphaPixel(uint8_t intensity, uint8_t alpha) {
+    const uint32_t gray = uint32_t(intensity) * 0x00010101u;
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    return (gray << 8) | alpha;
+#else
+    return gray | uint32_t(alpha) << 24;
+#endif
+}
+
 static const uint8_t kTileW[16] = {8, 8, 8, 4, 4, 4, 4, 0, 8, 8, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileH[16] = {8, 4, 4, 4, 4, 4, 4, 0, 8, 4, 4, 0, 0, 0, 8, 0};
 static const uint8_t kTileBytes[16] = {32, 32, 32, 32, 32, 32, 64, 0, 32, 32, 32, 0, 0, 0, 32, 0};
@@ -70,6 +79,45 @@ void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
     for (uint32_t ty = 0; ty < rows; ++ty) {
         for (uint32_t tx = 0; tx < cols; ++tx) {
             const uint32_t x0 = tx * tw, y0 = ty * th;
+            if (x0 + tw <= w && y0 + th <= h) {
+                uint32_t* dst = reinterpret_cast<uint32_t*>(out + (size_t(y0) * w + x0) * 4);
+                switch (fmt) {
+                case 0: // I4
+                    for (uint32_t r = 0; r < 8; ++r) {
+                        for (uint32_t q = 0; q < 4; ++q) {
+                            const uint8_t b = p[r * 4 + q];
+                            const uint32_t hi = uint32_t(b >> 4) * 17 * 0x01010101u;
+                            const uint32_t lo = uint32_t(b & 15) * 17 * 0x01010101u;
+                            dst[q * 2] = hi;
+                            dst[q * 2 + 1] = lo;
+                        }
+                        dst = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(dst) + size_t(w) * 4);
+                    }
+                    break;
+                case 1: // I8
+                    for (uint32_t r = 0; r < 4; ++r) {
+                        for (uint32_t q = 0; q < 8; ++q)
+                            dst[q] = uint32_t(p[r * 8 + q]) * 0x01010101u;
+                        dst = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(dst) + size_t(w) * 4);
+                    }
+                    break;
+                case 3: // IA8
+                    for (uint32_t r = 0; r < 4; ++r) {
+                        for (uint32_t q = 0; q < 4; ++q) {
+                            const uint16_t v = be16(p + 2 * (r * 4 + q));
+                            dst[q] = grayAlphaPixel(uint8_t(v), uint8_t(v >> 8));
+                        }
+                        dst = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(dst) + size_t(w) * 4);
+                    }
+                    break;
+                default:
+                    break;
+                }
+                if (fmt == 0 || fmt == 1 || fmt == 3) {
+                    p += kTileBytes[fmt];
+                    continue;
+                }
+            }
             auto put = [&](uint32_t x, uint32_t y, const uint8_t* c) {
                 if (x < w && y < h) memcpy(out + (size_t(y) * w + x) * 4, c, 4);
             };
