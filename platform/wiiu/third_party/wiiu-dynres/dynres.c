@@ -48,8 +48,11 @@ uint8_t dynres_begin_stage(dynres_ctx* ctx, int remembered_lines, int default_li
     ctx->measured = 0;
     ctx->heaviest_us = 0;
     ctx->recent_n = ctx->recent_pos = 0;
+    ctx->held = 0;
     return ctx->index;
 }
+
+void dynres_hold(dynres_ctx* ctx) { ctx->held = 1; }
 
 uint8_t dynres_frame(dynres_ctx* ctx, uint32_t gpu_busy_us) {
     if (!ctx->active) return ctx->index;
@@ -59,6 +62,10 @@ uint8_t dynres_frame(dynres_ctx* ctx, uint32_t gpu_busy_us) {
     ctx->frames = 0;
     ctx->sum_us = 0;
     ctx->last_avg_us = avg;
+    if (ctx->held) {
+        ctx->held = 0;
+        return ctx->index;
+    }
     if (ctx->cooldown) {
         --ctx->cooldown;
         ctx->over = 0;

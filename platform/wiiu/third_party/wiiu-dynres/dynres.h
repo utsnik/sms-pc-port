@@ -39,6 +39,7 @@ typedef struct {
                                over down_windows consecutive measured windows */
     uint32_t recent[DYNRES_MAX_DOWN_WINDOWS];  /* the last measured window averages */
     uint8_t recent_n, recent_pos;
+    uint8_t held;           /* the current window is not judged (dynres_hold) */
     uint32_t last_avg_us;   /* the last complete window's average */
 } dynres_ctx;
 
@@ -46,6 +47,10 @@ void dynres_default_config(dynres_config* cfg, const uint16_t* lines, uint8_t n_
 int dynres_init(dynres_ctx* ctx, const dynres_config* cfg);
 uint8_t dynres_begin_stage(dynres_ctx* ctx, int remembered_lines, int default_lines);
 uint8_t dynres_frame(dynres_ctx* ctx, uint32_t gpu_busy_us);
+/* The current window is not judged: neither a step down, nor the heaviest
+ * load, nor a break in a run of slow windows.  For load the render size
+ * cannot fix, such as textures streaming in at a stage's start. */
+void dynres_hold(dynres_ctx* ctx);
 int dynres_end_stage(dynres_ctx* ctx);
 uint16_t dynres_lines(const dynres_ctx* ctx);
 

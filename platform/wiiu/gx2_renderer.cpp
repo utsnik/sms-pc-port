@@ -4392,8 +4392,21 @@ static void dynresEndVisit() {
 }
 
 // Core 1, at present: one frame's GPU busy time, read four frames late.
+// While HD pack textures stream in (a stage's first seconds, about 4 ms of
+// extra GPU time at any render size) the window is held, not judged; the
+// 8-frame tail covers the frames read late.
+static uint32_t s_dynresReadBytes, s_dynresSinceRead = 1000;
 extern "C" void sms_wiiu_dynres_gpu_frame(uint32_t busy_us) {
     if (s_dynresState != 1 || !s_dynres.active) return;
+    gx::TexturePackStats tp;
+    gx::texturePackGetStats(&tp);
+    if (tp.archiveReadBytes != s_dynresReadBytes) {
+        s_dynresReadBytes = tp.archiveReadBytes;
+        s_dynresSinceRead = 0;
+    } else if (s_dynresSinceRead < 1000) {
+        ++s_dynresSinceRead;
+    }
+    if (s_dynresSinceRead < 8) dynres_hold(&s_dynres);
     const uint16_t before = dynres_lines(&s_dynres);
     dynres_frame(&s_dynres, busy_us);
     const uint16_t after = dynres_lines(&s_dynres);
