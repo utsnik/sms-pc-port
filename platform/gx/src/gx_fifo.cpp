@@ -173,7 +173,7 @@ uint32_t ptrToPhys(const void* p) {
 // A platform whose game memory is not at the window's base (the Wii U's
 // window is at address zero and the game arena in MEM2) points the tracked
 // range at it with GXPC_SetWriteStampWindow.
-enum : uint32_t { kStampShift = 12, kStampPages = (128u << 20) >> kStampShift };
+enum : uint32_t { kStampShift = 12, kStampPages = (256u << 20) >> kStampShift };
 static std::atomic<uint32_t> s_pageStamp[kStampPages];
 static std::atomic<uint32_t> s_writeClock{1};
 static uint8_t* s_stampBase = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(0x80000000u));

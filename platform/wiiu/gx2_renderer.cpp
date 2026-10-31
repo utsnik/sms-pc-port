@@ -37,6 +37,7 @@
  * one texture-modulate pass cover the title and most early menu geometry.
  */
 #include "../gx/src/gx_internal.h"
+#include "sms_gx/gx_pc.h"
 #include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
@@ -4898,6 +4899,9 @@ void rendererInit(float) {
     g_dlPromoteFirst = sdMarkerPresent("dlpromotefirst");
     g_dlIgnoreExternal = sdMarkerPresent("dlnoexternal");
     g_dlNoHash = sdMarkerPresent("dlnohash");
+    // d43: track write stamps over the whole 0x10000000-0x1fffffff user range (RPX data, game arena, MEM1 copy,
+    // system heap), not just the arena: display lists outside it were hashed on every call (~9 MB/frame).
+    if (sdMarkerPresent("stampwide")) GXPC_SetWriteStampWindow(reinterpret_cast<void*>(uintptr_t(0x10000000u)));
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl");
