@@ -578,6 +578,37 @@ static bool s_noApplyCache, s_noShaderCache, s_noTevUniformCache;
 static bool s_noVtxLiveCache, s_noBindCache, s_noXfUniformCache;
 static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets, 5 = 3 plus GX2DrawDone per draw
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
+static bool s_gpuDiag;  // SD marker "perfdiag": GPU timestamps and command-stream counters
+
+struct CmdCounters {
+    uint32_t vsUniDw, psUniDw, vsUniCalls, psUniCalls;
+    uint32_t shaderSw, fetchSw, texBinds, samplerBinds, attrBinds, draws;
+    uint32_t dlCalls, dlBytes;
+};
+// Core 1 calls lists; gx2prod records their contents on its worker core.
+// Each core writes only its own slot, and the report reads after kWaitPresent.
+static CmdCounters s_cmdByCore[2];
+static inline CmdCounters& cmdCounters() { return s_cmdByCore[OSGetCoreId() == 1 ? 0 : 1]; }
+
+// A GX2 call made while a display list is open is counted when recorded,
+// not again when that list is replayed. dlCalls/dlBytes count actual calls.
+#define GX2SetVertexUniformReg(offset, count, data) do { \
+    const uint32_t cmdWords = (count); \
+    if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.vsUniCalls; cmd.vsUniDw += cmdWords; } \
+    ::GX2SetVertexUniformReg(offset, cmdWords, data); \
+} while (0)
+#define GX2SetPixelUniformReg(offset, count, data) do { \
+    const uint32_t cmdWords = (count); \
+    if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.psUniCalls; cmd.psUniDw += cmdWords; } \
+    ::GX2SetPixelUniformReg(offset, cmdWords, data); \
+} while (0)
+#define GX2SetVertexShader(...) do { if (s_gpuDiag) ++cmdCounters().shaderSw; ::GX2SetVertexShader(__VA_ARGS__); } while (0)
+#define GX2SetPixelShader(...) do { if (s_gpuDiag) ++cmdCounters().shaderSw; ::GX2SetPixelShader(__VA_ARGS__); } while (0)
+#define GX2SetFetchShader(...) do { if (s_gpuDiag) ++cmdCounters().fetchSw; ::GX2SetFetchShader(__VA_ARGS__); } while (0)
+#define GX2SetPixelTexture(...) do { if (s_gpuDiag) ++cmdCounters().texBinds; ::GX2SetPixelTexture(__VA_ARGS__); } while (0)
+#define GX2SetPixelSampler(...) do { if (s_gpuDiag) ++cmdCounters().samplerBinds; ::GX2SetPixelSampler(__VA_ARGS__); } while (0)
+#define GX2SetAttribBuffer(...) do { if (s_gpuDiag) ++cmdCounters().attrBinds; ::GX2SetAttribBuffer(__VA_ARGS__); } while (0)
+#define GX2DrawIndexedEx(...) do { if (s_gpuDiag) ++cmdCounters().draws; ::GX2DrawIndexedEx(__VA_ARGS__); } while (0)
 
 // What each pixel texture unit holds, so an unchanged texture or sampler is
 // not bound again on every draw (the image pointers and GX2 register words,
@@ -838,7 +869,6 @@ static GpuSig s_gpuSigs[256];
 static uint64_t s_rateStamp0, s_rateStamp1;
 static OSTime s_rateTime0, s_rateTime1;
 
-static bool s_gpuDiag;  // SD marker "perfdiag": per-draw GPU timestamps and the [gpu] report
 static GpuDrawInfo gpuInfo(uint32_t kind) { GpuDrawInfo i = {}; i.kind = kind; return i; }
 static uint32_t gpuVertsBucket(uint32_t verts) {
     return verts <= 6 ? 0 : verts <= 64 ? 1 : verts <= 1024 ? 2 : 3;
@@ -5466,6 +5496,7 @@ static void gx2ProdCallList(void* list, uint32_t bytes) {
     if (OSGetCoreId() != 1)
         WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());
     GX2DirectCallDisplayList(list, bytes);
+    if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.dlCalls; cmd.dlBytes += bytes; }
     ++s_perfDlCalled;
     s_perfDlCoreCall = OSGetCoreId();
 }
@@ -6714,6 +6745,24 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall);
+        if (s_gpuDiag) {
+            CmdCounters cmd = s_cmdByCore[0];
+            const CmdCounters& worker = s_cmdByCore[1];
+            cmd.vsUniDw += worker.vsUniDw; cmd.psUniDw += worker.psUniDw;
+            cmd.vsUniCalls += worker.vsUniCalls; cmd.psUniCalls += worker.psUniCalls;
+            cmd.shaderSw += worker.shaderSw; cmd.fetchSw += worker.fetchSw;
+            cmd.texBinds += worker.texBinds; cmd.samplerBinds += worker.samplerBinds;
+            cmd.attrBinds += worker.attrBinds; cmd.draws += worker.draws;
+            cmd.dlCalls += worker.dlCalls; cmd.dlBytes += worker.dlBytes;
+            WHBLogPrintf("SMS Wii U: [cmd] per-frame vsUniDw=%u psUniDw=%u vsUniCalls=%u psUniCalls=%u shaderSw=%u fetchSw=%u texBinds=%u samplerBinds=%u attrBinds=%u draws=%u dlCalls=%u dlBytes=%u",
+                         unsigned(cmd.vsUniDw / 30), unsigned(cmd.psUniDw / 30),
+                         unsigned(cmd.vsUniCalls / 30), unsigned(cmd.psUniCalls / 30),
+                         unsigned(cmd.shaderSw / 30), unsigned(cmd.fetchSw / 30),
+                         unsigned(cmd.texBinds / 30), unsigned(cmd.samplerBinds / 30),
+                         unsigned(cmd.attrBinds / 30), unsigned(cmd.draws / 30),
+                         unsigned(cmd.dlCalls / 30), unsigned(cmd.dlBytes / 30));
+            memset(s_cmdByCore, 0, sizeof(s_cmdByCore));
+        }
         if ((g_displayFrames + 1) % 300 == 0) {
             WHBLogPrintf("SMS Wii U: [dlhash] frame=%u per-frame calls=%u periodic=%u always=%u oorList=%u oorArray=%u stampedList=%u stampedArray=%u kbytes=%u nohash=%d",
                          unsigned(g_displayFrames + 1), unsigned(g_dlHash.calls / 300), unsigned(g_dlHash.periodic / 300),
