@@ -802,7 +802,7 @@ static uint32_t s_gx2DlUsed[kVertexArenas];
 extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
 extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
 extern "C" uint32_t sms_wiiu_vsync_event_count(void);
-static constexpr uint32_t kGpuStamps = 1024;
+static constexpr uint32_t kGpuStamps = 4096;  // heavy frames: ~1200 draws + 360 copies + clears
 enum GpuKind { GPU_DRAW, GPU_EFBCOPY, GPU_CLEAR, GPU_PRESENT, GPU_OTHER, GPU_KIND_COUNT };
 struct GpuDrawInfo {
     uint32_t kind, verts, stages, texMask, blend, zmode, texW, texH, area, drawNo;
