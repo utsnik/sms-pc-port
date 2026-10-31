@@ -705,10 +705,9 @@ WPADExtensionCallback WPADSetExtensionCallback(s32 chan, WPADExtensionCallback c
         return nullptr;
     WPADExtensionCallback old = s_extension_callbacks[chan];
     s_extension_callbacks[chan] = callback;
-    if (chan == WPAD_CHAN0 && callback && s_connected && !s_extension_reported) {
-        s_extension_reported = true;
-        callback(chan, WPAD_DEV_FREESTYLE);
-    }
+    /* Delivered by report_callbacks() on the next KPADRead, as the real
+     * library does asynchronously: calling it here ran WPad::connectCallback
+     * inside the WPadHolder constructor, before MR::getWPad() worked (DSI). */
     return old;
 }
 
@@ -718,10 +717,9 @@ WPADConnectCallback WPADSetConnectCallback(s32 chan, WPADConnectCallback callbac
         return nullptr;
     WPADConnectCallback old = s_connect_callbacks[chan];
     s_connect_callbacks[chan] = callback;
-    if (chan == WPAD_CHAN0 && callback && s_connected && !s_connect_reported) {
-        s_connect_reported = true;
-        callback(chan, WPAD_ERR_NONE);
-    }
+    /* Delivered by report_callbacks() on the next KPADRead, as the real
+     * library does asynchronously: calling it here ran WPad::connectCallback
+     * inside the WPadHolder constructor, before MR::getWPad() worked (DSI). */
     return old;
 }
 
