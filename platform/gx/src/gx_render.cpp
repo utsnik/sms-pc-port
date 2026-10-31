@@ -1296,7 +1296,7 @@ bool g_dlPromoteFirst = false;
 void noteDlHitFallback(DlPerfFallback, uint32_t, uint32_t) {}
 void noteDlArenaDirect(uint32_t, uint32_t) {}
 void noteDlMiss(uint32_t, uint32_t) {}
-void noteDlImmediate(uint32_t, uint32_t) {}
+void noteDlImmediate(DlImmediateContext, uint32_t, uint32_t) {}
 
 // ------------------------------------------------------------------ display-list arena
 // Cached display-list runs (gx_fifo.cpp) are stored once in the arena, the

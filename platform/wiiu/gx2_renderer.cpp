@@ -5030,7 +5030,9 @@ static uint32_t s_perfDlGenerationVerts, s_perfDlGenerationDraws;
 static uint32_t s_perfDlUnwarmedVerts, s_perfDlUnwarmedDraws;
 static uint32_t s_perfDlCompactVerts, s_perfDlCompactDraws;
 static uint32_t s_perfDlMissVerts, s_perfDlMissDraws;
-static uint32_t s_perfDlImmediateVerts, s_perfDlImmediateDraws;
+static uint32_t s_perfDlImmSkipVerts, s_perfDlImmSkipDraws;
+static uint32_t s_perfDlImmBypassVerts, s_perfDlImmBypassDraws;
+static uint32_t s_perfDlImmDirectVerts, s_perfDlImmDirectDraws;
 // arenaUpload's arguments, for the store appendArena makes right after it.
 static struct { const uint8_t* verts; const uint32_t* idx; } s_dlStash;
 static struct { const ArenaRef* ref; uint32_t n, nidx; const uint8_t* verts; } s_dlPending;
@@ -5106,8 +5108,26 @@ void noteDlArenaDirect(uint32_t vertices, uint32_t draws) {
 void noteDlMiss(uint32_t vertices, uint32_t draws) {
     addDlPerf(s_perfDlMissVerts, s_perfDlMissDraws, vertices, draws);
 }
-void noteDlImmediate(uint32_t vertices, uint32_t draws) {
-    addDlPerf(s_perfDlImmediateVerts, s_perfDlImmediateDraws, vertices, draws);
+void noteDlImmediate(DlImmediateContext context, uint32_t vertices, uint32_t draws) {
+    switch (context) {
+    case kDlImmSkip: addDlPerf(s_perfDlImmSkipVerts, s_perfDlImmSkipDraws, vertices, draws); break;
+    case kDlImmBypass: addDlPerf(s_perfDlImmBypassVerts, s_perfDlImmBypassDraws, vertices, draws); break;
+    case kDlImmDirect: addDlPerf(s_perfDlImmDirectVerts, s_perfDlImmDirectDraws, vertices, draws); break;
+    }
+}
+
+static const char* dlMissFieldName(DlMissField field) {
+    switch (field) {
+    case kDlMissBytes: return "bytes";
+    case kDlMissVcd: return "vcd";
+    case kDlMissVat: return "vat";
+    case kDlMissMatA: return "matA";
+    case kDlMissMatB: return "matB";
+    case kDlMissArray: return "array";
+    case kDlMissZtex: return "ztex";
+    case kDlMissExternal: return "externalState";
+    default: return "?";
+    }
 }
 bool arenaUpload(const uint8_t* verts, uint32_t, uint32_t, const uint32_t* idx, uint32_t, ArenaRef& out) {
     // The decode needs the run's format and matrix registers, which only
@@ -6064,7 +6084,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmediateVerts=%u dlImmediateDraws=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -6083,12 +6103,27 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)(s_perfDlUnwarmedVerts / 30), (unsigned)(s_perfDlUnwarmedDraws / 30),
                      (unsigned)(s_perfDlCompactVerts / 30), (unsigned)(s_perfDlCompactDraws / 30),
                      (unsigned)(s_perfDlMissVerts / 30), (unsigned)(s_perfDlMissDraws / 30),
-                     (unsigned)(s_perfDlImmediateVerts / 30), (unsigned)(s_perfDlImmediateDraws / 30),
+                     (unsigned)(s_perfDlImmSkipVerts / 30), (unsigned)(s_perfDlImmSkipDraws / 30),
+                     (unsigned)(s_perfDlImmBypassVerts / 30), (unsigned)(s_perfDlImmBypassDraws / 30),
+                     (unsigned)(s_perfDlImmDirectVerts / 30), (unsigned)(s_perfDlImmDirectDraws / 30),
+                     unsigned(dlcache.bytesChanged), unsigned(dlcache.stateMismatch),
+                     unsigned(dlcache.stateVcd), unsigned(dlcache.stateVat), unsigned(dlcache.stateMatA),
+                     unsigned(dlcache.stateMatB), unsigned(dlcache.stateArray), unsigned(dlcache.stateZtex),
+                     unsigned(dlcache.stateExternal),
                      s_gx2DlEnabled ? 1 : 0, (unsigned)s_perfDlRecorded, (unsigned)s_perfDlCalled, (unsigned)s_perfDlBytes,
                      (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall);
+        if ((g_displayFrames + 1) % 300 == 0) {
+            DlMissReport missWindow[8]{};
+            const uint32_t missWindowCount = dlCacheTakeMissWindow(missWindow, 8);
+            for (uint32_t i = 0; i < missWindowCount; ++i)
+                WHBLogPrintf("SMS Wii U: [dlmiss] frame=%u address=%p size=%u variants=%u misses=%u dominant=%s",
+                             unsigned(g_displayFrames + 1), missWindow[i].address, unsigned(missWindow[i].size),
+                             unsigned(missWindow[i].variants), unsigned(missWindow[i].misses),
+                             dlMissFieldName(missWindow[i].dominantField));
+        }
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
             WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",
@@ -6111,7 +6146,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfDlUnwarmedVerts = s_perfDlUnwarmedDraws = 0;
         s_perfDlCompactVerts = s_perfDlCompactDraws = 0;
         s_perfDlMissVerts = s_perfDlMissDraws = 0;
-        s_perfDlImmediateVerts = s_perfDlImmediateDraws = 0;
+        s_perfDlImmSkipVerts = s_perfDlImmSkipDraws = 0;
+        s_perfDlImmBypassVerts = s_perfDlImmBypassDraws = 0;
+        s_perfDlImmDirectVerts = s_perfDlImmDirectDraws = 0;
         s_perfDlRecorded = s_perfDlCalled = s_perfDlBytes = s_perfDlMaxBytes = 0;
         s_perfDlFallbacks = s_perfDlForbidden = s_perfDlOverflows = s_perfDlBadAlignment = 0;
         s_perfDlSplitsCopy = s_perfDlSplitsClear = s_perfDlSplitsContext = s_perfDlSplitsFrame = 0;

@@ -202,10 +202,14 @@ void appendDecoded(PrimClass cls, uint32_t fmt, uint32_t stride, const uint8_t* 
                    const uint32_t* idx, uint32_t nidx);
 enum DlPerfFallback { kDlPerfNonTriangle, kDlPerfMatrixKey, kDlPerfGeneration,
                       kDlPerfUnwarmed, kDlPerfCompact };
+enum DlImmediateContext { kDlImmSkip, kDlImmBypass, kDlImmDirect };
+enum DlMissField { kDlMissBytes, kDlMissVcd, kDlMissVat, kDlMissMatA,
+                   kDlMissMatB, kDlMissArray, kDlMissZtex, kDlMissExternal,
+                   kDlMissFieldCount };
 void noteDlHitFallback(DlPerfFallback why, uint32_t vertices, uint32_t draws);
 void noteDlArenaDirect(uint32_t vertices, uint32_t draws);
 void noteDlMiss(uint32_t vertices, uint32_t draws);
-void noteDlImmediate(uint32_t vertices, uint32_t draws);
+void noteDlImmediate(DlImmediateContext context, uint32_t vertices, uint32_t draws);
 extern bool g_dlPromoteFirst;
 bool rendererReady();
 void releaseGlThread();  // gx_platform.cpp, for GXPC_Shutdown
@@ -234,8 +238,16 @@ void markXfMemDirty();
 void dlCacheExternalStateChanged();
 struct DlCacheStats {
     uint32_t hits, variantHits, misses, evictions, arenaPromotionAttempts;
+    uint32_t bytesChanged, stateMismatch;
+    uint32_t stateVcd, stateVat, stateMatA, stateMatB, stateArray, stateZtex, stateExternal;
 };
 void dlCacheTakeStats(DlCacheStats& out);
+struct DlMissReport {
+    const void* address;
+    uint32_t size, variants, misses;
+    DlMissField dominantField;
+};
+uint32_t dlCacheTakeMissWindow(DlMissReport* out, uint32_t capacity);
 // XF memory words changed since the backend last consumed them (inclusive;
 // lo > hi = none). writeXF keeps them; a backend resets them after upload.
 extern uint32_t g_xfDirtyLo, g_xfDirtyHi;

@@ -28,6 +28,7 @@ namespace gx {
 State g;
 State gProducer;
 ParserContext g_parser = {&g, 0};
+static DlImmediateContext s_dlImmediateContext = kDlImmDirect;
 
 void syncProducerState() {
     const size_t head = offsetof(State, tlutMem), tail = offsetof(State, tlutMem) + sizeof(g.tlutMem);
@@ -259,6 +260,53 @@ bool g_dlVariantsEnabled = true;
 uint32_t g_dlExternalState = 1;
 
 static uint32_t s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotionAttempts;
+static uint32_t s_dlBytesChanged, s_dlStateMismatch;
+static uint32_t s_dlStateVcd, s_dlStateVat, s_dlStateMatA, s_dlStateMatB;
+static uint32_t s_dlStateArray, s_dlStateZtex, s_dlStateExternal;
+
+struct DlMissWindowEntry {
+    const void* address = nullptr;
+    uint32_t size = 0, variants = 0, misses = 0;
+    uint32_t fields[kDlMissFieldCount] = {};
+};
+static DlMissWindowEntry s_dlMissWindow[256];
+
+static void noteDlMissCause(DlMissField field) {
+    if (field == kDlMissBytes) {
+        ++s_dlBytesChanged;
+        return;
+    }
+    ++s_dlStateMismatch;
+    switch (field) {
+    case kDlMissVcd: ++s_dlStateVcd; break;
+    case kDlMissVat: ++s_dlStateVat; break;
+    case kDlMissMatA: ++s_dlStateMatA; break;
+    case kDlMissMatB: ++s_dlStateMatB; break;
+    case kDlMissArray: ++s_dlStateArray; break;
+    case kDlMissZtex: ++s_dlStateZtex; break;
+    case kDlMissExternal: ++s_dlStateExternal; break;
+    default: break;
+    }
+}
+
+static void noteDlMissWindow(const void* address, uint32_t size, uint32_t variants, DlMissField field) {
+    DlMissWindowEntry* slot = nullptr;
+    for (DlMissWindowEntry& e : s_dlMissWindow) {
+        if (e.address == address) { slot = &e; break; }
+        if (!slot && !e.address) slot = &e;
+    }
+    if (!slot) {
+        slot = &s_dlMissWindow[0];
+        for (DlMissWindowEntry& e : s_dlMissWindow)
+            if (e.misses < slot->misses) slot = &e;
+        *slot = {};
+    }
+    slot->address = address;
+    slot->size = size;
+    slot->variants = variants;
+    ++slot->misses;
+    ++slot->fields[field];
+}
 
 void dlCacheExternalStateChanged() {
     ++g_dlExternalState;
@@ -266,8 +314,35 @@ void dlCacheExternalStateChanged() {
 }
 
 void dlCacheTakeStats(DlCacheStats& out) {
-    out = {s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotionAttempts};
+    out = {s_dlHits, s_dlVariantHits, s_dlMisses, s_dlEvictions, s_dlArenaPromotionAttempts,
+           s_dlBytesChanged, s_dlStateMismatch, s_dlStateVcd, s_dlStateVat, s_dlStateMatA,
+           s_dlStateMatB, s_dlStateArray, s_dlStateZtex, s_dlStateExternal};
     s_dlHits = s_dlVariantHits = s_dlMisses = s_dlEvictions = s_dlArenaPromotionAttempts = 0;
+    s_dlBytesChanged = s_dlStateMismatch = 0;
+    s_dlStateVcd = s_dlStateVat = s_dlStateMatA = s_dlStateMatB = 0;
+    s_dlStateArray = s_dlStateZtex = s_dlStateExternal = 0;
+}
+
+uint32_t dlCacheTakeMissWindow(DlMissReport* out, uint32_t capacity) {
+    if (!out || !capacity) return 0;
+    bool used[256] = {};
+    uint32_t nout = 0;
+    while (nout < capacity && nout < 8) {
+        int best = -1;
+        for (int i = 0; i < int(sizeof(s_dlMissWindow) / sizeof(s_dlMissWindow[0])); i++) {
+            if (used[i] || !s_dlMissWindow[i].address) continue;
+            if (best < 0 || s_dlMissWindow[i].misses > s_dlMissWindow[best].misses) best = i;
+        }
+        if (best < 0) break;
+        used[best] = true;
+        DlMissWindowEntry& e = s_dlMissWindow[best];
+        DlMissField dominant = kDlMissBytes;
+        for (int f = 1; f < kDlMissFieldCount; f++)
+            if (e.fields[f] > e.fields[dominant]) dominant = DlMissField(f);
+        out[nout++] = {e.address, e.size, e.variants, e.misses, dominant};
+    }
+    for (DlMissWindowEntry& e : s_dlMissWindow) e = {};
+    return nout;
 }
 
 void resetState() {
@@ -1024,7 +1099,7 @@ static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t 
     for (int k = 0; k < nops; k++) ops[k].fn(ops[k], p, L.size, out, stride, count);
     primitiveEnd(opcode, count);
     if (s_dlRec) dlRecordPrimitive(opcode, p, count, vat, S, out);
-    else noteDlImmediate(count, 1);
+    else noteDlImmediate(s_dlImmediateContext, count, 1);
     return p + size_t(count) * L.size;
 }
 
@@ -1311,19 +1386,37 @@ static void dlRecordPrimitive(uint8_t opcode, const uint8_t* p, uint32_t count, 
 // The state a recording depends on besides the list's bytes. Keep the
 // Galaxy-specific renderer boundaries in this key: the decoded vertices are
 // reusable only within the same z-texture and EFB/peek state.
-static bool dlStateMatches(const DlEntry& e, uint32_t size) {
-    if (!e.valid || e.size != size) return false;
-    if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return false;
+static DlMissField dlStateFirstMismatch(const DlEntry& e, uint32_t size) {
+    if (!e.valid || e.size != size) return kDlMissBytes;
+    if (!e.stateOnly && (e.vcdLo != g.cpVcdLo || e.vcdHi != g.cpVcdHi)) return kDlMissVcd;
     for (int v = 0; v < 8; v++)
         if ((e.vatMask >> v) & 1)
-            if (e.vat[v][0] != g.cpVatA[v] || e.vat[v][1] != g.cpVatB[v] || e.vat[v][2] != g.cpVatC[v]) return false;
-    if (e.usesMtx && (e.matA != g.xfReg[XFR_MATIDX_A] || e.matB != g.xfReg[XFR_MATIDX_B])) return false;
+            if (e.vat[v][0] != g.cpVatA[v] || e.vat[v][1] != g.cpVatB[v] || e.vat[v][2] != g.cpVatC[v])
+                return kDlMissVat;
+    if (e.usesMtx && e.matA != g.xfReg[XFR_MATIDX_A]) return kDlMissMatA;
+    if (e.usesMtx && e.matB != g.xfReg[XFR_MATIDX_B]) return kDlMissMatB;
     for (const DlArray& a : e.arrays)
         if (a.base != g.arrayBase[a.slot] || a.stride != g.arrayStride[a.slot] || a.be != g.arrayBigEndian[a.slot])
-            return false;
-    if (e.ztex2 != g.bp[BP_ZTEX2] || e.ztexBias != g.bp[BP_ZTEX_BIAS]) return false;
-    if (e.externalState != g_dlExternalState) return false;
-    return true;
+            return kDlMissArray;
+    if (e.ztex2 != g.bp[BP_ZTEX2] || e.ztexBias != g.bp[BP_ZTEX_BIAS]) return kDlMissZtex;
+    if (e.externalState != g_dlExternalState) return kDlMissExternal;
+    return kDlMissFieldCount;
+}
+
+static bool dlStateMatches(const DlEntry& e, uint32_t size) {
+    return dlStateFirstMismatch(e, size) == kDlMissFieldCount;
+}
+
+static uint32_t dlVariantCount(const DlEntry& head) {
+    uint32_t n = 0;
+    for (const DlEntry* e = &head; e; e = e->alt) ++n;
+    return n;
+}
+
+static bool dlAnyVariantStateMatches(const DlEntry& head, uint32_t size) {
+    for (const DlEntry* e = &head; e; e = e->alt)
+        if (dlStateMatches(*e, size)) return true;
+    return false;
 }
 
 static bool dlReusable(DlEntry& e, const uint8_t* data, uint32_t size) {
@@ -1438,12 +1531,23 @@ void callDisplayList(const uint8_t* data, uint32_t size) {
 }
 
 static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
+    // Any vertices decoded while servicing GXCallDisplayList belong to that
+    // call, even if a state-only replay reaches a nested raw list.  The
+    // explicit skip scope below distinguishes its back-off path.
+    struct ImmediateContextScope {
+        DlImmediateContext previous;
+        explicit ImmediateContextScope(DlImmediateContext context) : previous(s_dlImmediateContext) {
+            s_dlImmediateContext = context;
+        }
+        ~ImmediateContextScope() { s_dlImmediateContext = previous; }
+    } callContext(kDlImmBypass);
     if (!data || !dlCacheEnabled() || !rendererReady() || s_dlRec) {
         runCommands(data, size);
         return;
     }
     DlEntry& head = dlLookup(data);
     if (head.skip) {
+        ImmediateContextScope skipContext(kDlImmSkip);
         head.skip--;
         runCommands(data, size);
         return;
@@ -1535,8 +1639,13 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
         head.alt = nullptr;
     }
     if (!fresh && (head.valid || head.size)) {
+        DlMissField cause = kDlMissBytes;
+        if (head.valid && head.size == size && !dlAnyVariantStateMatches(head, size))
+            cause = dlStateFirstMismatch(head, size);
         ++head.misses;
         ++s_dlMisses;
+        noteDlMissCause(cause);
+        noteDlMissWindow(data, size, dlVariantCount(head), cause);
     }
     if (batchUsesArena()) flushBatch();  // the batch may still read the runs about to be dropped
     DlEntry& e = *target;
