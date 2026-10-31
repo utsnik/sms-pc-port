@@ -160,6 +160,8 @@ add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/gx2_texture.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/gx2_renderer.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/port_heap.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wiiu-dynres/dynres.c
+  ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wiiu-dynres/dynres_store.c
   ${SMS_WIIU_COMMON_SOURCES}
   ${SMS_WIIU_PS_SOURCES})
 target_include_directories(sms BEFORE PRIVATE ${SMS_WIIU_GAME_INCLUDES}

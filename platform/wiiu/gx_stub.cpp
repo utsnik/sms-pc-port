@@ -27,6 +27,9 @@
 #include <gx2/state.h>
 extern "C" void sms_wiiu_gx2_target_begin(void);
 extern "C" void sms_wiiu_gx2_target_present(void);
+extern "C" __attribute__((weak)) int sms_wiiu_dynres_enabled(void) { return 0; }
+extern "C" __attribute__((weak)) void sms_wiiu_dynres_gpu_frame(uint32_t) {}
+extern "C" __attribute__((weak)) void sms_wiiu_dynres_shutdown(void) {}
 #include <gx2/surface.h>
 #include <gx2/swap.h>
 #include <gx2/texture.h>
@@ -541,6 +544,8 @@ extern "C" void sms_wiiu_exit(void)
 	 * "exiting" line, so a repeat must show which step never returned. */
 	WHBLogPrintf("SMS Wii U: exit: audio shutdown");
 	gx::texturePackShutdown();
+	WHBLogPrintf("SMS Wii U: exit: dynres save");
+	sms_wiiu_dynres_shutdown();
 	sms_wiiu_audio_shutdown();
 	sms_wiiu_vsync_pace_stop();
 	if (s_gfx_initialized) {
@@ -585,6 +590,7 @@ extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
 namespace {
 constexpr uint32_t kGfFrames = 4, kGfStamps = 512;
 bool s_gf;
+bool s_gfLog;
 uint64_t* s_gfStamp;
 /* Stamp kinds: 0 top of pipe; bottom after 1 a list, 2 a copy or clear,
  * 3 a retile, 4 another callback, 5 the frame's draws (before the present),
@@ -601,7 +607,8 @@ uint32_t s_gfStamps, s_gfFrames, s_gfNotReady, s_gfOverflow;
 
 void gf_init()
 {
-	s_gf = sms_wiiu_sd_marker("gpuframe") != 0;
+	s_gfLog = sms_wiiu_sd_marker("gpuframe") != 0;
+	s_gf = s_gfLog || sms_wiiu_dynres_enabled();
 	if (s_gf) {
 		s_gfStamp = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGfFrames * kGfStamps * 8, 64));
 		if (s_gfStamp) {
@@ -611,7 +618,7 @@ void gf_init()
 			s_gf = false;
 		}
 	}
-	port_log("SMS Wii U: GPU frame stamps %s (SD marker gpuframe)\n", s_gf ? "on" : "off");
+	port_log("SMS Wii U: GPU frame stamps %s (log %s, SD marker gpuframe)\n", s_gf ? "on" : "off", s_gfLog ? "on" : "off");
 }
 
 void gf_stamp(uint32_t kind, bool end = false)
@@ -665,8 +672,9 @@ void gf_collect(uint32_t f)
 			s_gfSpan += span;
 			s_gfIdle += idle;
 			if (span > s_gfSpanMax) s_gfSpanMax = span;
-			s_gfStamps += n;
+			 s_gfStamps += n;
 			++s_gfFrames;
+			sms_wiiu_dynres_gpu_frame(uint32_t((span - (idle < span ? idle : span)) / 27));
 		}
 		s_gfPrevEnd = end;
 	} else {
@@ -684,6 +692,7 @@ void gf_end_frame()
 	++s_gfFrame;
 	gf_collect(s_gfFrame % kGfFrames);
 	if (s_gfFrames >= 30) {
+		if (s_gfLog) {
 		port_log("SMS Wii U: [gpuframe] per-frame x0.1ms span=%u busy=%u idle=%u startGap=%u maxSpan=%u stamps=%u /window: frames=%u notReady=%u overflow=%u\n",
 		         unsigned(s_gfSpan / s_gfFrames / 2700),
 		         unsigned((s_gfSpan - (s_gfIdle < s_gfSpan ? s_gfIdle : s_gfSpan)) / s_gfFrames / 2700),
@@ -711,6 +720,7 @@ void gf_end_frame()
 			s_gfSegCost[best] = 0;
 		}
 		port_log("SMS Wii U: [gpuframe] top positions x0.01ms:%s\n", buf);
+		}
 		memset(s_gfKindCost, 0, sizeof(s_gfKindCost));
 		memset(s_gfSegCost, 0, sizeof(s_gfSegCost));
 		s_gfSpan = s_gfSpanMax = s_gfIdle = s_gfStartGap = 0;
