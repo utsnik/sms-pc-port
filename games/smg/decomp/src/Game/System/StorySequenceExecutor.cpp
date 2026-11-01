@@ -9,6 +9,7 @@
 #include "Game/System/GameDataFunction.hpp"
 #include "Game/System/GameSequenceFunction.hpp"
 #include "Game/System/GameSystemFunction.hpp"
+#include "Game/System/ScenarioDataParser.hpp"
 #include "Game/System/StageResultSequenceChecker.hpp"
 #include "Game/Util/CameraUtil.hpp"
 #include "Game/Util/DemoUtil.hpp"
@@ -21,6 +22,15 @@
 #include "Game/Util/StarPointerUtil.hpp"
 #include "Game/Util/StringUtil.hpp"
 #include <cstdio>
+
+#if defined(PORT_GAME_SMG) && defined(TARGET_WIIU)
+extern "C" {
+int smg_wiiu_warp_pending(void);
+const char* smg_wiiu_warp_galaxy(void);
+int smg_wiiu_warp_scenario(void);
+void smg_wiiu_warp_consume(void);
+}
+#endif
 
 namespace {
     enum {
@@ -1040,6 +1050,20 @@ void StorySequenceExecutor::overwriteGalaxyNameAfterLoading(GalaxyMoveArgument* 
         pMoveArgument->mStageName = "PeachCastleGardenGalaxy";
         pMoveArgument->mScenarioNo = 1;
     }
+
+#if defined(PORT_GAME_SMG) && defined(TARGET_WIIU)
+    if (smg_wiiu_warp_pending() && MR::isEqualString(pMoveArgument->mStageName, "PeachCastleGardenGalaxy")) {
+        const char* galaxy = smg_wiiu_warp_galaxy();
+        const ScenarioData* data = ScenarioDataFunction::getScenarioDataParser()->getScenarioData(galaxy);
+        if (data != nullptr) {
+            pMoveArgument->mStageName = data->mGalaxyName;
+            pMoveArgument->mScenarioNo = smg_wiiu_warp_scenario();
+        } else {
+            port_log("[warp] unknown galaxy");
+        }
+        smg_wiiu_warp_consume();
+    }
+#endif
 }
 
 void StorySequenceExecutor::setNextStageToAstroGalaxyOrDome(GalaxyMoveArgument* pMoveArgument) {

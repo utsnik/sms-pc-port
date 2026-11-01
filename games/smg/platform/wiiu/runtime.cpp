@@ -59,6 +59,9 @@ int s_file_warned;
 int s_input_warned;
 int s_audio_warned;
 unsigned s_app_root_index;
+int s_warp_pending;
+char s_warp_galaxy[64];
+int s_warp_scenario;
 
 /* Game, audio and loader threads all log: without a lock their open/append/
  * close sequences interleaved and cut each other's lines. */
@@ -129,6 +132,29 @@ void resolve_app_root()
              kAppRootCandidates[s_app_root_index]);
 }
 
+void read_warp_marker()
+{
+    FILE* file = std::fopen("fs:/vol/external01/smg-data/warp", "rb");
+    if (!file)
+        return;
+
+    char marker[128];
+    const size_t length = std::fread(marker, 1, sizeof(marker) - 1, file);
+    std::fclose(file);
+    marker[length] = '\0';
+
+    char galaxy[sizeof(s_warp_galaxy)];
+    int scenario = 0;
+    char extra = '\0';
+    if (std::sscanf(marker, " %63s %d %c", galaxy, &scenario, &extra) != 2 || scenario <= 0)
+        return;
+
+    std::snprintf(s_warp_galaxy, sizeof(s_warp_galaxy), "%s", galaxy);
+    s_warp_scenario = scenario;
+    s_warp_pending = 1;
+    port_log("[warp] marker=on galaxy=%s scenario=%d", s_warp_galaxy, s_warp_scenario);
+}
+
 void log_unsupported_once(int* flag, const char* what)
 {
     if (*flag)
@@ -192,6 +218,10 @@ int sms_wiiu_sd_marker(const char* name)
     std::fclose(file);
     return 1;
 }
+int smg_wiiu_warp_pending(void) { return s_warp_pending; }
+const char* smg_wiiu_warp_galaxy(void) { return s_warp_galaxy; }
+int smg_wiiu_warp_scenario(void) { return s_warp_scenario; }
+void smg_wiiu_warp_consume(void) { s_warp_pending = 0; }
 const char* smg_wiiu_save_root(void)
 {
     static char save_root[160];
@@ -211,6 +241,7 @@ void smg_wiiu_runtime_init(void)
     s_log_mutex_ready = true;
     resolve_app_root();
     s_initialized = 1;
+    read_warp_marker();
     port_log("SMG Wii U: arenas MEM1=25165824 MEM2=67108864 alignment=64");
     port_log("SMG Wii U: app root=%s", sms_wiiu_app_root());
     port_log("SMG Wii U: stage2 runtime initialized; static arenas");

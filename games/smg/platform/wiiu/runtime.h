@@ -51,6 +51,10 @@ void smg_wiiu_load_dol_data(void);
 const char* smg_wiiu_save_root(void);
 const char* sms_wiiu_app_root(void);
 int sms_wiiu_sd_marker(const char* name);
+int smg_wiiu_warp_pending(void);
+const char* smg_wiiu_warp_galaxy(void);
+int smg_wiiu_warp_scenario(void);
+void smg_wiiu_warp_consume(void);
 void port_log(const char* fmt, ...);
 
 /* The shared VI boundary counts presented fields; Galaxy autoplay is keyed
