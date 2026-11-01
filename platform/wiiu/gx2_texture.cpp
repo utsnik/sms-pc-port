@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "../gx/src/gx_texture_pack_common.h"
+#include "gx2_texture.h"
 
 namespace gx {
 
@@ -294,6 +295,43 @@ void gx2DecodeTextureR8(const uint8_t* src, uint32_t w, uint32_t h,
                             out[size_t(y0 + r) * pitch + x0 + q] = p[r * 8 + q];
             }
             p += kTileBytes[1];
+        }
+    }
+}
+
+bool gx2NativeTextureFormat(uint32_t fmt) {
+    return (fmt & 15) == 14;
+}
+
+uint32_t gx2NativeTextureBytes(uint32_t fmt, uint32_t w, uint32_t h) {
+    if ((fmt & 15) != 14) return 0;
+    return ((w + 3) / 4) * ((h + 3) / 4) * 8;
+}
+
+static inline uint8_t reverseBc1Row(uint8_t v) {
+    return uint8_t(((v >> 6) & 3) | ((v >> 2) & 0x0c) |
+                   ((v << 2) & 0x30) | ((v << 6) & 0xc0));
+}
+
+void gx2ConvertTextureNative(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
+                             uint8_t* out) {
+    if (!src || !out || !gx2NativeTextureFormat(fmt) || !w || !h) return;
+
+    const uint32_t tileCols = (w + 7) / 8, tileRows = (h + 7) / 8;
+    const uint32_t blockCols = (w + 3) / 4, blockRows = (h + 3) / 4;
+    for (uint32_t ty = 0; ty < tileRows; ++ty) {
+        for (uint32_t tx = 0; tx < tileCols; ++tx) {
+            const uint8_t* tile = src + (size_t(ty) * tileCols + tx) * 32;
+            for (uint32_t sb = 0; sb < 4; ++sb) {
+                const uint8_t* in = tile + sb * 8;
+                const uint32_t bx = tx * 2 + (sb & 1), by = ty * 2 + (sb >> 1);
+                if (bx >= blockCols || by >= blockRows) continue;
+                uint8_t* block = out + (size_t(by) * blockCols + bx) * 8;
+                block[0] = in[1]; block[1] = in[0];
+                block[2] = in[3]; block[3] = in[2];
+                for (uint32_t row = 0; row < 4; ++row)
+                    block[4 + row] = reverseBc1Row(in[4 + row]);
+            }
         }
     }
 }

@@ -40,6 +40,7 @@
 #include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
 #include "gx2_shader_inl.h"
+#include "gx2_texture.h"
 #include "gx2_vertex_program.h"
 #include "gx2_texture_pack.h"
 #include "widescreen_math.h"
@@ -91,13 +92,6 @@ static bool gx2DlOpenForDraw();
 static void gx2DlClose();
 static uint32_t textureCacheEntryCount();
 static void resetTargetScissor();
-void gx2DecodeTexture(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
-                      const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out);
-bool gx2DecodeTextureDirect(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
-                            const uint8_t* tlut, uint32_t tlutFmt, uint8_t* out,
-                            uint32_t pitch);
-void gx2DecodeTextureR8(const uint8_t* src, uint32_t w, uint32_t h,
-                        uint8_t* out, uint32_t pitch);
 
 enum WorkerTimingOp {
     kWorkerTextureMiss,
@@ -1078,7 +1072,8 @@ static bool s_gx2ProdMarker;
 static int s_peekTokenMode;  // 0 prod6 ("peekprod6"), 1 token snapshots (default), 2 "peekcmp" (see peekToken)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
-static bool s_texSplit, s_texDirect, s_texR8;
+static bool s_texSplit, s_texDirect, s_texR8, s_cmprBc;
+static uint32_t s_cmprBcUploads, s_cmprRgbaUploads;
 static uint32_t s_texSplitLogs;
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
@@ -3765,6 +3760,11 @@ static bool enqueueProducerRetile(const GX2Surface& linear, const GX2Surface& ti
 }
 
 static void retileTexture(GX2Texture& texture) {
+    // CMPR marked cmprbc is already in GX2's native BC1 block order.  A
+    // GX2CopySurface through the RGBA retile path does not preserve that
+    // GameCube-to-GX2 block mapping, and the producer variant would enqueue
+    // the same invalid conversion on core 1; keep the linear BC1 surface.
+    if (s_cmprBc && texture.surface.format == GX2_SURFACE_FORMAT_UNORM_BC1) return;
     if (!s_retileTextures || runningUnderCemu()) return;
     const bool worker = s_gx2ProdEnabled && OSGetCoreId() != 1;
     GX2Surface& linear = texture.surface;
@@ -3909,20 +3909,23 @@ static TextureEntry* getTexture(int map) {
     e.texture.surface.mipLevels = levels;
     // automip: levels from genFrom on are box-filtered here, not decoded.
     uint32_t genFrom = 0;
-    if (s_autoMip && levels == 1 && autoMipWrap(mode0) && w >= 32 && h >= 32 && !(w & (w - 1)) && !(h & (h - 1))) {
+    if (s_autoMip && !(s_cmprBc && fmt == 14) && levels == 1 && autoMipWrap(mode0) &&
+        w >= 32 && h >= 32 && !(w & (w - 1)) && !(h & (h - 1))) {
         uint32_t n = 1;
         while ((std::min(w, h) >> n) >= 4 && n < 12) ++n;
         e.texture.surface.mipLevels = n;
         genFrom = 1;
     }
-    // Keep native R8 uploads out of the generated-mip path: the downsample
-    // and arbitrary-mip probes below intentionally operate on RGBA8 scratch.
-    // A wrapped single-level texture therefore keeps the established RGBA8
-    // path when automip has expanded it.
+    const bool cmprBcUpload = s_cmprBc && fmt == 14;
+    // Keep native R8 and BC1 uploads out of the generated-mip path: the
+    // downsample and arbitrary-mip probes below intentionally operate on
+    // RGBA8 scratch.  The marker's CMPR path disables automip above so every
+    // source CMPR level remains a native BC1 level.
     const bool r8Upload = s_texR8 && fmt == 1 && levels == 1 && genFrom == 0;
     const uint32_t bytesPerTexel = r8Upload ? 1 : 4;
-    e.texture.surface.format = r8Upload ? GX2_SURFACE_FORMAT_UNORM_R8
-                                        : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    e.texture.surface.format = cmprBcUpload ? GX2_SURFACE_FORMAT_UNORM_BC1
+                            : r8Upload ? GX2_SURFACE_FORMAT_UNORM_R8
+                                       : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.texture.surface.aa = GX2_AA_MODE1X;
     e.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&e.texture.surface);
@@ -3933,8 +3936,40 @@ static TextureEntry* getTexture(int map) {
     GX2Surface& surf = e.texture.surface;
     uint32_t mipOffset[12] = {};
     uint32_t mipPitch[12] = {};
-    mipPitch[0] = surf.pitch;
-    if (surf.mipLevels > 1) {
+    uint32_t mipPitchBytes[12] = {};
+    if (cmprBcUpload) {
+        mipPitchBytes[0] = surf.pitch * 8;
+        if (surf.mipLevels > 1) {
+            bool agrees = true;
+            for (uint32_t l = 1; l < surf.mipLevels; ++l) {
+                const uint32_t lw = std::max(w >> l, 1u), lh = std::max(h >> l, 1u);
+                mipOffset[l] = l == 1 ? 0 : surf.mipLevelOffset[l - 1];
+                GX2Surface level = surf;
+                level.width = lw; level.height = lh; level.mipLevels = 1;
+                level.image = nullptr; level.mipmaps = nullptr;
+                GX2CalcSurfaceSizeAndAlignment(&level);
+                mipPitchBytes[l] = level.pitch * 8;
+                const uint32_t next = l + 1 < surf.mipLevels ? surf.mipLevelOffset[l] : surf.mipmapSize;
+                const uint32_t rowCount = (lh + 3) / 4;
+                if (next < mipOffset[l] || mipPitchBytes[l] * rowCount > next - mipOffset[l]) agrees = false;
+            }
+            if (!agrees) {
+                static bool logged;
+                if (!logged) {
+                    logged = true;
+                    WHBLogPrintf("SMS Wii U: unexpected BC1 mip layout %ux%u levels=%u pitch=%u mipSize=%u off1=%u",
+                                 (unsigned)w, (unsigned)h, (unsigned)surf.mipLevels, (unsigned)surf.pitch,
+                                 (unsigned)surf.mipmapSize, (unsigned)surf.mipLevelOffset[1]);
+                }
+                surf.mipLevels = 1;
+                GX2CalcSurfaceSizeAndAlignment(&surf);
+                mipPitchBytes[0] = surf.pitch * 8;
+            }
+        }
+    } else {
+        mipPitch[0] = surf.pitch;
+    }
+    if (!cmprBcUpload && surf.mipLevels > 1) {
         bool agrees = surf.pitch == ((w + 63) & ~63u);
         uint32_t end = 0;
         for (uint32_t l = 1; l < surf.mipLevels && agrees; ++l) {
@@ -3959,7 +3994,9 @@ static TextureEntry* getTexture(int map) {
     }
     e.texture.viewNumMips = surf.mipLevels;
     e.texture.viewNumSlices = 1;
-    e.texture.compMap = r8Upload
+    e.texture.compMap = cmprBcUpload
+        ? GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A)
+        : r8Upload
         ? GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R, GX2_SQ_SEL_R)
         : GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
     const bool fullIntensityTiles = (fmt == 0 && !(w & 7) && !(h & 7)) ||
@@ -4001,14 +4038,17 @@ static TextureEntry* getTexture(int map) {
         e.checkedFrame = g_displayFrames;
         e.dataHash = xxh64(source, srcBytes, 0);
     }
-    uint8_t* rgba = readable && !directRgba && !r8Upload
+    uint8_t* rgba = readable && !directRgba && !r8Upload && !cmprBcUpload
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
-    uint8_t* prev = (readable && surf.mipLevels > 1)
+    uint8_t* nativeData = readable && cmprBcUpload
+        ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(gx2NativeTextureBytes(fmt, w, h), 64)) : nullptr;
+    uint8_t* prev = (readable && surf.mipLevels > 1 && !cmprBcUpload)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
     allocationTiming.setCacheEntries(static_cast<uint32_t>(s_textures.size()));
     allocationTiming.finish();
-    const bool scratchFailure = (!directRgba && !r8Upload && !rgba) ||
-                                (surf.mipLevels > 1 && !prev);
+    const bool scratchFailure = (!directRgba && !r8Upload && !cmprBcUpload && !rgba) ||
+                                (cmprBcUpload && !nativeData) ||
+                                (surf.mipLevels > 1 && !cmprBcUpload && !prev);
     if (!readable || scratchFailure) {
         if (s_whiteFillLogs < 40) {
             ++s_whiteFillLogs;
@@ -4017,8 +4057,19 @@ static TextureEntry* getTexture(int map) {
                          readable ? 0u : 1u, readable ? 1u : 0u,
                          (unsigned)(w * h * bytesPerTexel * (surf.mipLevels > 1 ? 2 : 1)));
         }
-        memset(surf.image, 0xff, surf.imageSize);
-        if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
+        if (cmprBcUpload) {
+            auto fillBc1 = [](void* image, uint32_t bytes) {
+                uint8_t* p = static_cast<uint8_t*>(image);
+                memset(p, 0, bytes);
+                for (uint32_t i = 0; i + 8 <= bytes; i += 8)
+                    p[i + 0] = p[i + 1] = p[i + 2] = p[i + 3] = 0xff;
+            };
+            fillBc1(surf.image, surf.imageSize);
+            if (surf.mipmaps) fillBc1(surf.mipmaps, surf.mipmapSize);
+        } else {
+            memset(surf.image, 0xff, surf.imageSize);
+            if (surf.mipmaps) memset(surf.mipmaps, 0xff, surf.mipmapSize);
+        }
     } else {
         const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
         const uint8_t* src = source;
@@ -4040,11 +4091,12 @@ static TextureEntry* getTexture(int map) {
                 if (direct) gx2DecodeTextureDirect(src, fmt, lw, lh, tlutPtr, tlutFmt,
                                                    static_cast<uint8_t*>(surf.image), surf.pitch);
                 else if (directR8) gx2DecodeTextureR8(src, lw, lh, static_cast<uint8_t*>(surf.image), surf.pitch);
+                else if (cmprBcUpload) gx2ConvertTextureNative(src, fmt, lw, lh, nativeData);
                 else gx2DecodeTexture(src, fmt, lw, lh, tlutPtr, tlutFmt, rgba);
                 if (splitTiming)
                     splitDecodeUs += uint32_t(OSTicksToMicroseconds(OSGetTime() - decodeStart));
             }
-            if (!direct && !directR8) {
+            if (!direct && !directR8 && !cmprBcUpload) {
                 uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
                                       : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
                 const uint32_t rowBytes = lw * bytesPerTexel;
@@ -4054,9 +4106,18 @@ static TextureEntry* getTexture(int map) {
                            rgba + size_t(y) * rowBytes, rowBytes);
                 if (splitTiming)
                     splitCopyUs += uint32_t(OSTicksToMicroseconds(OSGetTime() - copyStart));
+            } else if (cmprBcUpload) {
+                uint8_t* dst = l == 0 ? static_cast<uint8_t*>(surf.image)
+                                      : static_cast<uint8_t*>(surf.mipmaps) + mipOffset[l];
+                const uint32_t rowBytes = ((lw + 3) / 4) * 8;
+                const uint32_t rowCount = (lh + 3) / 4;
+                for (uint32_t y = 0; y < rowCount; ++y)
+                    memcpy(dst + size_t(y) * mipPitchBytes[l], nativeData + size_t(y) * rowBytes, rowBytes);
             }
-            if (l > 0 && !generated) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
-            if (prev) std::swap(prev, rgba);
+            if (!cmprBcUpload) {
+                if (l > 0 && !generated) mipDiff += mipLevelDiff(prev, pw, ph, rgba, lw, lh);
+                if (prev) std::swap(prev, rgba);
+            }
             pw = lw; ph = lh;
             if (!generated) src += texLevelBytes(fmt, lw, lh);
         }
@@ -4071,6 +4132,7 @@ static TextureEntry* getTexture(int map) {
         e.arbitraryMips = surf.mipLevels > 1 && mipDiff / float(surf.mipLevels - 1) > kArbitraryMipThreshold;
     }
     if (rgba) MEMFreeToDefaultHeap(rgba);
+    if (nativeData) MEMFreeToDefaultHeap(nativeData);
     if (prev) MEMFreeToDefaultHeap(prev);
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
     if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
@@ -4080,6 +4142,10 @@ static TextureEntry* getTexture(int map) {
     retileTiming.finish();
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips, s_autoMip && e.levels == 1);
     e.valid = true;
+    if (fmt == 14) {
+        if (cmprBcUpload) ++s_cmprBcUploads;
+        else ++s_cmprRgbaUploads;
+    }
     if (texturePackEnabled()) {
         TexturePackRequest request = {};
         request.source = source;
@@ -5406,9 +5472,11 @@ void rendererInit(float) {
     s_texSplit = sdMarkerPresent("texsplit");
     s_texDirect = !sdMarkerPresent("notexdirect");
     s_texR8 = sdMarkerPresent("texr8");
+    s_cmprBc = sdMarkerPresent("cmprbc");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     WHBLogPrintf("SMS Wii U: direct texture uploads %s (SD marker notexdirect)", s_texDirect ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [cmprbc] marker=%s", s_cmprBc ? "on" : "off");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
@@ -7919,7 +7987,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             prodBlocked = prodNow.core1BlockedMicros - s_prodPerfLast.core1BlockedMicros;
             s_prodPerfLast = prodNow;
         }
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u prodFrontend=%u prodPeek=%u prodPresent=%u prodBlocked=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u prodFrontend=%u prodPeek=%u prodPresent=%u prodBlocked=%u cmprBc=%u cmprRgba=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -7934,7 +8002,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
                      (unsigned)s_perfDlCoreInit, (unsigned)s_perfDlCoreRecord, (unsigned)s_perfDlCoreCall,
-                     (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked);
+                     (unsigned)prodFrontend, (unsigned)prodPeek, (unsigned)prodPresent, (unsigned)prodBlocked,
+                     (unsigned)s_cmprBcUploads, (unsigned)s_cmprRgbaUploads);
         tokReport();
         drawDoneReport();
         WHBLogPrintf("SMS Wii U: [frames] frame=%u over34=%u over42=%u maxUs=%u missMask=%08x logUs=%u", (unsigned)g_displayFrames,
@@ -7963,6 +8032,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfDlCoreRecord = s_perfDlCoreCall = 0;
         s_perfDraws = s_perfVerts = s_perfUnique = s_perfFrames = 0;
         s_perfGpuDraws = s_perfCpuDraws = s_perfGpuVerts = s_perfCpuVerts = 0;
+        s_cmprBcUploads = s_cmprRgbaUploads = 0;
     }
     // [hitch] shadows, taken after any 30-frame reset above.
     s_hitchLast.copies = s_perfCopies;

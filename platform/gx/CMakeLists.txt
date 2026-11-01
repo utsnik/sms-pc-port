@@ -171,6 +171,12 @@ if(SMS_GX_BUILD_TESTS)
     target_include_directories(gx2_texture_pack_format_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_compile_features(gx2_texture_pack_format_test PRIVATE cxx_std_17)
     add_test(NAME gx2_texture_pack_format_test COMMAND gx2_texture_pack_format_test)
+    add_executable(gx2_texture_native_test tests/gx2_texture_native_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../wiiu/gx2_texture.cpp)
+    target_include_directories(gx2_texture_native_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../wiiu)
+    target_compile_features(gx2_texture_native_test PRIVATE cxx_std_17)
+    add_test(NAME gx2_texture_native_test COMMAND gx2_texture_native_test)
 
     add_library(gx2_texture_pack_core STATIC
         src/gx_texture_pack_common.cpp
