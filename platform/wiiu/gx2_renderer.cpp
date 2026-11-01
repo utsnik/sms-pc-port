@@ -5646,14 +5646,16 @@ void rendererInit(float) {
     s_texSplit = sdMarkerPresent("texsplit");
     s_texDirect = !sdMarkerPresent("notexdirect");
     s_texR8 = sdMarkerPresent("texr8");
-    s_cmprBc = sdMarkerPresent("cmprbc");
+    // Defaults since batch231: CMPR as native BC1 (no worker decode stalls, shots within noise) and the
+    // texture hash reused for the pack lookup (3.2 s -> 4 ms per Plaza run). Opt-outs nocmprbc, nohashreuse.
+    s_cmprBc = !sdMarkerPresent("nocmprbc");
     s_cmprBcLinear = s_cmprBc && sdMarkerPresent("cmprbclin");
-    s_packHashReuse = sdMarkerPresent("hashreuse");
-    WHBLogPrintf("SMS Wii U: [hashreuse] marker=%s", s_packHashReuse ? "on" : "off");
+    s_packHashReuse = !sdMarkerPresent("nohashreuse");
+    WHBLogPrintf("SMS Wii U: [hashreuse] %s (SD marker nohashreuse)", s_packHashReuse ? "on" : "off");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     WHBLogPrintf("SMS Wii U: direct texture uploads %s (SD marker notexdirect)", s_texDirect ? "on" : "off");
-    WHBLogPrintf("SMS Wii U: [cmprbc] marker=%s linear=%s", s_cmprBc ? "on" : "off", s_cmprBcLinear ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [cmprbc] %s linear=%s (SD markers nocmprbc, cmprbclin)", s_cmprBc ? "on" : "off", s_cmprBcLinear ? "on" : "off");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");

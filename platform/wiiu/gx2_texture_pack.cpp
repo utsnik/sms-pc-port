@@ -282,8 +282,10 @@ static bool parseEntry(const uint8_t* p, TexturePackEntry* e) {
 
 bool texturePackInit() {
     if (s_state.enabled) return true;
-    s_state.packBc = sms_wiiu_sd_marker("packbc") != 0;
-    WHBLogPrintf("SMS Wii U: [packbc] marker=%s", s_state.packBc ? "on" : "off");
+    // Native BC1/BC3 uploads for pack entries that carry them (default since batch231: -1.5..2.0 ms GPU,
+    // 5x less texture memory and SD reads); RGBA-only packs are unaffected. SD marker nopackbc turns it off.
+    s_state.packBc = sms_wiiu_sd_marker("nopackbc") == 0;
+    WHBLogPrintf("SMS Wii U: [packbc] %s (SD marker nopackbc)", s_state.packBc ? "on" : "off");
     char path[256];
     std::snprintf(path, sizeof path, "%stextures/GMSE01.gx2pack", sms_wiiu_app_root());
     FILE* f = std::fopen(path, "rb");
