@@ -1189,6 +1189,8 @@ extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
 static constexpr uint32_t kGpuStamps = 1024;
 struct GpuDrawInfo {
     uint32_t verts, stages, texMask, blend, zmode, texW, texH, area, drawNo;
+    // The bound GX2 surface (an HD pack texture replaces the game's size) and the GX source hash.
+    uint32_t surfW, surfH, surfMips, surfFmt, packState, hashHi;
 };
 static uint64_t* s_gpuStamps[3];
 static uint64_t* s_gpuTopStamps[3];
@@ -1278,6 +1280,12 @@ static void gpuCollect(uint32_t arena) {
     }
 }
 
+static void gpuInfoTexture(GpuDrawInfo& info, const TextureEntry* t) {
+    info.texW = t->width; info.texH = t->height;
+    info.surfW = t->texture.surface.width; info.surfH = t->texture.surface.height;
+    info.surfMips = t->texture.surface.mipLevels; info.surfFmt = uint32_t(t->texture.surface.format);
+    info.packState = t->packState; info.hashHi = uint32_t(t->dataHash >> 32);
+}
 static void gpuReport() {
     if (!s_gpuFrames) return;
     WHBLogPrintf("SMS Wii U: [gpu] frames=%u avg-frame-cycles=%u idle=%u busy=%u timer-rate=%u/s (top single draws over the window follow)",
@@ -1292,10 +1300,11 @@ static void gpuReport() {
             if (s_gpuTop[k].cost && (best < 0 || s_gpuTop[k].cost - s_gpuTop[k].idle > s_gpuTop[best].cost - s_gpuTop[best].idle)) best = k;
         if (best < 0) break;
         const GpuDrawInfo& d = s_gpuTop[best].info;
-        WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u idle=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u",
+        WHBLogPrintf("SMS Wii U: [gpu] %d cycles=%u idle=%u draw#%u verts=%u stages=%u texmask=%02x tex=%ux%u blend=%08x z=%02x bboxPx=%u surf=%ux%u mips=%u fmt=%x pack=%u hash=%08x",
                      r, (unsigned)s_gpuTop[best].cost, (unsigned)s_gpuTop[best].idle, (unsigned)d.drawNo, (unsigned)d.verts, (unsigned)d.stages,
                      (unsigned)d.texMask, (unsigned)d.texW, (unsigned)d.texH, (unsigned)d.blend, (unsigned)d.zmode,
-                     (unsigned)d.area);
+                     (unsigned)d.area, (unsigned)d.surfW, (unsigned)d.surfH, (unsigned)d.surfMips, (unsigned)d.surfFmt,
+                     (unsigned)d.packState, (unsigned)d.hashHi);
         s_gpuTop[best].cost = 0;
     }
     memset(s_gpuTop, 0, sizeof(s_gpuTop));
@@ -6725,7 +6734,7 @@ void flushBatch() {
                 info.zmode = g.bp[BP_ZMODE] & 0xff;
                 info.drawNo = debugDrawNo;
                 for (int m = 0; m < 8; ++m)
-                    if (tevTextures[m]) { info.texW = tevTextures[m]->width; info.texH = tevTextures[m]->height; break; }
+                    if (tevTextures[m]) { gpuInfoTexture(info, tevTextures[m]); break; }
                 gpuStamp(s_vertexArenaIndex, &info);
             }
             return;
@@ -6933,7 +6942,7 @@ void flushBatch() {
             info.drawNo = debugDrawNo;
             TextureEntry* t0 = texture;
             for (int m = 0; m < 8 && !t0; ++m) t0 = tevTextures[m];
-            if (t0) { info.texW = t0->width; info.texH = t0->height; }
+            if (t0) gpuInfoTexture(info, t0);
             // Screen-space bounding box of the draw (clip -> TV pixels).
             float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
             for (size_t v = 0; v < vertexCount && !gpuPath; ++v) {

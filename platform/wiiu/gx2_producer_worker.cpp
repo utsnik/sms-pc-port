@@ -60,7 +60,7 @@ static WutMessageQueue s_wakeQueue;
 static WutMessage s_wakeSlots[kWakeSlots] __attribute__((aligned(32)));
 static uint8_t s_workerStack[kWorkerStackSize] __attribute__((aligned(32)));
 static uint8_t s_byteRing[kByteRingSize] __attribute__((aligned(64)));
-static bool s_prodZero;  // SD marker prodzero, see zeroWholeLines
+static bool s_prodZero;  // SD marker noprodzero, see zeroWholeLines
 static ServiceRecord s_serviceRing[kServiceRingSize] __attribute__((aligned(64)));
 
 static Hooks s_hooks;
@@ -260,8 +260,8 @@ bool start(const Hooks& hooks, bool core2) {
     }
 
     core2 = core2 || sms_wiiu_sd_marker("gx2core2");
-    s_prodZero = sms_wiiu_sd_marker("prodzero");
-    port_log("SMS Wii U: [prod] prodzero=%d\n", s_prodZero ? 1 : 0);
+    s_prodZero = !sms_wiiu_sd_marker("noprodzero");  // default since batch233 (append 3.6 -> 1.2 ms/frame)
+    port_log("SMS Wii U: [prod] prodzero=%d (SD marker noprodzero)\n", s_prodZero ? 1 : 0);
     s_hooks = hooks;
     s_byteRead = s_byteWrite = 0;
     s_serviceRead = s_serviceWrite = 0;
@@ -298,7 +298,7 @@ bool enabled() { return s_started; }
 
 static void (*s_flushHook)();
 
-// SD marker prodzero: claim the whole 32-byte ring lines an append covers with
+// Default (SD marker noprodzero turns it off): claim the whole 32-byte ring lines an append covers with
 // dcbz instead of letting each store miss and read the line from MEM2 first.
 // The 2 MiB ring is rewritten once per wrap, so every append missed (batch231
 // pf-plaza: 441 KB/frame took 3.9 ms of core 1). Edge lines shared with bytes

@@ -549,7 +549,7 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
 }
 #ifdef __WIIU__
 extern "C" int sms_wiiu_sd_marker(const char* name);
-// SD marker vatbatch: GXSetVtxAttrFmtv folds the whole list into the three VAT
+// Default (SD marker novatbatch turns it off): GXSetVtxAttrFmtv folds the whole list into the three VAT
 // words and writes each once. Per attribute, producer mode wrote all three
 // (forceVtxState), and ReInitializeGX (called from every TLightCommon::setLight)
 // sets 12 attributes in all 8 formats: 288 CP writes become 24. No draw can
@@ -557,8 +557,8 @@ extern "C" int sms_wiiu_sd_marker(const char* name);
 static bool vatBatch() {
     static int s_on = -1;
     if (s_on < 0) {
-        s_on = sms_wiiu_sd_marker("vatbatch") ? 1 : 0;
-        logmsg("vatbatch marker=%d", s_on);
+        s_on = sms_wiiu_sd_marker("novatbatch") ? 0 : 1;  // default since batch233 (-12% GX bytes)
+        logmsg("vatbatch=%d (SD marker novatbatch)", s_on);
     }
     return s_on != 0;
 }
