@@ -8,6 +8,13 @@ namespace sms_wiiu_imgfx {
 enum CopyOwner : uint32_t {
     kCopyOwnerUntagged = 0,
     kCopyOwnerBloom = 1,
+    kCopyOwnerSimpleBloom = 2,
+    kCopyOwnerDepthOfField = 3,
+    kCopyOwnerScreenBlur = 4,
+    kCopyOwnerFullScreenBlur = 5,
+    kCopyOwnerCaptureScreen = 6,
+    kCopyOwnerWaterFilter = 7,
+    kCopyOwnerScreenAlpha = 8,
 };
 
 struct CopySizes {

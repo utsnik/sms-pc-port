@@ -32,12 +32,21 @@ void ImageEffectLocalUtil::capture(JUTTexture* pTexture, s32 divisions, s32 tile
 }
 
 void ImageEffectLocalUtil::capture(JUTTexture* pTexture, s32 divisions, s32 tile, GXTexFmt format, bool clear, u8 filter, u32 owner) {
+    CaptureOwnerScope ownerScope(owner);
+    capture(pTexture, divisions, tile, format, clear, filter);
+}
+
+ImageEffectLocalUtil::CaptureOwnerScope::CaptureOwnerScope(u32 owner) {
 #ifdef __WIIU__
     sms_wiiu_gx2_imgfx_capture_owner(owner);
+#else
+    (void)owner;
 #endif
-    capture(pTexture, divisions, tile, format, clear, filter);
+}
+
+ImageEffectLocalUtil::CaptureOwnerScope::~CaptureOwnerScope() {
 #ifdef __WIIU__
-    sms_wiiu_gx2_imgfx_capture_owner(0);
+    sms_wiiu_gx2_imgfx_capture_owner(ImageEffectLocalUtil::CaptureOwner_None);
 #endif
 }
 

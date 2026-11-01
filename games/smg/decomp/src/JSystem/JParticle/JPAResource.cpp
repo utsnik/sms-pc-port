@@ -21,13 +21,42 @@ extern "C" int sms_wiiu_sd_marker(const char*);
 #if defined(TARGET_WIIU)
 namespace {
 struct DirectionKey {
+    u32 flags;
     GXColor prm, env;
     u8 alpha, tex;
     s16 age;
 };
 
-DirectionKey directionKey(JPABaseParticle* particle, bool ageMatters) {
+enum DirectionKeyFlags {
+    DirectionKeyPrm = 1 << 0,
+    DirectionKeyEnv = 1 << 1,
+    DirectionKeyAlpha = 1 << 2,
+    DirectionKeyTex = 1 << 3,
+    DirectionKeyAge = 1 << 4,
+};
+
+u32 directionKeyFlags(JPAResource::ParticleFunc* funcs, int funcCount, bool ageMatters) {
+    const JPAResource::ParticleFunc loadTexAnm = static_cast<JPAResource::ParticleFunc>(&JPALoadTexAnm);
+    const JPAResource::ParticleFunc registEnv = static_cast<JPAResource::ParticleFunc>(&JPARegistEnv);
+    u32 flags = ageMatters ? DirectionKeyAge : 0;
+    for (int i = 1; i < funcCount; ++i) {
+        JPAResource::ParticleFunc func = funcs[i];
+        if (func == loadTexAnm) flags |= DirectionKeyTex;
+        if (func == &JPALoadCalcTexCrdMtxAnm) flags |= DirectionKeyAge;
+        if (func == &JPARegistPrmAlpha || func == &JPARegistPrmAlphaEnv) flags |= DirectionKeyPrm;
+        if (func == registEnv || func == &JPARegistAlphaEnv || func == &JPARegistPrmAlphaEnv)
+            flags |= DirectionKeyEnv;
+        if (func == &JPARegistAlpha || func == &JPARegistAlphaEnv || func == &JPARegistPrmAlpha ||
+            func == &JPARegistPrmAlphaEnv)
+            flags |= DirectionKeyAlpha;
+    }
+    return flags;
+}
+
+DirectionKey directionKey(JPABaseParticle* particle, JPAResource::ParticleFunc* funcs, int funcCount,
+                          bool ageMatters) {
     DirectionKey key;
+    key.flags = directionKeyFlags(funcs, funcCount, ageMatters);
     key.prm = particle->mPrmClr;
     key.env = particle->mEnvClr;
     key.alpha = particle->mPrmColorAlphaAnm;
@@ -37,9 +66,14 @@ DirectionKey directionKey(JPABaseParticle* particle, bool ageMatters) {
 }
 
 bool sameDirectionKey(const DirectionKey& a, const DirectionKey& b) {
-    return a.prm.r == b.prm.r && a.prm.g == b.prm.g && a.prm.b == b.prm.b && a.prm.a == b.prm.a &&
-           a.env.r == b.env.r && a.env.g == b.env.g && a.env.b == b.env.b && a.env.a == b.env.a &&
-           a.alpha == b.alpha && a.tex == b.tex && a.age == b.age;
+    if (a.flags != b.flags) return false;
+    if ((a.flags & DirectionKeyPrm) &&
+        (a.prm.r != b.prm.r || a.prm.g != b.prm.g || a.prm.b != b.prm.b || a.prm.a != b.prm.a)) return false;
+    if ((a.flags & DirectionKeyEnv) &&
+        (a.env.r != b.env.r || a.env.g != b.env.g || a.env.b != b.env.b || a.env.a != b.env.a)) return false;
+    if ((a.flags & DirectionKeyAlpha) && a.alpha != b.alpha) return false;
+    if ((a.flags & DirectionKeyTex) && a.tex != b.tex) return false;
+    return !(a.flags & DirectionKeyAge) || a.age == b.age;
 }
 
 void countDirectionalParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shapeType) {
@@ -60,6 +94,13 @@ bool batchMarker() {
     static int marker = -1;
     if (marker < 0) marker = sms_wiiu_sd_marker("jpabatch") != 0;
     return marker != 0;
+}
+
+bool canBatchDirectional(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs, int funcCount,
+                         int shapeType) {
+    return batchMarker() && (shapeType == 3 || shapeType == 4) && work->mPrjType == 0 &&
+        work->mpEmtr->mpPtclCallBack == NULL && funcCount > 0 &&
+        (funcs[0] == &JPADrawDirection || funcs[0] == &JPADrawRotDirection);
 }
 
 const char* jpaDrawFuncName(JPAResource::ParticleFunc func) {
@@ -92,9 +133,10 @@ struct DirectionTracker {
     bool have;
     DirectionKey previous;
     DirectionTracker() : have(false) { }
-    void observe(JPAEmitterWorkData* work, JPABaseParticle* particle, bool directional, bool ageMatters) {
+    void observe(JPAEmitterWorkData* work, JPABaseParticle* particle, bool directional, bool ageMatters,
+                 JPAResource::ParticleFunc* funcs, int funcCount) {
         if (!directional || !jpa_batch::eligible(work, particle)) return;
-        const DirectionKey key = directionKey(particle, ageMatters);
+        const DirectionKey key = directionKey(particle, funcs, funcCount, ageMatters);
         if (have && !sameDirectionKey(previous, key)) sms_wiiu_jpa_split();
         previous = key;
         have = true;
@@ -883,7 +925,7 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             havePrevious = false;
             continue;
         }
-        const DirectionKey key = directionKey(particle, ageMatters);
+        const DirectionKey key = directionKey(particle, funcs, funcCount, ageMatters);
         if (havePrevious && !sameDirectionKey(previous, key)) sms_wiiu_jpa_split();
         previous = key;
         havePrevious = true;
@@ -893,7 +935,8 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             if (runLength == maxRunLength) break; // GXBegin's vertex count is u16.
             work->mpCurNode = scan;
             JPABaseParticle* candidate = scan->getObject();
-            if (!jpa_batch::eligible(work, candidate) || !sameDirectionKey(key, directionKey(candidate, ageMatters))) break;
+            if (!jpa_batch::eligible(work, candidate) ||
+                !sameDirectionKey(key, directionKey(candidate, funcs, funcCount, ageMatters))) break;
             noteParticle(work, candidate, shapeType, child, funcs, funcCount);
             ++runLength;
         }
@@ -988,9 +1031,7 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
     const bool directionalFunc = mpDrawParticleFuncListNum > 0 &&
         (mpDrawParticleFuncList[0] == &JPADrawDirection || mpDrawParticleFuncList[0] == &JPADrawRotDirection);
     const bool directional = (shapeType == 3 || shapeType == 4) && directionalFunc;
-    if (batchMarker() && (shapeType == 3 || shapeType == 4) && work->mPrjType == 0 &&
-        work->mpEmtr->mpPtclCallBack == NULL && mpDrawParticleFuncListNum > 0 &&
-        (mpDrawParticleFuncList[0] == &JPADrawDirection || mpDrawParticleFuncList[0] == &JPADrawRotDirection)) {
+    if (canBatchDirectional(work, mpDrawParticleFuncList, mpDrawParticleFuncListNum, shapeType)) {
         const int center = mpExtraShape != NULL
             ? (mpExtraShape->getScaleCenterX() + 3 * mpExtraShape->getScaleCenterY()) * 0xC : 0x30;
         const int offset = shapeType == 3 ? center + mpBaseShape->getBasePlaneType() * 0x6C : center;
@@ -1008,7 +1049,9 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
             noteParticle(work, node->getObject(), shapeType, false, mpDrawParticleFuncList, mpDrawParticleFuncListNum);
-            directionTracker.observe(work, node->getObject(), directional, mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex());
+            directionTracker.observe(work, node->getObject(), directional,
+                                     mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex(),
+                                     mpDrawParticleFuncList, mpDrawParticleFuncListNum);
 #endif
             if (mpDrawParticleFuncList != NULL) {
                 for (int i = mpDrawParticleFuncListNum - 1; i >= 0; i--) {
@@ -1022,7 +1065,9 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
             noteParticle(work, node->getObject(), shapeType, false, mpDrawParticleFuncList, mpDrawParticleFuncListNum);
-            directionTracker.observe(work, node->getObject(), directional, mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex());
+            directionTracker.observe(work, node->getObject(), directional,
+                                     mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex(),
+                                     mpDrawParticleFuncList, mpDrawParticleFuncListNum);
 #endif
             if (mpDrawParticleFuncList != NULL) {
                 for (int i = mpDrawParticleFuncListNum - 1; i >= 0; i--) {
@@ -1082,9 +1127,7 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
     const bool directionalFunc = mpDrawParticleChildFuncListNum > 0 &&
         (mpDrawParticleChildFuncList[0] == &JPADrawDirection || mpDrawParticleChildFuncList[0] == &JPADrawRotDirection);
     const bool directional = (shapeType == 3 || shapeType == 4) && directionalFunc;
-    if (batchMarker() && (shapeType == 3 || shapeType == 4) && work->mPrjType == 0 &&
-        work->mpEmtr->mpPtclCallBack == NULL && mpDrawParticleChildFuncListNum > 0 &&
-        (mpDrawParticleChildFuncList[0] == &JPADrawDirection || mpDrawParticleChildFuncList[0] == &JPADrawRotDirection)) {
+    if (canBatchDirectional(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum, shapeType)) {
         const int offset = shapeType == 3 ? 0x30 + mpChildShape->getBasePlaneType() * 0x6C : 0x30;
         drawDirectionalList(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum,
                             mpBaseShape->isDrawFwdAhead(), false, shapeType,
@@ -1099,7 +1142,8 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
             noteParticle(work, node->getObject(), shapeType, true, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum);
-            directionTracker.observe(work, node->getObject(), directional, false);
+            directionTracker.observe(work, node->getObject(), directional, false,
+                                     mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum);
 #endif
             if (mpDrawParticleChildFuncList != NULL) {
                 for (int i = mpDrawParticleChildFuncListNum - 1; i >= 0; i--) {
@@ -1113,7 +1157,8 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
             noteParticle(work, node->getObject(), shapeType, true, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum);
-            directionTracker.observe(work, node->getObject(), directional, false);
+            directionTracker.observe(work, node->getObject(), directional, false,
+                                     mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum);
 #endif
             if (mpDrawParticleChildFuncList != NULL) {
                 for (int i = mpDrawParticleChildFuncListNum - 1; i >= 0; i--) {

@@ -1298,7 +1298,6 @@ void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
 
 void sms_wiiu_gx2_imgfx_capture_owner(uint32_t owner) {
 #ifdef __WIIU__
-    if (!sms_wiiu_gx2_imgfxnative_enabled()) return;
     GX_STATE.copyOwner = owner;
     if (hostState()) producerHostState(kHostCopyOwner, 0, owner);
 #else

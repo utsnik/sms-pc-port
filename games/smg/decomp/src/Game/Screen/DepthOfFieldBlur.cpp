@@ -46,13 +46,13 @@ void DepthOfFieldBlur::draw() const {
     }
 
     CopyFilterNegater negator;
-    ImageEffectLocalUtil::capture(_18, 4, 0, GX_TF_RGB565, false, 0);
-    ImageEffectLocalUtil::capture(_1C, 1, 0, GX_TF_RGB565, true, 0);
+    ImageEffectLocalUtil::capture(_18, 4, 0, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_DepthOfField);
+    ImageEffectLocalUtil::capture(_1C, 1, 0, GX_TF_RGB565, true, 0, ImageEffectLocalUtil::CaptureOwner_DepthOfField);
     drawZAlphaTex();
-    ImageEffectLocalUtil::capture(_28, 1, 0, GX_CTF_R8, false, 0);
+    ImageEffectLocalUtil::capture(_28, 1, 0, GX_CTF_R8, false, 0, ImageEffectLocalUtil::CaptureOwner_DepthOfField);
     ImageEffectLocalUtil::setupDrawTexture();
     createBlurTexture();
-    ImageEffectLocalUtil::capture(_20, 1, 0, GX_TF_Z8, true, 0);
+    ImageEffectLocalUtil::capture(_20, 1, 0, GX_TF_Z8, true, 0, ImageEffectLocalUtil::CaptureOwner_DepthOfField);
     drawFinal();
     MR::loadProjectionMtx();
     MR::loadViewMtx();
@@ -137,9 +137,9 @@ void DepthOfFieldBlur::drawZAlphaTex() const {
 
 void DepthOfFieldBlur::createBlurTexture() const {
     ImageEffectLocalUtil::drawTexture(_1C, 4, 0, 255, ImageEffectLocalUtil::TexDrawType_0);
-    ImageEffectLocalUtil::capture(_24, 4, 0, GX_TF_RGB565, false, 0);
+    ImageEffectLocalUtil::capture(_24, 4, 0, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_DepthOfField);
     ImageEffectLocalUtil::blurTexture(_24, 4, 0, 4, mIntensity * get_10() * 0.005f, 1.0f);
-    ImageEffectLocalUtil::capture(_24, 4, 0, GX_TF_RGB565, false, 0);
+    ImageEffectLocalUtil::capture(_24, 4, 0, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_DepthOfField);
 }
 
 void DepthOfFieldBlur::drawFinal() const {

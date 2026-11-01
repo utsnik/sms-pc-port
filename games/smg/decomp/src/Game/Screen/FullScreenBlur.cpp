@@ -1,4 +1,5 @@
 #include "Game/Screen/FullScreenBlur.hpp"
+#include "Game/Screen/ImageEffectLocalUtil.hpp"
 #include "Game/Util/CameraUtil.hpp"
 #include "Game/Util/Color.hpp"
 #include "Game/Util/DirectDraw.hpp"
@@ -33,6 +34,7 @@ namespace MR {
         GXColorS10 color2 = {0, 0, 0, param4};
         GXSetTevColorS10(GX_TEVREG0, color2);
         TDDraw::drawTexture(TVec2f(-param2, -param2), MR::getFullScreenBlurTexture(), TVec2f(screenWidth + param2 * 2.0f, 456.0f + param2 * 2.0f));
+        ImageEffectLocalUtil::CaptureOwnerScope ownerScope(ImageEffectLocalUtil::CaptureOwner_FullScreenBlur);
         MR::nonFilteredCapture(MR::getFullScreenBlurTexture(), 0, 464);
         MR::loadProjectionMtx();
         MR::loadViewMtx();

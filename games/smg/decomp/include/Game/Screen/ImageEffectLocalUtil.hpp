@@ -10,6 +10,19 @@ namespace ImageEffectLocalUtil {
     enum ECaptureOwner {
         CaptureOwner_None = 0,
         CaptureOwner_NormalBloom = 1,
+        CaptureOwner_SimpleBloom = 2,
+        CaptureOwner_DepthOfField = 3,
+        CaptureOwner_ScreenBlur = 4,
+        CaptureOwner_FullScreenBlur = 5,
+        CaptureOwner_CaptureScreen = 6,
+        CaptureOwner_WaterFilter = 7,
+        CaptureOwner_ScreenAlpha = 8,
+    };
+
+    class CaptureOwnerScope {
+    public:
+        explicit CaptureOwnerScope(u32 owner);
+        ~CaptureOwnerScope();
     };
 
     enum ETexDrawType {

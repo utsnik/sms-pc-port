@@ -1,5 +1,6 @@
 #include "Game/Screen/ScreenAlphaCapture.hpp"
 #include "Game/Scene/SceneObjHolder.hpp"
+#include "Game/Screen/ImageEffectLocalUtil.hpp"
 #include "Game/Util/DrawUtil.hpp"
 #include "Game/Util/MemoryUtil.hpp"
 #include <JSystem/JKernel/JKRSolidHeap.hpp>
@@ -36,6 +37,7 @@ void ScreenAlphaCapture::captureScreenAlpha(s32 textureIndex) {
     GXRenderModeObj* renderModeObj = JUTVideo::getManager()->getRenderMode();
 
     GXSetCopyFilter(GX_FALSE, renderModeObj->sample_pattern, GX_FALSE, renderModeObj->vfilter);
+    ImageEffectLocalUtil::CaptureOwnerScope ownerScope(ImageEffectLocalUtil::CaptureOwner_ScreenAlpha);
     mTexture[textureIndex]->capture(0, 0, GX_CTF_A8, false, 0);
     GXSetCopyFilter(GX_FALSE, renderModeObj->sample_pattern, GX_TRUE, renderModeObj->vfilter);
 }

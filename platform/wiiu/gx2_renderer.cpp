@@ -4131,7 +4131,17 @@ static CopyOwnerWindowEntry s_copyOwnerWindow[32];
 static uint32_t s_copyOwnerWindowCount;
 
 static const char* copyOwnerName(uint32_t owner) {
-    return owner == sms_wiiu_imgfx::kCopyOwnerBloom ? "bloom" : "untagged";
+    switch (owner) {
+    case sms_wiiu_imgfx::kCopyOwnerBloom: return "bloom";
+    case sms_wiiu_imgfx::kCopyOwnerSimpleBloom: return "simple-bloom";
+    case sms_wiiu_imgfx::kCopyOwnerDepthOfField: return "dof";
+    case sms_wiiu_imgfx::kCopyOwnerScreenBlur: return "screen-blur";
+    case sms_wiiu_imgfx::kCopyOwnerFullScreenBlur: return "fullscreen-blur";
+    case sms_wiiu_imgfx::kCopyOwnerCaptureScreen: return "capture-screen";
+    case sms_wiiu_imgfx::kCopyOwnerWaterFilter: return "water-filter";
+    case sms_wiiu_imgfx::kCopyOwnerScreenAlpha: return "screen-alpha";
+    default: return "untagged";
+    }
 }
 
 static void noteCopyOwner(uint32_t owner, uint32_t logicalW, uint32_t logicalH,

@@ -116,6 +116,7 @@ void ScreenBlurEffect::drawBlur() const {
 
 void ScreenBlurEffect::captureBlur() const {
     CopyFilterNegater copyFilterNegater = CopyFilterNegater();
+    ImageEffectLocalUtil::CaptureOwnerScope ownerScope(ImageEffectLocalUtil::CaptureOwner_ScreenBlur);
 
     _14->capture(0, 0, GX_TF_RGBA8, false, 0);
     _18->capture(0, 0, GX_TF_Z8, true, 0);

@@ -3,6 +3,7 @@
 #include "Game/Map/WaterAreaHolder.hpp"
 #include "Game/Scene/SceneFunction.hpp"
 #include "Game/Screen/MissLayout.hpp"
+#include "Game/Screen/ImageEffectLocalUtil.hpp"
 #include "Game/Util/CameraUtil.hpp"
 #include "Game/Util/DemoUtil.hpp"
 #include "Game/Util/LiveActorUtil.hpp"
@@ -113,6 +114,7 @@ void WaterCameraFilter::draw() const {
 
     GXRenderModeObj* pRenderMode = JUTVideo::getManager()->getRenderMode();
     GXSetCopyFilter(GX_FALSE, pRenderMode->sample_pattern, GX_FALSE, pRenderMode->vfilter);
+    ImageEffectLocalUtil::CaptureOwnerScope ownerScope(ImageEffectLocalUtil::CaptureOwner_WaterFilter);
     mScreenTex->capture(0, 0, GX_TF_RGB565, false, 0);
     GXSetCopyFilter(GX_FALSE, pRenderMode->sample_pattern, GX_TRUE, pRenderMode->vfilter);
     loadMaterial();

@@ -54,25 +54,25 @@ void BloomEffectSimple::draw() const {
     ::TexSpec texSpec;
     texSpec.set(_20, 4, 0, GX_TF_RGB565);
 
-    ImageEffectLocalUtil::capture(texSpec._0, texSpec._4, texSpec._8, texSpec._C, false, 0);
-    ImageEffectLocalUtil::capture(_18, texSpec._4, texSpec._8, GX_TF_RGB565, true, 0);
+    ImageEffectLocalUtil::capture(texSpec._0, texSpec._4, texSpec._8, texSpec._C, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
+    ImageEffectLocalUtil::capture(_18, texSpec._4, texSpec._8, GX_TF_RGB565, true, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
     MR::reinitGX();
     ImageEffectLocalUtil::setupDrawTexture();
     ImageEffectLocalUtil::drawTexture(_18, 4, 0, 255, ImageEffectLocalUtil::TexDrawType_0);
-    ImageEffectLocalUtil::capture(_1C, 4, 0, GX_TF_RGB565, false, 0);
+    ImageEffectLocalUtil::capture(_1C, 4, 0, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
 
     switch (mMaskFilter) {
     case 0:
-        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_TF_I8, false, 0);
+        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_TF_I8, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
         break;
     case 1:
-        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_CTF_R8, false, 0);
+        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_CTF_R8, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
         break;
     case 2:
-        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_CTF_G8, false, 0);
+        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_CTF_G8, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
         break;
     case 3:
-        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_CTF_B8, false, 0);
+        ImageEffectLocalUtil::capture(_2C, 4, 0, GX_CTF_B8, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
         break;
     }
 
@@ -82,14 +82,14 @@ void BloomEffectSimple::draw() const {
     GXSetTevAlphaIn(GX_TEVSTAGE0, GX_CA_ZERO, GX_CA_ZERO, GX_CA_ZERO, GX_CA_KONST);
     GXSetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
     ImageEffectLocalUtil::drawTexture(_2C, 4, 0, mThreshold, ImageEffectLocalUtil::TexDrawType_3);
-    ImageEffectLocalUtil::capture(_24, 4, 0, GX_TF_RGB565, true, 0);
+    ImageEffectLocalUtil::capture(_24, 4, 0, GX_TF_RGB565, true, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
     GXSetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
     GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
     ImageEffectLocalUtil::setupDrawTexture();
     texSpec.set(_24, 8, 0, GX_TF_RGB565);
     ImageEffectLocalUtil::blurTexture(texSpec._0, texSpec._4, texSpec._8, 8, 0.009f, 1.0f);
-    ImageEffectLocalUtil::capture(_28, texSpec._4, texSpec._8, texSpec._C, false, 0);
+    ImageEffectLocalUtil::capture(_28, texSpec._4, texSpec._8, texSpec._C, false, 0, ImageEffectLocalUtil::CaptureOwner_SimpleBloom);
     ImageEffectLocalUtil::drawTexture(_20, 4, 0, 255, ImageEffectLocalUtil::TexDrawType_0);
     const u8 alpha = 255.0f * mIntensity * get_10();
     ImageEffectLocalUtil::drawTexture(_28, 1, 0, alpha, ImageEffectLocalUtil::TexDrawType_1);

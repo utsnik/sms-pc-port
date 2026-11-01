@@ -1,5 +1,6 @@
 #include "Game/Screen/CaptureScreenDirector.hpp"
 #include "Game/Scene/SceneFunction.hpp"
+#include "Game/Screen/ImageEffectLocalUtil.hpp"
 #include "Game/Util/MemoryUtil.hpp"
 #include "Game/Util/ObjUtil.hpp"
 #include "Game/Util/ScreenUtil.hpp"
@@ -33,6 +34,7 @@ void CaptureScreenDirector::capture() {
     GXRenderModeObj* pRenderModeObj = JUTVideo::getManager()->getRenderMode();
 
     GXSetCopyFilter(GX_FALSE, pRenderModeObj->sample_pattern, GX_FALSE, pRenderModeObj->vfilter);
+    ImageEffectLocalUtil::CaptureOwnerScope ownerScope(ImageEffectLocalUtil::CaptureOwner_CaptureScreen);
     mTexture->capture(0, 0, GX_TF_RGB565, false, 0);
     GXSetCopyFilter(GX_FALSE, pRenderModeObj->sample_pattern, GX_TRUE, pRenderModeObj->vfilter);
 }

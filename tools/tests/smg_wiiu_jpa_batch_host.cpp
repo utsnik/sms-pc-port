@@ -5,6 +5,17 @@
 
 static bool same(float a, float b) { return std::fabs(a - b) < 0.0001f; }
 
+struct ChildType4State {
+    unsigned prm;
+    unsigned env;
+    unsigned alpha;
+    unsigned tex;
+};
+
+static bool sameChildType4State(const ChildType4State& a, const ChildType4State& b) {
+    return a.prm == b.prm && a.env == b.env && a.alpha == b.alpha && a.tex == b.tex;
+}
+
 int main() {
     // Two directional particles, including a rotation in the second one's
     // already composed model-view matrix. These are the actual S8 quad bytes.
@@ -91,6 +102,28 @@ int main() {
                 return 1;
         }
     }
-    std::puts("jpa-batch: PASS (type-3 quads and type-4 cross quads)");
+
+    // Child type-4 particles with the same state form one directional run and
+    // therefore one GX draw with the remaining particles emitted in that run.
+    const ChildType4State childRun[] = {
+        {0x10, 0x20, 0x30, 0x40},
+        {0x10, 0x20, 0x30, 0x40},
+        {0x10, 0x20, 0x30, 0x40},
+        {0x10, 0x20, 0x30, 0x40},
+    };
+    unsigned drawCount = 0;
+    unsigned batchedParticles = 0;
+    for (unsigned first = 0; first < sizeof(childRun) / sizeof(childRun[0]);) {
+        unsigned end = first + 1;
+        while (end < sizeof(childRun) / sizeof(childRun[0]) && sameChildType4State(childRun[first], childRun[end]))
+            ++end;
+        ++drawCount;
+        batchedParticles += end - first - 1;
+        first = end;
+    }
+    if (drawCount != 1 || batchedParticles != 3)
+        return 1;
+
+    std::puts("jpa-batch: PASS (type-3 quads, type-4 cross quads, child type-4 run)");
     return 0;
 }
