@@ -211,6 +211,7 @@ static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display
 static bool s_earlyZMarker;
 static bool s_hizMarker;
 static bool s_peek2Marker;
+static bool s_mem1CopyMarker;
 #endif
 bool g_dlPromoteFirst = false;
 bool g_dlIgnoreExternal = false;
@@ -4084,6 +4085,9 @@ struct CopyEntry {
     const void* dest = nullptr;
     TextureEntry tex;
     uint32_t sourceX = 0, sourceY = 0, sourceW = 0, sourceH = 0;
+    bool mem1Image = false;
+    MEMHeapHandle mem1Heap = nullptr;
+    uint32_t imageBytes = 0;
 };
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
 static std::vector<CopyEntry>* s_copyObject;
@@ -4224,6 +4228,79 @@ static bool runningUnderCemu() {
     if (result < 0) result = sms_wiiu_efb_full_copy || (OSGetTitleID() >> 32) == 0xffffffffu;
     return result != 0;
 }
+#if defined(PORT_GAME_SMG)
+static MEMHeapHandle s_mem1CopyHeap;
+static uint32_t s_mem1CopyBudget;
+static uint32_t s_mem1CopySurfaces, s_mem1CopyBytes, s_mem1CopyMisses;
+
+static void refreshMem1CopyHeap() {
+    if (!s_mem1CopyMarker) return;
+    GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
+    s_mem1CopyHeap = td && td->surface.image ? MEMFindContainHeap(td->surface.image) : nullptr;
+    s_mem1CopyBudget = s_mem1CopyHeap && s_mem1CopyHeap->tag == MEM_EXPANDED_HEAP_TAG
+        ? MEMGetAllocatableSizeForExpHeapEx(s_mem1CopyHeap, 0x100) : 0;
+}
+
+static void releaseCopyImage(CopyEntry& e) {
+    if (!e.tex.texture.surface.image) return;
+    if (e.mem1Image) {
+        if (e.mem1Heap) MEMFreeToExpHeap(e.mem1Heap, e.tex.texture.surface.image);
+        if (s_mem1CopySurfaces) --s_mem1CopySurfaces;
+        s_mem1CopyBytes -= e.imageBytes;
+    } else {
+        MEMFreeToDefaultHeap(e.tex.texture.surface.image);
+    }
+    e.tex.texture.surface.image = nullptr;
+    e.tex.valid = false;
+    e.mem1Image = false;
+    e.mem1Heap = nullptr;
+    e.imageBytes = 0;
+}
+
+static void dropMem1CopyImages() {
+    if (!s_mem1CopyMarker) return;
+    for (CopyEntry& e : copyCache()) {
+        if (!e.mem1Image) continue;
+        // WHBGfx owns the foreground heap and destroys it during release;
+        // do not call into the now-invalid heap handle here.
+        e.tex.texture.surface.image = nullptr;
+        e.tex.valid = false;
+        e.mem1Image = false;
+        e.mem1Heap = nullptr;
+        e.imageBytes = 0;
+    }
+    s_mem1CopySurfaces = 0;
+    s_mem1CopyBytes = 0;
+    s_mem1CopyHeap = nullptr;
+}
+
+static void* allocCopyImage(CopyEntry& e, uint32_t size, uint32_t alignment) {
+    if (!s_mem1CopyMarker)
+        return alignedZero(alignment, size);
+    if (s_mem1CopyHeap && s_mem1CopyHeap->tag == MEM_EXPANDED_HEAP_TAG) {
+        void* image = MEMAllocFromExpHeapEx(s_mem1CopyHeap, size, int(alignment));
+        if (image) {
+            e.mem1Image = true;
+            e.mem1Heap = s_mem1CopyHeap;
+            e.imageBytes = size;
+            ++s_mem1CopySurfaces;
+            s_mem1CopyBytes += size;
+            return image;
+        }
+    }
+    ++s_mem1CopyMisses;
+    return MEMAllocFromDefaultHeapEx(size, int(alignment));
+}
+
+extern "C" void sms_wiiu_gx2_renderer_foreground_release(void) {
+    dropMem1CopyImages();
+}
+
+extern "C" void sms_wiiu_gx2_renderer_foreground_acquire(void) {
+    if (!s_mem1CopyMarker) return;
+    refreshMem1CopyHeap();
+}
+#endif
 static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     ++s_perfCopies;
@@ -4248,8 +4325,12 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
     if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         GX2DrawDone(); // earlier draws this frame may still sample it
+#if defined(PORT_GAME_SMG)
+        releaseCopyImage(*e);
+#else
         MEMFreeToDefaultHeap(e->tex.texture.surface.image);
         e->tex.valid = false;
+#endif
     }
     if (!e) { copyCache().push_back(CopyEntry()); e = &copyCache().back(); e->dest = dest; }
     e->tex.source = static_cast<const uint8_t*>(dest);
@@ -4288,7 +4369,11 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         t.texture.viewNumSlices = 1;
         t.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
         GX2CalcSurfaceSizeAndAlignment(&t.texture.surface);
+#if defined(PORT_GAME_SMG)
+        t.texture.surface.image = allocCopyImage(*e, t.texture.surface.imageSize, t.texture.surface.alignment);
+#else
         t.texture.surface.image = alignedZero(t.texture.surface.alignment, t.texture.surface.imageSize);
+#endif
         if (!t.texture.surface.image) return;
         // The zero fill must not be written back over the GPU's copy later.
         DCFlushRange(t.texture.surface.image, t.texture.surface.imageSize);
@@ -5794,9 +5879,13 @@ void rendererInit(float) {
     s_earlyZMarker = sdMarkerPresent("earlyz");
     s_hizMarker = sdMarkerPresent("hiz");
     s_peek2Marker = sdMarkerPresent("peek2");
+    s_mem1CopyMarker = sdMarkerPresent("mem1copy");
     WHBLogPrintf("SMS Wii U: [earlyz] marker=%s", s_earlyZMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [hiz] marker=%s", s_hizMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peek2] marker=%s", s_peek2Marker ? "on" : "off");
+    refreshMem1CopyHeap();
+    WHBLogPrintf("SMS Wii U: [mem1copy] marker=%s budget=%u", s_mem1CopyMarker ? "on" : "off",
+                 unsigned(s_mem1CopyBudget));
 #endif
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
@@ -7470,7 +7559,14 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         const auto ms = [](OSTime t) { return unsigned(OSTicksToMicroseconds(t) / 30 / 100); };
         DlCacheStats dlcache;
         dlCacheTakeStats(dlcache);
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u",
+#if defined(PORT_GAME_SMG)
+        const unsigned m1copy = s_mem1CopySurfaces;
+        const unsigned m1copyMiss = s_mem1CopyMisses;
+        const unsigned m1copyBytes = s_mem1CopyBytes;
+#else
+        const unsigned m1copy = 0, m1copyMiss = 0, m1copyBytes = 0;
+#endif
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u m1copy=%u m1copyMiss=%u m1copyBytes=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -7505,7 +7601,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      unsigned(s_perfTevFoldFallbacks / 30), s_texNative ? 1u : 0u,
                      unsigned(s_texNativeCounts[0]), unsigned(s_texNativeCounts[1]),
                      unsigned(s_texNativeCounts[2]), unsigned(s_texNativeCounts[3]),
-                     unsigned(s_texNativeCounts[4]), unsigned(s_texNativeCounts[14]));
+                     unsigned(s_texNativeCounts[4]), unsigned(s_texNativeCounts[14]),
+                     m1copy, m1copyMiss, m1copyBytes);
         if (s_gpuDiag) {
             CmdCounters cmd = s_cmdByCore[0];
             const CmdCounters& worker = s_cmdByCore[1];
@@ -7553,6 +7650,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             g_dlTicks = 0;
         }
         s_perfCopies = s_perfPeeks = s_perfClears = 0;
+#if defined(PORT_GAME_SMG)
+        s_mem1CopyMisses = 0;
+#endif
         memset(s_perfVsyncHist, 0, sizeof(s_perfVsyncHist));
         static uint32_t s_gpuReportEvery;
         if (++s_gpuReportEvery >= 4) { s_gpuReportEvery = 0; gpuReport(); }

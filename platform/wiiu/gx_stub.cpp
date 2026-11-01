@@ -77,6 +77,10 @@ extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
 extern "C" void sms_wiiu_gx2_texture_pack_pump(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
 extern "C" void sms_wiiu_d1_note_present_core(void);
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_gx2_renderer_foreground_release(void);
+extern "C" void sms_wiiu_gx2_renderer_foreground_acquire(void);
+#endif
 
 void log_active_once()
 {
@@ -895,11 +899,19 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	if (!s_gfx_initialized)
 		return;
 	if (!ProcUIInForeground()) {
+		if (s_was_foreground) {
+#if defined(PORT_GAME_SMG)
+			sms_wiiu_gx2_renderer_foreground_release();
+#endif
+		}
 		s_was_foreground = false;
 		return;
 	}
 	if (!s_was_foreground) {
 		s_was_foreground = true;
+		#if defined(PORT_GAME_SMG)
+		sms_wiiu_gx2_renderer_foreground_acquire();
+		#endif
 		drc_setup(false);
 	}
 	if (!s_frame_open) {
