@@ -73,7 +73,7 @@ bool autopress_marker_present()
  * (SMS_WARP, SMS_SKIP_MOVIES), so getenv-driven debug switches work here. */
 struct ScriptPress {
 	u16 button;
-	s8 sx, sy;
+	s8 sx, sy, cx, cy;
 	uint32_t at, until;
 };
 ScriptPress s_script[48];
@@ -82,19 +82,23 @@ volatile uint32_t s_field;
 
 bool script_control(const char* name, ScriptPress& p)
 {
-	static const struct { const char* name; u16 button; s8 sx, sy; } kControls[] = {
+	static const struct { const char* name; u16 button; s8 sx, sy, cx, cy; } kControls[] = {
 		{ "a", PAD_BUTTON_A, 0, 0 }, { "b", PAD_BUTTON_B, 0, 0 }, { "x", PAD_BUTTON_X, 0, 0 },
 		{ "y", PAD_BUTTON_Y, 0, 0 }, { "start", PAD_BUTTON_START, 0, 0 }, { "z", PAD_TRIGGER_Z, 0, 0 },
 		{ "l", PAD_TRIGGER_L, 0, 0 }, { "r", PAD_TRIGGER_R, 0, 0 }, { "up", PAD_BUTTON_UP, 0, 0 },
 		{ "down", PAD_BUTTON_DOWN, 0, 0 }, { "left", PAD_BUTTON_LEFT, 0, 0 },
 		{ "right", PAD_BUTTON_RIGHT, 0, 0 }, { "stick_left", 0, -100, 0 }, { "stick_right", 0, 100, 0 },
 		{ "stick_up", 0, 0, 100 }, { "stick_down", 0, 0, -100 },
+		{ "cstick_left", 0, 0, 0, -100, 0 }, { "cstick_right", 0, 0, 0, 100, 0 },
+		{ "cstick_up", 0, 0, 0, 0, 100 }, { "cstick_down", 0, 0, 0, 0, -100 },
 	};
 	for (const auto& c : kControls)
 		if (strcasecmp(c.name, name) == 0) {
 			p.button = c.button;
 			p.sx = c.sx;
 			p.sy = c.sy;
+			p.cx = c.cx;
+			p.cy = c.cy;
 			return true;
 		}
 	return false;
@@ -482,6 +486,8 @@ void sms_wiiu_input_poll(void)
 				s_status[0].button |= p.button;
 				if (p.sx) s_status[0].stickX = p.sx;
 				if (p.sy) s_status[0].stickY = p.sy;
+				if (p.cx) s_status[0].substickX = p.cx;
+				if (p.cy) s_status[0].substickY = p.cy;
 			}
 		} else if (s_autoplay > 0 && n >= 3600 && (n % 120) < 6) {
 			s_status[0].button |= PAD_BUTTON_A;
