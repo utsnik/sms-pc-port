@@ -181,10 +181,15 @@ static void matchRequest(const TexturePackRequest& request) {
         publishResult(result);
         return;
     }
-    const OSTime hashStart = OSGetTime();
-    result.key.dataHash = xxh64(request.source, bytes, 0);
-    s_stats.hashBytes += bytes;
-    s_stats.hashMicros += uint32_t(OSTicksToMicroseconds(OSGetTime() - hashStart));
+    if (request.hasKnownHash) {
+        result.key.dataHash = request.knownHash;
+        ++s_stats.hashReused;
+    } else {
+        const OSTime hashStart = OSGetTime();
+        result.key.dataHash = xxh64(request.source, bytes, 0);
+        s_stats.hashBytes += bytes;
+        s_stats.hashMicros += uint32_t(OSTicksToMicroseconds(OSGetTime() - hashStart));
+    }
     if (request.format >= 8 && request.format <= 10 && request.tlut) {
         uint32_t lo = 0, hi = 0;
         paletteRange(request.source, bytes, request.format, &lo, &hi);
@@ -431,6 +436,7 @@ void texturePackGetStats(TexturePackStats* stats) {
     __sync_synchronize();
     stats->hashBytes = s_stats.hashBytes;
     stats->hashMicros = s_stats.hashMicros;
+    stats->hashReused = s_stats.hashReused;
     stats->archiveReadBytes = s_stats.archiveReadBytes;
     stats->queuedJobs = s_stats.queuedJobs;
     stats->bcUploads = s_stats.bcUploads;

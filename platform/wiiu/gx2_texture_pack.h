@@ -58,6 +58,11 @@ struct TexturePackRequest {
     uint32_t tlutFormat, writeClock, generation;
     uint32_t requestId;
     uint32_t retry;
+    /* xxh64(source, level-0 bytes, 0) when the renderer already hashed exactly
+     * those bytes for this request (single-level textures); saves the pack
+     * worker a second pass over the same source. */
+    uint64_t knownHash;
+    bool hasKnownHash;
 };
 
 struct TexturePackResult {
@@ -78,7 +83,7 @@ struct TexturePackUploadChunk {
 };
 
 struct TexturePackStats {
-    uint32_t hashBytes, hashMicros, archiveReadBytes, queuedJobs, bcUploads, rgbaUploads;
+    uint32_t hashBytes, hashMicros, archiveReadBytes, queuedJobs, bcUploads, rgbaUploads, hashReused;
 };
 
 class TexturePackRequestQueue {

@@ -1072,7 +1072,7 @@ static bool s_gx2ProdMarker;
 static int s_peekTokenMode;  // 0 prod6 ("peekprod6"), 1 token snapshots (default), 2 "peekcmp" (see peekToken)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
-static bool s_texSplit, s_texDirect, s_texR8, s_cmprBc, s_cmprBcLinear;
+static bool s_texSplit, s_texDirect, s_texR8, s_cmprBc, s_cmprBcLinear, s_packHashReuse;
 static uint32_t s_cmprBcUploads, s_cmprRgbaUploads;
 static uint32_t s_texSplitLogs;
 static constexpr uint32_t kGx2DlAlignment = 32;
@@ -4031,11 +4031,13 @@ static TextureEntry* getTexture(int map) {
     const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
     const bool readable = source && srcBytes && a1 > a0 &&
         ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
+    bool hashedNow = false;
     if (readable && s_texRecheck && writeStampTracked(source, srcBytes)) {
         e.srcBytes = srcBytes;
         e.checkedClock = writeClock();
         e.checkedFrame = g_displayFrames;
         e.dataHash = xxh64(source, srcBytes, 0);
+        hashedNow = true;
     }
     uint8_t* rgba = readable && !directRgba && !r8Upload && !cmprBcUpload
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
@@ -4153,6 +4155,12 @@ static TextureEntry* getTexture(int map) {
         request.width = w; request.height = h; request.format = fmt; request.levels = levels;
         request.tlutFormat = tlutFmt; request.writeClock = writeClock(); request.generation = s_copyGeneration;
         request.requestId = ++s_nextPackRequestId; request.retry = 0;
+        // hashreuse: the pack keys on xxh64 of level 0 only; reuse the hash
+        // above when it covered exactly those bytes.
+        if (s_packHashReuse && hashedNow && srcBytes == texLevelBytes(fmt, w, h)) {
+            request.knownHash = e.dataHash;
+            request.hasKnownHash = true;
+        }
         e.packRequestId = request.requestId;
         e.packState = texturePackEnqueue(request) ? 1 : 2;
     }
@@ -4340,6 +4348,7 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
         if (result.changed) {
             if (result.retry <= 1) {
                 result.request.retry = result.retry; result.request.writeClock = writeClock();
+                result.request.hasKnownHash = false;  // the source changed: hash it afresh
                 e->packState = texturePackEnqueue(result.request) ? 1 : 2;
             } else e->packState = 2;
         } else if (!result.found) {
@@ -4390,12 +4399,12 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     if (++s_packDiagFrames == 30) {
         TexturePackStats stats = {};
         texturePackGetStats(&stats);
-        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u packUploadsBC=%u packUploadsRGBA=%u fallback=%u cap=%u texEntries=%u retired=%u reused=%u",
+        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u packUploadsBC=%u packUploadsRGBA=%u hashReused=%u fallback=%u cap=%u texEntries=%u retired=%u reused=%u",
                      unsigned(g_displayFrames), unsigned(stats.hashBytes), unsigned(stats.hashMicros),
                      unsigned(stats.archiveReadBytes), unsigned(stats.queuedJobs),
                      unsigned(s_packLru.residentBytes()), unsigned(s_packStagingPeak), unsigned(s_packCompleted),
                      unsigned(s_packEvictions), unsigned(s_packUploadBytes), unsigned(s_packUploadMicros),
-                     unsigned(stats.bcUploads), unsigned(stats.rgbaUploads), unsigned(s_packFallback),
+                     unsigned(stats.bcUploads), unsigned(stats.rgbaUploads), unsigned(stats.hashReused), unsigned(s_packFallback),
                      unsigned(s_packResidentBudget), unsigned(s_textures.size()),
                      unsigned(s_texRetired), unsigned(s_texReused));
         s_packDiagFrames = 0;
@@ -5473,6 +5482,8 @@ void rendererInit(float) {
     s_texR8 = sdMarkerPresent("texr8");
     s_cmprBc = sdMarkerPresent("cmprbc");
     s_cmprBcLinear = s_cmprBc && sdMarkerPresent("cmprbclin");
+    s_packHashReuse = sdMarkerPresent("hashreuse");
+    WHBLogPrintf("SMS Wii U: [hashreuse] marker=%s", s_packHashReuse ? "on" : "off");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     WHBLogPrintf("SMS Wii U: direct texture uploads %s (SD marker notexdirect)", s_texDirect ? "on" : "off");
