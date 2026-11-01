@@ -29,10 +29,13 @@ int smg_wiiu_warp_pending(void);
 const char* smg_wiiu_warp_galaxy(void);
 int smg_wiiu_warp_scenario(void);
 void smg_wiiu_warp_consume(void);
+void port_log(const char*, ...);
 }
 #endif
 
 namespace {
+    bool s_warp_demo_skip;
+
     enum {
         EVENT_BUTLER_REPORT_FORTRESS = 5,
         EVENT_BUTLER_REPORT_KOOPA_FORTRESS = 6,
@@ -652,6 +655,17 @@ void StorySequenceExecutor::exePlayDemoSequence() {
     if (MR::isFirstStep(this)) {
     }
 
+#if defined(PORT_GAME_SMG) && defined(TARGET_WIIU)
+    if (s_warp_demo_skip) {
+        port_log("[warp] demo sequence skipped at step %u", pDemoInfo->_0);
+        s_warp_demo_skip = false;
+        // Step 8 opens the wipe before the prologue; keep that so the galaxy is visible.
+        MR::forceOpenWipeFade();
+        forceStop();
+        return;
+    }
+#endif
+
     switch (pDemoInfo->_0) {
     case 0:
         if (tryStartDemo(pDemoInfo->_4)) {
@@ -1058,6 +1072,7 @@ void StorySequenceExecutor::overwriteGalaxyNameAfterLoading(GalaxyMoveArgument* 
         if (data != nullptr) {
             pMoveArgument->mStageName = data->mGalaxyName;
             pMoveArgument->mScenarioNo = smg_wiiu_warp_scenario();
+            s_warp_demo_skip = true;
         } else {
             port_log("[warp] unknown galaxy");
         }
