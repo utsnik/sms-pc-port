@@ -60,6 +60,7 @@ static WutMessageQueue s_wakeQueue;
 static WutMessage s_wakeSlots[kWakeSlots] __attribute__((aligned(32)));
 static uint8_t s_workerStack[kWorkerStackSize] __attribute__((aligned(32)));
 static uint8_t s_byteRing[kByteRingSize] __attribute__((aligned(64)));
+static bool s_prodZero;  // SD marker prodzero, see zeroWholeLines
 static ServiceRecord s_serviceRing[kServiceRingSize] __attribute__((aligned(64)));
 
 static Hooks s_hooks;
@@ -259,6 +260,8 @@ bool start(const Hooks& hooks, bool core2) {
     }
 
     core2 = core2 || sms_wiiu_sd_marker("gx2core2");
+    s_prodZero = sms_wiiu_sd_marker("prodzero");
+    port_log("SMS Wii U: [prod] prodzero=%d\n", s_prodZero ? 1 : 0);
     s_hooks = hooks;
     s_byteRead = s_byteWrite = 0;
     s_serviceRead = s_serviceWrite = 0;
@@ -295,6 +298,17 @@ bool enabled() { return s_started; }
 
 static void (*s_flushHook)();
 
+// SD marker prodzero: claim the whole 32-byte ring lines an append covers with
+// dcbz instead of letting each store miss and read the line from MEM2 first.
+// The 2 MiB ring is rewritten once per wrap, so every append missed (batch231
+// pf-plaza: 441 KB/frame took 3.9 ms of core 1). Edge lines shared with bytes
+// the worker has not consumed yet are left alone.
+static inline void zeroWholeLines(uint8_t* dst, uint32_t n) {
+    uintptr_t a = (reinterpret_cast<uintptr_t>(dst) + 31) & ~uintptr_t(31);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(dst) + n) & ~uintptr_t(31);
+    for (; a < end; a += 32) __asm__ volatile("dcbz 0,%0" : : "r"(a) : "memory");
+}
+
 bool append(const uint8_t* bytes, uint32_t size) {
     if (!s_started || !bytes || !size) return false;
     add(&s_totals.producerAppendCalls, 1);
@@ -327,6 +341,10 @@ bool append(const uint8_t* bytes, uint32_t size) {
     const uint32_t offset = write % kByteRingSize;
     uint32_t first = kByteRingSize - offset;
     if (first > size) first = size;
+    if (s_prodZero) {
+        zeroWholeLines(s_byteRing + offset, first);
+        if (first != size) zeroWholeLines(s_byteRing, size - first);
+    }
     std::memcpy(s_byteRing + offset, bytes, first);
     if (first != size) std::memcpy(s_byteRing, bytes + first, size - first);
     releaseBarrier();

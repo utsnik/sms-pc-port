@@ -155,8 +155,8 @@ Reason: port: THP video decoder for the host: portable C Huffman bit reader (big
 +		o[3] = t3 - t4;
 +		out = Gbase + (yTile + i / 4) * (Gwid * 4) + xPos * 4 + (i % 4) * 8;
 +		for (k = 0; k < 8; k++) {
-+			long v = lrintf(o[k] * 0.125f + 128.0f);
-+			out[k] = (THPSample)(v < 0 ? 0 : v > 255 ? 255 : v);
++			f32 v = o[k] * 0.125f + 128.5f; // lrintf was a libm call per pixel; clamp, then truncate (fctiwz)
++			out[k] = (THPSample)(v < 0.0f ? 0 : v >= 255.0f ? 255 : (int)v);
 +		}
 +	}
 +}
