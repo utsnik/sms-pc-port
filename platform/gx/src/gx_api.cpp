@@ -512,8 +512,7 @@ void GXGetVtxDescv(GXVtxDescList* vcd) {
     vcd[n].attr = GX_VA_NULL;
 }
 
-void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
-    uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
+static inline void vatSetAttr(uint32_t& A, uint32_t& B, uint32_t& C, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
     uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
     switch (attr) {
     case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
@@ -535,14 +534,46 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
     case GX_VA_TEX7: C = setField(C, 1, 23, c); C = setField(C, 3, 24, t); C = setField(C, 5, 27, f); break;
     default: break;
     }
+}
+static inline void vatEmit(GXVtxFmt fmt, uint32_t A, uint32_t B, uint32_t C) {
     A |= 1u << 30;
     const bool always = forceVtxState();
     if (always || A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
     if (always || B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
     if (always || C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
 }
+void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
+    uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
+    vatSetAttr(A, B, C, attr, cnt, type, frac);
+    vatEmit(fmt, A, B, C);
+}
+#ifdef __WIIU__
+extern "C" int sms_wiiu_sd_marker(const char* name);
+// SD marker vatbatch: GXSetVtxAttrFmtv folds the whole list into the three VAT
+// words and writes each once. Per attribute, producer mode wrote all three
+// (forceVtxState), and ReInitializeGX (called from every TLightCommon::setLight)
+// sets 12 attributes in all 8 formats: 288 CP writes become 24. No draw can
+// happen inside the call, so the worker ends with the same VAT.
+static bool vatBatch() {
+    static int s_on = -1;
+    if (s_on < 0) {
+        s_on = sms_wiiu_sd_marker("vatbatch") ? 1 : 0;
+        logmsg("vatbatch marker=%d", s_on);
+    }
+    return s_on != 0;
+}
+#else
+static bool vatBatch() { return false; }
+#endif
 void GXSetVtxAttrFmtv(GXVtxFmt fmt, const GXVtxAttrFmtList* list) {
-    for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);
+    if (!vatBatch()) {
+        for (; list->attr != GX_VA_NULL; list++) GXSetVtxAttrFmt(fmt, list->attr, list->cnt, list->type, list->frac);
+        return;
+    }
+    uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
+    bool any = false;
+    for (; list->attr != GX_VA_NULL; list++, any = true) vatSetAttr(A, B, C, list->attr, list->cnt, list->type, list->frac);
+    if (any) vatEmit(fmt, A, B, C);
 }
 void GXGetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt* cnt, GXCompType* type, u8* frac) {
     uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
