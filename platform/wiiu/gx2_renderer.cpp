@@ -1072,7 +1072,7 @@ static bool s_gx2ProdMarker;
 static int s_peekTokenMode;  // 0 prod6 ("peekprod6"), 1 token snapshots (default), 2 "peekcmp" (see peekToken)
 static bool s_gx2ProdCore2;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
-static bool s_texSplit, s_texDirect, s_texR8, s_cmprBc;
+static bool s_texSplit, s_texDirect, s_texR8, s_cmprBc, s_cmprBcLinear;
 static uint32_t s_cmprBcUploads, s_cmprRgbaUploads;
 static uint32_t s_texSplitLogs;
 static constexpr uint32_t kGx2DlAlignment = 32;
@@ -3760,11 +3760,10 @@ static bool enqueueProducerRetile(const GX2Surface& linear, const GX2Surface& ti
 }
 
 static void retileTexture(GX2Texture& texture) {
-    // CMPR marked cmprbc is already in GX2's native BC1 block order.  A
-    // GX2CopySurface through the RGBA retile path does not preserve that
-    // GameCube-to-GX2 block mapping, and the producer variant would enqueue
-    // the same invalid conversion on core 1; keep the linear BC1 surface.
-    if (s_cmprBc && texture.surface.format == GX2_SURFACE_FORMAT_UNORM_BC1) return;
+    // cmprbc BC1 surfaces retile like any other format (GX2CopySurface keeps
+    // the block data; Galaxy's texnative and the packbc path both rely on it).
+    // SD marker cmprbclin keeps them linear instead, for A/B.
+    if (s_cmprBcLinear && texture.surface.format == GX2_SURFACE_FORMAT_UNORM_BC1) return;
     if (!s_retileTextures || runningUnderCemu()) return;
     const bool worker = s_gx2ProdEnabled && OSGetCoreId() != 1;
     GX2Surface& linear = texture.surface;
@@ -5473,10 +5472,11 @@ void rendererInit(float) {
     s_texDirect = !sdMarkerPresent("notexdirect");
     s_texR8 = sdMarkerPresent("texr8");
     s_cmprBc = sdMarkerPresent("cmprbc");
+    s_cmprBcLinear = s_cmprBc && sdMarkerPresent("cmprbclin");
     WHBLogPrintf("SMS Wii U: generated mips for wrapped single-level textures %s (SD marker noautomip)", s_autoMip ? "on" : "off");
     WHBLogPrintf("SMS Wii U: copy clears %s (SD marker norectclear)", s_rectClear ? "cover the copied rectangle" : "cover the whole buffer");
     WHBLogPrintf("SMS Wii U: direct texture uploads %s (SD marker notexdirect)", s_texDirect ? "on" : "off");
-    WHBLogPrintf("SMS Wii U: [cmprbc] marker=%s", s_cmprBc ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [cmprbc] marker=%s linear=%s", s_cmprBc ? "on" : "off", s_cmprBcLinear ? "on" : "off");
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
     s_noDiff = s_noDiffMarker = sdMarkerPresent("nodiff");
