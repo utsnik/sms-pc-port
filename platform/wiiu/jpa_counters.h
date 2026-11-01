@@ -13,6 +13,8 @@ void sms_wiiu_jpa_reject_prj(void);
 void sms_wiiu_jpa_reject_ineligible(void);
 void sms_wiiu_jpa_type3(void);
 void sms_wiiu_jpa_type4(void);
+void sms_wiiu_jpa_histogram(int child, unsigned type, const char* func, int callback,
+                            const void* emitter);
 #ifdef __cplusplus
 }
 #endif

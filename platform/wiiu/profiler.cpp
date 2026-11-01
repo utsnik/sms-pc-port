@@ -592,6 +592,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	extern uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 	extern uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
 	extern uint32_t s_jpaType3, s_jpaType4;
+	extern void sms_wiiu_jpa_histogram_report(void);
 	static unsigned s_jpaWindowFrames;
 	if (++s_jpaWindowFrames == 30) {
 		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u t3=%u t4=%u\n",
@@ -600,6 +601,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 		         (unsigned)s_jpaRejectType, (unsigned)s_jpaRejectCallback,
 		         (unsigned)s_jpaRejectPrj, (unsigned)s_jpaRejectIneligible,
 		         (unsigned)s_jpaType3, (unsigned)s_jpaType4);
+		sms_wiiu_jpa_histogram_report();
 		s_jpaParticles = s_jpaDraws = s_jpaSplits = s_jpaBatched = 0;
 		s_jpaRejectType = s_jpaRejectCallback = s_jpaRejectPrj = s_jpaRejectIneligible = 0;
 		s_jpaType3 = s_jpaType4 = 0;
@@ -646,6 +648,66 @@ extern "C" void sms_wiiu_profiler_tick(void)
 uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
 uint32_t s_jpaType3, s_jpaType4;
+struct JPAHistogramBucket {
+	unsigned type, count, emitters;
+	const char* func;
+	const void* emitter[32];
+	unsigned emitterCount;
+	unsigned child, callback;
+};
+static JPAHistogramBucket s_jpaHistogram[64];
+
+extern "C" void sms_wiiu_jpa_histogram(int child, unsigned type, const char* func, int callback,
+	                                      const void* emitter)
+{
+	JPAHistogramBucket* bucket = NULL;
+	for (unsigned i = 0; i < sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0]); ++i) {
+		JPAHistogramBucket& candidate = s_jpaHistogram[i];
+		if (candidate.count != 0 && candidate.child == (unsigned)child &&
+		    candidate.type == type && candidate.callback == (unsigned)callback && candidate.func == func) {
+			bucket = &candidate;
+			break;
+		}
+	}
+	if (bucket == NULL) {
+		for (unsigned i = 0; i < sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0]); ++i) {
+			if (s_jpaHistogram[i].count == 0) {
+				bucket = &s_jpaHistogram[i];
+				bucket->child = (unsigned)child;
+				bucket->type = type;
+				bucket->callback = (unsigned)callback;
+				bucket->func = func;
+				bucket->emitterCount = 0;
+				break;
+			}
+		}
+	}
+	if (bucket == NULL) return;
+	++bucket->count;
+	for (unsigned i = 0; i < bucket->emitterCount; ++i)
+		if (bucket->emitter[i] == emitter) return;
+	if (bucket->emitterCount < sizeof(bucket->emitter) / sizeof(bucket->emitter[0]))
+		bucket->emitter[bucket->emitterCount++] = emitter;
+	++bucket->emitters;
+}
+
+extern "C" void sms_wiiu_jpa_histogram_report(void)
+{
+	bool reported[sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0])] = {};
+	for (unsigned rank = 0; rank < 12; ++rank) {
+		unsigned best = sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0]);
+		for (unsigned i = 0; i < sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0]); ++i)
+			if (!reported[i] && s_jpaHistogram[i].count != 0 &&
+			    (best == sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0]) ||
+			     s_jpaHistogram[i].count > s_jpaHistogram[best].count)) best = i;
+		if (best == sizeof(s_jpaHistogram) / sizeof(s_jpaHistogram[0])) break;
+		reported[best] = true;
+		const JPAHistogramBucket& b = s_jpaHistogram[best];
+		port_log("[jpahist] %s type=%u func=%s cb=%u n=%u emitters=%u\n",
+		         b.child ? "child" : "parent", b.type, b.func, b.callback, b.count, b.emitters);
+	}
+	std::memset(s_jpaHistogram, 0, sizeof(s_jpaHistogram));
+}
 extern "C" void sms_wiiu_jpa_particle(void) { ++s_jpaParticles; }
 extern "C" void sms_wiiu_jpa_draw(void) { ++s_jpaDraws; }
 extern "C" void sms_wiiu_jpa_split(void) { ++s_jpaSplits; }

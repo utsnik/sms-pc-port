@@ -61,6 +61,33 @@ bool batchMarker() {
     if (marker < 0) marker = sms_wiiu_sd_marker("jpabatch") != 0;
     return marker != 0;
 }
+
+const char* jpaDrawFuncName(JPAResource::ParticleFunc func) {
+    if (func == &JPADrawBillboard) return "JPADrawBillboard";
+    if (func == &JPADrawRotBillboard) return "JPADrawRotBillboard";
+    if (func == &JPADrawYBillboard) return "JPADrawYBillboard";
+    if (func == &JPADrawRotYBillboard) return "JPADrawRotYBillboard";
+    if (func == &JPADrawDirection) return "JPADrawDirection";
+    if (func == &JPADrawRotDirection) return "JPADrawRotDirection";
+    if (func == &JPADrawDBillboard) return "JPADrawDBillboard";
+    if (func == &JPADrawRotation) return "JPADrawRotation";
+    if (func == &JPADrawPoint) return "JPADrawPoint";
+    if (func == &JPADrawLine) return "JPADrawLine";
+    if (func == &JPADrawParticleCallBack) return "JPADrawParticleCallBack";
+    return "unknown";
+}
+
+void noteParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shapeType,
+                  bool child, JPAResource::ParticleFunc* funcs, int funcCount) {
+    sms_wiiu_jpa_particle();
+    const bool directionalFunc = funcCount > 0 &&
+        (funcs[0] == &JPADrawDirection || funcs[0] == &JPADrawRotDirection);
+    if (directionalFunc) countDirectionalParticle(work, particle, shapeType);
+    sms_wiiu_jpa_histogram(child, (unsigned)shapeType,
+                           funcCount > 0 ? jpaDrawFuncName(funcs[0]) : "none",
+                           work->mpEmtr->mpPtclCallBack != NULL, work->mpEmtr);
+}
+
 struct DirectionTracker {
     bool have;
     DirectionKey previous;
@@ -837,7 +864,7 @@ void JPAResource::draw(JPAEmitterWorkData* work, JPABaseEmitter* emtr) {
 // with a fixed count. The template TEX0 indices remain indexed throughout.
 static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs,
                                 int funcCount, bool reverse, bool ageMatters,
-                                int shapeType,
+                                int shapeType, bool child,
                                 const signed char* template_xyz, const void* pos_array,
                                 const void* tex_array) {
     typedef JPANode< JPABaseParticle > Node;
@@ -849,8 +876,7 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
         work->mpCurNode = node;
         JPABaseParticle* particle = node->getObject();
         Node* next = reverse ? node->getPrev() : node->getNext();
-        sms_wiiu_jpa_particle();
-        countDirectionalParticle(work, particle, shapeType);
+        noteParticle(work, particle, shapeType, child, funcs, funcCount);
         if (!jpa_batch::eligible(work, particle)) {
             for (int i = funcCount - 1; i >= 0; --i) (*funcs[i])(work, particle);
             node = next;
@@ -868,6 +894,7 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             work->mpCurNode = scan;
             JPABaseParticle* candidate = scan->getObject();
             if (!jpa_batch::eligible(work, candidate) || !sameDirectionKey(key, directionKey(candidate, ageMatters))) break;
+            noteParticle(work, candidate, shapeType, child, funcs, funcCount);
             ++runLength;
         }
         work->mpCurNode = node;
@@ -902,7 +929,6 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
                 }
             }
             if (i != 0) {
-                sms_wiiu_jpa_particle();
                 sms_wiiu_jpa_batched();
             }
             emit = reverse ? emit->getPrev() : emit->getNext();
@@ -971,7 +997,7 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
         const int crd_offset = (mpBaseShape->getTilingS() + 2 * mpBaseShape->getTilingT()) * 8;
         drawDirectionalList(work, mpDrawParticleFuncList, mpDrawParticleFuncListNum,
                             mpBaseShape->isDrawFwdAhead(), mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex(),
-                            shapeType,
+                            shapeType, false,
                             reinterpret_cast<const signed char*>(jpa_pos + offset),
                             jpa_pos + offset, jpa_crd + crd_offset);
     } else
@@ -981,8 +1007,7 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
         for (; node != work->mpEmtr->mAlivePtclBase.getEnd(); node = node->getPrev()) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
-            sms_wiiu_jpa_particle();
-            if (directionalFunc) countDirectionalParticle(work, node->getObject(), shapeType);
+            noteParticle(work, node->getObject(), shapeType, false, mpDrawParticleFuncList, mpDrawParticleFuncListNum);
             directionTracker.observe(work, node->getObject(), directional, mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex());
 #endif
             if (mpDrawParticleFuncList != NULL) {
@@ -996,8 +1021,7 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
         for (; node != work->mpEmtr->mAlivePtclBase.getEnd(); node = node->getNext()) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
-            sms_wiiu_jpa_particle();
-            if (directionalFunc) countDirectionalParticle(work, node->getObject(), shapeType);
+            noteParticle(work, node->getObject(), shapeType, false, mpDrawParticleFuncList, mpDrawParticleFuncListNum);
             directionTracker.observe(work, node->getObject(), directional, mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex());
 #endif
             if (mpDrawParticleFuncList != NULL) {
@@ -1064,6 +1088,7 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
         const int offset = shapeType == 3 ? 0x30 + mpChildShape->getBasePlaneType() * 0x6C : 0x30;
         drawDirectionalList(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum,
                             mpBaseShape->isDrawFwdAhead(), false, shapeType,
+                            true,
                             reinterpret_cast<const signed char*>(jpa_pos + offset),
                             jpa_pos + offset, jpa_crd);
     } else
@@ -1073,8 +1098,7 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
         for (; node != work->mpEmtr->mAlivePtclChld.getEnd(); node = node->getPrev()) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
-            sms_wiiu_jpa_particle();
-            if (directionalFunc) countDirectionalParticle(work, node->getObject(), shapeType);
+            noteParticle(work, node->getObject(), shapeType, true, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum);
             directionTracker.observe(work, node->getObject(), directional, false);
 #endif
             if (mpDrawParticleChildFuncList != NULL) {
@@ -1088,8 +1112,7 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
         for (; node != work->mpEmtr->mAlivePtclChld.getEnd(); node = node->getNext()) {
             work->mpCurNode = node;
 #if defined(TARGET_WIIU)
-            sms_wiiu_jpa_particle();
-            if (directionalFunc) countDirectionalParticle(work, node->getObject(), shapeType);
+            noteParticle(work, node->getObject(), shapeType, true, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum);
             directionTracker.observe(work, node->getObject(), directional, false);
 #endif
             if (mpDrawParticleChildFuncList != NULL) {
