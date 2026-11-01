@@ -261,6 +261,22 @@ static bool sdMarkerPresent(const char* name) {
     return false;
 }
 
+static bool sdDefaultOnMarker(const char* name) {
+    char disableName[64];
+    std::snprintf(disableName, sizeof(disableName), "no%s", name);
+    return !sdMarkerPresent(disableName);
+}
+
+// Galaxy's hardware-verified switches default on; other games sharing this
+// renderer keep the opt-in marker.
+static bool sdGameDefaultMarker(const char* name) {
+#if defined(PORT_GAME_SMG)
+    return sdDefaultOnMarker(name);
+#else
+    return sdMarkerPresent(name);
+#endif
+}
+
 struct FixedShader {
     GX2VertexShader vertex;
     GX2PixelShader pixel;
@@ -5923,7 +5939,7 @@ static void vertexSelfCheckDraw(const VertexKey& key, const TevKey& tevKey, bool
 void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
-    s_tv720Marker = sdMarkerPresent("tv720");
+    s_tv720Marker = sdGameDefaultMarker("tv720");
     s_nativeQuads = sdMarkerPresent("quads");
     WHBLogPrintf("SMS Wii U: [tv720] marker=%s", s_tv720Marker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [quads] marker=%s", s_nativeQuads ? "on" : "off");
@@ -5971,8 +5987,8 @@ void rendererInit(float) {
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
-    s_textiledMarker = sdMarkerPresent("textiled");
-    s_texNative = sdMarkerPresent("texnative");
+    s_textiledMarker = sdGameDefaultMarker("textiled");
+    s_texNative = sdGameDefaultMarker("texnative");
     WHBLogPrintf("SMS Wii U: [texnative] marker=%s", s_texNative ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [textiled] marker=%s", s_textiledMarker ? "on" : "off");
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
@@ -5986,10 +6002,14 @@ void rendererInit(float) {
 #if defined(PORT_GAME_SMG)
     // d49 switches are read once here so shader generation, depth setup, and
     // peek scheduling cannot observe a changing SD card during a run.
-    s_earlyZMarker = sdMarkerPresent("earlyz");
-    s_hizMarker = sdMarkerPresent("hiz");
-    s_peek2Marker = sdMarkerPresent("peek2");
-    s_mem1CopyMarker = sdMarkerPresent("mem1copy");
+    s_earlyZMarker = sdDefaultOnMarker("earlyz");
+    s_hizMarker = sdDefaultOnMarker("hiz");
+    s_peek2Marker = sdDefaultOnMarker("peek2");
+    s_mem1CopyMarker = sdDefaultOnMarker("mem1copy");
+    WHBLogPrintf("[defaults] earlyz=%d hiz=%d peek2=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
+                 s_earlyZMarker ? 1 : 0, s_hizMarker ? 1 : 0, s_peek2Marker ? 1 : 0,
+                 s_textiledMarker ? 1 : 0, s_tv720Marker ? 1 : 0, s_texNative ? 1 : 0,
+                 s_mem1CopyMarker ? 1 : 0);
     WHBLogPrintf("SMS Wii U: [earlyz] marker=%s", s_earlyZMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [hiz] marker=%s", s_hizMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peek2] marker=%s", s_peek2Marker ? "on" : "off");
