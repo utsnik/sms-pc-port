@@ -254,6 +254,9 @@ void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& r
                  const uint8_t* verts);
 bool batchUsesArena();
 void onStateChange();  // called before any register write that changes state
+#ifdef __WIIU__
+void rendererStateWritten(); // every BP/XF write, including unchanged values
+#endif
 void executeCopy(uint32_t execReg);
 void markXfMemDirty();
 void dlCacheExternalStateChanged();

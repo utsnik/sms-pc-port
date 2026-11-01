@@ -608,6 +608,12 @@ static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused reg
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 static bool s_gpuDiag;  // SD marker "perfdiag": GPU timestamps and command-stream counters
 static bool s_uniblock; // SD marker "uniblock": generated shaders use uniform blocks
+static bool s_fastState, s_fastLive, s_fastStateCheck;
+static uint64_t s_rendererGeneration;
+static uint32_t s_fsReuse, s_fsMiss, s_flReuse, s_fsCheckMismatch;
+void rendererStateWritten() {
+    if (s_fastState) ++s_rendererGeneration;
+}
 static bool s_shaderModeBlock;
 static bool s_tevFold;  // SD marker "tevfold": fold stable TEV inputs into generated code
 static constexpr uint32_t kTevFoldVariantCap = 8;
@@ -744,6 +750,7 @@ static void bindPixelTexture(GX2Texture* texture, GX2Sampler* sampler, uint32_t 
 }
 
 static void invalidateVertexUniforms() {
+    rendererStateWritten();
     for (BoundPixelTexture& b : s_boundPixelTex) b.valid = false;
     s_tevPixelValid = s_vtxLiveValid = s_stateValid = false;
     s_boundFetch = s_boundVertex = s_boundPixel = nullptr;
@@ -1230,6 +1237,7 @@ static void* uniformBlockCopy(UniformRingBlock block, const void* data, uint32_t
 
 static void setGeneratedShaderMode(bool block) {
     if (!s_uniblock || s_shaderModeBlock == block) return;
+    rendererStateWritten();
     GX2SetShaderModeEx(block ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER,
                        64, 64, 0, 0, 184, 192);
     s_shaderModeBlock = block;
@@ -4329,6 +4337,7 @@ static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     ++s_perfCopies;
     ++s_copyGeneration;
+    rendererStateWritten();
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return;
     const uint32_t tx = uint32_t(s_gameOffsetX + float(x) * s_gameScaleX), ty = uint32_t(float(y) * s_gameScaleY);
@@ -4597,6 +4606,7 @@ static bool textiledTexture(TextureEntry& e) {
         GX2InitTextureRegs(&tiled);
         e.textiledLinear = e.texture;
         e.texture = tiled;
+        rendererStateWritten();
         e.textiledPending = true;
         if (!gx2prod::enqueueService(textiledTextureService, &e)) {
             MEMFreeToDefaultHeap(e.texture.surface.image);
@@ -4705,6 +4715,7 @@ static TextureEntry* getTexture(int map) {
                         deferFree(e.texture.surface.image);
                         deferFree(e.texture.surface.mipmaps);
                         e.valid = false;
+                        rendererStateWritten();
                         continue;
                     }
                     e.dataHash = dataHash;
@@ -4724,6 +4735,7 @@ static TextureEntry* getTexture(int map) {
         }
     }
     SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
+    rendererStateWritten();
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
     e.next = first;
@@ -4906,6 +4918,7 @@ static void packEvict(TextureEntry& e) {
     deferFree(e.texture.surface.image);
     deferFree(e.texture.surface.mipmaps);
     e.texture = e.packFallback;
+    rendererStateWritten();
     std::memset(&e.packFallback, 0, sizeof e.packFallback);
     e.packState = 2;
     e.packResidentBytes = 0;
@@ -4998,6 +5011,7 @@ static void packInstall(TextureEntry& e) {
     }
     e.packFallback = e.texture;
     e.texture = e.packTiled; std::memset(&e.packTiled, 0, sizeof e.packTiled);
+    rendererStateWritten();
     deferFree(e.packLinear.surface.image); deferFree(e.packLinear.surface.mipmaps);
     std::memset(&e.packLinear, 0, sizeof e.packLinear);
     e.packResidentBytes = bytes; e.packStagingBytes = 0; e.packState = 3;
@@ -5588,49 +5602,49 @@ static TextureEntry* textureForCoord(const TevKey& key, TextureEntry* const* tex
     return nullptr;
 }
 
-static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textures) {
-    memset(s_vtxLive, 0, sizeof(s_vtxLive));
+static void buildVertexLiveUniforms(const TevKey& key, TextureEntry* const* textures, float* live) {
+    memset(live, 0, sizeof(s_vtxLive));
     const float* proj = reinterpret_cast<const float*>(&g.xfReg[XFR_PROJ]);
     const float* xfViewport = reinterpret_cast<const float*>(&g.xfReg[XFR_VIEWPORT]);
-    memcpy(&s_vtxLive[0], proj, 6 * sizeof(float));
-    s_vtxLive[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
-    memcpy(&s_vtxLive[8], g.viewport, 4 * sizeof(float));
+    memcpy(&live[0], proj, 6 * sizeof(float));
+    live[6] = float(g.xfReg[XFR_PROJ + 6] & 1);
+    memcpy(&live[8], g.viewport, 4 * sizeof(float));
     // C187 is the viewport mapping block consumed by the generated vertex
     // program: X/Y scales, X offset and TV width. C188.z is the TV height.
     // Do not leave the XF viewport's depth pair in front of it; that made the
     // generated path use z-offset/scale as its 2D scale and sent every vertex
     // offscreen.
-    s_vtxLive[12] = s_gameScaleX;
-    s_vtxLive[13] = s_gameScaleY;
-    s_vtxLive[14] = s_gameOffsetX;
-    s_vtxLive[15] = s_tvW;
+    live[12] = s_gameScaleX;
+    live[13] = s_gameScaleY;
+    live[14] = s_gameOffsetX;
+    live[15] = s_tvW;
     // C188.xy are depth scale/offset, already divided by the XF 24-bit
     // depth range.  This keeps the live block self-contained without
     // spending a constant register on 1 / 16777215.  The generated shader
     // evaluates C188.x * z + C188.y * w, matching transformPosition.
-    s_vtxLive[16] = xfViewport[2] / 16777215.0f;
-    s_vtxLive[17] = xfViewport[5] / 16777215.0f;
-    s_vtxLive[18] = s_tvH;
+    live[16] = xfViewport[2] / 16777215.0f;
+    live[17] = xfViewport[5] / 16777215.0f;
+    live[18] = s_tvH;
     auto colour = [](uint32_t value, float* out) {
         out[0] = float((value >> 24) & 255) / 255.0f;
         out[1] = float((value >> 16) & 255) / 255.0f;
         out[2] = float((value >> 8) & 255) / 255.0f;
         out[3] = float(value & 255) / 255.0f;
     };
-    colour(g.xfReg[XFR_MAT0 + 0], &s_vtxLive[20]);
-    colour(g.xfReg[XFR_AMB0 + 0], &s_vtxLive[24]);
-    colour(g.xfReg[XFR_MAT0 + 1], &s_vtxLive[28]);
-    colour(g.xfReg[XFR_AMB0 + 1], &s_vtxLive[32]);
+    colour(g.xfReg[XFR_MAT0 + 0], &live[20]);
+    colour(g.xfReg[XFR_AMB0 + 0], &live[24]);
+    colour(g.xfReg[XFR_MAT0 + 1], &live[28]);
+    colour(g.xfReg[XFR_AMB0 + 1], &live[32]);
     // C193..C196: manual scale followed by the copy rectangle transform.
     for (int coord = 0; coord < 8; ++coord) {
-        float* scale = &s_vtxLive[36 + coord * 2];
+        float* scale = &live[36 + coord * 2];
         scale[0] = scale[1] = 1.0f;
         TextureEntry* texture = textureForCoord(key, textures, coord);
         if (g.tcManual[coord] && texture && texture->width && texture->height) {
             scale[0] = float((g.bp[BP_SU_SSIZE + coord * 2] & 0xffff) + 1) / float(texture->width);
             scale[1] = float((g.bp[BP_SU_SSIZE + coord * 2 + 1] & 0xffff) + 1) / float(texture->height);
         }
-        float* copy = &s_vtxLive[52 + coord * 4];
+        float* copy = &live[52 + coord * 4];
         copy[0] = copy[1] = 1.0f;
         copy[2] = copy[3] = 0.0f;
         const CopyEntry* entry = copyEntryForTexture(texture);
@@ -5641,6 +5655,71 @@ static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textu
             copy[3] = float(entry->sourceY) / s_tvH;
         }
     }
+}
+
+// Explicit input bytes are folded into one compact signature. Keep this beside
+// the packer so each new read in buildVertexLiveUniforms has an input here.
+struct VertexLiveInputs {
+    uint32_t projection[7], depth[2], material[2], ambient[2];
+    float viewport[4], render[5];
+    uint32_t manual[8], size[16], copyGeneration, uniformMode;
+    uint32_t stages, genmode, order[16], iref;
+    struct Texture {
+        const TextureEntry* entry;
+        uint32_t width, height, copyRect[4];
+    } textures[8];
+};
+static VertexLiveInputs vertexLiveInputs(const TevKey& key, TextureEntry* const* textures) {
+    VertexLiveInputs in;
+    memset(&in, 0, sizeof(in));
+    memcpy(in.projection, &g.xfReg[XFR_PROJ], sizeof(in.projection));
+    in.depth[0] = g.xfReg[XFR_VIEWPORT + 2];
+    in.depth[1] = g.xfReg[XFR_VIEWPORT + 5];
+    memcpy(in.viewport, g.viewport, sizeof(in.viewport));
+    memcpy(in.material, &g.xfReg[XFR_MAT0], sizeof(in.material));
+    memcpy(in.ambient, &g.xfReg[XFR_AMB0], sizeof(in.ambient));
+    in.render[0] = s_gameScaleX; in.render[1] = s_gameScaleY;
+    in.render[2] = s_gameOffsetX; in.render[3] = s_tvW; in.render[4] = s_tvH;
+    in.copyGeneration = s_copyGeneration;
+    in.uniformMode = s_uniblock;
+    in.stages = key.stages; in.genmode = key.genmode; in.iref = key.iref;
+    memcpy(in.order, key.order, sizeof(in.order));
+    for (int i = 0; i < 8; ++i) {
+        in.manual[i] = g.tcManual[i];
+        in.size[i * 2] = g.bp[BP_SU_SSIZE + i * 2];
+        in.size[i * 2 + 1] = g.bp[BP_SU_SSIZE + i * 2 + 1];
+        auto& tex = in.textures[i];
+        tex.entry = textures[i];
+        if (!textures[i]) continue;
+        tex.width = textures[i]->width; tex.height = textures[i]->height;
+        if (const CopyEntry* copy = copyEntryForTexture(textures[i])) {
+            tex.copyRect[0] = copy->sourceX; tex.copyRect[1] = copy->sourceY;
+            tex.copyRect[2] = copy->sourceW; tex.copyRect[3] = copy->sourceH;
+        }
+    }
+    return in;
+}
+
+static void packVertexLiveUniforms(const TevKey& key, TextureEntry* const* textures) {
+    static uint64_t previous;
+    static bool haveInputs;
+    VertexLiveInputs inputs;
+    if (s_fastLive) {
+        inputs = vertexLiveInputs(key, textures);
+        const uint64_t signature = xxh64(&inputs, sizeof(inputs), 0x564c495645ull);
+        if (haveInputs && s_vtxLiveValid && signature == previous) {
+            ++s_flReuse;
+            if (s_fastStateCheck) {
+                float slow[kVtxLiveRegs * 4];
+                buildVertexLiveUniforms(key, textures, slow);
+                if (memcmp(slow, s_vtxLive, sizeof(s_vtxLive))) ++s_fsCheckMismatch;
+            }
+            return;
+        }
+        previous = signature;
+        haveInputs = true;
+    }
+    buildVertexLiveUniforms(key, textures, s_vtxLive);
     static float s_vtxLiveShadow[sizeof(s_vtxLive) / sizeof(float)];
     if (s_vtxLiveValid && !memcmp(s_vtxLive, s_vtxLiveShadow, sizeof(s_vtxLiveShadow))) return;
     memcpy(s_vtxLiveShadow, s_vtxLive, sizeof(s_vtxLiveShadow));
@@ -5923,6 +6002,12 @@ void rendererInit(float) {
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_uniblock = sdMarkerPresent("uniblock");
+    s_fastState = sdMarkerPresent("faststate");
+    s_fastLive = sdMarkerPresent("fastlive");
+    s_fastStateCheck = sdMarkerPresent("faststatecheck");
+    WHBLogPrintf("[faststate] marker=%s fastlive=%s check=%s",
+                 s_fastState ? "on" : "off", s_fastLive ? "on" : "off",
+                 s_fastStateCheck ? "on" : "off");
     s_tevFold = sdMarkerPresent("tevfold");
     WHBLogPrintf("SMS Wii U: [tevfold] marker=%s cap=%u", s_tevFold ? "on" : "off",
                  unsigned(kTevFoldVariantCap));
@@ -5990,6 +6075,8 @@ void releaseGlThread() {}
 
 void onStateChange() {
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
+    // The flush may cache the old state: invalidate after it, before mutation.
+    rendererStateWritten();
 }
 
 PrimClass primClass(uint8_t op) {
@@ -6408,6 +6495,46 @@ struct PerfScope {
 #endif
 };
 
+// Texture resolution still runs on every draw. Cache only after comparing the
+// resolved descriptors, including in-place replacement and sampler changes.
+struct FastTextureDescriptor {
+    const TextureEntry* entry;
+    const void* image;
+    const void* mipmaps;
+    uint32_t width, height, compMap, format, tileMode, valid;
+    uint32_t textureRegs[5], samplerRegs[3];
+};
+static FastTextureDescriptor fastTextureDescriptor(const TextureEntry* texture) {
+    FastTextureDescriptor out;
+    memset(&out, 0, sizeof(out));
+    out.entry = texture;
+    if (texture) {
+        out.image = texture->texture.surface.image;
+        out.mipmaps = texture->texture.surface.mipmaps;
+        out.width = texture->width; out.height = texture->height;
+        out.compMap = texture->texture.compMap;
+        out.format = texture->texture.surface.format;
+        out.tileMode = texture->texture.surface.tileMode;
+        out.valid = texture->valid;
+        static_assert(sizeof(out.textureRegs) == sizeof(texture->texture.regs), "texture descriptor regs");
+        static_assert(sizeof(out.samplerRegs) == sizeof(texture->sampler.regs), "sampler descriptor regs");
+        memcpy(out.textureRegs, texture->texture.regs, sizeof(out.textureRegs));
+        memcpy(out.samplerRegs, texture->sampler.regs, sizeof(out.samplerRegs));
+    }
+    return out;
+}
+struct FastDrawState {
+    bool valid, vertexEligible;
+    uint64_t generation;
+    uint32_t copyGeneration, textureGeneration, uniformMode;
+    FastTextureDescriptor textures[9]; // eight TEV maps plus fixed fallback
+    TevKey tevKey;
+    VertexKey vertexKey;
+    TevShader* tevShader;
+    VertexProgram* vertex;
+};
+static FastDrawState s_fastDraw;
+
 static void prepareDrawState(const TevKey& tevKey, TevShader* tevShader, FixedShader& shader,
                              TextureEntry* const* tevTextures, TextureEntry* texture, VertexProgram* vertex,
                              bool gpuPath) {
@@ -6468,16 +6595,25 @@ void flushBatch() {
 #else
     OSTime perfTex0 = OSGetTime();
 #endif
-    const TevKey tevKey = currentTevKey();
+    const bool vertexEligible = s_gpuXfEnabled && g_displayFrames >= SMS_GX2_GPU_XF_DELAY;
+    const bool reuseKey = s_fastState && s_fastDraw.valid &&
+                      s_fastDraw.generation == s_rendererGeneration &&
+                      s_fastDraw.copyGeneration == s_copyGeneration &&
+                      s_fastDraw.textureGeneration == s_textureGeneration &&
+                      s_fastDraw.uniformMode == uint32_t(s_uniblock) &&
+                      s_fastDraw.vertexEligible == vertexEligible;
+    bool reuseState = reuseKey;
+    TevKey tevKey = reuseState ? s_fastDraw.tevKey : currentTevKey();
     const bool textured = tevTextureMask(tevKey) != 0;
     TextureEntry* tevTextures[8] = {};
     TevShader* tevShader = nullptr;
-    if (tevSupported(tevKey)) {
+    const bool supported = tevSupported(tevKey);
+    bool allTextures = true;
+    if (supported) {
         const uint32_t mask = tevTextureMask(tevKey);
         // One lookup per map: the cache is a deque that only grows by
         // push_back, so an entry's address survives later insertions (the
         // old warm-up pass resolved every map twice).
-        bool allTextures = true;
         for (int map = 0; map < 8; ++map) {
             if (!(mask & (1u << map))) continue;
             tevTextures[map] = getTexture(map);
@@ -6487,16 +6623,31 @@ void flushBatch() {
         // colour-only geometry. Keep the generated TEV path for every draw
         // that actually samples a texture; no-texture draws still use the
         // CPU TEV evaluator when they are priming a generated fixed program.
-        if (allTextures && (mask || SMS_GX2_TEV_UNTEXTURED)) tevShader = tevShaderForKey(tevKey);
     }
+    int coord = 0, map = 0;
+    TextureEntry* texture = nullptr;
+    FastTextureDescriptor descriptors[9];
+    if (s_fastState) {
+        texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
+        for (int i = 0; i < 8; ++i) descriptors[i] = fastTextureDescriptor(tevTextures[i]);
+        descriptors[8] = fastTextureDescriptor(texture);
+        reuseState = reuseState && s_fastDraw.generation == s_rendererGeneration &&
+                     !memcmp(descriptors, s_fastDraw.textures, sizeof(descriptors));
+        // Materialisation can advance the generation after the tentative key
+        // reuse. A descriptor miss takes the complete slow key/lookup path.
+        if (reuseKey && !reuseState) tevKey = currentTevKey();
+    }
+    const bool wantTev = supported && allTextures && (tevTextureMask(tevKey) || SMS_GX2_TEV_UNTEXTURED);
+    if (wantTev)
+        tevShader = reuseState ? s_fastDraw.tevShader : tevShaderForKey(tevKey);
     const bool tevPath = tevShader != nullptr;
     if (SMS_GX2_DEBUG_DUMP && !tevPath) {
         const uint32_t mask = tevTextureMask(tevKey);
         for (int debugMap = 0; debugMap < 8; ++debugMap)
             if (mask & (1u << debugMap)) tevTextures[debugMap] = getTexture(debugMap);
     }
-    int coord = 0, map = 0;
-    TextureEntry* texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
+    if (!s_fastState)
+        texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
     // samples a texture we could not load still draws through the stage-1
     // fallback (8 or 10 floats), while the TEV path uses 28 floats.
@@ -6509,12 +6660,35 @@ void flushBatch() {
     if (g_perfStages) s_stKey += stT - perfTex0;
     const bool useTex = !tevPath && textured && texture;
     FixedShader& shader = useTex ? s_modulate : s_untextured;
-    const VertexKey vertexKey = currentVertexKey(tevPath, coord, useTex);
+    const VertexKey vertexKey = reuseState ? s_fastDraw.vertexKey : currentVertexKey(tevPath, coord, useTex);
     // Fixed-path draws take their colour from the CPU TEV evaluator (and
     // their UVs from the manual/copy adjustments), which the generated
     // program does not reproduce, so only TEV draws move to the GPU.
-    VertexProgram* vertex = s_gpuXfEnabled && tevPath && g_displayFrames >= SMS_GX2_GPU_XF_DELAY
-                                ? vertexShaderForKey(vertexKey) : nullptr;
+    VertexProgram* vertex = reuseState ? s_fastDraw.vertex :
+                            (vertexEligible && tevPath ? vertexShaderForKey(vertexKey) : nullptr);
+    if (s_fastState) {
+        if (reuseState) {
+            ++s_fsReuse;
+            if (s_fastStateCheck) {
+                const TevKey slowTev = currentTevKey();
+                const VertexKey slowVertex = currentVertexKey(tevPath, coord, useTex);
+                if (memcmp(&slowTev, &tevKey, sizeof(tevKey)) ||
+                    memcmp(&slowVertex, &vertexKey, sizeof(vertexKey))) ++s_fsCheckMismatch;
+            }
+        } else {
+            ++s_fsMiss;
+            // Preserve retries after a transient pixel-program allocation failure.
+            s_fastDraw.valid = !wantTev || tevShader != nullptr;
+            s_fastDraw.generation = s_rendererGeneration;
+            s_fastDraw.copyGeneration = s_copyGeneration;
+            s_fastDraw.textureGeneration = s_textureGeneration;
+            s_fastDraw.uniformMode = s_uniblock;
+            s_fastDraw.vertexEligible = vertexEligible;
+            memcpy(s_fastDraw.textures, descriptors, sizeof(descriptors));
+            s_fastDraw.tevKey = tevKey; s_fastDraw.vertexKey = vertexKey;
+            s_fastDraw.tevShader = tevShader; s_fastDraw.vertex = vertex;
+        }
+    }
     // Let the CPU reference present one complete draw before Cemu/Cafe first
     // compiles a new generated pipeline.  Compilation is synchronous on Cemu;
     // without this priming draw the old render target remains black during
@@ -6851,6 +7025,7 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     ProducerResolvedCopy result = {};
     ++s_perfCopies;
     ++s_copyGeneration;
+    rendererStateWritten();
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return result;
     const uint32_t tx = uint32_t(s_gameOffsetX + float(x) * s_gameScaleX);
@@ -7105,6 +7280,7 @@ static void producerCopyService(void* opaque) {
 void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
     flushBatch();
+    rendererStateWritten();
 #ifdef __WIIU__
     if (s_gx2ProdEnabled) {
         // A copy is an ordered GPU boundary: finish the worker's list before
@@ -7193,6 +7369,7 @@ void executeCopy(uint32_t ctrl) {
 }
 void markXfMemDirty() {
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
+    rendererStateWritten();
     s_xfMemoryDirty = true;
 }
 // GXPeekARGB: the game reads the EFB back through the CPU. Sunshine's Mario
@@ -7473,9 +7650,9 @@ uint32_t peekZ(int x, int y) {
 void pixMetricClear() {}
 uint32_t pixMetricRead() { return 0; }
 
-void textureInvalidateAll() { ++s_textureGeneration; }
-void textureInvalidateRange(const void*, uint32_t) { ++s_textureGeneration; }
-void textureCpuWrote(const void*, uint32_t) { ++s_textureGeneration; }
+void textureInvalidateAll() { ++s_textureGeneration; rendererStateWritten(); }
+void textureInvalidateRange(const void*, uint32_t) { ++s_textureGeneration; rendererStateWritten(); }
+void textureCpuWrote(const void*, uint32_t) { ++s_textureGeneration; rendererStateWritten(); }
 
 void* physToPtr(uint32_t);
 uint32_t ptrToPhys(const void*);
@@ -7710,9 +7887,11 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         }
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;
-            WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u",
+            WHBLogPrintf("SMS Wii U: [stages] per-frame x0.1ms flush=%u key=%u vkey=%u state=%u shader=%u xfu=%u submit=%u dl=%u fsReuse=%u fsMiss=%u flReuse=%u fsCheckMismatch=%u",
                          ms(s_perfFlush), ms(s_stKey), ms(s_stVkey), ms(s_stState), ms(s_stShader), ms(s_stXfu),
-                         ms(s_perfFlush > staged ? s_perfFlush - staged : 0), ms(OSTime(g_dlTicks)));
+                         ms(s_perfFlush > staged ? s_perfFlush - staged : 0), ms(OSTime(g_dlTicks)),
+                         unsigned(s_fsReuse), unsigned(s_fsMiss), unsigned(s_flReuse), unsigned(s_fsCheckMismatch));
+            s_fsReuse = s_fsMiss = s_flReuse = s_fsCheckMismatch = 0;
             s_stKey = s_stVkey = s_stState = s_stShader = s_stXfu = 0;
             g_dlTicks = 0;
         }

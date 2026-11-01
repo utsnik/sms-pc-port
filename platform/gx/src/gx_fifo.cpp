@@ -442,6 +442,9 @@ void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words) {
 }
 
 void writeBP(uint32_t value) {
+#ifdef __WIIU__
+    rendererStateWritten();
+#endif
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
     if (reg == BP_MASK) {
@@ -565,6 +568,9 @@ void writeCP(uint8_t reg, uint32_t value) {
 
 void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
     for (uint32_t i = 0; i < count; i++, addr++) {
+#ifdef __WIIU__
+        rendererStateWritten();
+#endif
         uint32_t v = words[i];
         if (addr < XF_MEM_WORDS) {
             if (g.xfMem[addr] != v) {
