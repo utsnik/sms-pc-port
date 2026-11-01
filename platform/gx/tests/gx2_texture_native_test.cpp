@@ -63,6 +63,45 @@ int main() {
             return 1;
         }
     }
+
+    // R8 and R8G8 must reproduce the fallback decoder's component mapping,
+    // not merely its colour channels: I8's intensity is also alpha, while
+    // IA8 stores intensity then alpha in the GameCube big-endian word.
+    const std::array<uint8_t, 32> i8 = {
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+        0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80,
+        0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x01,
+    };
+    std::array<uint8_t, 8 * 4 * 4> i8Rgba{};
+    gx::gx2DecodeTexture(i8.data(), 1, 8, 4, nullptr, 0, i8Rgba.data());
+    std::array<uint8_t, 8 * 4> i8Native{};
+    gx::gx2ConvertTextureNative(i8.data(), 1, 8, 4, i8Native.data());
+    for (size_t p = 0; p < i8Native.size(); ++p)
+        for (int c = 0; c != 4; ++c)
+            if (i8Native[p] != i8Rgba[p * 4 + c]) {
+                std::cerr << "gx2_texture_native_test: I8 alpha/component mismatch\n";
+                return 1;
+            }
+
+    const std::array<uint8_t, 32> ia8 = {
+        0x00, 0x10, 0x20, 0x21, 0x40, 0x32, 0x60, 0x43,
+        0x80, 0x54, 0xa0, 0x65, 0xc0, 0x76, 0xe0, 0x87,
+        0xff, 0x98, 0x12, 0xa9, 0x34, 0xba, 0x56, 0xcb,
+        0x78, 0xdc, 0x9a, 0xed, 0xbc, 0xfe, 0xde, 0x0f,
+    };
+    std::array<uint8_t, 4 * 4 * 4> ia8Rgba{};
+    gx::gx2DecodeTexture(ia8.data(), 3, 4, 4, nullptr, 0, ia8Rgba.data());
+    std::array<uint8_t, 4 * 4 * 2> ia8Native{};
+    gx::gx2ConvertTextureNative(ia8.data(), 3, 4, 4, ia8Native.data());
+    for (size_t p = 0; p < ia8Native.size() / 2; ++p) {
+        const uint8_t* expected = ia8Rgba.data() + p * 4;
+        if (ia8Native[p * 2] != expected[0] || ia8Native[p * 2 + 1] != expected[3] ||
+            expected[0] != expected[1] || expected[0] != expected[2]) {
+            std::cerr << "gx2_texture_native_test: IA8 alpha/component mismatch\n";
+            return 1;
+        }
+    }
     std::cout << "gx2_texture_native_test: PASS\n";
     return 0;
 }

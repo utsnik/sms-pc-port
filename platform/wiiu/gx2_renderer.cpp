@@ -4549,6 +4549,13 @@ static void textiledTextureService(void* opaque) {
 }
 
 static bool textiledTexture(TextureEntry& e) {
+    // Native-format uploads are already in the GX2 format's compact linear
+    // layout (R8/R8G8/R5G6B5 or BC1).  GX2CopySurface cannot preserve the
+    // GameCube-to-GX2 block/texel mapping for these formats on hardware: the
+    // resulting DEFAULT-tiled surface samples as zero.  Keep them linear;
+    // this also avoids repeating the expensive format-specific staging copy
+    // when the source is invalidated by the producer.
+    if (s_texNative && gx2NativeTextureFormat(e.fmt)) return false;
     if ((!s_retileTextures && !s_textiledMarker) ||
         (!s_textiledMarker && runningUnderCemu())) return false;
     if (s_gx2ProdEnabled && OSGetCoreId() != 1) {
