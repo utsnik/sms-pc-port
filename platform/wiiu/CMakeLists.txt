@@ -141,6 +141,7 @@ set_source_files_properties(${SMS_DECOMP_PCH_SOURCES} PROPERTIES
 add_executable(sms
   ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/runtime.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/pauseguard.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/os_core.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/os_thread.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/dvd.cpp

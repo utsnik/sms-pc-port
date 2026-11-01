@@ -5,21 +5,23 @@ ORACLE := $(BUILD_DIR)/latte_vs_oracle_test
 SCISSOR := $(BUILD_DIR)/widescreen_scissor_test
 REMOTE := $(BUILD_DIR)/remote_pad_mapping_test
 TEXTURE := $(BUILD_DIR)/texture_decode_test
+PAUSEGUARD := $(BUILD_DIR)/pauseguard_range_test
 # No FMA contraction: the oracle compares against unfused Latte arithmetic.
 CXXFLAGS ?= -std=c++11 -Wall -Wextra -Werror -O2 -ffp-contract=off
 
 .PHONY: check check-sanitize clean
 
-check: $(TEST) $(ORACLE) $(SCISSOR) $(REMOTE) $(TEXTURE)
+check: $(TEST) $(ORACLE) $(SCISSOR) $(REMOTE) $(TEXTURE) $(PAUSEGUARD)
 	$(TEST)
 	$(ORACLE)
 	$(SCISSOR)
 	$(REMOTE)
 	$(TEXTURE)
+	$(PAUSEGUARD)
 
 check-sanitize:
 	$(MAKE) CXXFLAGS="$(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer" \
-		TEST=$(BUILD_DIR)/grass_gpu_math_test-san ORACLE=$(BUILD_DIR)/latte_vs_oracle_test-san SCISSOR=$(BUILD_DIR)/widescreen_scissor_test-san REMOTE=$(BUILD_DIR)/remote_pad_mapping_test-san TEXTURE=$(BUILD_DIR)/texture_decode_test-san check
+		TEST=$(BUILD_DIR)/grass_gpu_math_test-san ORACLE=$(BUILD_DIR)/latte_vs_oracle_test-san SCISSOR=$(BUILD_DIR)/widescreen_scissor_test-san REMOTE=$(BUILD_DIR)/remote_pad_mapping_test-san TEXTURE=$(BUILD_DIR)/texture_decode_test-san PAUSEGUARD=$(BUILD_DIR)/pauseguard_range_test-san check
 
 $(TEST): grass_gpu_math_test.cpp ../grass_math.h ../gx2_vertex_program.h ../gx2_shader_inl.h
 	mkdir -p $(BUILD_DIR)
@@ -42,5 +44,9 @@ $(TEXTURE): texture_decode_test.cpp ../gx2_texture.cpp ../../gx/src/gx_texture_p
 	mkdir -p $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) -I.. $< ../gx2_texture.cpp -o $@
 
+$(PAUSEGUARD): pauseguard_range_test.cpp ../pauseguard_range.h
+	mkdir -p $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) -I.. $< -o $@
+
 clean:
-	rm -f $(TEST) $(ORACLE) $(SCISSOR) $(REMOTE) $(TEXTURE) $(BUILD_DIR)/grass_gpu_math_test-san $(BUILD_DIR)/latte_vs_oracle_test-san $(BUILD_DIR)/widescreen_scissor_test-san $(BUILD_DIR)/remote_pad_mapping_test-san $(BUILD_DIR)/texture_decode_test-san
+	rm -f $(TEST) $(ORACLE) $(SCISSOR) $(REMOTE) $(TEXTURE) $(PAUSEGUARD) $(BUILD_DIR)/grass_gpu_math_test-san $(BUILD_DIR)/latte_vs_oracle_test-san $(BUILD_DIR)/widescreen_scissor_test-san $(BUILD_DIR)/remote_pad_mapping_test-san $(BUILD_DIR)/texture_decode_test-san $(BUILD_DIR)/pauseguard_range_test-san

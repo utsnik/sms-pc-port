@@ -1,4 +1,5 @@
 #include "runtime.h"
+#include "pauseguard.h"
 #include "remote_pad_mapping.h"
 
 #include <dolphin/pad.h>
@@ -527,6 +528,13 @@ void sms_wiiu_input_poll(void)
 		if (s_status[chan].err == PAD_ERR_NONE)
 			connected |= 1u << chan;
 		log_error_transition(chan, s_status[chan].err);
+	}
+	if (sms_wiiu_pauseguard_enabled()) {
+		static u16 previous;
+		const u16 current = s_status[0].button;
+		if ((current & PAD_BUTTON_START) && !(previous & PAD_BUTTON_START))
+			sms_wiiu_pauseguard_start();
+		previous = current;
 	}
 	if (connected != s_connected_mask)
 		port_log("[pad] connected-channel-mask=0x%x\n", connected);

@@ -6,6 +6,7 @@
 #include "sms_gx/gx_pc.h"
 #ifdef __WIIU__
 #include "../../wiiu/gx2_producer_worker.h"
+#include "../../wiiu/pauseguard.h"
 #endif
 
 #include <dolphin/gx.h>
@@ -1347,6 +1348,21 @@ void GXSetCopyFilter(GXBool aa, const u8 pattern[12][2], GXBool vf, const u8 vfi
 void GXSetDispCopyGamma(GXGamma gamma) { s_dispCtrl = setField(s_dispCtrl, 2, 7, gamma); }
 
 static void doCopy(void* dest, GXBool clear, bool disp) {
+#ifdef __WIIU__
+    if (sms_wiiu_pauseguard_enabled()) {
+        const uint32_t encodedSize = disp ? s_dispSize : s_texSize;
+        const uint32_t rows = getField(encodedSize, 10, 10) + 1;
+        const uint32_t stride = (disp ? s_dispStride : s_texStride) * 32;
+        const uint64_t bytes64 = uint64_t(stride) * rows;
+        const uint32_t bytes = bytes64 > 0xffffffffu ? 0xffffffffu : uint32_t(bytes64);
+        if (!sms_wiiu_pauseguard_check_range(disp ? "EFB display copy dst" : "EFB texture copy dst",
+                                             dest, bytes,
+                                             reinterpret_cast<uintptr_t>(__builtin_return_address(0))))
+            return;
+        sms_wiiu_pauseguard_trace("EFB-copy", dest, bytes, nullptr, 0, nullptr, 0, nullptr, 0,
+                                  reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    }
+#endif
     apiBP(BP_COPY_SRC_TL, disp ? s_dispSrc : s_texSrc);
     apiBP(BP_COPY_SRC_WH, disp ? s_dispSize : s_texSize);
     apiBP(BP_COPY_STRIDE, disp ? s_dispStride : s_texStride);
@@ -1504,6 +1520,12 @@ void* GXGetTexObjUserData(const GXTexObj* obj) { return reinterpret_cast<const T
 
 void GXLoadTexObjPreLoaded(GXTexObj* obj, GXTexRegion*, GXTexMapID id) {
     const TexObjInt* t = reinterpret_cast<const TexObjInt*>(obj);
+#ifdef __WIIU__
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_range("GX texture image", t->image, 1,
+                                         reinterpret_cast<uintptr_t>(__builtin_return_address(0))))
+        return;
+#endif
     int map = int(id) & 7;
     apiBP(bpTexReg(BP_TX_MODE0, map), t->mode0);
     apiBP(bpTexReg(BP_TX_MODE1, map), t->mode1);
@@ -1537,13 +1559,19 @@ void GXLoadTlut(GXTlutObj* obj, u32 name) {
     const TlutRegionInt* r = reinterpret_cast<const TlutRegionInt*>(reg);
     uint32_t idx = uint32_t(reg - s_tlutRegions);
     if (idx < 20) s_tlutLoaded[idx] = *t;
+    uint32_t bytes = uint32_t(t->entries) * 2;
+#ifdef __WIIU__
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_range("GX TLUT source", t->data, bytes,
+                                         reinterpret_cast<uintptr_t>(__builtin_return_address(0))))
+        return;
+#endif
     if (s_recording) {
         apiBP(BP_LOADTLUT0, ptrToPhys(t->data) >> 5);
         apiBP(BP_LOADTLUT1, ((r->tmemAddr - TMEM_TLUT_BASE) >> 9) | uint32_t((t->entries + 15) / 16) << 10);
         return;
     }
     uint32_t off = r->tmemAddr - TMEM_TLUT_BASE;
-    uint32_t bytes = uint32_t(t->entries) * 2;
     if (off + bytes > TMEM_TLUT_SIZE) bytes = TMEM_TLUT_SIZE - off;
 #ifdef __WIIU__
     if (hostState()) {

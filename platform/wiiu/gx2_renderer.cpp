@@ -1,5 +1,6 @@
 #include "port_heap.h"
 #include "runtime.h"
+#include "pauseguard.h"
 #include "gx2_producer_worker.h"
 #include <cstdio>
 #ifndef SMS_GX2_ASYNC_PEEK
@@ -671,6 +672,10 @@ enum GrassStreamKind : uint8_t {
     kGrassDraw = 2,
 };
 
+template <typename Mode>
+static void pauseguardInvalidate(Mode mode, const void* ptr, uint32_t size,
+                                 uintptr_t caller);
+
 static uint32_t grassFloatBits(float value) {
     uint32_t result;
     memcpy(&result, &value, sizeof result);
@@ -789,8 +794,10 @@ static void grassRegisterConsumer(uint32_t id, uint32_t count,
         grassRefuse(result, "grass publication list");
         return;
     }
-    GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, result.nearBuffer, result.bytes);
-    GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, result.farBuffer, result.bytes);
+    pauseguardInvalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, result.nearBuffer, result.bytes,
+                         reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    pauseguardInvalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, result.farBuffer, result.bytes,
+                         reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     result.uploaded = true;
     ++s_grassStaticUploads;
     s_grassStaticUploadBytes += 2 * result.bytes;
@@ -1087,9 +1094,79 @@ static constexpr uint32_t kGx2DlMaxDraws = 48;
 enum { kDlSplitCopy, kDlSplitClear, kDlSplitContext, kDlSplitFrame };
 static void gx2DlClose();
 static void gx2DlSplit(int reason);
-#define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurface(__VA_ARGS__))
-#define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopySurfaceEx(__VA_ARGS__))
-#define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), ::GX2CopyColorBufferToScanBuffer(__VA_ARGS__))
+
+template <typename Mode>
+static void pauseguardInvalidate(Mode mode, const void* ptr, uint32_t size,
+                                 uintptr_t caller)
+{
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_range("GX2Invalidate", ptr, size, caller))
+        return;
+    sms_wiiu_pauseguard_trace("invalidate", ptr, size, nullptr, 0, nullptr, 0, nullptr, 0, caller);
+    ::GX2Invalidate(mode, const_cast<void*>(ptr), size);
+}
+
+static bool pauseguardSurface(const char* op, const GX2Surface* surface, uintptr_t caller)
+{
+    if (!surface)
+        return sms_wiiu_pauseguard_check_range(op, nullptr, 1, caller) != 0;
+    return sms_wiiu_pauseguard_check_surface(op, surface->image, surface->imageSize,
+                                             surface->mipmaps, surface->mipmapSize, caller);
+}
+
+static void pauseguardCopySurface(GX2Surface* source, uint32_t sourceLevel, uint32_t sourceSlice,
+                                  GX2Surface* target, uint32_t targetLevel, uint32_t targetSlice)
+{
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    if (sms_wiiu_pauseguard_enabled() &&
+        (!pauseguardSurface("GX2CopySurface source", source, caller) ||
+         !pauseguardSurface("GX2CopySurface target", target, caller)))
+        return;
+    sms_wiiu_pauseguard_trace("copy", source ? source->image : nullptr,
+                              source ? source->imageSize : 0, target ? target->image : nullptr,
+                              target ? target->imageSize : 0, source ? source->mipmaps : nullptr,
+                              source ? source->mipmapSize : 0, target ? target->mipmaps : nullptr,
+                              target ? target->mipmapSize : 0, caller);
+    ::GX2CopySurface(source, sourceLevel, sourceSlice, target, targetLevel, targetSlice);
+}
+
+static void pauseguardCopySurfaceEx(GX2Surface* source, uint32_t sourceLevel, uint32_t sourceSlice,
+                                    GX2Surface* target, uint32_t targetLevel, uint32_t targetSlice,
+                                    uint32_t flags, GX2Rect* sourceRect,
+                                    GX2Point* targetPoint)
+{
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    if (sms_wiiu_pauseguard_enabled() &&
+        (!pauseguardSurface("GX2CopySurfaceEx source", source, caller) ||
+         !pauseguardSurface("GX2CopySurfaceEx target", target, caller)))
+        return;
+    sms_wiiu_pauseguard_trace("copyex", source ? source->image : nullptr,
+                              source ? source->imageSize : 0, target ? target->image : nullptr,
+                              target ? target->imageSize : 0, source ? source->mipmaps : nullptr,
+                              source ? source->mipmapSize : 0, target ? target->mipmaps : nullptr,
+                              target ? target->mipmapSize : 0, caller);
+    ::GX2CopySurfaceEx(source, sourceLevel, sourceSlice, target, targetLevel, targetSlice,
+                       flags, sourceRect, targetPoint);
+}
+
+static void pauseguardCopyColorBufferToScanBuffer(GX2ColorBuffer* source, GX2ScanTarget target)
+{
+    const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    const GX2Surface* surface = source ? &source->surface : nullptr;
+    if (sms_wiiu_pauseguard_enabled() &&
+        (!surface ? !sms_wiiu_pauseguard_check_range("CopyColorBuffer source", nullptr, 1, caller) :
+         !sms_wiiu_pauseguard_check_scan(uint32_t(target), surface->image, surface->imageSize, caller)))
+        return;
+    sms_wiiu_pauseguard_trace("present", surface ? surface->image : nullptr,
+                              surface ? surface->imageSize : 0, nullptr, 0, nullptr, 0, nullptr, 0,
+                              caller);
+    ::GX2CopyColorBufferToScanBuffer(source, target);
+}
+
+#define GX2Invalidate(...) pauseguardInvalidate(__VA_ARGS__, reinterpret_cast<uintptr_t>(__builtin_return_address(0)))
+#define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), pauseguardCopySurface(__VA_ARGS__))
+#define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), pauseguardCopySurfaceEx(__VA_ARGS__))
+#define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), pauseguardCopyColorBufferToScanBuffer(__VA_ARGS__))
 #define GX2ClearColor(...) (gx2DlSplit(kDlSplitClear), ::GX2ClearColor(__VA_ARGS__))
 #define GX2ClearDepthStencilEx(...) (gx2DlSplit(kDlSplitClear), ::GX2ClearDepthStencilEx(__VA_ARGS__))
 #define GX2SetContextState(...) (gx2DlSplit(kDlSplitContext), ::GX2SetContextState(__VA_ARGS__))
@@ -2105,6 +2182,9 @@ static VertexProgram* vertexShaderForKey(const VertexKey& key) {
                  (unsigned)key.numChans, (unsigned)key.colorCtrl[0], (unsigned)key.colorCtrl[1],
                  (unsigned)key.texgen[0], (unsigned)key.texgen[1], (unsigned)key.texgen[2], (unsigned)key.texgen[3],
                  (unsigned)key.dualTex);
+    sms_wiiu_pauseguard_trace("shader-key", &key, sizeof(key), shader->vertex.program,
+                              shader->vertex.size, shader->fetch.program, shader->fetch.size,
+                              nullptr, 0, reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     return shader;
 }
 
@@ -2955,6 +3035,9 @@ static TevShader* tevShaderForKey(const TevKey& key) {
     WHBLogPrintf("SMS Wii U: generated TEV pixel shader stages=%u tex=%02x gprs=%u groups=%u bytes=%u cache=%u",
                  (unsigned)key.stages, (unsigned)shader->textureMask, (unsigned)s_ra.count,
                  (unsigned)s_tevGroups, (unsigned)shader->pixel.size, (unsigned)s_tevShaders.size());
+    sms_wiiu_pauseguard_trace("shader-key", &key, sizeof(key), shader->psProgram,
+                              shader->pixel.size, nullptr, 0, nullptr, 0,
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     return shader;
 }
 
@@ -3480,6 +3563,19 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         GX2CalcSurfaceSizeAndAlignment(&t.texture.surface);
         t.texture.surface.image = alignedZero(t.texture.surface.alignment, t.texture.surface.imageSize);
         if (!t.texture.surface.image) return;
+        if (sms_wiiu_pauseguard_enabled() &&
+            !sms_wiiu_pauseguard_check_surface("EFB texture create", t.texture.surface.image,
+                                               t.texture.surface.imageSize, t.texture.surface.mipmaps,
+                                               t.texture.surface.mipmapSize,
+                                               reinterpret_cast<uintptr_t>(__builtin_return_address(0)))) {
+            MEMFreeToDefaultHeap(t.texture.surface.image);
+            t.texture.surface.image = nullptr;
+            return;
+        }
+        sms_wiiu_pauseguard_trace("texture-create", dest, 0, t.texture.surface.image,
+                                  t.texture.surface.imageSize, t.texture.surface.mipmaps,
+                                  t.texture.surface.mipmapSize, nullptr, 0,
+                                  reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
         // The zero fill must not be written back over the GPU's copy later.
         DCFlushRange(t.texture.surface.image, t.texture.surface.imageSize);
         GX2InitTextureRegs(&t.texture);
@@ -3625,6 +3721,19 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
         t.texture.surface.image = alignedZero(t.texture.surface.alignment,
                                               t.texture.surface.imageSize);
         if (!t.texture.surface.image) return result;
+        if (sms_wiiu_pauseguard_enabled() &&
+            !sms_wiiu_pauseguard_check_surface("EFB texture create", t.texture.surface.image,
+                                               t.texture.surface.imageSize, t.texture.surface.mipmaps,
+                                               t.texture.surface.mipmapSize,
+                                               reinterpret_cast<uintptr_t>(__builtin_return_address(0)))) {
+            MEMFreeToDefaultHeap(t.texture.surface.image);
+            t.texture.surface.image = nullptr;
+            return result;
+        }
+        sms_wiiu_pauseguard_trace("texture-create", dest, 0, t.texture.surface.image,
+                                  t.texture.surface.imageSize, t.texture.surface.mipmaps,
+                                  t.texture.surface.mipmapSize, nullptr, 0,
+                                  reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
         DCFlushRange(t.texture.surface.image, t.texture.surface.imageSize);
         GX2InitTextureRegs(&t.texture);
         t.valid = true;
@@ -3717,6 +3826,11 @@ static bool s_retileTextures = true;
 static uint32_t s_whiteFillLogs;
 static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level) {
     if (level >= tiled.surface.mipLevels) return false;
+    sms_wiiu_pauseguard_trace("retile", linear.surface.image, linear.surface.imageSize,
+                              tiled.surface.image, tiled.surface.imageSize, linear.surface.mipmaps,
+                              linear.surface.mipmapSize, tiled.surface.mipmaps,
+                              tiled.surface.mipmapSize,
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     GX2CopySurface(&linear.surface, level, 0, &tiled.surface, level, 0); invalidateVertexUniforms();
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, tiled.surface.image, tiled.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, tiled.surface.image, tiled.surface.imageSize);
@@ -3736,8 +3850,13 @@ static ProducerRetile s_producerRetiles[256];
 static uint32_t s_producerRetileWrite;
 static void producerRetileService(void* opaque) {
     ProducerRetile& r = *static_cast<ProducerRetile*>(opaque);
-    for (uint32_t level = 0; level < r.tiled.mipLevels; ++level)
+    for (uint32_t level = 0; level < r.tiled.mipLevels; ++level) {
+        sms_wiiu_pauseguard_trace("retile", r.linear.image, r.linear.imageSize, r.tiled.image,
+                                  r.tiled.imageSize, r.linear.mipmaps, r.linear.mipmapSize,
+                                  r.tiled.mipmaps, r.tiled.mipmapSize,
+                                  reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
         GX2CopySurface(&r.linear, level, 0, &r.tiled, level, 0);
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, r.tiled.image, r.tiled.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.tiled.image, r.tiled.imageSize);
     if (r.tiled.mipmaps) {
@@ -3780,6 +3899,17 @@ static void retileTexture(GX2Texture& texture) {
         t.mipmaps = alignedZero(t.alignment, t.mipmapSize);
         if (!t.mipmaps) { MEMFreeToDefaultHeap(t.image); return; }
     }
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_surface("retile target", t.image, t.imageSize,
+                                           t.mipmaps, t.mipmapSize,
+                                           reinterpret_cast<uintptr_t>(__builtin_return_address(0)))) {
+        MEMFreeToDefaultHeap(t.image);
+        if (t.mipmaps) MEMFreeToDefaultHeap(t.mipmaps);
+        return;
+    }
+    sms_wiiu_pauseguard_trace("texture-create", nullptr, 0, t.image, t.imageSize,
+                              t.mipmaps, t.mipmapSize, nullptr, 0,
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     // The zero fill must not be written back over the GPU's copy later.
     DCFlushRange(t.image, t.imageSize);
     if (t.mipmaps) DCFlushRange(t.mipmaps, t.mipmapSize);
@@ -4014,6 +4144,18 @@ static TextureEntry* getTexture(int map) {
             return nullptr;
         }
     }
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_surface("texture create", surf.image, surf.imageSize,
+                                           surf.mipmaps, surf.mipmapSize,
+                                           reinterpret_cast<uintptr_t>(__builtin_return_address(0)))) {
+        MEMFreeToDefaultHeap(surf.image);
+        if (surf.mipmaps) MEMFreeToDefaultHeap(surf.mipmaps);
+        surf.image = surf.mipmaps = nullptr;
+        return nullptr;
+    }
+    sms_wiiu_pauseguard_trace("texture-create", source, 0, surf.image, surf.imageSize,
+                              surf.mipmaps, surf.mipmapSize, nullptr, 0,
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     GX2InitTextureRegs(&e.texture);
 
     // Decode through explicitly checked buffers: a failed allocation returns
@@ -4024,12 +4166,18 @@ static TextureEntry* getTexture(int map) {
     uint32_t srcBytes = 0;
     for (uint32_t l = 0; l < (genFrom ? genFrom : surf.mipLevels); ++l)
         srcBytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
+    sms_wiiu_pauseguard_trace("texture-source", source, srcBytes, surf.image, surf.imageSize,
+                              surf.mipmaps, surf.mipmapSize, nullptr, 0,
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     // A texture address that did not survive the 30-bit GX physical address
     // (outside the main heap) must not be read: in Cemu that kills the title.
     // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
     // texture came out white), so check the app's MEM2/MEM1 ranges directly.
     const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
-    const bool readable = source && srcBytes && a1 > a0 &&
+    const bool pauseReadable = !sms_wiiu_pauseguard_enabled() ||
+        sms_wiiu_pauseguard_check_range("texture source", source, srcBytes,
+                                        reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    const bool readable = source && srcBytes && a1 > a0 && pauseReadable &&
         ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
     bool hashedNow = false;
     if (readable && s_texRecheck && writeStampTracked(source, srcBytes)) {
@@ -4254,6 +4402,23 @@ static bool packStart(TextureEntry& e, const TexturePackEntry* entry) {
         if (!e.packTiled.surface.mipmaps) { packFreeLoading(e); return false; }
         DCFlushRange(e.packTiled.surface.mipmaps, e.packTiled.surface.mipmapSize);
     }
+    if (sms_wiiu_pauseguard_enabled() &&
+        (!sms_wiiu_pauseguard_check_surface("pack texture create", e.packLinear.surface.image,
+                                            e.packLinear.surface.imageSize, e.packLinear.surface.mipmaps,
+                                            e.packLinear.surface.mipmapSize,
+                                            reinterpret_cast<uintptr_t>(__builtin_return_address(0))) ||
+         !sms_wiiu_pauseguard_check_surface("pack texture create", e.packTiled.surface.image,
+                                            e.packTiled.surface.imageSize, e.packTiled.surface.mipmaps,
+                                            e.packTiled.surface.mipmapSize,
+                                            reinterpret_cast<uintptr_t>(__builtin_return_address(0))))) {
+        packFreeLoading(e);
+        return false;
+    }
+    sms_wiiu_pauseguard_trace("texture-create", nullptr, 0, e.packLinear.surface.image,
+                              e.packLinear.surface.imageSize, e.packLinear.surface.mipmaps,
+                              e.packLinear.surface.mipmapSize, e.packTiled.surface.image,
+                              e.packTiled.surface.imageSize,
+                              reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     GX2InitTextureRegs(&e.packTiled);
     std::memset(e.packLevelBytes, 0, sizeof e.packLevelBytes);
     e.packLevelDone = 0; e.packEntry = entry; e.packStagingBytes = staging;
@@ -5416,6 +5581,7 @@ static void vertexSelfCheckDraw(const VertexKey& key, const TevKey& tevKey, bool
 void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
+    sms_wiiu_pauseguard_init();
     texturePackInit();
     if (texturePackEnabled()) {
         uint64_t cap = 128u << 20;

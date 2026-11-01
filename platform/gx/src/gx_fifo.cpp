@@ -8,6 +8,7 @@
 #include "gx_internal.h"
 #ifdef __WIIU__
 #include "../../wiiu/gx2_producer_worker.h"
+#include "../../wiiu/pauseguard.h"
 #endif
 #include <time.h>
 #ifdef __APPLE__
@@ -161,20 +162,36 @@ static uint32_t s_memSize = 0x01800000;
 void* physToPtr(uint32_t phys) {
     phys &= 0x3FFFFFFF;
     if (!phys) return nullptr;
+    void* result;
 #ifdef __WIIU__
     // The Wii U renderer uses an address-zero window for MEM2.  The title's
     // low GX texture addresses are physical offsets into the app arena, so
     // resolve them through the same MEM2 base as the OS compatibility shim.
     if (!s_memBase && sms_wiiu_mem2_base && phys < sms_wiiu_mem2_size)
-        return sms_wiiu_mem2_base + phys;
+        result = sms_wiiu_mem2_base + phys;
+    else
 #endif
-    return s_memBase + phys;
+        result = s_memBase + phys;
+#ifdef __WIIU__
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_translation("physToPtr", result, phys, 1,
+                                               reinterpret_cast<uintptr_t>(__builtin_return_address(0))))
+        return nullptr;
+#endif
+    return result;
 }
 
 uint32_t ptrToPhys(const void* p) {
     if (!p) return 0;
     uintptr_t off = reinterpret_cast<uintptr_t>(p) - reinterpret_cast<uintptr_t>(s_memBase);
-    return static_cast<uint32_t>(off);
+    uint32_t phys = static_cast<uint32_t>(off);
+#ifdef __WIIU__
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_translation("ptrToPhys", p, phys, 1,
+                                               reinterpret_cast<uintptr_t>(__builtin_return_address(0))))
+        return 0;
+#endif
+    return phys;
 }
 
 // ------------------------------------------------------------------ memory write stamps

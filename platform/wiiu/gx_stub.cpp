@@ -4,6 +4,7 @@
 #include "include/dolphin/gx/GXVert.h"
 #include "../gx/include/sms_gx/gx_pc.h"
 #include "runtime.h"
+#include "pauseguard.h"
 #include "gx2_texture_pack.h"
 #include "gx2_producer_worker.h"
 
@@ -193,7 +194,11 @@ void drc_register_scan_buffer()
 		         unsigned(MEMGetAllocatableSizeForExpHeapEx(heap, GX2_SCAN_BUFFER_ALIGNMENT)));
 		return;
 	}
-	GX2Invalidate(GX2_INVALIDATE_MODE_CPU, s_drc_scan, bytes);
+	sms_wiiu_pauseguard_note_scan_buffer(uint32_t(GX2_SCAN_TARGET_DRC), s_drc_scan, bytes);
+	if (!sms_wiiu_pauseguard_enabled() ||
+		sms_wiiu_pauseguard_check_range("DRC scan invalidate", s_drc_scan, bytes,
+		                                reinterpret_cast<uintptr_t>(__builtin_return_address(0))))
+		GX2Invalidate(GX2_INVALIDATE_MODE_CPU, s_drc_scan, bytes);
 	GX2SetDRCBuffer(s_drc_scan, bytes, mode, GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8, scan_buffering());
 	GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
 	GX2SetDRCScale(tv->surface.width, tv->surface.height);
@@ -232,6 +237,8 @@ void drc_setup(bool first)
 	log_surface("tvColour", tv->surface);
 	log_surface("tvDepth", WHBGfxGetTVDepthBuffer()->surface);
 	GX2ColorBuffer* drc = WHBGfxGetDRCColourBuffer();
+	sms_wiiu_pauseguard_note_scan_buffer(uint32_t(GX2_SCAN_TARGET_DRC), drc->surface.image,
+	                                    drc->surface.imageSize);
 	log_surface("drcColour", drc->surface);
 	log_surface("drcDepth", WHBGfxGetDRCDepthBuffer()->surface);
 	port_log("[drc] contexts tv=%p drc=%p\n", static_cast<void*>(WHBGfxGetTVContextState()),
@@ -393,6 +400,17 @@ void shot_surface(const GX2Surface& src, const char* path, uint32_t shrink)
 	}
 	std::memset(dst.image, 0, dst.imageSize);
 	DCFlushRange(dst.image, dst.imageSize);
+	const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+	if (sms_wiiu_pauseguard_enabled() &&
+		(!sms_wiiu_pauseguard_check_surface("screenshot source", src.image, src.imageSize,
+		                                   src.mipmaps, src.mipmapSize, caller) ||
+		 !sms_wiiu_pauseguard_check_surface("screenshot target", dst.image, dst.imageSize,
+		                                    dst.mipmaps, dst.mipmapSize, caller))) {
+		MEMFreeToDefaultHeap(dst.image);
+		return;
+	}
+	sms_wiiu_pauseguard_trace("screenshot-copy", src.image, src.imageSize, dst.image, dst.imageSize,
+	                         src.mipmaps, src.mipmapSize, dst.mipmaps, dst.mipmapSize, caller);
 	GX2CopySurface(const_cast<GX2Surface*>(&src), 0, 0, &dst, 0, 0);
 	GX2Flush();
 	GX2DrawDone();
@@ -498,6 +516,7 @@ void __wrap_GX2SetTVBuffer(void* buffer, uint32_t size, GX2TVRenderMode mode, GX
 {
 	if (s_tribuf)
 		buffering = GX2_BUFFERING_MODE_TRIPLE;
+	sms_wiiu_pauseguard_note_scan_buffer(uint32_t(GX2_SCAN_TARGET_TV), buffer, size);
 	port_log("[present] TV scan buffer %p+%u mode=%d buffering=%d\n", buffer, unsigned(size), int(mode),
 	         int(buffering));
 	__real_GX2SetTVBuffer(buffer, size, mode, format, buffering);
@@ -869,6 +888,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	sms_wiiu_gx2_target_present();
 	if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined();
 	else WHBGfxFinishRender();
+	sms_wiiu_pauseguard_present();
 	const int64_t t1 = wut_OSGetTime_stub();
 	drc_register_scan_buffer();
 	present_diagnostics();
