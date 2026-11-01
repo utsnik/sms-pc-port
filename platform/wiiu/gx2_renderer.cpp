@@ -1100,11 +1100,12 @@ static void gpuReport() {
 
 // GPU-read memory released mid-frame (linear texture staging) is freed once
 // the fence of the frame that queued it has retired.
-struct DeferredFree { void* p; uint32_t arena; };
+struct DeferredFree { void* p; uint32_t arena; MEMHeapHandle mem1Heap; uint32_t imageBytes; };
 static DeferredFree s_deferredFree[256];
 static uint32_t s_deferredFreeCount;
+static void freeDeferred(const DeferredFree& entry);
 
-static void deferFree(void* p) {
+static void deferFree(void* p, MEMHeapHandle mem1Heap = nullptr, uint32_t imageBytes = 0) {
     if (!p) return;
     if (s_deferredFreeCount == 256) {
         if (s_gx2ProdEnabled) {
@@ -1112,10 +1113,10 @@ static void deferFree(void* p) {
             return;
         }
         GX2DrawDone();
-        for (uint32_t i = 0; i < s_deferredFreeCount; ++i) MEMFreeToDefaultHeap(s_deferredFree[i].p);
+        for (uint32_t i = 0; i < s_deferredFreeCount; ++i) freeDeferred(s_deferredFree[i]);
         s_deferredFreeCount = 0;
     }
-    s_deferredFree[s_deferredFreeCount++] = {p, s_vertexArenaIndex};
+    s_deferredFree[s_deferredFreeCount++] = {p, s_vertexArenaIndex, mem1Heap, imageBytes};
 }
 
 static void beginVertexArena() {
@@ -1174,7 +1175,7 @@ static void beginVertexArena() {
     // That fence also covers everything queued while this arena was last used.
     uint32_t kept = 0;
     for (uint32_t i = 0; i < s_deferredFreeCount; ++i) {
-        if (s_deferredFree[i].arena == s_vertexArenaIndex) MEMFreeToDefaultHeap(s_deferredFree[i].p);
+        if (s_deferredFree[i].arena == s_vertexArenaIndex) freeDeferred(s_deferredFree[i]);
         else s_deferredFree[kept++] = s_deferredFree[i];
     }
     s_deferredFreeCount = kept;
@@ -4233,6 +4234,18 @@ static MEMHeapHandle s_mem1CopyHeap;
 static uint32_t s_mem1CopyBudget;
 static uint32_t s_mem1CopySurfaces, s_mem1CopyBytes, s_mem1CopyMisses;
 
+static void dropPendingMem1ProducerCopies();
+
+static void freeDeferred(const DeferredFree& entry) {
+    if (entry.mem1Heap) {
+        MEMFreeToExpHeap(entry.mem1Heap, entry.p);
+        if (s_mem1CopySurfaces) --s_mem1CopySurfaces;
+        s_mem1CopyBytes -= entry.imageBytes;
+    } else {
+        MEMFreeToDefaultHeap(entry.p);
+    }
+}
+
 static void refreshMem1CopyHeap() {
     if (!s_mem1CopyMarker) return;
     GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
@@ -4259,6 +4272,13 @@ static void releaseCopyImage(CopyEntry& e) {
 
 static void dropMem1CopyImages() {
     if (!s_mem1CopyMarker) return;
+    // WHBGfx destroys its foreground heap on release. Its outstanding copy
+    // images must not be freed through a stale heap handle after reacquire.
+    uint32_t kept = 0;
+    for (uint32_t i = 0; i < s_deferredFreeCount; ++i)
+        if (!s_deferredFree[i].mem1Heap) s_deferredFree[kept++] = s_deferredFree[i];
+    s_deferredFreeCount = kept;
+    dropPendingMem1ProducerCopies();
     for (CopyEntry& e : copyCache()) {
         if (!e.mem1Image) continue;
         // WHBGfx owns the foreground heap and destroys it during release;
@@ -4299,6 +4319,10 @@ extern "C" void sms_wiiu_gx2_renderer_foreground_release(void) {
 extern "C" void sms_wiiu_gx2_renderer_foreground_acquire(void) {
     if (!s_mem1CopyMarker) return;
     refreshMem1CopyHeap();
+}
+#else
+static void freeDeferred(const DeferredFree& entry) {
+    MEMFreeToDefaultHeap(entry.p);
 }
 #endif
 static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
@@ -6816,6 +6840,8 @@ struct ProducerResolvedCopy {
     GX2Rect sourceRect;
     GX2Point destinationPoint;
     void* retiredImage;
+    MEMHeapHandle retiredMem1Heap;
+    uint32_t retiredImageBytes;
     bool ready, fullSurface;
 };
 
@@ -6847,6 +6873,15 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     if (e && (e->tex.texture.surface.width != copyW ||
               e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         result.retiredImage = e->tex.texture.surface.image;
+#if defined(PORT_GAME_SMG)
+        if (e->mem1Image) {
+            result.retiredMem1Heap = e->mem1Heap;
+            result.retiredImageBytes = e->imageBytes;
+            e->mem1Image = false;
+            e->mem1Heap = nullptr;
+            e->imageBytes = 0;
+        }
+#endif
         e->tex.valid = false;
     }
     if (!e) {
@@ -6878,8 +6913,13 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
         t.texture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G,
                                          GX2_SQ_SEL_B, GX2_SQ_SEL_A);
         GX2CalcSurfaceSizeAndAlignment(&t.texture.surface);
+#if defined(PORT_GAME_SMG)
+        t.texture.surface.image = allocCopyImage(*e, t.texture.surface.imageSize,
+                                                 t.texture.surface.alignment);
+#else
         t.texture.surface.image = alignedZero(t.texture.surface.alignment,
                                               t.texture.surface.imageSize);
+#endif
         if (!t.texture.surface.image) return result;
         DCFlushRange(t.texture.surface.image, t.texture.surface.imageSize);
         GX2InitTextureRegs(&t.texture);
@@ -6923,6 +6963,18 @@ struct ProducerFrameState {
     uint32_t draws;
 };
 static ProducerFrameState s_producerFrames[2] = {{{}, 0, 0, 0}, {{}, 0, 1, 0}};
+#if defined(PORT_GAME_SMG)
+static void dropPendingMem1ProducerCopies() {
+    for (ProducerFrameState& frame : s_producerFrames)
+        for (uint32_t i = 0; i < frame.copyWrite; ++i) {
+            ProducerResolvedCopy& copy = frame.copies[i].copy;
+            if (!copy.retiredMem1Heap) continue;
+            copy.retiredImage = nullptr;
+            copy.retiredMem1Heap = nullptr;
+            copy.retiredImageBytes = 0;
+        }
+}
+#endif
 static uint32_t s_producerRecordFrame;
 static uint32_t s_producerWorkerFrame;
 static bool s_pipe2PresentQueued;
@@ -6962,7 +7014,8 @@ static void producerPresentService(void* opaque) {
         GX2SetDepthBuffer(renderDepth());
     }
     for (uint32_t i = 0; i < frame.copyWrite; ++i) {
-        deferFree(frame.copies[i].copy.retiredImage);
+        deferFree(frame.copies[i].copy.retiredImage, frame.copies[i].copy.retiredMem1Heap,
+                  frame.copies[i].copy.retiredImageBytes);
         frame.copies[i].copy.retiredImage = nullptr;
     }
     frame.copyWrite = 0;
@@ -7540,7 +7593,8 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             gx2prod::service();
             ProducerFrameState& frame = producerFrameForWorker();
             for (uint32_t i = 0; i < frame.copyWrite; ++i) {
-                deferFree(frame.copies[i].copy.retiredImage);
+                deferFree(frame.copies[i].copy.retiredImage, frame.copies[i].copy.retiredMem1Heap,
+                          frame.copies[i].copy.retiredImageBytes);
                 frame.copies[i].copy.retiredImage = nullptr;
             }
             frame.copyWrite = 0;
