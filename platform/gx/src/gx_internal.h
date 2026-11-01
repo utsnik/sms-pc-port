@@ -109,6 +109,8 @@ struct State {
     uint32_t xfMem[XF_MEM_WORDS];
     const uint8_t* texImage[8];   // host pointer for each texture map
     void* copyDest;               // host pointer of the EFB copy destination (BP 0x4B)
+    uint32_t copyDstWidth, copyDstHeight;
+    uint32_t copyOwner;
     uint8_t tlutMem[TMEM_TLUT_SIZE];
     // manual texcoord scale (GXSetTexCoordScaleManually), per texcoord
     bool tcManual[8];
@@ -194,7 +196,8 @@ enum ProducerHostKind : uint8_t {
     kHostArrayBase = 1, kHostArrayStride, kHostArrayBE, kHostDefaultBE,
     kHostViewport, kHostScissor, kHostCull, kHostLineWidth, kHostPointSize,
     kHostTcManual, kHostCopyDest, kHostTexImage, kHostCallDlPtr, kHostCallDlSize,
-    kHostTlutPtr, kHostTlutOffset, kHostTlutLoad,
+    kHostTlutPtr, kHostTlutOffset, kHostTlutLoad, kHostCopyOwner, kHostCopyDstWidth,
+    kHostCopyDstHeight,
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
 #endif

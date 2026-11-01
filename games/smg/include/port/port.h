@@ -140,6 +140,10 @@ void port_perf_prepare(int64_t ns);    // a frame prepared for the renderer
 void port_perf_render(int64_t cpuNs, int64_t uploadNs);  // a displayed frame
 void port_perf_gpu_wait(int64_t ns);   // GPU time after submission (simulation)
 
+#ifdef __WIIU__
+void sms_wiiu_gx2_imgfx_capture_owner(unsigned int owner);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

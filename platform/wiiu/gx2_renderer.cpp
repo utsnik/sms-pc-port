@@ -46,6 +46,7 @@
 #include "gx2_shader_inl.h"
 #include "gx2_texture.h"
 #include "gx2_texture_pack.h"
+#include "imgfx_copy.h"
 #if defined(PORT_GAME_SMG)
 #include "gx2_ztex.h"
 #endif
@@ -108,6 +109,7 @@ uint32_t g_displayFrames = 0;
 // GX2WaitTimeStamp; forcepres = the d6 forced present segment.
 static bool s_d7NoSwap, s_d7FencePoll, s_d6Force;
 static bool s_tv720Marker;
+static bool s_imgfxNative;
 static bool s_nativeQuads;
 static bool s_pipe1Marker;
 static bool s_pipe2Marker;
@@ -275,6 +277,10 @@ static bool sdGameDefaultMarker(const char* name) {
 #else
     return sdMarkerPresent(name);
 #endif
+}
+
+extern "C" int sms_wiiu_gx2_imgfxnative_enabled(void) {
+    return s_imgfxNative ? 1 : 0;
 }
 
 struct FixedShader {
@@ -4117,6 +4123,41 @@ struct CopyEntry {
     MEMHeapHandle mem1Heap = nullptr;
     uint32_t imageBytes = 0;
 };
+
+struct CopyOwnerWindowEntry {
+    uint32_t owner, logicalW, logicalH, physicalW, physicalH, count;
+};
+static CopyOwnerWindowEntry s_copyOwnerWindow[32];
+static uint32_t s_copyOwnerWindowCount;
+
+static const char* copyOwnerName(uint32_t owner) {
+    return owner == sms_wiiu_imgfx::kCopyOwnerBloom ? "bloom" : "untagged";
+}
+
+static void noteCopyOwner(uint32_t owner, uint32_t logicalW, uint32_t logicalH,
+                          uint32_t physicalW, uint32_t physicalH) {
+    for (uint32_t i = 0; i < s_copyOwnerWindowCount; ++i) {
+        CopyOwnerWindowEntry& entry = s_copyOwnerWindow[i];
+        if (entry.owner == owner && entry.logicalW == logicalW && entry.logicalH == logicalH &&
+            entry.physicalW == physicalW && entry.physicalH == physicalH) {
+            ++entry.count;
+            return;
+        }
+    }
+    if (s_copyOwnerWindowCount >= sizeof(s_copyOwnerWindow) / sizeof(s_copyOwnerWindow[0])) return;
+    s_copyOwnerWindow[s_copyOwnerWindowCount++] = {owner, logicalW, logicalH, physicalW, physicalH, 1};
+}
+
+static void logCopyOwnerWindow() {
+    for (uint32_t i = 0; i < s_copyOwnerWindowCount; ++i) {
+        const CopyOwnerWindowEntry& entry = s_copyOwnerWindow[i];
+        WHBLogPrintf("[copyown] owner=%s n=%u logical=%ux%u physical=%ux%u",
+                     copyOwnerName(entry.owner), unsigned(entry.count), unsigned(entry.logicalW),
+                     unsigned(entry.logicalH), unsigned(entry.physicalW), unsigned(entry.physicalH));
+    }
+    s_copyOwnerWindowCount = 0;
+}
+
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
 static std::vector<CopyEntry>* s_copyObject;
 static std::vector<CopyEntry>& copyCache() {
@@ -4359,22 +4400,28 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     rendererStateWritten();
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return;
-    const uint32_t tx = uint32_t(s_gameOffsetX + float(x) * s_gameScaleX), ty = uint32_t(float(y) * s_gameScaleY);
-    uint32_t tw = uint32_t(float(w) * s_gameScaleX), th = uint32_t(float(h) * s_gameScaleY);
+    const bool cemu = runningUnderCemu();
+    const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
+    const sms_wiiu_imgfx::CopySizes sizes = sms_wiiu_imgfx::selectCopySizes(
+        s_imgfxNative, g.copyOwner, w, h, half, g.copyDstWidth, g.copyDstHeight,
+        s_gameScaleX, s_gameScaleY, cemu, fullW, fullH);
+    const uint32_t tx = sizes.native ? x : uint32_t(s_gameOffsetX + float(x) * s_gameScaleX);
+    const uint32_t ty = sizes.native ? y : uint32_t(float(y) * s_gameScaleY);
+    uint32_t tw = sizes.sourceW, th = sizes.sourceH;
     if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
     if (ty + th > cb->surface.height) th = cb->surface.height - ty;
     if (!tw || !th) return;
     CopyEntry* e = nullptr;
     for (CopyEntry& c : copyCache())
         if (c.dest == dest) { e = &c; break; }
-    const bool cemu = runningUnderCemu();
     // Cemu's GX2CopySurfaceEx implementation only handles a full-surface
     // copy. Keep the compatibility path's backing texture the size of the
     // TV target, copy that surface in one operation, and apply the source
     // rectangle in the texture coordinates sent to the shader below.
-    const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
-    const uint32_t logicalW = half ? (w + 1) / 2 : w, logicalH = half ? (h + 1) / 2 : h;
-    const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
+    const uint32_t logicalW = sizes.logicalW, logicalH = sizes.logicalH;
+    const uint32_t copyW = sizes.native ? logicalW : (cemu ? fullW : tw);
+    const uint32_t copyH = sizes.native ? logicalH : (cemu ? fullH : th);
+    noteCopyOwner(g.copyOwner, logicalW, logicalH, copyW, copyH);
     if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         GX2DrawDone(); // earlier draws this frame may still sample it
 #if defined(PORT_GAME_SMG)
@@ -5940,8 +5987,10 @@ void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
     s_tv720Marker = sdGameDefaultMarker("tv720");
+    s_imgfxNative = sdMarkerPresent("imgfxnative");
     s_nativeQuads = sdMarkerPresent("quads");
     WHBLogPrintf("SMS Wii U: [tv720] marker=%s", s_tv720Marker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [imgfxnative] marker=%s", s_imgfxNative ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [quads] marker=%s", s_nativeQuads ? "on" : "off");
     if (s_tv720Marker) {
         kRenderW = 1280;
@@ -7087,10 +7136,14 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     rendererStateWritten();
     GX2ColorBuffer* cb = renderColour();
     if (!dest || !cb || !w || !h) return result;
-    const uint32_t tx = uint32_t(s_gameOffsetX + float(x) * s_gameScaleX);
-    const uint32_t ty = uint32_t(float(y) * s_gameScaleY);
-    uint32_t tw = uint32_t(float(w) * s_gameScaleX);
-    uint32_t th = uint32_t(float(h) * s_gameScaleY);
+    const bool cemu = runningUnderCemu();
+    const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
+    const sms_wiiu_imgfx::CopySizes sizes = sms_wiiu_imgfx::selectCopySizes(
+        s_imgfxNative, g.copyOwner, w, h, half, g.copyDstWidth, g.copyDstHeight,
+        s_gameScaleX, s_gameScaleY, cemu, fullW, fullH);
+    const uint32_t tx = sizes.native ? x : uint32_t(s_gameOffsetX + float(x) * s_gameScaleX);
+    const uint32_t ty = sizes.native ? y : uint32_t(float(y) * s_gameScaleY);
+    uint32_t tw = sizes.sourceW, th = sizes.sourceH;
     if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
     if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
     if (ty + th > cb->surface.height) th = cb->surface.height - ty;
@@ -7099,11 +7152,10 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     CopyEntry* e = nullptr;
     for (CopyEntry& c : copyCache())
         if (c.dest == dest) { e = &c; break; }
-    const bool cemu = runningUnderCemu();
-    const uint32_t fullW = cb->surface.width, fullH = cb->surface.height;
-    const uint32_t logicalW = half ? (w + 1) / 2 : w;
-    const uint32_t logicalH = half ? (h + 1) / 2 : h;
-    const uint32_t copyW = cemu ? fullW : tw, copyH = cemu ? fullH : th;
+    const uint32_t logicalW = sizes.logicalW, logicalH = sizes.logicalH;
+    const uint32_t copyW = sizes.native ? logicalW : (cemu ? fullW : tw);
+    const uint32_t copyH = sizes.native ? logicalH : (cemu ? fullH : th);
+    noteCopyOwner(g.copyOwner, logicalW, logicalH, copyW, copyH);
     if (e && (e->tex.texture.surface.width != copyW ||
               e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
         result.retiredImage = e->tex.texture.surface.image;
@@ -7993,6 +8045,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     if (!sms_wiiu_pipe2_enabled())
         s_drawsThisFrame = 0;
     ++g_displayFrames;
+    if ((g_displayFrames % 120) == 0) logCopyOwnerWindow();
     gx2prod::note_frame(g_displayFrames);
 }
 

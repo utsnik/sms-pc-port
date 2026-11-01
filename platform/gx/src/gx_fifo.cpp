@@ -2030,6 +2030,9 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         if (slot < 8) g.tcManual[slot] = value != 0;
         break;
     case kHostCopyDest: g.copyDest = const_cast<uint8_t*>(ptr); break;
+    case kHostCopyOwner: g.copyOwner = value; break;
+    case kHostCopyDstWidth: g.copyDstWidth = value; break;
+    case kHostCopyDstHeight: g.copyDstHeight = value; break;
     case kHostTexImage:
         if (slot < 8) g.texImage[slot] = ptr;
         break;

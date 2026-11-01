@@ -81,7 +81,7 @@ void BloomEffect::preDraw() const {
 
     {
         CopyFilterNegater copyFilterNegator;
-        ImageEffectLocalUtil::capture(_24, 1, 0, GX_TF_RGBA8, false, 0);
+        ImageEffectLocalUtil::capture(_24, 1, 0, GX_TF_RGBA8, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     }
 
     MR::fillScreen(Color8(0, 0, 0, 0xFF).mGXColor);
@@ -98,13 +98,13 @@ void BloomEffect::postDraw() const {
     GXRenderModeObj* pRenderObj = JUTVideo::getManager()->getRenderMode();
     GXSetCopyFilter(GX_FALSE, pRenderObj->sample_pattern, GX_FALSE, pRenderObj->vfilter);
 
-    ImageEffectLocalUtil::capture(_28, 1, 0, GX_TF_RGB565, true, 0);
+    ImageEffectLocalUtil::capture(_28, 1, 0, GX_TF_RGB565, true, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     initDraw();
     GXSetCopyClear(Color8(0, 0, 0, 0xFF), 0xFFFFFF);
     drawTexture(_28, 4, 0, 0xFF, DrawType_0);
 
-    ImageEffectLocalUtil::capture(_2C, 4, 0, GX_TF_RGB565, false, 0);
-    ImageEffectLocalUtil::capture(_40, 4, 0, GX_TF_I8, false, 0);
+    ImageEffectLocalUtil::capture(_2C, 4, 0, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
+    ImageEffectLocalUtil::capture(_40, 4, 0, GX_TF_I8, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     drawTexture(_2C, 4, 2, 0xFF, DrawType_0);
 
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
@@ -117,19 +117,19 @@ void BloomEffect::postDraw() const {
     GXSetBlendMode(GX_BM_NONE, GX_BL_ZERO, GX_BL_ZERO, GX_LO_CLEAR);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, GX_TEXMAP0, GX_COLOR0A0);
     GXSetTevOp(GX_TEVSTAGE0, GX_MODULATE);
-    ImageEffectLocalUtil::capture(_44, 4, 2, GX_TF_RGB565, false, 0);
+    ImageEffectLocalUtil::capture(_44, 4, 2, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     blurTexture(_44, _48, 4, 3, 6, _18, 2, &::sL1RadAndOfs[0]._0);
 
-    ImageEffectLocalUtil::capture(_30, 4, 3, GX_TF_RGB565, false, 0);
-    ImageEffectLocalUtil::capture(_34, 4, 3, GX_TF_RGB565, true, 0);
+    ImageEffectLocalUtil::capture(_30, 4, 3, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
+    ImageEffectLocalUtil::capture(_34, 4, 3, GX_TF_RGB565, true, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     blurTexture(_34, _4C, 8, 20, 12, _1C, 3, &::sL2RadAndOfs[0]._0);
 
-    ImageEffectLocalUtil::capture(_38, 8, 20, GX_TF_RGB565, false, 0);
+    ImageEffectLocalUtil::capture(_38, 8, 20, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     const u8 intensity = _14 * get_10();
     drawTexture(_30, 4, 7, intensity, DrawType_0);
     drawTexture(_38, 4, 7, intensity, DrawType_1);
 
-    ImageEffectLocalUtil::capture(_3C, 4, 7, GX_TF_RGB565, false, 0);
+    ImageEffectLocalUtil::capture(_3C, 4, 7, GX_TF_RGB565, false, 0, ImageEffectLocalUtil::CaptureOwner_NormalBloom);
     GXSetCopyFilter(GX_FALSE, pRenderObj->sample_pattern, GX_TRUE, pRenderObj->vfilter);
 
     drawTexture(_24, 1, 0, 0xFF, DrawType_0);

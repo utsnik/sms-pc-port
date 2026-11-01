@@ -7,6 +7,7 @@
 #include "Game/Util/ObjUtil.hpp"
 #include "Game/Util/ScreenUtil.hpp"
 #include "Game/Util/SystemUtil.hpp"
+#include "port/port.h"
 #include <JSystem/JUtility/JUTTexture.hpp>
 
 namespace {
@@ -28,6 +29,16 @@ void MR::connectToSceneImageEffectMovement(NameObj* pObj) {
 void ImageEffectLocalUtil::capture(JUTTexture* pTexture, s32 divisions, s32 tile, GXTexFmt format, bool clear, u8 filter) {
     pTexture->capture((tile % divisions) * MR::getFrameBufferWidth() / divisions, (tile / divisions) * MR::getFrameBufferHeight() / divisions, format,
                       clear, filter);
+}
+
+void ImageEffectLocalUtil::capture(JUTTexture* pTexture, s32 divisions, s32 tile, GXTexFmt format, bool clear, u8 filter, u32 owner) {
+#ifdef __WIIU__
+    sms_wiiu_gx2_imgfx_capture_owner(owner);
+#endif
+    capture(pTexture, divisions, tile, format, clear, filter);
+#ifdef __WIIU__
+    sms_wiiu_gx2_imgfx_capture_owner(0);
+#endif
 }
 
 void ImageEffectLocalUtil::setupDrawTexture() {

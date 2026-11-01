@@ -6,6 +6,7 @@
 #include "sms_gx/gx_pc.h"
 #ifdef __WIIU__
 #include "../../wiiu/gx2_producer_worker.h"
+extern "C" int sms_wiiu_gx2_imgfxnative_enabled(void);
 #endif
 
 #include <dolphin/gx.h>
@@ -1274,6 +1275,8 @@ void GXSetTexCopySrc(u16 left, u16 top, u16 wd, u16 ht) {
 }
 void GXSetDispCopyDst(u16 wd, u16) { s_dispStride = uint32_t(wd) * 2 / 32; }
 void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
+    GX_STATE.copyDstWidth = wd;
+    GX_STATE.copyDstHeight = ht;
     uint32_t f = uint32_t(fmt) & 0xF;
     if (fmt == GX_TF_Z16) f = 0xB;
     bool intensity = fmt == GX_TF_I4 || fmt == GX_TF_I8 || fmt == GX_TF_IA4 || fmt == GX_TF_IA8 || fmt == GX_CTF_YUVA8;
@@ -1285,6 +1288,22 @@ void GXSetTexCopyDst(u16 wd, u16 ht, GXTexFmt fmt, GXBool mipmap) {
     // bit 13 is unused by the hardware copy path here: remember the Z-ness of the
     // format for the renderer (the SDK does this by switching the pixel format)
     s_texStride = GXGetTexBufferSize(wd, ht, fmt, GX_FALSE, 0) / (ht ? ht : 1);
+#ifdef __WIIU__
+    if (hostState() && GX_STATE.copyOwner) {
+        producerHostState(kHostCopyDstWidth, 0, wd);
+        producerHostState(kHostCopyDstHeight, 0, ht);
+    }
+#endif
+}
+
+void sms_wiiu_gx2_imgfx_capture_owner(uint32_t owner) {
+#ifdef __WIIU__
+    if (!sms_wiiu_gx2_imgfxnative_enabled()) return;
+    GX_STATE.copyOwner = owner;
+    if (hostState()) producerHostState(kHostCopyOwner, 0, owner);
+#else
+    (void)owner;
+#endif
 }
 void GXSetDispCopyFrame2Field(GXCopyMode mode) {
     s_dispCtrl = setField(s_dispCtrl, 2, 12, mode);
