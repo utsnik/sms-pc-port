@@ -18,7 +18,9 @@ enum TexturePackCodec {
     TEXTURE_PACK_CODEC_BC1 = 2,
     TEXTURE_PACK_CODEC_BC2 = 3,
     TEXTURE_PACK_CODEC_BC3 = 4,
-    TEXTURE_PACK_CODEC_BC7 = 7
+    TEXTURE_PACK_CODEC_BC7 = 7,
+    /* Converter-only selector; it is resolved to BC1 or BC3 before writing. */
+    TEXTURE_PACK_CODEC_AUTO = 0xffffffffu
 };
 
 struct TexturePackKey {

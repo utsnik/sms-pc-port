@@ -33,8 +33,11 @@ int main() {
     query = wildcard.key; query.wildcardTlut = false; query.tlutHash = 0x9988776655443322ull;
     found = reader.find(query); expect(found && found->key.wildcardTlut, "wildcard TLUT lookup");
     if (found) {
-        std::vector<uint8_t> payload; expect(reader.read(found->levels[0].rgbaOffset, found->levels[0].rgbaSize, &payload, &error), "payload range read");
-        expect(payload == wildcard.levels[0].rgbaPayload, "payload bytes round trip exactly");
+        std::vector<uint8_t> payload;
+        expect(reader.read(found->levels[0].rgbaOffset, found->levels[0].rgbaSize, &payload, &error), "RGBA payload range read");
+        expect(payload == wildcard.levels[0].rgbaPayload, "RGBA payload bytes round trip exactly");
+        expect(reader.read(found->levels[0].bcOffset, found->levels[0].bcSize, &payload, &error), "BC payload range read");
+        expect(payload == wildcard.levels[0].bcPayload, "BC payload bytes round trip exactly");
     }
     std::vector<gx::TexturePackEntry> duplicate = {exact, exact}; expect(!gx::TexturePackWriter::serialize(duplicate, 64, &bytes, &error), "duplicate key rejected");
     std::vector<uint8_t> truncated(bytes); if (!truncated.empty()) truncated.pop_back(); expect(!reader.openBytes(truncated, &error), "truncated archive rejected");

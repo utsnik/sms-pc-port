@@ -37,6 +37,7 @@ struct State {
     TexturePackEntry* entries;
     uint64_t readBytes;
     bool enabled;
+    bool packBc;
 };
 
 State s_state = {};
@@ -104,6 +105,7 @@ static bool validFormat(uint32_t fmt) {
            fmt == 6 || fmt == 8 || fmt == 9 || fmt == 10 || fmt == 14;
 }
 static bool validCodec(uint32_t codec) { return codec == kRgbaCodec || codec == 2 || codec == 3 || codec == 4 || codec == 7; }
+static bool bcUploadCodec(uint32_t codec) { return codec == 2 || codec == 4; }
 
 static uint64_t keyHash(const TexturePackKey& k) {
     uint8_t b[40];
@@ -210,18 +212,21 @@ static void matchRequest(const TexturePackRequest& request) {
     result.found = entry != nullptr;
     publishResult(result);
     if (!entry) return;
+    const bool useBc = s_state.packBc && bcUploadCodec(entry->bcCodec);
     for (uint32_t level = 0; level != entry->mipCount; ++level) {
         const TexturePackLevel& source = entry->levels[level];
-        for (uint32_t offset = 0; offset < source.rgbaSize; ) {
+        const uint64_t payloadOffset = useBc ? source.bcOffset : source.rgbaOffset;
+        const uint32_t payloadSize = useBc ? source.bcSize : source.rgbaSize;
+        for (uint32_t offset = 0; offset < payloadSize; ) {
             if (s_workerStop) return;
-            const uint32_t bytesToRead = std::min<uint32_t>(kTexturePackMaxChunk, source.rgbaSize - offset);
+            const uint32_t bytesToRead = std::min<uint32_t>(kTexturePackMaxChunk, payloadSize - offset);
             TexturePackUploadChunk chunk = {};
             chunk.requestId = request.requestId; chunk.level = level; chunk.offset = offset;
             uint8_t* staging = acquireStaging();
             if (s_workerStop) return;
             chunk.bytes = bytesToRead; chunk.data = staging; chunk.entry = entry;
-            chunk.last = offset + bytesToRead == source.rgbaSize;
-            chunk.ok = readAt(source.rgbaOffset + offset, staging, bytesToRead);
+            chunk.last = offset + bytesToRead == payloadSize;
+            chunk.ok = readAt(payloadOffset + offset, staging, bytesToRead);
             publishChunk(chunk);
             if (!chunk.ok) return;
             offset += bytesToRead;
@@ -272,6 +277,8 @@ static bool parseEntry(const uint8_t* p, TexturePackEntry* e) {
 
 bool texturePackInit() {
     if (s_state.enabled) return true;
+    s_state.packBc = sms_wiiu_sd_marker("packbc") != 0;
+    WHBLogPrintf("SMS Wii U: [packbc] marker=%s", s_state.packBc ? "on" : "off");
     char path[256];
     std::snprintf(path, sizeof path, "%stextures/GMSE01.gx2pack", sms_wiiu_app_root());
     FILE* f = std::fopen(path, "rb");
@@ -350,6 +357,8 @@ bool texturePackInit() {
 }
 
 void texturePackShutdown() {
+    if (s_state.enabled)
+        WHBLogPrintf("SMS Wii U: [packbc] uploads bc=%u rgba=%u", unsigned(s_stats.bcUploads), unsigned(s_stats.rgbaUploads));
     if (s_workerStarted) {
         s_workerStop = true;
         // Never block on the send: with the queue full of wakes and the worker
@@ -376,6 +385,7 @@ void texturePackShutdown() {
     s_chunkRead = s_chunkWrite = 0;
 }
 bool texturePackEnabled() { return s_state.enabled; }
+bool texturePackBcEnabled() { return s_state.enabled && s_state.packBc; }
 uint32_t texturePackMaxDimension() { return s_state.maxDimension; }
 uint32_t texturePackEntryCount() { return s_state.entryCount; }
 uint64_t texturePackReadBytes() { return s_state.readBytes; }
@@ -423,6 +433,13 @@ void texturePackGetStats(TexturePackStats* stats) {
     stats->hashMicros = s_stats.hashMicros;
     stats->archiveReadBytes = s_stats.archiveReadBytes;
     stats->queuedJobs = s_stats.queuedJobs;
+    stats->bcUploads = s_stats.bcUploads;
+    stats->rgbaUploads = s_stats.rgbaUploads;
+}
+
+void texturePackNoteUpload(bool bc) {
+    if (bc) ++s_stats.bcUploads;
+    else ++s_stats.rgbaUploads;
 }
 
 void texturePackNoteFrame(uint32_t) {}

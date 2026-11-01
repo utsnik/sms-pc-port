@@ -538,6 +538,7 @@ struct TextureEntry {
     GX2Texture packFallback;
     uint32_t packLevelBytes[16] = {};
     uint32_t packLevelDone;
+    bool packBc;
     uint64_t packStagingBytes;
     uint64_t packResidentBytes;
     uint32_t next = UINT32_MAX;  // older entry with the same source (textureIndex chain)
@@ -4146,12 +4147,14 @@ static void packEvict(TextureEntry& e) {
 
 static bool packStart(TextureEntry& e, const TexturePackEntry* entry) {
     if (!entry || entry->mipCount > 16) return false;
+    e.packBc = texturePackBcEnabled() && (entry->bcCodec == 2 || entry->bcCodec == 4);
     std::memset(&e.packLinear, 0, sizeof e.packLinear);
     e.packLinear.surface.use = GX2_SURFACE_USE_TEXTURE;
     e.packLinear.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
     e.packLinear.surface.width = entry->width; e.packLinear.surface.height = entry->height;
     e.packLinear.surface.depth = 1; e.packLinear.surface.mipLevels = entry->mipCount;
-    e.packLinear.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    e.packLinear.surface.format = e.packBc ? (entry->bcCodec == 2 ? GX2_SURFACE_FORMAT_UNORM_BC1 : GX2_SURFACE_FORMAT_UNORM_BC3)
+                                           : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.packLinear.surface.aa = GX2_AA_MODE1X;
     e.packLinear.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&e.packLinear.surface);
@@ -4187,9 +4190,12 @@ static bool packStart(TextureEntry& e, const TexturePackEntry* entry) {
 
 static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) {
     if (!e.packEntry || e.packEntry != chunk.entry || chunk.level >= e.packEntry->mipCount ||
-        !chunk.data || chunk.offset + chunk.bytes > e.packEntry->levels[chunk.level].rgbaSize) return false;
+        !chunk.data) return false;
     const TexturePackLevel& level = e.packEntry->levels[chunk.level];
-    const uint32_t rowBytes = level.width * 4;
+    const uint32_t blockBytes = e.packBc ? (e.packEntry->bcCodec == 2 ? 8u : 16u) : 0u;
+    const uint32_t payloadSize = e.packBc ? level.bcSize : level.rgbaSize;
+    if (chunk.offset + chunk.bytes > payloadSize) return false;
+    const uint32_t rowBytes = e.packBc ? ((level.width + 3) / 4) * blockBytes : level.width * 4;
     uint32_t offset = chunk.offset, copied = 0;
     // Level 1 starts the mipmap buffer; level l >= 2 is at mipLevelOffset[l - 1]
     // (the layout the decoded-texture path above uses). Reading level 1 from
@@ -4198,22 +4204,33 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
     const GX2Surface& ls = e.packLinear.surface;
     const uint32_t mipOff = chunk.level <= 1 ? 0 : ls.mipLevelOffset[chunk.level - 1];
     uint8_t* base = chunk.level == 0 ? static_cast<uint8_t*>(ls.image) : static_cast<uint8_t*>(ls.mipmaps) + mipOff;
-    const uint32_t pitch = chunk.level == 0 ? ls.pitch : ((level.width + 63) & ~63u);
-    const uint64_t levelEnd = uint64_t(chunk.level == 0 ? 0 : mipOff) + uint64_t(pitch) * 4 * level.height;
-    if (!base || pitch < level.width || levelEnd > (chunk.level == 0 ? ls.imageSize : ls.mipmapSize)) return false;
+    const uint32_t pitch = chunk.level == 0 ? ls.pitch : ((e.packBc ? ((level.width + 3) / 4) : level.width) + 63) & ~63u;
+    const uint32_t rows = e.packBc ? (level.height + 3) / 4 : level.height;
+    const uint32_t pitchBytes = e.packBc ? pitch * blockBytes : pitch * 4;
+    const uint64_t levelEnd = uint64_t(chunk.level == 0 ? 0 : mipOff) + uint64_t(pitchBytes) * rows;
+    if (!base || pitch < (e.packBc ? (level.width + 3) / 4 : level.width) || levelEnd > (chunk.level == 0 ? ls.imageSize : ls.mipmapSize)) return false;
     while (copied < chunk.bytes) {
         const uint32_t row = offset / rowBytes, col = offset % rowBytes;
         const uint32_t n = std::min(chunk.bytes - copied, rowBytes - col);
-        std::memcpy(base + size_t(row) * pitch * 4 + col, chunk.data + copied, n);
-        DCFlushRange(base + size_t(row) * pitch * 4 + col, n);
+        std::memcpy(base + size_t(row) * pitchBytes + col, chunk.data + copied, n);
+        DCFlushRange(base + size_t(row) * pitchBytes + col, n);
         offset += n; copied += n;
     }
     e.packLevelBytes[chunk.level] += chunk.bytes;
     if (chunk.last) {
-        if (e.packLevelBytes[chunk.level] != level.rgbaSize) return false;
+        if (e.packLevelBytes[chunk.level] != payloadSize) return false;
         GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, base,
                       static_cast<uint32_t>(levelEnd - (chunk.level == 0 ? 0 : mipOff)));
-        if (!retileTexture(e.packLinear, e.packTiled, chunk.level)) return false;
+        if (e.packBc) {
+            GX2CopySurface(&e.packLinear.surface, chunk.level, 0, &e.packTiled.surface, chunk.level, 0);
+            invalidateVertexUniforms();
+            GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, e.packTiled.surface.image, e.packTiled.surface.imageSize);
+            GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e.packTiled.surface.image, e.packTiled.surface.imageSize);
+            if (e.packTiled.surface.mipmaps) {
+                GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, e.packTiled.surface.mipmaps, e.packTiled.surface.mipmapSize);
+                GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e.packTiled.surface.mipmaps, e.packTiled.surface.mipmapSize);
+            }
+        } else if (!retileTexture(e.packLinear, e.packTiled, chunk.level)) return false;
         e.packLevelDone |= 1u << chunk.level;
     }
     return true;
@@ -4223,8 +4240,13 @@ static void packInstall(TextureEntry& e) {
     const WorkerTextureInfo info = {
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(e.source)), e.fmt, e.width, e.height, e.levels, e.tlut
     };
+    if (e.packBc) rebindTvTarget();  // GX2CopySurface leaves its destination bound
     WorkerOpTimer evictionTiming(kWorkerPackEvict, info, static_cast<uint32_t>(s_textures.size()));
     uint64_t bytes = uint64_t(e.packTiled.surface.imageSize) + e.packTiled.surface.mipmapSize;
+    if (e.packBc) {
+        bytes = 0;
+        for (uint32_t level = 0; level != e.packEntry->mipCount; ++level) bytes += e.packEntry->levels[level].bcSize;
+    }
     uint32_t evicted[kTexturePackMaxResidents];
     const uint32_t n = s_packLru.evict(s_packFrame, bytes, evicted, kTexturePackMaxResidents);
     for (uint32_t i = 0; i < n; ++i) if (TextureEntry* old = packTextureForRequest(evicted[i])) packEvict(*old);
@@ -4237,6 +4259,7 @@ static void packInstall(TextureEntry& e) {
     deferFree(e.packLinear.surface.image); deferFree(e.packLinear.surface.mipmaps);
     std::memset(&e.packLinear, 0, sizeof e.packLinear);
     e.packResidentBytes = bytes; e.packStagingBytes = 0; e.packState = 3;
+    texturePackNoteUpload(e.packBc);
     ++s_packCompleted;
 }
 
@@ -4302,12 +4325,13 @@ extern "C" void sms_wiiu_gx2_texture_pack_pump(void) {
     if (++s_packDiagFrames == 30) {
         TexturePackStats stats = {};
         texturePackGetStats(&stats);
-        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u fallback=%u cap=%u texEntries=%u retired=%u reused=%u",
+        WHBLogPrintf("SMS Wii U: [texpack] frame=%u hashBytes=%u hashUs=%u readBytes=%u queued=%u resident=%u stagingPeak=%u completed=%u evictions=%u uploadBytes=%u uploadUs=%u packUploadsBC=%u packUploadsRGBA=%u fallback=%u cap=%u texEntries=%u retired=%u reused=%u",
                      unsigned(g_displayFrames), unsigned(stats.hashBytes), unsigned(stats.hashMicros),
                      unsigned(stats.archiveReadBytes), unsigned(stats.queuedJobs),
                      unsigned(s_packLru.residentBytes()), unsigned(s_packStagingPeak), unsigned(s_packCompleted),
                      unsigned(s_packEvictions), unsigned(s_packUploadBytes), unsigned(s_packUploadMicros),
-                     unsigned(s_packFallback), unsigned(s_packResidentBudget), unsigned(s_textures.size()),
+                     unsigned(stats.bcUploads), unsigned(stats.rgbaUploads), unsigned(s_packFallback),
+                     unsigned(s_packResidentBudget), unsigned(s_textures.size()),
                      unsigned(s_texRetired), unsigned(s_texReused));
         s_packDiagFrames = 0;
         s_packUploadBytes = s_packUploadMicros = s_packFallback = 0;

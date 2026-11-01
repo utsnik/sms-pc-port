@@ -78,7 +78,7 @@ struct TexturePackUploadChunk {
 };
 
 struct TexturePackStats {
-    uint32_t hashBytes, hashMicros, archiveReadBytes, queuedJobs;
+    uint32_t hashBytes, hashMicros, archiveReadBytes, queuedJobs, bcUploads, rgbaUploads;
 };
 
 class TexturePackRequestQueue {
@@ -202,6 +202,7 @@ struct TexturePackUploadBudget {
 bool texturePackInit();
 void texturePackShutdown();
 bool texturePackEnabled();
+bool texturePackBcEnabled();
 const TexturePackEntry* texturePackLookup(const TexturePackKey& key);
 bool texturePackReadChunk(uint64_t offset, uint32_t bytes, void* out);
 bool texturePackEnqueue(const TexturePackRequest& request);
@@ -210,6 +211,7 @@ bool texturePackResultsPending();
 bool texturePackPopUploadChunk(TexturePackUploadChunk* chunk);
 void texturePackReleaseUploadChunk();
 void texturePackGetStats(TexturePackStats* stats);
+void texturePackNoteUpload(bool bc);
 void texturePackNoteFrame(uint32_t frame);
 uint32_t texturePackMaxDimension();
 uint32_t texturePackEntryCount();

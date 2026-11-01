@@ -65,13 +65,13 @@ void pngChunk(std::vector<uint8_t>* png, const char type[4], const std::vector<u
     be32(png, crc32(png->data() + start, 4 + data.size()));
 }
 
-void writePng(const std::filesystem::path& path, uint32_t width, uint32_t height, uint8_t seed) {
+void writePng(const std::filesystem::path& path, uint32_t width, uint32_t height, uint8_t seed, bool opaque = false) {
     std::vector<uint8_t> raw; raw.reserve(size_t(height) * (width * 4 + 1));
     for (uint32_t y = 0; y < height; ++y) {
         raw.push_back(0);
         for (uint32_t x = 0; x < width; ++x) {
             raw.push_back(uint8_t(seed + x * 13 + y * 7)); raw.push_back(uint8_t(seed + x * 3));
-            raw.push_back(uint8_t(seed + y * 11)); raw.push_back(uint8_t(255 - ((x + y) & 31)));
+            raw.push_back(uint8_t(seed + y * 11)); raw.push_back(opaque ? 255 : uint8_t(255 - ((x + y) & 31)));
         }
     }
     std::vector<uint8_t> zlib = {0x78, 0x01};
@@ -223,10 +223,45 @@ void checkDdsConversion() {
     std::filesystem::remove_all(root);
 }
 
+void checkAutoCodecAndBcRoundTrip() {
+    const auto root = std::filesystem::temp_directory_path() / ("sms-gx2-auto-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root);
+    const auto opaqueSource = bytes(gx::texLevelBytes(6, 4, 4), 23);
+    const auto alphaSource = bytes(gx::texLevelBytes(6, 4, 4), 47);
+    const std::string opaqueName = keyName(opaqueSource, 6, 4, 4);
+    const std::string alphaName = keyName(alphaSource, 6, 4, 4);
+    writePng(root / (opaqueName + ".png"), 4, 4, 23, true);
+    writePng(root / (alphaName + ".png"), 4, 4, 47, false);
+    gx::TexturePackConversionOptions options; options.bcCodec = gx::TEXTURE_PACK_CODEC_AUTO;
+    gx::TexturePackConversionStats stats; std::string error;
+    const auto archive = root / "auto.gx2pack";
+    expect(gx::convertTexturePack(root.string(), archive.string(), options, &stats, &error), "auto codec conversion: " + error);
+    gx::TexturePackReader reader; expect(reader.open(archive.string(), &error), "auto codec archive opens: " + error);
+    const gx::TexturePackEntry* opaque = nullptr;
+    const gx::TexturePackEntry* alpha = nullptr;
+    for (const auto& entry : reader.entries()) {
+        if (entry.key.dataHash == gx::xxh64(opaqueSource.data(), opaqueSource.size(), 0)) opaque = &entry;
+        if (entry.key.dataHash == gx::xxh64(alphaSource.data(), alphaSource.size(), 0)) alpha = &entry;
+    }
+    expect(opaque && opaque->bcCodec == gx::TEXTURE_PACK_CODEC_BC1, "auto selects BC1 for opaque entry");
+    expect(alpha && alpha->bcCodec == gx::TEXTURE_PACK_CODEC_BC3, "auto selects BC3 for alpha entry");
+    if (opaque) {
+        std::vector<uint8_t> payload;
+        expect(reader.read(opaque->levels[0].bcOffset, opaque->levels[0].bcSize, &payload, &error) && payload.size() == 8,
+               "opaque BC1 payload round trip");
+    }
+    if (alpha) {
+        std::vector<uint8_t> payload;
+        expect(reader.read(alpha->levels[0].bcOffset, alpha->levels[0].bcSize, &payload, &error) && payload.size() == 16,
+               "alpha BC3 payload round trip");
+    }
+    std::filesystem::remove_all(root);
+}
+
 } // namespace
 
 int main() {
-    checkHashesAndNames(); checkBc(); checkArchiveAndConversion(); checkDdsConversion();
+    checkHashesAndNames(); checkBc(); checkArchiveAndConversion(); checkDdsConversion(); checkAutoCodecAndBcRoundTrip();
     if (failures) return failures;
     std::cout << "gx2_texture_pack_test: PASS\n";
     return 0;

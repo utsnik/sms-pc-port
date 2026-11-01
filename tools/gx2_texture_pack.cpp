@@ -220,6 +220,22 @@ static Image nextMip(const Image& src) {
 
 static uint32_t bcBlockSize(uint32_t codec) { return codec == TEXTURE_PACK_CODEC_BC1 ? 8 : 16; }
 
+static int encoderCodec(uint32_t codec) {
+    switch (codec) {
+    case TEXTURE_PACK_CODEC_BC1: return 1;
+    case TEXTURE_PACK_CODEC_BC2: return 2;
+    case TEXTURE_PACK_CODEC_BC3: return 3;
+    default: return 7;
+    }
+}
+
+static bool hasAlpha(const std::vector<Image>& levels) {
+    for (const Image& image : levels)
+        for (size_t i = 3; i < image.pixels.size(); i += 4)
+            if (image.pixels[i] != 255) return true;
+    return false;
+}
+
 static std::vector<uint8_t> encodeBc(const Image& image, uint32_t codec) {
     const uint32_t bw = (image.width + 3) / 4, bh = (image.height + 3) / 4, blockSize = bcBlockSize(codec);
     std::vector<uint8_t> out(size_t(bw) * bh * blockSize);
@@ -229,7 +245,7 @@ static std::vector<uint8_t> encodeBc(const Image& image, uint32_t codec) {
             const uint32_t sx = std::min(bx * 4 + x, image.width - 1), sy = std::min(by * 4 + y, image.height - 1);
             std::copy_n(&image.pixels[(size_t(sy) * image.width + sx) * 4], 4, block + (y * 4 + x) * 4);
         }
-        encodeBlock(int(codec), block, out.data() + (size_t(by) * bw + bx) * blockSize);
+        encodeBlock(encoderCodec(codec), block, out.data() + (size_t(by) * bw + bx) * blockSize);
     }
     return out;
 }
@@ -293,9 +309,11 @@ static bool collect(const std::string& input, std::map<std::string, SourceGroup>
 
 static bool makeEntry(const SourceGroup& group, const TexturePackConversionOptions& options,
                       TexturePackEntry* out, TexturePackConversionStats* stats, std::string* error) {
-    if (!options.maxSize || (options.bcCodec != TEXTURE_PACK_CODEC_BC1 && options.bcCodec != TEXTURE_PACK_CODEC_BC2 &&
+    if (!options.maxSize || (options.bcCodec != TEXTURE_PACK_CODEC_AUTO &&
+                             options.bcCodec != TEXTURE_PACK_CODEC_BC1 && options.bcCodec != TEXTURE_PACK_CODEC_BC2 &&
                              options.bcCodec != TEXTURE_PACK_CODEC_BC3 && options.bcCodec != TEXTURE_PACK_CODEC_BC7))
         return fail(error, "invalid converter options");
+    const bool autoCodec = options.bcCodec == TEXTURE_PACK_CODEC_AUTO;
     DecodedSource baseSource;
     if (!decodeSource(group.files.at(0).path, &baseSource, error)) return false;
     Image base = baseSource.levels[0];
@@ -309,7 +327,7 @@ static bool makeEntry(const SourceGroup& group, const TexturePackConversionOptio
     std::vector<Image> levels;
     std::vector<std::vector<uint8_t>> sourceBc;
     levels.push_back(std::move(base));
-    sourceBc.push_back(!downscaled && baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[0] : std::vector<uint8_t>());
+    sourceBc.push_back(!autoCodec && !downscaled && baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[0] : std::vector<uint8_t>());
     const uint32_t chain = [&] { uint32_t n = 1, longest = std::max(levels[0].width, levels[0].height); while (longest > 1) { longest >>= 1; ++n; } return n; }();
     // A game texture without mips is drawn from level 0 only (Dolphin uses the
     // game's sampler, LOD 0 to 0), so a pack's stored levels for it were never
@@ -326,24 +344,25 @@ static bool makeEntry(const SourceGroup& group, const TexturePackConversionOptio
             if (!decodeSource(explicitMip->second.path, &suppliedSource, error)) return false;
             Image supplied = suppliedSource.levels[0];
             const uint32_t w = std::max(1u, levels[0].width >> i), h = std::max(1u, levels[0].height >> i);
-            sourceBc.push_back(supplied.width == w && supplied.height == h && suppliedSource.bcCodec == options.bcCodec
+            sourceBc.push_back(!autoCodec && supplied.width == w && supplied.height == h && suppliedSource.bcCodec == options.bcCodec
                                    ? suppliedSource.bcLevels[0] : std::vector<uint8_t>());
             levels.push_back(scaleBox(supplied, w, h));
         } else if (!downscaled && i < baseSource.levels.size()) {
-            sourceBc.push_back(baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[i] : std::vector<uint8_t>());
+            sourceBc.push_back(!autoCodec && baseSource.bcCodec == options.bcCodec ? baseSource.bcLevels[i] : std::vector<uint8_t>());
             levels.push_back(baseSource.levels[i]);
         } else {
             sourceBc.emplace_back();
             levels.push_back(nextMip(levels.back()));
         }
     }
+    const uint32_t codec = autoCodec ? (hasAlpha(levels) ? TEXTURE_PACK_CODEC_BC3 : TEXTURE_PACK_CODEC_BC1) : options.bcCodec;
     TexturePackEntry e; e.key = group.key; e.width = levels[0].width; e.height = levels[0].height;
-    e.mipCount = uint32_t(levels.size()); e.rgbaCodec = TEXTURE_PACK_CODEC_RGBA8_LINEAR; e.bcCodec = options.bcCodec;
+    e.mipCount = uint32_t(levels.size()); e.rgbaCodec = TEXTURE_PACK_CODEC_RGBA8_LINEAR; e.bcCodec = codec;
     e.surfaceFormat = 0x1a; e.surfacePitch = e.width * 4;
     for (size_t i = 0; i < levels.size(); ++i) {
         const Image& image = levels[i];
         TexturePackLevel l; l.width = image.width; l.height = image.height;
-        l.rgbaPayload = image.pixels; l.bcPayload = sourceBc[i].empty() ? encodeBc(image, options.bcCodec) : sourceBc[i];
+        l.rgbaPayload = image.pixels; l.bcPayload = sourceBc[i].empty() ? encodeBc(image, codec) : sourceBc[i];
         stats->rgbaBytes += l.rgbaPayload.size(); stats->bcBytes += l.bcPayload.size(); ++stats->levels;
         e.levels.push_back(std::move(l));
     }
@@ -370,14 +389,17 @@ bool convertTexturePack(const std::string& inputDirectory, const std::string& ou
 #ifndef GX2_TEXTURE_PACK_NO_MAIN
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <GMSE01-texture-dir> <output.gx2pack> [--max-size N] [--bc 1|2|3|7]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <GMSE01-texture-dir> <output.gx2pack> [--max-size N] [--bc 1|2|3|7|auto]\n", argv[0]);
         return 2;
     }
     gx::TexturePackConversionOptions options;
     for (int i = 3; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--max-size" && i + 1 < argc) options.maxSize = uint32_t(std::stoul(argv[++i]));
-        else if (arg == "--bc" && i + 1 < argc) options.bcCodec = uint32_t(std::stoul(argv[++i]));
+        else if (arg == "--bc" && i + 1 < argc) {
+            const std::string value = argv[++i];
+            options.bcCodec = value == "auto" ? gx::TEXTURE_PACK_CODEC_AUTO : uint32_t(std::stoul(value));
+        }
         else { std::fprintf(stderr, "unknown option: %s\n", arg.c_str()); return 2; }
     }
     gx::TexturePackConversionStats stats; std::string error;
