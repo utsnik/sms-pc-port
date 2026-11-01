@@ -37,6 +37,20 @@ enum {
     XFR_POSTTEX = 0x50,
 };
 
+// The Wii U faststate marker reuses only the fields below when selecting a
+// TEV/vertex program or resolving its texture descriptors.  Keep this small
+// dependency map next to the register definitions so the FIFO and its host
+// regression test exercise the same classification.
+inline bool fastStateXfWriteAffectsKeys(uint16_t addr) {
+    if (addr < XF_REG_BASE || addr >= XF_REG_BASE + XF_REG_COUNT) return false;
+    const uint32_t r = addr - XF_REG_BASE;
+    return r == XFR_NUMCHANS ||
+           (r >= XFR_COLOR0CTRL && r <= XFR_ALPHA0CTRL + 1) ||
+           r == XFR_DUALTEX || r == XFR_NUMTEXGENS ||
+           (r >= XFR_TEXGEN && r < XFR_TEXGEN + 8) ||
+           (r >= XFR_POSTTEX && r < XFR_POSTTEX + 8) || r == XFR_PROJ + 6;
+}
+
 // BP register ids
 enum {
     BP_GENMODE = 0x00, BP_IND_MTX = 0x06, BP_IND_IMASK = 0x0F, BP_IND_CMD = 0x10,
@@ -55,6 +69,20 @@ enum {
     BP_ALPHACOMPARE = 0xF3, BP_ZTEX_BIAS = 0xF4, BP_ZTEX2 = 0xF5, BP_TEV_KSEL = 0xF6,
     BP_MASK = 0xFE,
 };
+
+inline bool fastStateBpWriteAffectsKeys(uint32_t reg) {
+    // 16 TEV stages: colour/alpha env pairs, 2 orders per TREF, 1 indirect
+    // command each, 2 ksel fields per KSEL word (which also carry the swaps).
+    if (reg == BP_GENMODE || reg == BP_RAS1_IREF ||
+        reg == BP_ALPHACOMPARE || reg == BP_ZTEX2 ||
+        (reg >= BP_TREF && reg < BP_TREF + 8) ||
+        (reg >= BP_TEV_COLOR_ENV && reg < BP_TEV_COLOR_ENV + 32) ||
+        (reg >= BP_IND_CMD && reg < BP_IND_CMD + 16) ||
+        (reg >= BP_TEV_KSEL && reg < BP_TEV_KSEL + 8)) return true;
+    // getTexture() reads these mode/image/TLUT words into the descriptors.
+    return (reg >= BP_TX_MODE0 && reg < BP_TX_TLUT + 4) ||
+           (reg >= BP_TX_MODE0 + 0x20 && reg < BP_TX_TLUT + 0x20 + 4);
+}
 
 // Texture-map register addressing: maps 0-3 at 0x80.., 4-7 at 0xA0..
 inline int bpTexReg(int base, int map) { return base + (map & 3) + ((map & 4) ? 0x20 : 0); }
@@ -254,9 +282,10 @@ bool arenaUpload(const uint8_t* verts, uint32_t count, uint32_t stride, const ui
 void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& ref, uint32_t count, uint32_t nidx,
                  const uint8_t* verts);
 bool batchUsesArena();
-void onStateChange();  // called before any register write that changes state
+void onStateChange(bool rendererStateRelevant = true);  // before a state write
 #ifdef __WIIU__
-void rendererStateWritten(); // every BP/XF write, including unchanged values
+void rendererStateWritten();
+bool rendererFastStateUsesTevRegs();
 #endif
 void executeCopy(uint32_t execReg);
 void markXfMemDirty();

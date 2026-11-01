@@ -442,9 +442,6 @@ void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words) {
 }
 
 void writeBP(uint32_t value) {
-#ifdef __WIIU__
-    rendererStateWritten();
-#endif
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
     if (reg == BP_MASK) {
@@ -457,7 +454,11 @@ void writeBP(uint32_t value) {
     }
     if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) {
         if (g.kreg[reg & 7] != data) {
-            onStateChange();
+#ifdef __WIIU__
+            onStateChange(rendererFastStateUsesTevRegs());
+#else
+            onStateChange(false);
+#endif
             g.kreg[reg & 7] = data;
         }
         return;
@@ -516,7 +517,12 @@ void writeBP(uint32_t value) {
         break;
     }
     if (g.bp[reg] != data) {
-        onStateChange();
+        bool fastStateRelevant = fastStateBpWriteAffectsKeys(reg);
+#ifdef __WIIU__
+        if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8)
+            fastStateRelevant = fastStateRelevant || rendererFastStateUsesTevRegs();
+#endif
+        onStateChange(fastStateRelevant);
         g.bp[reg] = data;
     }
     if (reg == BP_COPY_DST) g.copyDest = physToPtr(data << 5);
@@ -568,13 +574,10 @@ void writeCP(uint8_t reg, uint32_t value) {
 
 void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
     for (uint32_t i = 0; i < count; i++, addr++) {
-#ifdef __WIIU__
-        rendererStateWritten();
-#endif
         uint32_t v = words[i];
         if (addr < XF_MEM_WORDS) {
             if (g.xfMem[addr] != v) {
-                onStateChange();
+                onStateChange(false);
                 g.xfMem[addr] = v;
                 if (addr < g_xfDirtyLo) g_xfDirtyLo = addr;
                 if (addr > g_xfDirtyHi) g_xfDirtyHi = addr;
@@ -583,7 +586,7 @@ void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
         } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
             uint32_t r = addr - XF_REG_BASE;
             if (g.xfReg[r] != v) {
-                onStateChange();
+                onStateChange(fastStateXfWriteAffectsKeys(addr));
                 g.xfReg[r] = v;
             }
         }

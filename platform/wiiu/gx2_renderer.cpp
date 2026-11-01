@@ -618,6 +618,7 @@ void rendererStateWritten() {
 static bool s_shaderModeBlock;
 static bool s_tevFold;  // SD marker "tevfold": fold stable TEV inputs into generated code
 static constexpr uint32_t kTevFoldVariantCap = 8;
+bool rendererFastStateUsesTevRegs() { return s_tevFold; }
 
 struct CmdCounters {
     uint32_t vsUniDw, psUniDw, vsUniCalls, psUniCalls;
@@ -6081,10 +6082,10 @@ float efbScale() { return 1.0f; }
 bool rendererReady() { return s_ready; }
 void releaseGlThread() {}
 
-void onStateChange() {
+void onStateChange(bool rendererStateRelevant) {
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
     // The flush may cache the old state: invalidate after it, before mutation.
-    rendererStateWritten();
+    if (rendererStateRelevant) rendererStateWritten();
 }
 
 PrimClass primClass(uint8_t op) {
@@ -6700,8 +6701,18 @@ void flushBatch() {
             if (s_fastStateCheck) {
                 const TevKey slowTev = currentTevKey();
                 const VertexKey slowVertex = currentVertexKey(tevPath, coord, useTex);
-                if (memcmp(&slowTev, &tevKey, sizeof(tevKey)) ||
-                    memcmp(&slowVertex, &vertexKey, sizeof(vertexKey))) ++s_fsCheckMismatch;
+                TevShader* slowShader = nullptr;
+                if (tevSupported(slowTev) && allTextures &&
+                    (tevTextureMask(slowTev) || SMS_GX2_TEV_UNTEXTURED))
+                    slowShader = tevShaderForKey(slowTev);
+                const bool slowTevPath = slowShader != nullptr;
+                VertexProgram* slowVertexProgram =
+                    vertexEligible && slowTevPath ? vertexShaderForKey(slowVertex) : nullptr;
+                if (memcmp(descriptors, s_fastDraw.textures, sizeof(descriptors)) ||
+                    memcmp(&slowTev, &tevKey, sizeof(tevKey)) ||
+                    memcmp(&slowVertex, &vertexKey, sizeof(vertexKey)) ||
+                    slowShader != s_fastDraw.tevShader ||
+                    slowVertexProgram != s_fastDraw.vertex) ++s_fsCheckMismatch;
             }
         } else {
             ++s_fsMiss;
@@ -7397,7 +7408,6 @@ void executeCopy(uint32_t ctrl) {
 }
 void markXfMemDirty() {
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
-    rendererStateWritten();
     s_xfMemoryDirty = true;
 }
 // GXPeekARGB: the game reads the EFB back through the CPU. Sunshine's Mario
