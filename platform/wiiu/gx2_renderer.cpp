@@ -6998,6 +6998,13 @@ extern "C" int sms_wiiu_pipe2_present_queued(void) {
     return s_pipe2PresentQueued ? 1 : 0;
 }
 
+extern "C" void sms_wiiu_gx2_renderer_exit_drain(void) {
+    if (!s_gx2ProdEnabled || !sms_wiiu_pipe2_enabled() || !s_pipe2PresentQueued)
+        return;
+    gx2prod::waitPending(gx2prod::kWaitEndFrame);
+    gx2prod::service();
+}
+
 static void producerCopyService(void* opaque) {
     ProducerCopyRequest& r = *static_cast<ProducerCopyRequest*>(opaque);
     const bool clear = (r.ctrl >> 11) & 1, disp = (r.ctrl >> 14) & 1;

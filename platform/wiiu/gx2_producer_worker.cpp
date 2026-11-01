@@ -32,6 +32,7 @@ BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t)
     __asm__("OSReceiveMessage");
 void wut_OSSleepTicks(int64_t) __asm__("OSSleepTicks");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
+int sms_wiiu_pipe2_enabled(void);
 }
 
 static const uint32_t kByteRingSize = 2u << 20;
@@ -333,6 +334,10 @@ void wake() {
 
 void wait(uint32_t kind) {
     if (!s_started) return;
+    /* A pipe2 worker may reach GX2DrawDone/GXFlush through the worker-side
+     * parser. It cannot wait for a barrier that only core 1 can service. */
+    if (sms_wiiu_pipe2_enabled() && OSGetCoreId() != 1)
+        return;
     if (s_pendingRequest)
         waitPending(kind);
     if (s_flushHook) s_flushHook();

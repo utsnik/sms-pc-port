@@ -29,6 +29,7 @@ void sms_wiiu_profiler_tick(void);
 void sms_wiiu_profiler_stop(void);
 void sms_wiiu_dvd_pump(void);
 void sms_wiiu_crash_return_to_menu(void);
+void sms_wiiu_gx2_renderer_exit_drain(void);
 extern volatile int sms_wiiu_crash_pending;
 extern "C" volatile int sms_wiiu_crash_stage;
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
@@ -127,6 +128,8 @@ void sms_wiiu_frame_boundary(void)
 	 * step: a hang inside GX2DrawDone means a draw had already hung the GPU. */
 	if (sms_wiiu_menu_exit_pending == 1) {
 		sms_wiiu_menu_exit_pending = 2;
+		/* Drain pipe2's ordered present before the ProcUI exit pump. */
+		sms_wiiu_gx2_renderer_exit_drain();
 		WHBLogPrintf("SMS Wii U: exit drain: submitted=%llu retired=%llu",
 		             (unsigned long long)GX2GetLastSubmittedTimeStamp(),
 		             (unsigned long long)GX2GetRetiredTimeStamp());
