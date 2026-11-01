@@ -155,6 +155,7 @@ uint8_t* getPipeRedirect();
 // they are deliberately separate from the producer-facing pipe functions.
 void producerConsume(const uint8_t* bytes, uint32_t n);
 void producerBoundary(uint32_t kind);
+void rendererGameDlCall();
 void setProducerMode(bool enabled);
 bool producerMode();
 // State the API sets outside the GX command stream (full host pointers that

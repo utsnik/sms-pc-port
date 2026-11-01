@@ -220,6 +220,7 @@ bool g_dlNoHash = false;
 // proof is opt-in so an absent marker keeps the existing direct path intact.
 static bool s_gx2DlEnabled;
 static bool s_gx2DlFallback;
+static bool s_dlMerge;
 static uint32_t s_perfDlCoreInit;
 static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
@@ -921,6 +922,7 @@ static void gx2DlSplit(int reason);
 #define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__), sms_wiiu_d4_submit_at("done", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
 #define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__), sms_wiiu_d4_submit_at("flush", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
 #define GX2GetLastSubmittedTimeStamp(...) (gx2DlSplit(kDlSplitFrame), ::GX2GetLastSubmittedTimeStamp(__VA_ARGS__))
+#define GX2WaitTimeStamp(...) (s_dlMerge ? gx2DlSplit(kDlSplitFrame) : (void)0, ::GX2WaitTimeStamp(__VA_ARGS__))
 static uint8_t* s_gx2DlArena[kVertexArenas];
 static uint32_t s_gx2DlUsed[kVertexArenas];
 
@@ -1157,7 +1159,7 @@ static void beginVertexArena() {
                                  unsigned(swaps), unsigned(flips), (unsigned long long)lastFlip);
             }
         } else {
-            rc = ::GX2WaitTimeStamp(fence);
+            rc = GX2WaitTimeStamp(fence);
         }
         const OSTime elapsed = OSGetTime() - t0;
         s_vertexFenceWait += elapsed;
@@ -4608,6 +4610,7 @@ static bool textiledTexture(TextureEntry& e) {
         e.texture = tiled;
         rendererStateWritten();
         e.textiledPending = true;
+        if (s_dlMerge) gx2DlSplit(kDlSplitFrame);
         if (!gx2prod::enqueueService(textiledTextureService, &e)) {
             MEMFreeToDefaultHeap(e.texture.surface.image);
             MEMFreeToDefaultHeap(e.texture.surface.mipmaps);
@@ -4734,6 +4737,9 @@ static TextureEntry* getTexture(int map) {
             return &e;
         }
     }
+    // The worker can enqueue a texture retile service while materialising a
+    // miss. Publish earlier draws before that service record.
+    if (s_dlMerge) gx2DlSplit(kDlSplitFrame);
     SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
     rendererStateWritten();
     s_textures.push_back(TextureEntry());
@@ -5999,6 +6005,8 @@ void rendererInit(float) {
     // independent opt-in for the single-threaded path.
     s_gx2DlEnabled = sdMarkerPresent("gx2dl") || s_gx2ProdMarker;
     s_gx2DlFallback = sdMarkerPresent("gx2dlfallback");
+    s_dlMerge = sdMarkerPresent("dlmerge") && s_gx2DlEnabled;
+    WHBLogPrintf("SMS Wii U: [dlmerge] marker=%s", s_dlMerge ? "on" : "off");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_uniblock = sdMarkerPresent("uniblock");
@@ -6338,6 +6346,7 @@ static uint32_t s_debugDrawNo;
 // Stage 1 command-list counters.  They are declared with the baseline path
 // as well so the control run reports zero recorder activity.
 static uint32_t s_perfDlRecorded, s_perfDlCalled, s_perfDlBytes, s_perfDlMaxBytes;
+static uint32_t s_perfDlRecordedDraws, s_perfDlMergeCalls;
 static uint32_t s_perfDlFallbacks, s_perfDlForbidden, s_perfDlOverflows, s_perfDlBadAlignment;
 static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, s_perfDlSplitsFrame;
 static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
@@ -6359,8 +6368,12 @@ static void gx2ProdConsume(const uint8_t* bytes, uint32_t size) {
 static void gx2ProdBoundary(uint32_t kind) {
     SMS_PORT_HEAP_SCOPE();
     producerBoundary(kind);
-    // The barrier must follow the completed list service record.
-    gx2DlClose();
+    // GXBeginDisplayList only needs the parser state synchronized before the
+    // game records bytes into RAM. It emits no GX2 command or core-1 service,
+    // so the next called list can keep appending to this GX2 list. All actual
+    // waits and frame/service boundaries still publish the completed list.
+    if (!s_dlMerge || kind != gx2prod::kWaitGameDlBegin)
+        gx2DlClose();
 }
 
 static bool gx2DlBegin(void** outList) {
@@ -6430,6 +6443,18 @@ static bool gx2DlEndCall(void* list) {
 
 static void* s_gx2DlOpen;
 static uint32_t s_gx2DlOpenDraws;
+static uint32_t s_gx2DlGameCall, s_gx2DlOpenGameCall;
+
+void rendererGameDlCall() {
+    if (s_dlMerge) ++s_gx2DlGameCall;
+}
+
+static void gx2DlNoteDraw() {
+    if (s_dlMerge && s_gx2DlOpenDraws && s_gx2DlOpenGameCall != s_gx2DlGameCall)
+        ++s_perfDlMergeCalls;
+    s_gx2DlOpenGameCall = s_gx2DlGameCall;
+    ++s_gx2DlOpenDraws;
+}
 
 static void gx2DlClose() {
     // Core 1 services are ordered between worker-produced lists.  They must
@@ -6438,7 +6463,9 @@ static void gx2DlClose() {
     if (!s_gx2DlOpen) return;
     void* list = s_gx2DlOpen;
     s_gx2DlOpen = nullptr;
-    if (!gx2DlEndCall(list))
+    if (gx2DlEndCall(list))
+        s_perfDlRecordedDraws += s_gx2DlOpenDraws;
+    else
         WHBLogPrintf("SMS Wii U: [gx2dl] merged list (%u draws) failed validation; its draws are lost",
                      (unsigned)s_gx2DlOpenDraws);
 }
@@ -6463,6 +6490,7 @@ static bool gx2DlOpenForDraw() {
         if (!gx2DlBegin(&list)) return false;
         s_gx2DlOpen = list;
         s_gx2DlOpenDraws = 0;
+        s_gx2DlOpenGameCall = s_gx2DlGameCall;
     }
     return true;
 }
@@ -6728,7 +6756,7 @@ void flushBatch() {
                                    dlArena() + pend.ref->baseVertex);
                 if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                  const_cast<uint32_t*>(storedIdx), 0, 1);
-                ++s_gx2DlOpenDraws;
+                gx2DlNoteDraw();
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    dlArena() + pend.ref->baseVertex);
@@ -6945,7 +6973,7 @@ void flushBatch() {
     sms_wiiu_d4_draw(indexCount, tevPath ? tevKey.stages : 0, g.bp[BP_CMODE0], tevTextureMask(tevKey));
     if (listReady) {
         if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
-        ++s_gx2DlOpenDraws;
+        gx2DlNoteDraw();
     } else {
         if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
     }
@@ -7810,7 +7838,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
 #else
         const unsigned m1copy = 0, m1copyMiss = 0, m1copyBytes = 0;
 #endif
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u m1copy=%u m1copyMiss=%u m1copyBytes=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlMergeCalls=%u dlAvgDrawsX10=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u m1copy=%u m1copyMiss=%u m1copyBytes=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -7836,7 +7864,10 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      unsigned(dlcache.stateVcd), unsigned(dlcache.stateVat), unsigned(dlcache.stateMatA),
                      unsigned(dlcache.stateMatB), unsigned(dlcache.stateArray), unsigned(dlcache.stateZtex),
                      unsigned(dlcache.stateExternal),
-                     s_gx2DlEnabled ? 1 : 0, (unsigned)s_perfDlRecorded, (unsigned)s_perfDlCalled, (unsigned)s_perfDlBytes,
+                     s_gx2DlEnabled ? 1 : 0, (unsigned)s_perfDlRecorded, (unsigned)s_perfDlCalled,
+                     (unsigned)s_perfDlMergeCalls,
+                     (unsigned)(s_perfDlRecorded ? 10ull * s_perfDlRecordedDraws / s_perfDlRecorded : 0),
+                     (unsigned)s_perfDlBytes,
                      (unsigned)s_perfDlMaxBytes, (unsigned)s_perfDlFallbacks, (unsigned)s_perfDlForbidden,
                      (unsigned)s_perfDlOverflows, (unsigned)s_perfDlBadAlignment, (unsigned)s_perfDlSplitsCopy,
                      (unsigned)s_perfDlSplitsClear, (unsigned)s_perfDlSplitsContext, (unsigned)s_perfDlSplitsFrame,
@@ -7917,6 +7948,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_perfDlImmBypassVerts = s_perfDlImmBypassDraws = 0;
         s_perfDlImmDirectVerts = s_perfDlImmDirectDraws = 0;
         s_perfDlRecorded = s_perfDlCalled = s_perfDlBytes = s_perfDlMaxBytes = 0;
+        s_perfDlRecordedDraws = s_perfDlMergeCalls = 0;
         s_perfDlFallbacks = s_perfDlForbidden = s_perfDlOverflows = s_perfDlBadAlignment = 0;
         s_perfDlSplitsCopy = s_perfDlSplitsClear = s_perfDlSplitsContext = s_perfDlSplitsFrame = 0;
         s_perfDlCoreRecord = s_perfDlCoreCall = 0;

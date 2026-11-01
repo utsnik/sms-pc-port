@@ -14,13 +14,17 @@ enum WaitKind {
     WAIT_KIND_COUNT = 5,
     WAIT_FLUSH = 5,
     BOUNDARY_STOP = 6,
+    // GXBeginDisplayList synchronizes the parser's state before CPU-side
+    // recording; it is not a GPU wait or a core-1 service boundary.
+    WAIT_GAME_DL_BEGIN = 7,
 
     kWaitPeek = WAIT_PEEK,
     kWaitDrawSync = WAIT_DRAWSYNC,
     kWaitDrawDone = WAIT_DRAWDONE,
     kWaitPresent = WAIT_PRESENT_DRAIN,
     kWaitEndFrame = WAIT_END_FRAME,
-    kWaitFlush = WAIT_FLUSH
+    kWaitFlush = WAIT_FLUSH,
+    kWaitGameDlBegin = WAIT_GAME_DL_BEGIN
 };
 
 /* All Hooks run on the producer worker.  consume() may be given two pieces

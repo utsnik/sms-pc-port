@@ -1592,6 +1592,7 @@ extern "C" int64_t sms_gx_wut_time(void) __asm__("OSGetTime");
 #endif
 void callDisplayList(const uint8_t* data, uint32_t size) {
 #ifdef __WIIU__
+    rendererGameDlCall();
     if (g_perfStages) {
         const int64_t t0 = sms_gx_wut_time();
         callDisplayListImpl(data, size);

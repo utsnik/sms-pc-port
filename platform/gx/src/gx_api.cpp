@@ -421,7 +421,7 @@ void GXRestoreWriteGatherPipe(void) { setPipeRedirect(nullptr); }
 // ================================================================== display lists
 void GXBeginDisplayList(void* list, u32 size) {
 #ifdef __WIIU__
-    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitDrawDone);
+    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitGameDlBegin);
     else
 #endif
     flushBatch();
