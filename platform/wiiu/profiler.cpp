@@ -586,6 +586,19 @@ extern "C" void sms_wiiu_profiler_tick(void)
 {
 	const WutTime now = wut_OSGetTime();
 	++s_frameTicks;
+#if defined(PORT_GAME_SMG)
+	// JPA rendering runs on this thread. Snapshot before resetting so each
+	// report covers exactly thirty completed frame boundaries.
+	extern uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
+	static unsigned s_jpaWindowFrames;
+	if (++s_jpaWindowFrames == 30) {
+		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u\n",
+		         (unsigned)s_jpaParticles, (unsigned)s_jpaDraws,
+		         (unsigned)s_jpaSplits, (unsigned)s_jpaBatched);
+		s_jpaParticles = s_jpaDraws = s_jpaSplits = s_jpaBatched = 0;
+		s_jpaWindowFrames = 0;
+	}
+#endif
 	/* The sampler costs CPU every millisecond: only with the SD marker
 	 * "perfdiag" (the frame count above still feeds the hang check). */
 	static int s_enabled = -1;
@@ -621,6 +634,14 @@ extern "C" void sms_wiiu_profiler_tick(void)
 		report_worker(s_wtables[wdone]);
 	}
 }
+
+#if defined(PORT_GAME_SMG)
+uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
+extern "C" void sms_wiiu_jpa_particle(void) { ++s_jpaParticles; }
+extern "C" void sms_wiiu_jpa_draw(void) { ++s_jpaDraws; }
+extern "C" void sms_wiiu_jpa_split(void) { ++s_jpaSplits; }
+extern "C" void sms_wiiu_jpa_batched(void) { ++s_jpaBatched; }
+#endif
 
 /* Called by the producer thread after it has entered the port heap scope.  The
  * alarm is created here so sampling follows the worker's CPU rather than the

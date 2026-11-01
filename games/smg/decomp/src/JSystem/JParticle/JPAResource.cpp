@@ -11,6 +11,56 @@
 #include "JSystem/JParticle/JPAKeyBlock.hpp"
 #include "JSystem/JParticle/JPAParticle.hpp"
 #include "JSystem/JParticle/JPAResourceManager.hpp"
+#include "JPADirectionalBatch.hpp"
+#include <revolution/mtx.h>
+#if defined(TARGET_WIIU)
+#include "wiiu/jpa_counters.h"
+extern "C" int sms_wiiu_sd_marker(const char*);
+#endif
+
+#if defined(TARGET_WIIU)
+namespace {
+struct DirectionKey {
+    GXColor prm, env;
+    u8 alpha, tex;
+    s16 age;
+};
+
+DirectionKey directionKey(JPABaseParticle* particle, bool ageMatters) {
+    DirectionKey key;
+    key.prm = particle->mPrmClr;
+    key.env = particle->mEnvClr;
+    key.alpha = particle->mPrmColorAlphaAnm;
+    key.tex = particle->mTexAnmIdx;
+    key.age = ageMatters ? particle->mAge : 0;
+    return key;
+}
+
+bool sameDirectionKey(const DirectionKey& a, const DirectionKey& b) {
+    return a.prm.r == b.prm.r && a.prm.g == b.prm.g && a.prm.b == b.prm.b && a.prm.a == b.prm.a &&
+           a.env.r == b.env.r && a.env.g == b.env.g && a.env.b == b.env.b && a.env.a == b.env.a &&
+           a.alpha == b.alpha && a.tex == b.tex && a.age == b.age;
+}
+
+bool batchMarker() {
+    static int marker = -1;
+    if (marker < 0) marker = sms_wiiu_sd_marker("jpabatch") != 0;
+    return marker != 0;
+}
+struct DirectionTracker {
+    bool have;
+    DirectionKey previous;
+    DirectionTracker() : have(false) { }
+    void observe(JPAEmitterWorkData* work, JPABaseParticle* particle, bool directional, bool ageMatters) {
+        if (!directional || !jpa_batch::eligible(work, particle)) return;
+        const DirectionKey key = directionKey(particle, ageMatters);
+        if (have && !sameDirectionKey(previous, key)) sms_wiiu_jpa_split();
+        previous = key;
+        have = true;
+    }
+};
+}
+#endif
 
 JPAResource::JPAResource() {
     mpDrawEmitterChildFuncList = NULL;
@@ -768,6 +818,83 @@ void JPAResource::draw(JPAEmitterWorkData* work, JPABaseEmitter* emtr) {
     }
 }
 
+#if defined(TARGET_WIIU)
+// A run is counted before GXBegin, so the FIFO receives exactly one primitive
+// with a fixed count. The template TEX0 indices remain indexed throughout.
+static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs,
+                                int funcCount, bool reverse, bool ageMatters,
+                                const signed char* template_xyz, const void* pos_array,
+                                const void* tex_array) {
+    typedef JPANode< JPABaseParticle > Node;
+    Node* const end = work->mpAlivePtcl->getEnd();
+    Node* node = reverse ? work->mpAlivePtcl->getLast() : work->mpAlivePtcl->getFirst();
+    bool havePrevious = false;
+    DirectionKey previous;
+    while (node != end) {
+        work->mpCurNode = node;
+        JPABaseParticle* particle = node->getObject();
+        Node* next = reverse ? node->getPrev() : node->getNext();
+        sms_wiiu_jpa_particle();
+        if (!jpa_batch::eligible(work, particle)) {
+            for (int i = funcCount - 1; i >= 0; --i) (*funcs[i])(work, particle);
+            node = next;
+            havePrevious = false;
+            continue;
+        }
+        const DirectionKey key = directionKey(particle, ageMatters);
+        if (havePrevious && !sameDirectionKey(previous, key)) sms_wiiu_jpa_split();
+        previous = key;
+        havePrevious = true;
+        unsigned runLength = 1;
+        for (Node* scan = next; scan != end; scan = reverse ? scan->getPrev() : scan->getNext()) {
+            if (runLength == 16383) break; // GXBegin's vertex count is u16.
+            work->mpCurNode = scan;
+            JPABaseParticle* candidate = scan->getObject();
+            if (!jpa_batch::eligible(work, candidate) || !sameDirectionKey(key, directionKey(candidate, ageMatters))) break;
+            ++runLength;
+        }
+        work->mpCurNode = node;
+        for (int i = funcCount - 1; i > 0; --i) (*funcs[i])(work, particle);
+        Mtx identity;
+        PSMTXIdentity(identity);
+        GXLoadPosMtxImm(identity, GX_PNMTX0);
+        GXSetCurrentMtx(GX_PNMTX0);
+        GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+        GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+        GXBegin(GX_QUADS, GX_VTXFMT0, runLength * 4);
+        Mtx lastMatrix;
+        Node* emit = node;
+        const bool rotated = funcs[0] == &JPADrawRotDirection;
+        for (unsigned i = 0; i < runLength; ++i) {
+            work->mpCurNode = emit;
+            jpa_batch::Vertex corners[4];
+            jpa_batch::materialize(work, emit->getObject(), template_xyz, corners, lastMatrix, rotated);
+            for (unsigned corner = 0; corner < 4; ++corner) {
+                GXPosition3f32(corners[corner].x, corners[corner].y, corners[corner].z);
+                GXTexCoord1x8(corner);
+            }
+            if (i != 0) {
+                sms_wiiu_jpa_particle();
+                sms_wiiu_jpa_batched();
+            }
+            emit = reverse ? emit->getPrev() : emit->getNext();
+        }
+        GXEnd();
+        sms_wiiu_jpa_draw();
+        GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+        GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+        GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S8, 0);
+        GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
+        GXSetArray(GX_VA_POS, pos_array, 3);
+        GXSetArray(GX_VA_TEX0, tex_array, 2);
+        GXLoadPosMtxImm(work->mPosCamMtx, GX_PNMTX0);
+        GXSetCurrentMtx(GX_PNMTX0);
+        node = emit;
+    }
+    if (havePrevious) sms_wiiu_jpa_split(); // phase/emitter boundary
+}
+#endif
+
 void JPAResource::drawP(JPAEmitterWorkData* work) {
     work->mpEmtr->clearStatus(0x80);
 
@@ -801,10 +928,31 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
         (*mpDrawEmitterFuncList[i])(work);
     }
 
+#if defined(TARGET_WIIU)
+    DirectionTracker directionTracker;
+    const bool directional = mpBaseShape->getType() == 3 && mpDrawParticleFuncListNum > 0 &&
+        (mpDrawParticleFuncList[0] == &JPADrawDirection || mpDrawParticleFuncList[0] == &JPADrawRotDirection);
+    if (batchMarker() && mpBaseShape->getType() == 3 && work->mPrjType == 0 &&
+        work->mpEmtr->mpPtclCallBack == NULL && mpDrawParticleFuncListNum > 0 &&
+        (mpDrawParticleFuncList[0] == &JPADrawDirection || mpDrawParticleFuncList[0] == &JPADrawRotDirection)) {
+        const int center = mpExtraShape != NULL
+            ? (mpExtraShape->getScaleCenterX() + 3 * mpExtraShape->getScaleCenterY()) * 0xC : 0x30;
+        const int offset = center + mpBaseShape->getBasePlaneType() * 0x6C;
+        const int crd_offset = (mpBaseShape->getTilingS() + 2 * mpBaseShape->getTilingT()) * 8;
+        drawDirectionalList(work, mpDrawParticleFuncList, mpDrawParticleFuncListNum,
+                            mpBaseShape->isDrawFwdAhead(), mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex(),
+                            reinterpret_cast<const signed char*>(jpa_pos + offset),
+                            jpa_pos + offset, jpa_crd + crd_offset);
+    } else
+#endif
     if (mpBaseShape->isDrawFwdAhead()) {
         JPANode< JPABaseParticle >* node = work->mpEmtr->mAlivePtclBase.getLast();
         for (; node != work->mpEmtr->mAlivePtclBase.getEnd(); node = node->getPrev()) {
             work->mpCurNode = node;
+#if defined(TARGET_WIIU)
+            sms_wiiu_jpa_particle();
+            directionTracker.observe(work, node->getObject(), directional, mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex());
+#endif
             if (mpDrawParticleFuncList != NULL) {
                 for (int i = mpDrawParticleFuncListNum - 1; i >= 0; i--) {
                     (*mpDrawParticleFuncList[i])(work, node->getObject());
@@ -815,6 +963,10 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
         JPANode< JPABaseParticle >* node = work->mpEmtr->mAlivePtclBase.getFirst();
         for (; node != work->mpEmtr->mAlivePtclBase.getEnd(); node = node->getNext()) {
             work->mpCurNode = node;
+#if defined(TARGET_WIIU)
+            sms_wiiu_jpa_particle();
+            directionTracker.observe(work, node->getObject(), directional, mpBaseShape->isTexCrdAnm() && !mpBaseShape->isPrjTex());
+#endif
             if (mpDrawParticleFuncList != NULL) {
                 for (int i = mpDrawParticleFuncListNum - 1; i >= 0; i--) {
                     (*mpDrawParticleFuncList[i])(work, node->getObject());
@@ -822,6 +974,10 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
             }
         }
     }
+
+#if defined(TARGET_WIIU)
+    if (directionTracker.have) sms_wiiu_jpa_split();
+#endif
 
     GXSetMisc(GX_MT_XF_FLUSH, 0);
 
@@ -863,10 +1019,27 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
         (*mpDrawEmitterChildFuncList[i])(work);
     }
 
+#if defined(TARGET_WIIU)
+    DirectionTracker directionTracker;
+    const bool directional = mpChildShape->getType() == 3 && mpDrawParticleChildFuncListNum > 0 &&
+        (mpDrawParticleChildFuncList[0] == &JPADrawDirection || mpDrawParticleChildFuncList[0] == &JPADrawRotDirection);
+    if (batchMarker() && mpChildShape->getType() == 3 && work->mPrjType == 0 &&
+        work->mpEmtr->mpPtclCallBack == NULL && mpDrawParticleChildFuncListNum > 0 &&
+        (mpDrawParticleChildFuncList[0] == &JPADrawDirection || mpDrawParticleChildFuncList[0] == &JPADrawRotDirection)) {
+        const int offset = 0x30 + mpChildShape->getBasePlaneType() * 0x6C;
+        drawDirectionalList(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum,
+                            mpBaseShape->isDrawFwdAhead(), false, reinterpret_cast<const signed char*>(jpa_pos + offset),
+                            jpa_pos + offset, jpa_crd);
+    } else
+#endif
     if (mpBaseShape->isDrawFwdAhead()) {
         JPANode< JPABaseParticle >* node = work->mpEmtr->mAlivePtclChld.getLast();
         for (; node != work->mpEmtr->mAlivePtclChld.getEnd(); node = node->getPrev()) {
             work->mpCurNode = node;
+#if defined(TARGET_WIIU)
+            sms_wiiu_jpa_particle();
+            directionTracker.observe(work, node->getObject(), directional, false);
+#endif
             if (mpDrawParticleChildFuncList != NULL) {
                 for (int i = mpDrawParticleChildFuncListNum - 1; i >= 0; i--) {
                     (*mpDrawParticleChildFuncList[i])(work, node->getObject());
@@ -877,6 +1050,10 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
         JPANode< JPABaseParticle >* node = work->mpEmtr->mAlivePtclChld.getFirst();
         for (; node != work->mpEmtr->mAlivePtclChld.getEnd(); node = node->getNext()) {
             work->mpCurNode = node;
+#if defined(TARGET_WIIU)
+            sms_wiiu_jpa_particle();
+            directionTracker.observe(work, node->getObject(), directional, false);
+#endif
             if (mpDrawParticleChildFuncList != NULL) {
                 for (int i = mpDrawParticleChildFuncListNum - 1; i >= 0; i--) {
                     (*mpDrawParticleChildFuncList[i])(work, node->getObject());
@@ -884,6 +1061,10 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
             }
         }
     }
+
+#if defined(TARGET_WIIU)
+    if (directionTracker.have) sms_wiiu_jpa_split();
+#endif
 
     GXSetMisc(GX_MT_XF_FLUSH, 0);
 

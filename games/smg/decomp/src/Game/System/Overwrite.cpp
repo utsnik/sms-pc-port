@@ -26,6 +26,10 @@
 #include <JSystem/JParticle/JPAEmitterManager.hpp>
 #include <JSystem/JParticle/JPAFieldBlock.hpp>
 #include <JSystem/JParticle/JPAParticle.hpp>
+#include "../../JSystem/JParticle/JPADirectionalBatch.hpp"
+#if defined(TARGET_WIIU)
+#include "wiiu/jpa_counters.h"
+#endif
 
 #include <JSystem/JAudio2/JASAramStream.hpp>
 #include <JSystem/JAudio2/JASAudioThread.hpp>
@@ -519,6 +523,49 @@ void JPABaseEmitter::init(JPAEmitterManager* pManager, JPAResource* pResource) {
     mTexAnmIdx = 0;
 }
 
+#if defined(TARGET_WIIU)
+bool jpa_batch::eligible(JPAEmitterWorkData* work, JPABaseParticle* particle) {
+    if (particle->checkStatus(8)) return false;
+    TVec3f direction, side;
+    p_direction[work->mDirType](work, particle, &direction);
+    if (MR::isNearZero(direction)) return false;
+    MR::normalize(&direction);
+    side.cross(particle->mBaseAxis, direction);
+    return !MR::isNearZero(side);
+}
+
+bool jpa_batch::materialize(JPAEmitterWorkData* work, JPABaseParticle* particle,
+                            const signed char* template_xyz, jpa_batch::Vertex out[4],
+                            float matrix[3][4], bool rotated) {
+    if (!eligible(work, particle)) return false;
+    TVec3f direction, side;
+    p_direction[work->mDirType](work, particle, &direction);
+    MR::normalize(&direction);
+    side.cross(particle->mBaseAxis, direction);
+    MR::normalize(&side);
+    particle->mBaseAxis.cross(direction, side);
+    MR::normalize(&particle->mBaseAxis);
+    const f32 scaleX = work->mGlobalPtclScl.x * particle->mParticleScaleX;
+    const f32 scaleY = work->mGlobalPtclScl.y * particle->mParticleScaleY;
+    Mtx local, world;
+    world[0][0] = particle->mBaseAxis.x; world[0][1] = direction.x; world[0][2] = side.x; world[0][3] = particle->mPosition.x;
+    world[1][0] = particle->mBaseAxis.y; world[1][1] = direction.y; world[1][2] = side.y; world[1][3] = particle->mPosition.y;
+    world[2][0] = particle->mBaseAxis.z; world[2][1] = direction.z; world[2][2] = side.z; world[2][3] = particle->mPosition.z;
+    if (rotated) {
+        p_rot[work->mRotType](JMASSin(particle->mRotateAngle), JMASCos(particle->mRotateAngle), local);
+        p_plane[work->mPlaneType](local, scaleX, scaleY);
+        PSMTXConcat(world, local, local);
+        PSMTXConcat(work->mPosCamMtx, local, matrix);
+    } else {
+        p_plane[work->mPlaneType](world, scaleX, scaleY);
+        PSMTXConcat(work->mPosCamMtx, world, matrix);
+    }
+    for (unsigned i = 0; i != 4; ++i)
+        out[i] = transform(matrix, template_xyz + i * 3);
+    return true;
+}
+#endif
+
 void JPADrawDirection(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
     if (pParticle->checkStatus(8)) {
         return;
@@ -560,6 +607,9 @@ void JPADrawDirection(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
     GXLoadPosMtxImm(matrix, GX_PNMTX0);
     p_prj[pWork->mPrjType](pWork, matrix);
     GXCallDisplayList(p_dl[pWork->mDLType], 32);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
 }
 
 void JPADrawRotDirection(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
@@ -608,6 +658,9 @@ void JPADrawRotDirection(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) 
     GXLoadPosMtxImm(matrix, GX_PNMTX0);
     p_prj[pWork->mPrjType](pWork, matrix);
     GXCallDisplayList(p_dl[pWork->mDLType], 32);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
 }
 
 void JPADrawDBillboard(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
@@ -642,6 +695,9 @@ void JPADrawDBillboard(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
     GXLoadPosMtxImm(matrix, GX_PNMTX0);
     p_prj[pWork->mPrjType](pWork, matrix);
     GXCallDisplayList(jpa_dl, 32);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
 }
 
 void JPADrawLine(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
@@ -661,6 +717,9 @@ void JPADrawLine(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
     GXBegin(GX_LINES, GX_VTXFMT1, 2);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     GXPosition3f32(position.x, position.y, position.z);
     GXTexCoord2f32(0.0f, 0.0f);
     GXPosition3f32(end.x, end.y, end.z);
@@ -710,6 +769,9 @@ void JPADrawStripe(JPAEmitterWorkData* pWork) {
     TVec3f vertices[2];
     Mtx matrix;
     GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT1, count * 2);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     for (JPANode< JPABaseParticle >* pNode = pFirst; pNode != pWork->mpAlivePtcl->getEnd();) {
         JPABaseParticle* pParticle = pNode->getObject();
         pWork->mpCurNode = pNode;
@@ -805,6 +867,9 @@ void JPADrawStripeX(JPAEmitterWorkData* pWork) {
     TVec3f vertices[2];
     Mtx matrix;
     GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT1, count * 2);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     for (JPANode< JPABaseParticle >* pNode = pFirst; pNode != pWork->mpAlivePtcl->getEnd();) {
         JPABaseParticle* pParticle = pNode->getObject();
         pWork->mpCurNode = pNode;
@@ -859,6 +924,9 @@ void JPADrawStripeX(JPAEmitterWorkData* pWork) {
     GXEnd();
     texCoord = startTexCoord;
     GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT1, count * 2);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     for (JPANode< JPABaseParticle >* pNode = pFirst; pNode != pWork->mpAlivePtcl->getEnd();) {
         JPABaseParticle* pParticle = pNode->getObject();
         pWork->mpCurNode = pNode;
@@ -1023,6 +1091,9 @@ void JPADrawYBillboard(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
     GXLoadPosMtxImm(matrix, GX_PNMTX0);
     p_prj[pWork->mPrjType](pWork, matrix);
     GXCallDisplayList(jpa_dl, 32);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
 }
 
 void JPADrawRotYBillboard(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle) {
@@ -1061,6 +1132,9 @@ void JPADrawRotYBillboard(JPAEmitterWorkData* pWork, JPABaseParticle* pParticle)
     GXLoadPosMtxImm(matrix, GX_PNMTX0);
     p_prj[pWork->mPrjType](pWork, matrix);
     GXCallDisplayList(jpa_dl, 32);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
 }
 
 void JKRAramPiece::startDMA(JKRAMCommand* pCommand) {

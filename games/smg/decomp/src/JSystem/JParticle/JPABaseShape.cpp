@@ -1,4 +1,7 @@
 #include "JSystem/JParticle/JPABaseShape.hpp"
+#if defined(TARGET_WIIU)
+#include "wiiu/jpa_counters.h"
+#endif
 #include "Inline.hpp"
 #include "JSystem/JKernel/JKRHeap.hpp"
 #include "JSystem/JMath/JMATrigonometric.hpp"
@@ -459,6 +462,9 @@ void JPADrawBillboard(JPAEmitterWorkData* work, JPABaseParticle* param_1) {
         GXLoadPosMtxImm(local_38, 0);
         p_prj[work->mPrjType](work, local_38);
         GXCallDisplayList(jpa_dl, sizeof(jpa_dl));
+#if defined(TARGET_WIIU)
+        sms_wiiu_jpa_draw();
+#endif
     }
 }
 
@@ -487,6 +493,9 @@ void JPADrawRotBillboard(JPAEmitterWorkData* work, JPABaseParticle* param_1) {
         GXLoadPosMtxImm(local_38, 0);
         p_prj[work->mPrjType](work, local_38);
         GXCallDisplayList(jpa_dl, sizeof(jpa_dl));
+#if defined(TARGET_WIIU)
+        sms_wiiu_jpa_draw();
+#endif
     }
 }
 
@@ -650,6 +659,9 @@ void JPADrawRotation(JPAEmitterWorkData* param_0, JPABaseParticle* param_1) {
         GXLoadPosMtxImm(auStack_88, 0);
         p_prj[param_0->mPrjType](param_0, auStack_88);
         GXCallDisplayList(p_dl[param_0->mDLType], sizeof(jpa_dl));
+#if defined(TARGET_WIIU)
+        sms_wiiu_jpa_draw();
+#endif
     }
 }
 
@@ -661,6 +673,9 @@ void JPADrawPoint(JPAEmitterWorkData* work, JPABaseParticle* ptcl) {
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
     GXBegin(GX_POINTS, GX_VTXFMT1, 1);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     GXPosition3f32(ptcl->mPosition.x, ptcl->mPosition.y, ptcl->mPosition.z);
     GXTexCoord2f32(0.0f, 0.0f);
     GXEnd();
@@ -687,6 +702,9 @@ void JPADrawLine(JPAEmitterWorkData* param_0, JPABaseParticle* param_1) {
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
     GXBegin(GX_LINES, GX_VTXFMT1, 2);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     GXPosition3f32(local_1c.x, local_1c.y, local_1c.z);
     GXTexCoord2f32(0.0f, 0.0f);
     GXPosition3f32(local_28.x, local_28.y, local_28.z);
@@ -743,6 +761,9 @@ void JPADrawStripe(JPAEmitterWorkData* param_0) {
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
     GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT1, ptcl_num << 1);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     for (JPANode< JPABaseParticle >* node = startNode; node != param_0->mpAlivePtcl->getEnd(); node = node_func(node), coord += step) {
         param_0->mpCurNode = node;
         JPABaseParticle* particle = node->getObject();
@@ -831,6 +852,9 @@ void JPADrawStripeX(JPAEmitterWorkData* param_0) {
     GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
     GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
     GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT1, ptcl_num << 1);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     for (JPANode< JPABaseParticle >* node = startNode; node != param_0->mpAlivePtcl->getEnd(); node = node_func(node), coord += step) {
         param_0->mpCurNode = node;
         JPABaseParticle* particle = node->getObject();
@@ -878,6 +902,9 @@ void JPADrawStripeX(JPAEmitterWorkData* param_0) {
 
     coord = start_coord;
     GXBegin(GX_TRIANGLESTRIP, GX_VTXFMT1, ptcl_num << 1);
+#if defined(TARGET_WIIU)
+    sms_wiiu_jpa_draw();
+#endif
     for (JPANode< JPABaseParticle >* node = startNode; node != param_0->mpAlivePtcl->getEnd(); node = node_func(node), coord += step) {
         param_0->mpCurNode = node;
         JPABaseParticle* particle = node->getObject();
