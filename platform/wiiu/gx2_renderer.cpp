@@ -1521,6 +1521,7 @@ static float s_lodScale = 1.5f;
 // mips thrashed the texture cache: 2.5 ms of GPU per frame at 545 MHz.
 // Clamped textures (UI, lookup ramps) keep the game's own sampling.
 static bool s_autoMip, s_autoMipPack;  // automipnopack: not for HD pack textures
+static bool s_packMipClamp;            // SD marker packmipclamp, see the sampler setup in getTexture
 static bool autoMipWrap(uint32_t mode0) { return (mode0 & 3) && ((mode0 >> 2) & 3); }
 static void boxDownsample(const uint8_t* s, uint32_t sw, uint32_t sh, uint8_t* d, uint32_t dw, uint32_t dh) {
     for (uint32_t y = 0; y < dh; ++y) {
@@ -1535,8 +1536,8 @@ static void boxDownsample(const uint8_t* s, uint32_t sw, uint32_t sh, uint8_t* d
 }
 
 static void initSampler(GX2Sampler* sampler, uint32_t mode0, uint32_t mode1, uint32_t levels, bool arbitraryMips,
-                        bool forceMips = false) {
-    if (forceMips && levels > 1 && autoMipWrap(mode0)) {
+                        bool forceMips = false, bool forceAnyWrap = false) {
+    if (forceMips && levels > 1 && (forceAnyWrap || autoMipWrap(mode0))) {
         mode0 = (mode0 & ~(3u << 5)) | (2u << 5);                  // linear between levels
         mode1 = (mode1 & ~0xffffu) | (((levels - 1) * 16) << 8);   // LOD 0 .. last level
     }
@@ -3998,7 +3999,11 @@ static TextureEntry* getTexture(int map) {
                                  unsigned(e.texture.surface.width), unsigned(e.texture.surface.height),
                                  unsigned(e.texture.surface.mipLevels), unsigned(mode0), static_cast<const void*>(e.source));
             }
-            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips, force);
+            // SD marker packmipclamp: an HD pack replacement larger than the game's texture also gets its mips when the
+            // game clamps it. Corona's bath-water drops (ball.bti, 128x128, clamped, ~170 additive billboards) sampled
+            // the full-size replacement at level 0 and cost ~5 ms of GPU per draw (batch233 pd-corona).
+            const bool anyWrap = s_packMipClamp && e.packState == 3 && e.texture.surface.width > e.width;
+            initSampler(&e.sampler, mode0, mode1, e.texture.surface.mipLevels, e.arbitraryMips, force, anyWrap);
             return &e;
         }
     }
@@ -5650,6 +5655,8 @@ void rendererInit(float) {
     s_rectClear = !sdMarkerPresent("norectclear") && !runningUnderCemu();
     s_autoMip = !sdMarkerPresent("noautomip");
     s_autoMipPack = !sdMarkerPresent("automipnopack");
+    s_packMipClamp = sdMarkerPresent("packmipclamp");
+    WHBLogPrintf("SMS Wii U: [packmipclamp] marker=%s", s_packMipClamp ? "on" : "off");
     s_depthSkip = !sdMarkerPresent("nodepthskip");
     s_texRecheck = !sdMarkerPresent("notexrecheck");
     s_texSplit = sdMarkerPresent("texsplit");
