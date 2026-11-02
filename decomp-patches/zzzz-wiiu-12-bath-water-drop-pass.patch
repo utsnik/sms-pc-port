@@ -1,4 +1,4 @@
-Reason: port: expose Corona's bath-water drop billboards and cap (one alpha mask) as a separate renderer pass; absent hooks leave the existing draw path unchanged
+Reason: port: expose the drop billboards and cap of both bath-water renderers (Corona uses the mesh one) (one alpha mask) as a separate renderer pass; absent hooks leave the existing draw path unchanged
 --- a/src/Map/BathWaterManager.cpp
 +++ b/src/Map/BathWaterManager.cpp
 @@ -31,6 +31,14 @@
@@ -38,3 +38,22 @@ Reason: port: expose Corona's bath-water drop billboards and cap (one alpha mask
  
  		// TODO: frame 0x1e0 against the ROM's 0x258; the instruction stream
  		// is identical. The 112 bytes missing are one Mtx plus one
+@@ -1340,10 +1356,18 @@
+ 		GXLoadPosMtxImm(mtx, GX_PNMTX0);
+ 		GXSetCurrentMtx(GX_PNMTX0);
+ 
++#ifdef TARGET_PC
++		if (GXPC_BathLowResBegin && GXPC_BathLowResEnd)
++			GXPC_BathLowResBegin();
++#endif
+ 		drawDropQuads(mtx, waters, params, num);
+ 
+ 		if (unk80134->showsCap.get() && !data.unk65)
+ 			drawBathtubCap(data);
++#ifdef TARGET_PC
++		if (GXPC_BathLowResBegin && GXPC_BathLowResEnd)
++			GXPC_BathLowResEnd();
++#endif
+ 
+ 		GXInitTexObj(&unk800D4, unk800A8, r23, r24, (GXTexFmt)1, GX_CLAMP,
+ 		             GX_CLAMP, GX_FALSE);
