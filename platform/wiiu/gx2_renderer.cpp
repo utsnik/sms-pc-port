@@ -4902,7 +4902,7 @@ static uint32_t s_bathDepthQuadNext;
 static BathLowResMapping s_bathFullMapping;
 static bool s_bathLowResMarker;
 static bool s_bathNoDepth;  // SD marker bathnodepth: skip the scene-depth downsample
-static bool s_bathFence;    // SD marker bathfence: fence the producer around bath services
+static bool s_bathFence;    // default ordering; SD marker bathnofence restores the old path
 static bool s_bathNoSwitch; // SD marker bathnoswitch: keep draws on the TV target
 static bool s_bathFull;     // SD marker bathfull: use a full-size bath target
 static bool s_bathHookActive;
@@ -5222,6 +5222,8 @@ static void bathCopyConsumed() {
 extern "C" void GXPC_BathLowResBegin(void) {
     if (!s_bathLowResMarker || s_bathHookActive || !s_frameActive || !ProcUIInForeground()) return;
     if (!bathEnsureTarget()) return;
+    // bathfence (batch239) is now the safe default.  Keep the old
+    // game-thread flush only behind bathnofence for comparison runs.
     if (!s_bathFence) flushBatch();
     bathSaveMapping();
     if (s_gx2ProdEnabled) {
@@ -6060,7 +6062,7 @@ void rendererInit(float) {
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_bathLowResMarker = sdMarkerPresent("bathlowres");
     s_bathNoDepth = sdMarkerPresent("bathnodepth");
-    s_bathFence = sdMarkerPresent("bathfence");
+    s_bathFence = !sdMarkerPresent("bathnofence");
     s_bathNoSwitch = sdMarkerPresent("bathnoswitch");
     s_bathFull = sdMarkerPresent("bathfull");
     WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s nodepth=%s fence=%s noswitch=%s full=%s",
