@@ -98,6 +98,7 @@ static bool gx2DlOpenForDraw();
 static void gx2DlClose();
 static uint32_t textureCacheEntryCount();
 static void resetTargetScissor();
+static void applyState();
 
 enum WorkerTimingOp {
     kWorkerTextureMiss,
@@ -4874,13 +4875,30 @@ struct BathLowResMapping {
 struct BathLowResTarget {
     GX2ColorBuffer colour;
     GX2DepthBuffer depth;
-    GX2Surface depthCopy;
+    GX2Texture depthTexture;
     GX2DepthBuffer sceneDepth;
     uint32_t sceneW, sceneH;
     bool valid;
 };
 
+struct BathDepthShader {
+    GX2PixelShader pixel;
+    GX2SamplerVar samplerVar;
+    GX2Sampler sampler;
+    void* program;
+    bool ready;
+};
+
+struct BathDepthVertex {
+    float position[4];
+    float texcoord[2];
+    float colour[4];
+};
+
 static BathLowResTarget s_bathLowRes;
+static BathDepthShader s_bathDepthShader;
+static BathDepthVertex* s_bathDepthQuadRing;
+static uint32_t s_bathDepthQuadNext;
 static BathLowResMapping s_bathFullMapping;
 static bool s_bathLowResMarker;
 static bool s_bathHookActive;
@@ -4945,7 +4963,117 @@ static bool bathAllocSurface(GX2Surface& surface, GX2SurfaceUse use, GX2SurfaceF
     return true;
 }
 
+static bool bathInitDepthShader() {
+    if (s_bathDepthShader.ready) return true;
+
+    // The vertex side is the established textured fixed shader: attribute 0 is
+    // clip-space position and attribute 1 is the interpolated texture
+    // coordinate.  The pixel side follows Galaxy's R600 export convention:
+    // sample R0.x, export it to computed Z (PIX_Z/61), then export a dummy
+    // colour which is disabled by the target channel masks below.
+    std::vector<uint64_t> program;
+    program.push_back(TEX(0, 2));
+    const uint64_t sample[] = {TEX_SAMPLE(0, _x, _y, _z, _w, 0, _x, _y, _z, _w, 0, 0)};
+    program.insert(program.end(), sample, sample + 2);
+    program.push_back(ALU(3, 1));
+    program.push_back(ALU_MOV(1, _x, _R(0), _x) ALU_LAST);
+    program.push_back(EXP(PIX_Z, _R(1), _x, _0, _0, _0));
+    program.push_back(EXP_DONE(PIX0, _R(0), _0, _0, _0, _0) END_OF_PROGRAM);
+
+    memset(&s_bathDepthShader, 0, sizeof(s_bathDepthShader));
+    s_bathDepthShader.program = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT,
+                                            program.size() * sizeof(uint64_t));
+    if (!s_bathDepthShader.program) return false;
+    memcpy(s_bathDepthShader.program, program.data(), program.size() * sizeof(uint64_t));
+
+    // Sunshine's hand-built shader setup uses the proven modulate shader
+    // inputs and only changes the export control to enable computed Z.
+    memcpy(&s_bathDepthShader.pixel.regs, dkr_modulate_ps_regs,
+           sizeof(dkr_modulate_ps_regs));
+    s_bathDepthShader.pixel.regs.sq_pgm_resources_ps = 6;
+    s_bathDepthShader.pixel.regs.sq_pgm_exports_ps = 2;  // PIX0 and PIX_Z
+    s_bathDepthShader.pixel.regs.cb_shader_mask = 0xf;
+    s_bathDepthShader.pixel.regs.cb_shader_control = 1;
+    s_bathDepthShader.pixel.regs.db_shader_control = (1u << 4) | (1u << 6) | 1u;
+    s_bathDepthShader.pixel.size = uint32_t(program.size() * sizeof(uint64_t));
+    s_bathDepthShader.pixel.program = s_bathDepthShader.program;
+    s_bathDepthShader.pixel.mode = GX2_SHADER_MODE_UNIFORM_REGISTER;
+    s_bathDepthShader.samplerVar = {"bathDepth", GX2_SAMPLER_VAR_TYPE_SAMPLER_2D, 0};
+    s_bathDepthShader.pixel.samplerVars = &s_bathDepthShader.samplerVar;
+    s_bathDepthShader.pixel.samplerVarCount = 1;
+    GX2InitSampler(&s_bathDepthShader.sampler, GX2_TEX_CLAMP_MODE_CLAMP,
+                   GX2_TEX_XY_FILTER_MODE_LINEAR);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, s_bathDepthShader.pixel.program,
+                  s_bathDepthShader.pixel.size);
+    s_bathDepthShader.ready = true;
+    WHBLogPrintf("SMS Wii U: [bathlowres] shader exports PIX0=%u PIX_Z=%u "
+                 "sq=%08x exports=%08x spi=%08x inputs=%u cbmask=%08x cbctl=%08x dbctl=%08x",
+                 unsigned(PIX0), unsigned(PIX_Z),
+                 unsigned(s_bathDepthShader.pixel.regs.sq_pgm_resources_ps),
+                 unsigned(s_bathDepthShader.pixel.regs.sq_pgm_exports_ps),
+                 unsigned(s_bathDepthShader.pixel.regs.spi_ps_in_control_0),
+                 unsigned(s_bathDepthShader.pixel.regs.num_spi_ps_input_cntl),
+                 unsigned(s_bathDepthShader.pixel.regs.cb_shader_mask),
+                 unsigned(s_bathDepthShader.pixel.regs.cb_shader_control),
+                 unsigned(s_bathDepthShader.pixel.regs.db_shader_control));
+    return true;
+}
+
+static bool bathDrawDepth(const GX2Texture& source, GX2DepthBuffer& target) {
+    if (!bathInitDepthShader()) return false;
+    if (!s_bathDepthQuadRing) {
+        constexpr uint32_t kBathDepthQuadSlots = 8;
+        s_bathDepthQuadRing = static_cast<BathDepthVertex*>(alignedZero(
+            GX2_VERTEX_BUFFER_ALIGNMENT, sizeof(BathDepthVertex) * 6 * kBathDepthQuadSlots));
+        if (!s_bathDepthQuadRing) return false;
+    }
+
+    static const float kCorners[6][4] = {
+        {-1.0f, -1.0f, 0.0f, 0.0f}, {1.0f, -1.0f, 1.0f, 0.0f},
+        {1.0f, 1.0f, 1.0f, 1.0f}, {-1.0f, -1.0f, 0.0f, 0.0f},
+        {1.0f, 1.0f, 1.0f, 1.0f}, {-1.0f, 1.0f, 0.0f, 1.0f}
+    };
+    constexpr uint32_t kBathDepthQuadSlots = 8;
+    BathDepthVertex* vertices = s_bathDepthQuadRing +
+        (s_bathDepthQuadNext++ % kBathDepthQuadSlots) * 6;
+    for (uint32_t i = 0; i < 6; ++i) {
+        vertices[i].position[0] = kCorners[i][0];
+        vertices[i].position[1] = kCorners[i][1];
+        vertices[i].position[2] = 0.0f;
+        vertices[i].position[3] = 1.0f;
+        vertices[i].texcoord[0] = kCorners[i][2];
+        vertices[i].texcoord[1] = kCorners[i][3];
+        memset(vertices[i].colour, 0, sizeof(vertices[i].colour));
+    }
+    DCFlushRange(vertices, sizeof(BathDepthVertex) * 6);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, vertices,
+                  sizeof(BathDepthVertex) * 6);
+
+    GX2SetFetchShader(&s_modulate.fetch);
+    GX2SetVertexShader(&s_modulate.vertex);
+    GX2SetPixelShader(&s_bathDepthShader.pixel);
+    GX2SetDepthBuffer(&target);
+    GX2SetPixelTexture(const_cast<GX2Texture*>(&source), 0);
+    GX2SetPixelSampler(&s_bathDepthShader.sampler, 0);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ZERO,
+                       GX2_BLEND_COMBINE_MODE_ADD, FALSE, GX2_BLEND_MODE_ONE,
+                       GX2_BLEND_MODE_ZERO, GX2_BLEND_COMBINE_MODE_ADD);
+    GX2SetDepthOnlyControl(TRUE, TRUE, GX2_COMPARE_FUNC_ALWAYS);
+    GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, 0x00, FALSE, TRUE);
+    GX2SetTargetChannelMasks((GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
+                             (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
+                             (GX2ChannelMask)0, (GX2ChannelMask)0);
+    GX2SetPolygonControl(GX2_FRONT_FACE_CW, FALSE, FALSE, FALSE,
+                         GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE,
+                         FALSE, FALSE, FALSE);
+    GX2SetAttribBuffer(0, sizeof(BathDepthVertex) * 6, sizeof(BathDepthVertex), vertices);
+    GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 0, 1);
+    return true;
+}
+
 static bool bathEnsureTarget() {
+    if (!bathInitDepthShader()) return false;
     GX2ColorBuffer* mainColour = renderColour();
     GX2DepthBuffer* mainDepth = renderDepth();
     if (!mainColour || !mainDepth || !mainColour->surface.width || !mainColour->surface.height ||
@@ -4953,38 +5081,48 @@ static bool bathEnsureTarget() {
         return false;
     const uint32_t width = (mainColour->surface.width + 1) / 2;
     const uint32_t height = (mainColour->surface.height + 1) / 2;
-    if (s_bathLowRes.valid && s_bathLowRes.sceneW == mainColour->surface.width &&
-        s_bathLowRes.sceneH == mainColour->surface.height)
+    if (s_bathLowRes.valid && s_bathLowRes.sceneW == mainDepth->surface.width &&
+        s_bathLowRes.sceneH == mainDepth->surface.height &&
+        s_bathLowRes.colour.surface.width == width &&
+        s_bathLowRes.colour.surface.height == height)
         return true;
 
     if (s_bathLowRes.valid) {
         deferFree(s_bathLowRes.colour.surface.image);
         deferFree(s_bathLowRes.depth.surface.image);
-        deferFree(s_bathLowRes.depthCopy.image);
+        deferFree(s_bathLowRes.depthTexture.surface.image);
         s_bathLowRes = BathLowResTarget{};
     }
     BathLowResTarget target = {};
     target.sceneDepth = *mainDepth;
-    target.sceneW = mainColour->surface.width;
-    target.sceneH = mainColour->surface.height;
+    target.sceneW = mainDepth->surface.width;
+    target.sceneH = mainDepth->surface.height;
     const GX2SurfaceUse colourUse = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
     const GX2SurfaceUse depthUse = GX2_SURFACE_USE_DEPTH_BUFFER;
     const bool colour = bathAllocSurface(target.colour.surface, colourUse, mainColour->surface.format,
                                          width, height);
     const bool depth = colour && bathAllocSurface(target.depth.surface, depthUse,
                                                   GX2_SURFACE_FORMAT_FLOAT_R32, width, height);
-    const bool copy = depth && bathAllocSurface(target.depthCopy, GX2_SURFACE_USE_TEXTURE,
-                                                GX2_SURFACE_FORMAT_FLOAT_R32, width, height);
-    if (!copy) {
+    const bool texture = depth && bathAllocSurface(target.depthTexture.surface,
+                                                   GX2_SURFACE_USE_TEXTURE,
+                                                   GX2_SURFACE_FORMAT_FLOAT_R32,
+                                                   target.sceneW, target.sceneH);
+    if (!texture) {
         if (target.colour.surface.image) MEMFreeToDefaultHeap(target.colour.surface.image);
         if (target.depth.surface.image) MEMFreeToDefaultHeap(target.depth.surface.image);
-        if (target.depthCopy.image) MEMFreeToDefaultHeap(target.depthCopy.image);
+        if (target.depthTexture.surface.image) MEMFreeToDefaultHeap(target.depthTexture.surface.image);
         return false;
     }
     target.colour.viewNumSlices = 1;
     target.depth.viewNumSlices = 1;
+    target.depthTexture.viewNumMips = 1;
+    target.depthTexture.viewNumSlices = 1;
+    target.depthTexture.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G,
+                                              GX2_SQ_SEL_B, GX2_SQ_SEL_A);
     GX2InitColorBufferRegs(&target.colour);
     GX2InitDepthBufferRegs(&target.depth);
+    GX2InitTextureRegs(&target.depthTexture);
+    target.valid = true;
     s_bathLowRes = target;
     WHBLogPrintf("SMS Wii U: [bathlowres] target=%ux%u depth=FLOAT_R32 source=%ux%u",
                  unsigned(width), unsigned(height), unsigned(target.sceneW), unsigned(target.sceneH));
@@ -4997,8 +5135,10 @@ static void bathBeginService(void*) {
     GX2ClearColor(&s_bathLowRes.colour, 0.0f, 0.0f, 0.0f, 0.0f);
     GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.sceneDepth.surface.image,
                   s_bathLowRes.sceneDepth.surface.imageSize);
-    GX2ConvertDepthBufferToTextureSurface(&s_bathLowRes.sceneDepth, &s_bathLowRes.depthCopy, 0, 0);
-    GX2CopySurface(&s_bathLowRes.depthCopy, 0, 0, &s_bathLowRes.depth.surface, 0, 0);
+    GX2ConvertDepthBufferToTextureSurface(&s_bathLowRes.sceneDepth,
+                                         &s_bathLowRes.depthTexture.surface, 0, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, s_bathLowRes.depthTexture.surface.image,
+                  s_bathLowRes.depthTexture.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.depth.surface.image,
                   s_bathLowRes.depth.surface.imageSize);
     GX2SetColorBuffer(&s_bathLowRes.colour, GX2_RENDER_TARGET_0);
@@ -5006,6 +5146,7 @@ static void bathBeginService(void*) {
     GX2SetViewport(0.0f, 0.0f, float(s_bathLowRes.colour.surface.width),
                    float(s_bathLowRes.colour.surface.height), 0.0f, 1.0f);
     GX2SetScissor(0, 0, s_bathLowRes.colour.surface.width, s_bathLowRes.colour.surface.height);
+    bathDrawDepth(s_bathLowRes.depthTexture, s_bathLowRes.depth);
     invalidateVertexUniforms();
 }
 
@@ -5014,6 +5155,7 @@ static void bathEndService(void*) {
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
     resetTargetScissor();
+    applyState();
     invalidateVertexUniforms();
 }
 
@@ -5894,10 +6036,6 @@ void rendererInit(float) {
                  s_gx2DlEnabled ? "on" : "off", s_gx2ProdMarker ? "on" : "off");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
-    // NOT READY FOR HARDWARE (review 2026-11-02): bathBeginService converts the full-size scene depth
-    // straight into half-size surfaces (GX2ConvertDepthBufferToTextureSurface, then GX2CopySurface), which
-    // expect matching dimensions and would overrun them. Depth must be downsampled by a draw (sample the
-    // full-size converted depth, write depth) before this marker is tested.
     s_bathLowResMarker = sdMarkerPresent("bathlowres");
     WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s", s_bathLowResMarker ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).

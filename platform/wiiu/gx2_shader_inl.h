@@ -221,6 +221,7 @@
 #define PIX(id) ((id) | (EXPORT_TYPE_PIXEL << 13))
 #define POS0 POS(0)
 #define PIX0 PIX(0)
+#define PIX_Z PIX(61) /* computed Z export, consumed when DB_SHADER_CONTROL.Z_EXPORT_ENABLE */
 #define CALL_FS to_QWORD(CF_DWORD0(0), CF_DWORD1(0, 0, 0, 0, 0, CF_INST_CALL_FS))
 #define EXP_DONE(dstReg_and_type, srcReg, srcSelX, srcSelY, srcSelZ, srcSelW) \
     to_QWORD(CF_EXP_WORD0(dstReg_and_type, srcReg, 0, 0, 0), \
