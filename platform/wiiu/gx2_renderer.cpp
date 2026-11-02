@@ -86,6 +86,11 @@ namespace gx {
 
 static GX2ColorBuffer* renderColour();
 static GX2DepthBuffer* renderDepth();
+static GX2ColorBuffer* bathCopyColour();
+static bool bathCopySourceActive();
+static void bathCopyPixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                           uint32_t* tx, uint32_t* ty, uint32_t* tw, uint32_t* th);
+static void bathCopyConsumed();
 static void gx2ProdConsume(const uint8_t* bytes, uint32_t size);
 static void gx2ProdBoundary(uint32_t kind);
 static void gx2ProdCallList(void* list, uint32_t bytes);
@@ -1536,7 +1541,7 @@ static void boxDownsample(const uint8_t* s, uint32_t sw, uint32_t sh, uint8_t* d
 }
 
 static void initSampler(GX2Sampler* sampler, uint32_t mode0, uint32_t mode1, uint32_t levels, bool arbitraryMips,
-                        bool forceMips = false, bool forceAnyWrap = false) {
+                        bool forceMips = false, bool forceAnyWrap = false, bool forceLinear = false) {
     if (forceMips && levels > 1 && (forceAnyWrap || autoMipWrap(mode0))) {
         mode0 = (mode0 & ~(3u << 5)) | (2u << 5);                  // linear between levels
         mode1 = (mode1 & ~0xffffu) | (((levels - 1) * 16) << 8);   // LOD 0 .. last level
@@ -1544,8 +1549,10 @@ static void initSampler(GX2Sampler* sampler, uint32_t mode0, uint32_t mode1, uin
     GX2InitSampler(sampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_POINT);
     GX2InitSamplerClamping(sampler, clampMode(mode0 & 3), clampMode((mode0 >> 2) & 3),
                            GX2_TEX_CLAMP_MODE_WRAP);
-    const GX2TexXYFilterMode mag = ((mode0 >> 4) & 1) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
-    const GX2TexXYFilterMode min = ((mode0 >> 7) & 1) ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
+    const GX2TexXYFilterMode mag = forceLinear || ((mode0 >> 4) & 1)
+        ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
+    const GX2TexXYFilterMode min = forceLinear || ((mode0 >> 7) & 1)
+        ? GX2_TEX_XY_FILTER_MODE_LINEAR : GX2_TEX_XY_FILTER_MODE_POINT;
     GX2InitSamplerXYFilter(sampler, mag, min, GX2_TEX_ANISO_RATIO_NONE);
     const uint32_t mip = (mode0 >> 5) & 3;
     if (levels <= 1 || mip == 0) {
@@ -3259,6 +3266,7 @@ struct CopyEntry {
     // These are the texels the copy shader should sample, in that texture.
     uint32_t sampleX = 0, sampleY = 0, sampleW = 0, sampleH = 0;
     uint32_t storageW = 0, storageH = 0;
+    bool bathLowRes = false;
 };
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
 static std::vector<CopyEntry>* s_copyObject;
@@ -3494,10 +3502,12 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     WorkerOpTimer timing(kWorkerCopyToTexture, info, textureCacheEntryCount());
     ++s_perfCopies;
     ++s_copyGeneration;
-    GX2ColorBuffer* cb = renderColour();
-    if (!dest || !cb || !w || !h) return;
+    GX2ColorBuffer* mainCb = renderColour();
+    GX2ColorBuffer* cb = bathCopyColour();
+    if (!dest || !mainCb || !cb || !w || !h) return;
     uint32_t tx, ty, tw, th;
-    if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+    if (bathCopySourceActive()) bathCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+    else if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
     else {
         tx = uint32_t(s_gameX + float(x) * s_gameScale);
         ty = uint32_t(float(y) * s_gameScale);
@@ -3548,6 +3558,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     e->sampleH = th;
     e->storageW = copyW;
     e->storageH = copyH;
+    e->bathLowRes = bathCopySourceActive();
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
@@ -3634,6 +3645,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
                   e->tex.texture.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e->tex.texture.surface.image,
                   e->tex.texture.surface.imageSize);
+    bathCopyConsumed();
 }
 
 #ifdef __WIIU__
@@ -3658,15 +3670,17 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     ProducerResolvedCopy result = {};
     ++s_perfCopies;
     ++s_copyGeneration;
-    GX2ColorBuffer* cb = renderColour();
-    if (!dest || !cb || !w || !h) return result;
+    GX2ColorBuffer* mainCb = renderColour();
+    GX2ColorBuffer* cb = bathCopyColour();
+    if (!dest || !mainCb || !cb || !w || !h) return result;
     uint32_t tx, ty, tw, th;
-    if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+    if (bathCopySourceActive()) bathCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
+    else if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &tx, &ty, &tw, &th);
     else {
         tx = uint32_t(s_gameX + float(x) * s_gameScale);
         ty = uint32_t(float(y) * s_gameScale);
-        tw = uint32_t(float(w) * s_gameScale);
-        th = uint32_t(float(h) * s_gameScale);
+        tw = uint32_t(w * s_gameScale);
+        th = uint32_t(h * s_gameScale);
     }
     if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
     if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
@@ -3709,6 +3723,7 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     e->sampleH = th;
     e->storageW = copyW;
     e->storageH = copyH;
+    e->bathLowRes = bathCopySourceActive();
     if (!e->tex.valid) {
         TextureEntry& t = e->tex;
         memset(&t.texture, 0, sizeof(t.texture));
@@ -3782,6 +3797,7 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     result.sourceRect = {int32_t(sourceLeft), int32_t(sourceTop), int32_t(sourceRight), int32_t(sourceBottom)};
     result.destinationPoint = {0, 0};
     result.ready = true;
+    bathCopyConsumed();
     return result;
 }
 #endif
@@ -3963,7 +3979,9 @@ static TextureEntry* getTexture(int map) {
     const uint32_t tlutFmt = indexed ? ((tlutReg >> 10) & 3) : 0;
     const uint8_t* source = g.texImage[map];
     if (TextureEntry* c = copyTexture(source)) {
-        initSampler(&c->sampler, mode0, mode1, 1, false);
+        const CopyEntry* copy = copyEntryForTexture(c);
+        initSampler(&c->sampler, mode0, mode1, 1, false, false, false,
+                    copy && copy->bathLowRes);
         return c;
     }
     const uint32_t levels = textureLevels(mode0, mode1, w, h);
@@ -4842,6 +4860,235 @@ static GX2DepthBuffer* renderDepth() {
     return s_renderOwn ? &s_renderDepth : WHBGfxGetTVDepthBuffer();
 }
 
+/* Corona's flat bath renderer is an unusually expensive alpha-only pass: the
+ * drop billboards cover a large fraction of the screen, but their result is
+ * immediately copied into an A8 texture and thresholded.  bathlowres keeps
+ * that intermediate at half the scene dimensions.  The hooks are called from
+ * the game's GX stream, so the producer path must put target changes on the
+ * core-1 service queue and fence both sides of the short pass. */
+struct BathLowResMapping {
+    float tvW, tvH, gameScale, gameX, efbW, ox, lodScale;
+    XMap xmap;
+};
+
+struct BathLowResTarget {
+    GX2ColorBuffer colour;
+    GX2DepthBuffer depth;
+    GX2Surface depthCopy;
+    GX2DepthBuffer sceneDepth;
+    uint32_t sceneW, sceneH;
+    bool valid;
+};
+
+static BathLowResTarget s_bathLowRes;
+static BathLowResMapping s_bathFullMapping;
+static bool s_bathLowResMarker;
+static bool s_bathHookActive;
+static bool s_bathCopyPending;
+static uint32_t s_bathLowResPasses;
+
+extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst,
+                                                        uint32_t dstMip, uint32_t dstSlice);
+
+static void bathSaveMapping() {
+    s_bathFullMapping = {s_tvW, s_tvH, s_gameScale, s_gameX, s_efbW, s_ox, s_lodScale, s_xmap};
+}
+
+static void bathSetMapping(bool low) {
+    if (low) {
+        s_tvW = float(s_bathLowRes.colour.surface.width);
+        s_tvH = float(s_bathLowRes.colour.surface.height);
+        s_gameScale = s_bathFullMapping.gameScale * 0.5f;
+        s_gameX = s_bathFullMapping.gameX * 0.5f;
+        s_efbW = s_bathFullMapping.efbW * 0.5f;
+        s_ox = s_bathFullMapping.ox * 0.5f;
+        s_lodScale = s_bathFullMapping.lodScale * 0.5f;
+    } else {
+        s_tvW = s_bathFullMapping.tvW;
+        s_tvH = s_bathFullMapping.tvH;
+        s_gameScale = s_bathFullMapping.gameScale;
+        s_gameX = s_bathFullMapping.gameX;
+        s_efbW = s_bathFullMapping.efbW;
+        s_ox = s_bathFullMapping.ox;
+        s_lodScale = s_bathFullMapping.lodScale;
+        s_xmap = s_bathFullMapping.xmap;
+    }
+    s_stateValid = false;
+    s_xfUniformValid = false;
+    s_xfMemoryDirty = true;
+}
+
+static bool bathAllocSurface(GX2Surface& surface, GX2SurfaceUse use, GX2SurfaceFormat format,
+                             uint32_t width, uint32_t height) {
+    memset(&surface, 0, sizeof(surface));
+    surface.use = use;
+    surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    surface.width = width;
+    surface.height = height;
+    surface.depth = 1;
+    surface.mipLevels = 1;
+    surface.format = format;
+    surface.aa = GX2_AA_MODE1X;
+    surface.tileMode = GX2_TILE_MODE_DEFAULT;
+    GX2CalcSurfaceSizeAndAlignment(&surface);
+    surface.image = alignedZero(surface.alignment, surface.imageSize);
+    if (!surface.image) return false;
+    if (sms_wiiu_pauseguard_enabled() &&
+        !sms_wiiu_pauseguard_check_surface("bathlowres target", surface.image, surface.imageSize,
+                                           nullptr, 0,
+                                           reinterpret_cast<uintptr_t>(__builtin_return_address(0)))) {
+        MEMFreeToDefaultHeap(surface.image);
+        surface.image = nullptr;
+        return false;
+    }
+    DCFlushRange(surface.image, surface.imageSize);
+    return true;
+}
+
+static bool bathEnsureTarget() {
+    GX2ColorBuffer* mainColour = renderColour();
+    GX2DepthBuffer* mainDepth = renderDepth();
+    if (!mainColour || !mainDepth || !mainColour->surface.width || !mainColour->surface.height ||
+        !mainDepth->surface.width || !mainDepth->surface.height)
+        return false;
+    const uint32_t width = (mainColour->surface.width + 1) / 2;
+    const uint32_t height = (mainColour->surface.height + 1) / 2;
+    if (s_bathLowRes.valid && s_bathLowRes.sceneW == mainColour->surface.width &&
+        s_bathLowRes.sceneH == mainColour->surface.height)
+        return true;
+
+    if (s_bathLowRes.valid) {
+        deferFree(s_bathLowRes.colour.surface.image);
+        deferFree(s_bathLowRes.depth.surface.image);
+        deferFree(s_bathLowRes.depthCopy.image);
+        s_bathLowRes = BathLowResTarget{};
+    }
+    BathLowResTarget target = {};
+    target.sceneDepth = *mainDepth;
+    target.sceneW = mainColour->surface.width;
+    target.sceneH = mainColour->surface.height;
+    const GX2SurfaceUse colourUse = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    const GX2SurfaceUse depthUse = GX2_SURFACE_USE_DEPTH_BUFFER;
+    const bool colour = bathAllocSurface(target.colour.surface, colourUse, mainColour->surface.format,
+                                         width, height);
+    const bool depth = colour && bathAllocSurface(target.depth.surface, depthUse,
+                                                  GX2_SURFACE_FORMAT_FLOAT_R32, width, height);
+    const bool copy = depth && bathAllocSurface(target.depthCopy, GX2_SURFACE_USE_TEXTURE,
+                                                GX2_SURFACE_FORMAT_FLOAT_R32, width, height);
+    if (!copy) {
+        if (target.colour.surface.image) MEMFreeToDefaultHeap(target.colour.surface.image);
+        if (target.depth.surface.image) MEMFreeToDefaultHeap(target.depth.surface.image);
+        if (target.depthCopy.image) MEMFreeToDefaultHeap(target.depthCopy.image);
+        return false;
+    }
+    target.colour.viewNumSlices = 1;
+    target.depth.viewNumSlices = 1;
+    GX2InitColorBufferRegs(&target.colour);
+    GX2InitDepthBufferRegs(&target.depth);
+    s_bathLowRes = target;
+    WHBLogPrintf("SMS Wii U: [bathlowres] target=%ux%u depth=FLOAT_R32 source=%ux%u",
+                 unsigned(width), unsigned(height), unsigned(target.sceneW), unsigned(target.sceneH));
+    return true;
+}
+
+static void bathBeginService(void*) {
+    if (!s_bathLowRes.valid) return;
+    bathSetMapping(true);
+    GX2ClearColor(&s_bathLowRes.colour, 0.0f, 0.0f, 0.0f, 0.0f);
+    GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.sceneDepth.surface.image,
+                  s_bathLowRes.sceneDepth.surface.imageSize);
+    GX2ConvertDepthBufferToTextureSurface(&s_bathLowRes.sceneDepth, &s_bathLowRes.depthCopy, 0, 0);
+    GX2CopySurface(&s_bathLowRes.depthCopy, 0, 0, &s_bathLowRes.depth.surface, 0, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.depth.surface.image,
+                  s_bathLowRes.depth.surface.imageSize);
+    GX2SetColorBuffer(&s_bathLowRes.colour, GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(&s_bathLowRes.depth);
+    GX2SetViewport(0.0f, 0.0f, float(s_bathLowRes.colour.surface.width),
+                   float(s_bathLowRes.colour.surface.height), 0.0f, 1.0f);
+    GX2SetScissor(0, 0, s_bathLowRes.colour.surface.width, s_bathLowRes.colour.surface.height);
+    invalidateVertexUniforms();
+}
+
+static void bathEndService(void*) {
+    bathSetMapping(false);
+    GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(renderDepth());
+    resetTargetScissor();
+    invalidateVertexUniforms();
+}
+
+static bool bathQueueService(void (*fn)(void*)) {
+    if (!s_gx2ProdEnabled) return false;
+    // wake() invokes the producer's flush hook, which publishes the partial
+    // GX byte chunk without parsing it on the game thread.
+    gx2prod::wake();
+    if (!gx2prod::enqueueService(fn, nullptr, gx2prod::SERVICE_COUNTER_COPY_CLEAR)) return false;
+    gx2prod::wake();
+    return true;
+}
+
+static GX2ColorBuffer* bathCopyColour() {
+    return s_bathCopyPending && s_bathLowRes.valid ? &s_bathLowRes.colour : renderColour();
+}
+
+static bool bathCopySourceActive() {
+    return s_bathCopyPending && s_bathLowRes.valid;
+}
+
+static void bathCopyPixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                           uint32_t* tx, uint32_t* ty, uint32_t* tw, uint32_t* th) {
+    uint32_t fullX, fullY, fullW, fullH;
+    if (s_wide > 1.0f) mappedCopyPixels(x, y, w, h, &fullX, &fullY, &fullW, &fullH);
+    else {
+        fullX = uint32_t(s_gameX + float(x) * s_gameScale);
+        fullY = uint32_t(float(y) * s_gameScale);
+        fullW = uint32_t(float(w) * s_gameScale);
+        fullH = uint32_t(float(h) * s_gameScale);
+    }
+    const uint32_t right = (fullX + fullW + 1) / 2;
+    const uint32_t bottom = (fullY + fullH + 1) / 2;
+    *tx = fullX / 2;
+    *ty = fullY / 2;
+    *tw = right > *tx ? right - *tx : 0;
+    *th = bottom > *ty ? bottom - *ty : 0;
+}
+
+static void bathCopyConsumed() {
+    if (s_bathCopyPending) s_bathCopyPending = false;
+}
+
+extern "C" void GXPC_BathLowResBegin(void) {
+    if (!s_bathLowResMarker || s_bathHookActive || !s_frameActive || !ProcUIInForeground()) return;
+    if (!bathEnsureTarget()) return;
+    flushBatch();
+    bathSaveMapping();
+    if (s_gx2ProdEnabled) {
+        if (!bathQueueService(bathBeginService)) return;
+    } else {
+        bathBeginService(nullptr);
+    }
+    s_bathHookActive = true;
+    ++s_bathLowResPasses;
+}
+
+extern "C" void GXPC_BathLowResEnd(void) {
+    if (!s_bathHookActive) return;
+    flushBatch();
+    if (s_gx2ProdEnabled) {
+        gx2prod::wait(gx2prod::kWaitFlush);
+        if (!bathQueueService(bathEndService)) {
+            WHBLogPrintf("SMS Wii U: [bathlowres] producer restore queue rejected");
+            s_bathHookActive = false;
+            return;
+        }
+        gx2prod::wait(gx2prod::kWaitFlush);
+    } else {
+        bathEndService(nullptr);
+    }
+    s_bathCopyPending = true;
+    s_bathHookActive = false;
+}
+
 // Frame start (instead of WHBGfxBeginRenderTV + clear) and present.
 extern "C" void sms_wiiu_gx2_target_begin(void) {
     initRenderTarget();
@@ -5647,6 +5894,8 @@ void rendererInit(float) {
                  s_gx2DlEnabled ? "on" : "off", s_gx2ProdMarker ? "on" : "off");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    s_bathLowResMarker = sdMarkerPresent("bathlowres");
+    WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s", s_bathLowResMarker ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
     s_compactVx = !sdMarkerPresent("nocompactvx");
     if (!s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
@@ -7963,6 +8212,7 @@ extern "C" void sms_wiiu_gx2_renderer_prepare_exit(void) {
 }
 
 extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
+    WHBLogPrintf("SMS Wii U: [bathlowres] lowres-passes=%u", unsigned(s_bathLowResPasses));
     if (s_gx2ProdEnabled) {
         sms_wiiu_gx2_renderer_prepare_exit();
         WHBLogPrintf("SMS Wii U: [gx2prod] worker stopped");
