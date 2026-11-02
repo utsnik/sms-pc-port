@@ -4902,6 +4902,9 @@ static uint32_t s_bathDepthQuadNext;
 static BathLowResMapping s_bathFullMapping;
 static bool s_bathLowResMarker;
 static bool s_bathNoDepth;  // SD marker bathnodepth: skip the scene-depth downsample
+static bool s_bathFence;    // SD marker bathfence: fence the producer around bath services
+static bool s_bathNoSwitch; // SD marker bathnoswitch: keep draws on the TV target
+static bool s_bathFull;     // SD marker bathfull: use a full-size bath target
 static bool s_bathHookActive;
 static bool s_bathCopyPending;
 static uint32_t s_bathLowResPasses;
@@ -4915,13 +4918,14 @@ static void bathSaveMapping() {
 
 static void bathSetMapping(bool low) {
     if (low) {
+        const float factor = s_bathFull ? 1.0f : 0.5f;
         s_tvW = float(s_bathLowRes.colour.surface.width);
         s_tvH = float(s_bathLowRes.colour.surface.height);
-        s_gameScale = s_bathFullMapping.gameScale * 0.5f;
-        s_gameX = s_bathFullMapping.gameX * 0.5f;
-        s_efbW = s_bathFullMapping.efbW * 0.5f;
-        s_ox = s_bathFullMapping.ox * 0.5f;
-        s_lodScale = s_bathFullMapping.lodScale * 0.5f;
+        s_gameScale = s_bathFullMapping.gameScale * factor;
+        s_gameX = s_bathFullMapping.gameX * factor;
+        s_efbW = s_bathFullMapping.efbW * factor;
+        s_ox = s_bathFullMapping.ox * factor;
+        s_lodScale = s_bathFullMapping.lodScale * factor;
     } else {
         s_tvW = s_bathFullMapping.tvW;
         s_tvH = s_bathFullMapping.tvH;
@@ -5080,8 +5084,10 @@ static bool bathEnsureTarget() {
     if (!mainColour || !mainDepth || !mainColour->surface.width || !mainColour->surface.height ||
         !mainDepth->surface.width || !mainDepth->surface.height)
         return false;
-    const uint32_t width = (mainColour->surface.width + 1) / 2;
-    const uint32_t height = (mainColour->surface.height + 1) / 2;
+    const uint32_t width = s_bathFull ? mainColour->surface.width :
+                                       (mainColour->surface.width + 1) / 2;
+    const uint32_t height = s_bathFull ? mainColour->surface.height :
+                                        (mainColour->surface.height + 1) / 2;
     if (s_bathLowRes.valid && s_bathLowRes.sceneW == mainDepth->surface.width &&
         s_bathLowRes.sceneH == mainDepth->surface.height &&
         s_bathLowRes.colour.surface.width == width &&
@@ -5152,11 +5158,14 @@ static void bathBeginService(void*) {
     // GPR split included, which hangs the GPU on hardware): restore the TV
     // context like every other clear/copy here, then bind the bath target.
     GX2SetContextState(WHBGfxGetTVContextState());
-    GX2SetColorBuffer(&s_bathLowRes.colour, GX2_RENDER_TARGET_0);
-    GX2SetDepthBuffer(&s_bathLowRes.depth);
-    GX2SetViewport(0.0f, 0.0f, float(s_bathLowRes.colour.surface.width),
-                   float(s_bathLowRes.colour.surface.height), 0.0f, 1.0f);
-    GX2SetScissor(0, 0, s_bathLowRes.colour.surface.width, s_bathLowRes.colour.surface.height);
+    if (!s_bathNoSwitch) {
+        GX2SetColorBuffer(&s_bathLowRes.colour, GX2_RENDER_TARGET_0);
+        GX2SetDepthBuffer(&s_bathLowRes.depth);
+        GX2SetViewport(0.0f, 0.0f, float(s_bathLowRes.colour.surface.width),
+                       float(s_bathLowRes.colour.surface.height), 0.0f, 1.0f);
+        GX2SetScissor(0, 0, s_bathLowRes.colour.surface.width, s_bathLowRes.colour.surface.height);
+        s_bathCopyPending = true;
+    }
     if (!s_bathNoDepth) bathDrawDepth(s_bathLowRes.depthTexture, s_bathLowRes.depth);
     invalidateVertexUniforms();
 }
@@ -5197,10 +5206,11 @@ static void bathCopyPixels(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
         fullW = uint32_t(float(w) * s_gameScale);
         fullH = uint32_t(float(h) * s_gameScale);
     }
-    const uint32_t right = (fullX + fullW + 1) / 2;
-    const uint32_t bottom = (fullY + fullH + 1) / 2;
-    *tx = fullX / 2;
-    *ty = fullY / 2;
+    const uint32_t divisor = s_bathFull ? 1 : 2;
+    const uint32_t right = (fullX + fullW + divisor - 1) / divisor;
+    const uint32_t bottom = (fullY + fullH + divisor - 1) / divisor;
+    *tx = fullX / divisor;
+    *ty = fullY / divisor;
     *tw = right > *tx ? right - *tx : 0;
     *th = bottom > *ty ? bottom - *ty : 0;
 }
@@ -5212,10 +5222,12 @@ static void bathCopyConsumed() {
 extern "C" void GXPC_BathLowResBegin(void) {
     if (!s_bathLowResMarker || s_bathHookActive || !s_frameActive || !ProcUIInForeground()) return;
     if (!bathEnsureTarget()) return;
-    flushBatch();
+    if (!s_bathFence) flushBatch();
     bathSaveMapping();
     if (s_gx2ProdEnabled) {
+        if (s_bathFence) gx2prod::wait(gx2prod::kWaitFlush);
         if (!bathQueueService(bathBeginService)) return;
+        if (s_bathFence) gx2prod::wait(gx2prod::kWaitFlush);
     } else {
         bathBeginService(nullptr);
     }
@@ -5225,19 +5237,19 @@ extern "C" void GXPC_BathLowResBegin(void) {
 
 extern "C" void GXPC_BathLowResEnd(void) {
     if (!s_bathHookActive) return;
-    flushBatch();
+    if (!s_bathFence) flushBatch();
     if (s_gx2ProdEnabled) {
-        gx2prod::wait(gx2prod::kWaitFlush);
+        if (s_bathFence) gx2prod::wait(gx2prod::kWaitFlush);
         if (!bathQueueService(bathEndService)) {
             WHBLogPrintf("SMS Wii U: [bathlowres] producer restore queue rejected");
             s_bathHookActive = false;
             return;
         }
-        gx2prod::wait(gx2prod::kWaitFlush);
+        if (s_bathFence) gx2prod::wait(gx2prod::kWaitFlush);
     } else {
         bathEndService(nullptr);
     }
-    s_bathCopyPending = true;
+    if (!s_bathNoSwitch) s_bathCopyPending = true;
     s_bathHookActive = false;
 }
 
@@ -6048,8 +6060,13 @@ void rendererInit(float) {
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_bathLowResMarker = sdMarkerPresent("bathlowres");
     s_bathNoDepth = sdMarkerPresent("bathnodepth");
-    WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s nodepth=%s", s_bathLowResMarker ? "on" : "off",
-                 s_bathNoDepth ? "on" : "off");
+    s_bathFence = sdMarkerPresent("bathfence");
+    s_bathNoSwitch = sdMarkerPresent("bathnoswitch");
+    s_bathFull = sdMarkerPresent("bathfull");
+    WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s nodepth=%s fence=%s noswitch=%s full=%s",
+                 s_bathLowResMarker ? "on" : "off", s_bathNoDepth ? "on" : "off",
+                 s_bathFence ? "on" : "off", s_bathNoSwitch ? "on" : "off",
+                 s_bathFull ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
     s_compactVx = !sdMarkerPresent("nocompactvx");
     if (!s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
