@@ -7,6 +7,7 @@
 #ifdef __WIIU__
 #include "../../wiiu/gx2_producer_worker.h"
 extern "C" int sms_wiiu_gx2_imgfxnative_enabled(void);
+extern "C" void sms_wiiu_gx2_wait_peek(int colour);
 #endif
 
 #include <dolphin/gx.h>
@@ -1246,7 +1247,11 @@ void GXPokeARGB(u16, u16, u32) {}
 void GXPeekARGB(u16 x, u16 y, u32* color) {
 #ifdef __WIIU__
     if (producerMode()) {
+#if defined(PORT_GAME_SMG)
+        if (colourPeekNeedsSync()) sms_wiiu_gx2_wait_peek(1);
+#else
         if (colourPeekNeedsSync()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+#endif
     }
     else
 #endif
@@ -1256,7 +1261,11 @@ void GXPeekARGB(u16 x, u16 y, u32* color) {
 void GXPeekZ(u16 x, u16 y, u32* z) {
 #ifdef __WIIU__
     if (producerMode()) {
+#if defined(PORT_GAME_SMG)
+        if (peekZNeedsSync()) sms_wiiu_gx2_wait_peek(0);
+#else
         if (peekZNeedsSync()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+#endif
     } else
 #endif
     drainCommandStream();

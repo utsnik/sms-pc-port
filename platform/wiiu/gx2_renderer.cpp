@@ -214,6 +214,7 @@ static bool s_earlyZMarker;
 static bool s_hizMarker;
 static bool s_peek2Marker;
 static bool s_peekColFrameMarker;
+static bool s_peekAsyncMarker;
 static bool s_mem1CopyMarker;
 #endif
 bool g_dlPromoteFirst = false;
@@ -4169,6 +4170,27 @@ static void logCopyOwnerWindow() {
     s_copyOwnerWindowCount = 0;
 }
 
+static uint32_t s_fpsPeeks, s_fpsPeekCopies;
+static uint32_t s_fpsVsyncHist[4];
+static uint32_t s_fpsWaitPeekColour, s_fpsWaitPeekZ;
+static OSTime s_fpsWindowStart;
+
+static void logFpsWindow() {
+    const OSTime now = OSGetTime();
+    const uint64_t micros = s_fpsWindowStart ? OSTicksToMicroseconds(now - s_fpsWindowStart) : 0;
+    const double fps = micros ? 120000000.0 / double(micros) : 0.0;
+    WHBLogPrintf("SMS Wii U: [fps] frame=%u wallfps=%.2f vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u peeks=%u peekcopies=%u waitPeekColour=%u waitPeekZ=%u",
+                 unsigned(g_displayFrames), fps, unsigned(s_fpsVsyncHist[0]),
+                 unsigned(s_fpsVsyncHist[1]), unsigned(s_fpsVsyncHist[2]),
+                 unsigned(s_fpsVsyncHist[3]), unsigned(s_fpsPeeks),
+                 unsigned(s_fpsPeekCopies), unsigned(s_fpsWaitPeekColour),
+                 unsigned(s_fpsWaitPeekZ));
+    s_fpsWindowStart = now;
+    memset(s_fpsVsyncHist, 0, sizeof(s_fpsVsyncHist));
+    s_fpsPeeks = s_fpsPeekCopies = 0;
+    s_fpsWaitPeekColour = s_fpsWaitPeekZ = 0;
+}
+
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
 static std::vector<CopyEntry>* s_copyObject;
 static std::vector<CopyEntry>& copyCache() {
@@ -6066,15 +6088,17 @@ void rendererInit(float) {
     s_hizMarker = sdDefaultOnMarker("hiz");
     s_peek2Marker = sdDefaultOnMarker("peek2");
     s_peekColFrameMarker = sdDefaultOnMarker("peekcolframe");
+    s_peekAsyncMarker = sdDefaultOnMarker("peekasync");
     s_mem1CopyMarker = sdDefaultOnMarker("mem1copy");
-    WHBLogPrintf("[defaults] earlyz=%d hiz=%d peek2=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
+    WHBLogPrintf("[defaults] earlyz=%d hiz=%d peek2=%d peekasync=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
                  s_earlyZMarker ? 1 : 0, s_hizMarker ? 1 : 0, s_peek2Marker ? 1 : 0,
-                 s_textiledMarker ? 1 : 0, s_tv720Marker ? 1 : 0, s_texNative ? 1 : 0,
-                 s_mem1CopyMarker ? 1 : 0);
+                 s_peekAsyncMarker ? 1 : 0, s_textiledMarker ? 1 : 0,
+                 s_tv720Marker ? 1 : 0, s_texNative ? 1 : 0, s_mem1CopyMarker ? 1 : 0);
     WHBLogPrintf("SMS Wii U: [earlyz] marker=%s", s_earlyZMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [hiz] marker=%s", s_hizMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peek2] marker=%s", s_peek2Marker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peekcolframe] marker=%s", s_peekColFrameMarker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [peekasync] marker=%s", s_peekAsyncMarker ? "on" : "off");
     refreshMem1CopyHeap();
     WHBLogPrintf("SMS Wii U: [mem1copy] marker=%s budget=%u", s_mem1CopyMarker ? "on" : "off",
                  unsigned(s_mem1CopyBudget));
@@ -7520,8 +7544,176 @@ static GX2Surface* s_peekColorRead = &s_peekColorSnapshot;
 static bool s_peekColorReady, s_peekColorQueued, s_peekColorCompleted;
 static uint64_t s_peekColorStamp;
 
+// Producer peeks cannot issue the first copy from the game thread: doing so
+// after the producer wait was the d75 stall.  The service is ordered after
+// the producer stream instead, and rotates three linear targets so the CPU
+// always reads a retired snapshot rather than the target currently written.
+struct ProducerColourPeekSlot {
+    GX2Surface surface;
+    uint64_t stamp;
+    uint32_t sequence;
+    bool inFlight;
+};
+struct ProducerColourPeekRequest {
+    GX2ColorBuffer* source;
+    uint32_t frame;
+};
+static ProducerColourPeekSlot s_producerColourPeekSlots[3];
+static ProducerColourPeekRequest s_producerColourPeekRequest;
+static bool s_producerColourPeekReady;
+static uint32_t s_producerColourPeekWidth, s_producerColourPeekHeight;
+static uint32_t s_producerColourPeekSequence;
+static volatile uint32_t s_producerColourPeekPublishedSequence;
+static volatile int32_t s_producerColourPeekPublishedSlot = -1;
+static uint32_t s_producerColourPeekFrame = ~0u;
+
+static bool producerColourPeekEnabled() {
+#if defined(PORT_GAME_SMG)
+    return s_gx2ProdEnabled && s_peekColFrameMarker && s_peekAsyncMarker &&
+           !runningUnderCemu() && SMS_GX2_ASYNC_PEEK;
+#else
+    return false;
+#endif
+}
+
+static void publishRetiredProducerColourPeeks() {
+    const uint64_t retired = ::GX2GetRetiredTimeStamp();
+    for (uint32_t i = 0; i < 3; ++i) {
+        ProducerColourPeekSlot& slot = s_producerColourPeekSlots[i];
+        if (!slot.inFlight || retired < slot.stamp) continue;
+        slot.inFlight = false;
+        slot.sequence = ++s_producerColourPeekSequence;
+        __sync_synchronize();
+        s_producerColourPeekPublishedSlot = int32_t(i);
+        s_producerColourPeekPublishedSequence = slot.sequence;
+    }
+}
+
+static bool producerColourPeekAnyInFlight() {
+    for (uint32_t i = 0; i < 3; ++i)
+        if (s_producerColourPeekSlots[i].inFlight) return true;
+    return false;
+}
+
+static bool initProducerColourPeekSlots(GX2ColorBuffer* cb) {
+    const uint32_t width = cb->surface.width, height = cb->surface.height;
+    publishRetiredProducerColourPeeks();
+    if (s_producerColourPeekReady &&
+        (s_producerColourPeekWidth != width || s_producerColourPeekHeight != height)) {
+        if (producerColourPeekAnyInFlight()) return false;
+        for (uint32_t i = 0; i < 3; ++i) {
+            MEMFreeToDefaultHeap(s_producerColourPeekSlots[i].surface.image);
+            s_producerColourPeekSlots[i].surface.image = nullptr;
+        }
+        s_producerColourPeekReady = false;
+        s_producerColourPeekPublishedSequence = 0;
+        s_producerColourPeekPublishedSlot = -1;
+    }
+    if (s_producerColourPeekReady) return true;
+    memset(s_producerColourPeekSlots, 0, sizeof(s_producerColourPeekSlots));
+    for (uint32_t i = 0; i < 3; ++i) {
+        GX2Surface& surface = s_producerColourPeekSlots[i].surface;
+        surface.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+        surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        surface.width = width;
+        surface.height = height;
+        surface.depth = 1;
+        surface.mipLevels = 1;
+        surface.format = cb->surface.format;
+        surface.aa = GX2_AA_MODE1X;
+        surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        GX2CalcSurfaceSizeAndAlignment(&surface);
+        surface.image = alignedZero(surface.alignment, surface.imageSize);
+        if (!surface.image) {
+            for (uint32_t j = 0; j <= i; ++j)
+                if (s_producerColourPeekSlots[j].surface.image)
+                    MEMFreeToDefaultHeap(s_producerColourPeekSlots[j].surface.image);
+            memset(s_producerColourPeekSlots, 0, sizeof(s_producerColourPeekSlots));
+            return false;
+        }
+        DCFlushRange(surface.image, surface.imageSize);
+    }
+    s_producerColourPeekWidth = width;
+    s_producerColourPeekHeight = height;
+    s_producerColourPeekSequence = 0;
+    s_producerColourPeekPublishedSequence = 0;
+    s_producerColourPeekPublishedSlot = -1;
+    s_producerColourPeekReady = true;
+    return true;
+}
+
+static void producerColourPeekService(void* opaque) {
+    ProducerColourPeekRequest& request = *static_cast<ProducerColourPeekRequest*>(opaque);
+    publishRetiredProducerColourPeeks();
+    if (!request.source || !initProducerColourPeekSlots(request.source)) return;
+    int selected = -1;
+    uint32_t oldest = ~0u;
+    for (uint32_t i = 0; i < 3; ++i) {
+        const ProducerColourPeekSlot& slot = s_producerColourPeekSlots[i];
+        if (slot.inFlight || (slot.sequence >= oldest && selected >= 0)) continue;
+        selected = int(i);
+        oldest = slot.sequence;
+    }
+    if (selected < 0) return;
+    ProducerColourPeekSlot& slot = s_producerColourPeekSlots[selected];
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, request.source->surface.image,
+                  request.source->surface.imageSize);
+    GX2CopySurface(&request.source->surface, 0, 0, &slot.surface, 0, 0);
+    invalidateVertexUniforms();
+    gpuStampSurface(GPU_EFBCOPY, request.source->surface, slot.surface);
+    rebindTvTarget();
+    GX2Flush();
+    slot.stamp = GX2GetLastSubmittedTimeStamp();
+    slot.inFlight = true;
+    ++s_perfPeekCopies;
+    ++s_fpsPeekCopies;
+}
+
+static bool queueProducerColourPeek(GX2ColorBuffer* cb) {
+    if (s_producerColourPeekFrame == g_displayFrames) return true;
+    s_producerColourPeekRequest = {cb, g_displayFrames};
+    if (!gx2prod::queueBoundary(gx2prod::kWaitPeek, producerColourPeekService,
+                                &s_producerColourPeekRequest))
+        return false;
+    s_producerColourPeekFrame = g_displayFrames;
+    return true;
+}
+
+static bool readProducerFrameColourPixels(GX2ColorBuffer* cb, const int (*points)[2],
+                                          uint32_t count, uint32_t* out) {
+    queueProducerColourPeek(cb);
+    const uint32_t published = s_producerColourPeekPublishedSequence;
+    const int32_t publishedSlot = s_producerColourPeekPublishedSlot;
+    if (!published || publishedSlot < 0 || publishedSlot >= 3 ||
+        s_producerColourPeekSlots[publishedSlot].sequence != published)
+        return false;
+    GX2Surface& surface = s_producerColourPeekSlots[publishedSlot].surface;
+    sms_wiiu_d4_event(D4_READBACK);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t px = uint32_t(s_gameOffsetX + (float(points[i][0]) + 0.5f) * s_gameScaleX);
+        uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScaleY);
+        if (px >= surface.width) px = surface.width - 1;
+        if (py >= surface.height) py = surface.height - 1;
+        uint8_t* texel = static_cast<uint8_t*>(surface.image) +
+                         (size_t(py) * surface.pitch + px) * 4;
+        DCInvalidateRange(texel, 4);
+        out[i] = uint32_t(texel[3]) << 24 | uint32_t(texel[0]) << 16 |
+                  uint32_t(texel[1]) << 8 | texel[2];
+    }
+    return true;
+}
+
+extern "C" void sms_wiiu_gx2_wait_peek(int colour) {
+    const OSTime start = OSGetTime();
+    gx2prod::wait(gx2prod::kWaitPeek);
+    const uint32_t micros = uint32_t(OSTicksToMicroseconds(OSGetTime() - start));
+    if (colour) s_fpsWaitPeekColour += micros;
+    else s_fpsWaitPeekZ += micros;
+}
+
 bool colourPeekNeedsSync() {
     // The legacy and Cemu paths still copy for every peek.
+    if (producerColourPeekEnabled()) return false;
     return !s_peekColFrameMarker || runningUnderCemu() || !SMS_GX2_ASYNC_PEEK ||
            s_peekColorFrame != g_displayFrames;
 }
@@ -7573,6 +7765,7 @@ static bool readFrameColourPixels(GX2ColorBuffer* cb, const int (*points)[2], ui
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
         GX2CopySurface(&cb->surface, 0, 0, s_peekColorWrite, 0, 0); invalidateVertexUniforms();
         ++s_perfPeekCopies;
+        ++s_fpsPeekCopies;
         gpuStampSurface(GPU_EFBCOPY, cb->surface, *s_peekColorWrite);
         rebindTvTarget();
         GX2Flush();
@@ -7595,16 +7788,27 @@ static bool readFrameColourPixels(GX2ColorBuffer* cb, const int (*points)[2], ui
     return true;
 }
 #else
+extern "C" void sms_wiiu_gx2_wait_peek(int colour) {
+    const OSTime start = OSGetTime();
+    gx2prod::wait(gx2prod::kWaitPeek);
+    const uint32_t micros = uint32_t(OSTicksToMicroseconds(OSGetTime() - start));
+    if (colour) s_fpsWaitPeekColour += micros;
+    else s_fpsWaitPeekZ += micros;
+}
 bool colourPeekNeedsSync() { return true; }
 #endif
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
     dlCacheExternalStateChanged();
     ++s_perfPeeks;
+    ++s_fpsPeeks;
     sms_wiiu_d4_event(D4_PEEK);
     GX2ColorBuffer* cb = renderColour();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
     if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
 #if defined(PORT_GAME_SMG)
+    if (s_peekColFrameMarker && !runningUnderCemu() && SMS_GX2_ASYNC_PEEK)
+        if (producerColourPeekEnabled())
+            return readProducerFrameColourPixels(cb, points, count, out);
     if (s_peekColFrameMarker && !runningUnderCemu() && SMS_GX2_ASYNC_PEEK)
         return readFrameColourPixels(cb, points, count, out);
 #endif
@@ -7666,6 +7870,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
         GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
         ++s_perfPeekCopies;
+        ++s_fpsPeekCopies;
         gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSurface);
         rebindTvTarget();
         GX2Flush();
@@ -7678,9 +7883,10 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     GX2DrawDone();
     GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
     ++s_perfPeekCopies;
+    ++s_fpsPeekCopies;
     gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSurface);
     GX2DrawDone();
-    if (cemu) { GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms(); ++s_perfPeekCopies; gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSpecial); }
+    if (cemu) { GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms(); ++s_perfPeekCopies; ++s_fpsPeekCopies; gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSpecial); }
     rebindTvTarget();
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
     sms_wiiu_d4_event(D4_READBACK);
@@ -8010,6 +8216,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     if (s_perfHaveVsync) {
         const uint32_t interval = std::min(vsync - s_perfLastVsync, 4u);
         ++s_perfVsyncHist[interval ? interval - 1 : 3];
+        ++s_fpsVsyncHist[interval ? interval - 1 : 3];
     }
     s_perfLastVsync = vsync;
     s_perfHaveVsync = true;
@@ -8149,7 +8356,11 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     if (!sms_wiiu_pipe2_enabled())
         s_drawsThisFrame = 0;
     ++g_displayFrames;
-    if ((g_displayFrames % 120) == 0) logCopyOwnerWindow();
+    if (!s_fpsWindowStart) s_fpsWindowStart = OSGetTime();
+    if ((g_displayFrames % 120) == 0) {
+        logCopyOwnerWindow();
+        logFpsWindow();
+    }
     gx2prod::note_frame(g_displayFrames);
 }
 

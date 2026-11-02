@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-MARKERS = ("earlyz", "hiz", "peek2", "peekcolframe", "textiled", "tv720", "texnative", "mem1copy")
+MARKERS = ("earlyz", "hiz", "peek2", "peekasync", "peekcolframe", "textiled", "tv720", "texnative", "mem1copy")
 
 
 def resolve(name: str, present: set[str], smg: bool = True) -> bool:
@@ -26,9 +26,11 @@ def main() -> int:
         "s_textiledMarker = sdGameDefaultMarker(\"textiled\")",
         "s_texNative = sdGameDefaultMarker(\"texnative\")",
         "s_peekColFrameMarker = sdDefaultOnMarker(\"peekcolframe\")",
+        "s_peekAsyncMarker = sdDefaultOnMarker(\"peekasync\")",
         "SMS Wii U: [peekcolframe] marker=%s",
+        "SMS Wii U: [peekasync] marker=%s",
         "std::snprintf(disableName, sizeof(disableName), \"no%s\", name)",
-        "[defaults] earlyz=%d hiz=%d peek2=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
+        "[defaults] earlyz=%d hiz=%d peek2=%d peekasync=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
     ]
     missing = [needle for needle in required if needle not in source]
     if missing:
@@ -69,7 +71,9 @@ int main() {
         assert not resolve(name, {f"no{name}"}), (name, "disable")
         assert resolve(name, {name}), (name, "legacy positive no-op")
         assert resolve(name, {name, f"no{name}"}) is False, (name, "disable wins")
-    for name in ("textiled", "tv720", "texnative"):
+    # Sunshine retains opt-in marker semantics, including the new SMG-only
+    # peekasync switch.
+    for name in ("textiled", "tv720", "texnative", "peekasync"):
         assert not resolve(name, set(), smg=False), (name, "other-game default")
         assert resolve(name, {name}, smg=False), (name, "other-game opt-in")
 
