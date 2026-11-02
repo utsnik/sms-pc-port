@@ -1,12 +1,14 @@
-Reason: port: expose Corona's bath-water drop billboards as a separate renderer pass; absent hooks leave the existing draw path unchanged
+Reason: port: expose Corona's bath-water drop billboards and cap (one alpha mask) as a separate renderer pass; absent hooks leave the existing draw path unchanged
 --- a/src/Map/BathWaterManager.cpp
 +++ b/src/Map/BathWaterManager.cpp
-@@ -31,5 +31,12 @@
+@@ -31,6 +31,14 @@
+ #include <System/DummyStrings.hpp>
  #include <M3DUtil/InfectiousStrings.hpp>
  
 +#ifdef TARGET_PC
-+// The renderer may redirect only the drop billboards to a low-res target.
-+// Weak hooks keep the original draw path when that renderer feature is absent.
++// The renderer may redirect only the drop billboards (and the cap, which joins
++// the same alpha mask) to a low-res target. Weak hooks keep the original draw
++// path when that renderer feature is absent.
 +extern "C" void GXPC_BathLowResBegin(void) __attribute__((weak));
 +extern "C" void GXPC_BathLowResEnd(void) __attribute__((weak));
 +#endif
@@ -14,7 +16,7 @@ Reason: port: expose Corona's bath-water drop billboards as a separate renderer 
  // NOTE: the main tragedy of this file is that it looks like a bunch of classes
  // were defined right inside of the cpp file and all their methods were defined
  // in-line, and furthermore, some methods were defined in-line inside of a
-@@ -946,6 +953,10 @@
+@@ -946,6 +954,10 @@
  		f32 u1 = graphics->mViewMtx.at(1, 1);
  		f32 u2 = graphics->mViewMtx.at(1, 2);
  
@@ -25,14 +27,14 @@ Reason: port: expose Corona's bath-water drop billboards as a separate renderer 
  		for (int i = 0; i < num; ++i) {
  			TBathWaterParams* p = params[i];
  			if (p->isVisible.get()) {
-@@ -972,6 +983,10 @@
- 			}
+@@ -978,6 +990,10 @@
+ 			        JGeometry::TUtil<f32>::sqrt(data.unk3C * data.unk3C
+ 			                                    - data.unk44 * data.unk44));
  		}
- 
 +#ifdef TARGET_PC
 +		if (GXPC_BathLowResBegin && GXPC_BathLowResEnd)
 +			GXPC_BathLowResEnd();
 +#endif
- 		if (unk2C->showsCap.get() && !data.unk65) {
- 			drawCap(data.getThing(),
- 			        JGeometry::TUtil<f32>::sqrt(data.unk3C * data.unk3C
+ 
+ 		// TODO: frame 0x1e0 against the ROM's 0x258; the instruction stream
+ 		// is identical. The 112 bytes missing are one Mtx plus one

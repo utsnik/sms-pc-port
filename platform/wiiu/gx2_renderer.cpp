@@ -5894,6 +5894,10 @@ void rendererInit(float) {
                  s_gx2DlEnabled ? "on" : "off", s_gx2ProdMarker ? "on" : "off");
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
+    // NOT READY FOR HARDWARE (review 2026-11-02): bathBeginService converts the full-size scene depth
+    // straight into half-size surfaces (GX2ConvertDepthBufferToTextureSurface, then GX2CopySurface), which
+    // expect matching dimensions and would overrun them. Depth must be downsampled by a draw (sample the
+    // full-size converted depth, write depth) before this marker is tested.
     s_bathLowResMarker = sdMarkerPresent("bathlowres");
     WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s", s_bathLowResMarker ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
