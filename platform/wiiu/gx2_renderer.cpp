@@ -7557,6 +7557,7 @@ struct ProducerColourPeekSlot {
 struct ProducerColourPeekRequest {
     GX2ColorBuffer* source;
     uint32_t frame;
+    uint32_t submitSequence;
 };
 static ProducerColourPeekSlot s_producerColourPeekSlots[3];
 static ProducerColourPeekRequest s_producerColourPeekRequest;
@@ -7578,14 +7579,21 @@ static bool producerColourPeekEnabled() {
 
 static void publishRetiredProducerColourPeeks() {
     const uint64_t retired = ::GX2GetRetiredTimeStamp();
+    int newest = -1;
+    uint32_t newestSequence = s_producerColourPeekPublishedSequence;
     for (uint32_t i = 0; i < 3; ++i) {
         ProducerColourPeekSlot& slot = s_producerColourPeekSlots[i];
         if (!slot.inFlight || retired < slot.stamp) continue;
         slot.inFlight = false;
-        slot.sequence = ++s_producerColourPeekSequence;
+        if (slot.sequence > newestSequence) {
+            newest = int(i);
+            newestSequence = slot.sequence;
+        }
+    }
+    if (newest >= 0) {
         __sync_synchronize();
-        s_producerColourPeekPublishedSlot = int32_t(i);
-        s_producerColourPeekPublishedSequence = slot.sequence;
+        s_producerColourPeekPublishedSlot = newest;
+        s_producerColourPeekPublishedSequence = newestSequence;
     }
 }
 
@@ -7650,7 +7658,8 @@ static void producerColourPeekService(void* opaque) {
     uint32_t oldest = ~0u;
     for (uint32_t i = 0; i < 3; ++i) {
         const ProducerColourPeekSlot& slot = s_producerColourPeekSlots[i];
-        if (slot.inFlight || (slot.sequence >= oldest && selected >= 0)) continue;
+        if (slot.inFlight || int32_t(i) == s_producerColourPeekPublishedSlot ||
+            (slot.sequence >= oldest && selected >= 0)) continue;
         selected = int(i);
         oldest = slot.sequence;
     }
@@ -7664,6 +7673,7 @@ static void producerColourPeekService(void* opaque) {
     rebindTvTarget();
     GX2Flush();
     slot.stamp = GX2GetLastSubmittedTimeStamp();
+    slot.sequence = request.submitSequence;
     slot.inFlight = true;
     ++s_perfPeekCopies;
     ++s_fpsPeekCopies;
@@ -7671,9 +7681,8 @@ static void producerColourPeekService(void* opaque) {
 
 static bool queueProducerColourPeek(GX2ColorBuffer* cb) {
     if (s_producerColourPeekFrame == g_displayFrames) return true;
-    s_producerColourPeekRequest = {cb, g_displayFrames};
-    if (!gx2prod::queueBoundary(gx2prod::kWaitPeek, producerColourPeekService,
-                                &s_producerColourPeekRequest))
+    s_producerColourPeekRequest = {cb, g_displayFrames, ++s_producerColourPeekSequence};
+    if (!gx2prod::enqueueService(producerColourPeekService, &s_producerColourPeekRequest))
         return false;
     s_producerColourPeekFrame = g_displayFrames;
     return true;
