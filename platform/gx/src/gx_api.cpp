@@ -1245,7 +1245,9 @@ void GXPokeZMode(GXBool, GXCompare, GXBool) {}
 void GXPokeARGB(u16, u16, u32) {}
 void GXPeekARGB(u16 x, u16 y, u32* color) {
 #ifdef __WIIU__
-    if (producerMode()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    if (producerMode()) {
+        if (colourPeekNeedsSync()) ::gx2prod::wait(::gx2prod::kWaitPeek);
+    }
     else
 #endif
     drainCommandStream();

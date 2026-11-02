@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 
 
-MARKERS = ("earlyz", "hiz", "peek2", "textiled", "tv720", "texnative", "mem1copy")
+MARKERS = ("earlyz", "hiz", "peek2", "peekcolframe", "textiled", "tv720", "texnative", "mem1copy")
 
 
 def resolve(name: str, present: set[str], smg: bool = True) -> bool:
@@ -25,6 +25,8 @@ def main() -> int:
         "s_tv720Marker = sdGameDefaultMarker(\"tv720\")",
         "s_textiledMarker = sdGameDefaultMarker(\"textiled\")",
         "s_texNative = sdGameDefaultMarker(\"texnative\")",
+        "s_peekColFrameMarker = sdDefaultOnMarker(\"peekcolframe\")",
+        "SMS Wii U: [peekcolframe] marker=%s",
         "std::snprintf(disableName, sizeof(disableName), \"no%s\", name)",
         "[defaults] earlyz=%d hiz=%d peek2=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
     ]

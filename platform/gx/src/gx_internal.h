@@ -312,6 +312,7 @@ uint32_t dlCacheTakeMissWindow(DlMissReport* out, uint32_t capacity);
 // lo > hi = none). writeXF keeps them; a backend resets them after upload.
 extern uint32_t g_xfDirtyLo, g_xfDirtyHi;
 uint32_t peekColor(int x, int y);  // A<<24|R<<16|G<<8|B
+bool colourPeekNeedsSync();        // Wii U: false once this frame's colour snapshot is queued
 uint32_t peekZ(int x, int y);      // 24-bit
 bool peekZNeedsSync();            // Wii U: false once this frame's depth snapshot is queued
 void pixMetricClear();

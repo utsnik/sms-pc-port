@@ -213,6 +213,7 @@ static bool s_dlArenaEnabled = true;  // SD marker "nodlarena" turns the display
 static bool s_earlyZMarker;
 static bool s_hizMarker;
 static bool s_peek2Marker;
+static bool s_peekColFrameMarker;
 static bool s_mem1CopyMarker;
 #endif
 bool g_dlPromoteFirst = false;
@@ -4403,7 +4404,7 @@ static void freeDeferred(const DeferredFree& entry) {
     MEMFreeToDefaultHeap(entry.p);
 }
 #endif
-static uint32_t s_perfCopies, s_perfPeeks, s_perfClears;
+static uint32_t s_perfCopies, s_perfPeeks, s_perfPeekCopies, s_perfClears;
 static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, uint32_t h, bool half, uint32_t fmt) {
     ++s_perfCopies;
     ++s_copyGeneration;
@@ -6064,6 +6065,7 @@ void rendererInit(float) {
     s_earlyZMarker = sdDefaultOnMarker("earlyz");
     s_hizMarker = sdDefaultOnMarker("hiz");
     s_peek2Marker = sdDefaultOnMarker("peek2");
+    s_peekColFrameMarker = sdDefaultOnMarker("peekcolframe");
     s_mem1CopyMarker = sdDefaultOnMarker("mem1copy");
     WHBLogPrintf("[defaults] earlyz=%d hiz=%d peek2=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
                  s_earlyZMarker ? 1 : 0, s_hizMarker ? 1 : 0, s_peek2Marker ? 1 : 0,
@@ -6072,6 +6074,7 @@ void rendererInit(float) {
     WHBLogPrintf("SMS Wii U: [earlyz] marker=%s", s_earlyZMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [hiz] marker=%s", s_hizMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peek2] marker=%s", s_peek2Marker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [peekcolframe] marker=%s", s_peekColFrameMarker ? "on" : "off");
     refreshMem1CopyHeap();
     WHBLogPrintf("SMS Wii U: [mem1copy] marker=%s budget=%u", s_mem1CopyMarker ? "on" : "off",
                  unsigned(s_mem1CopyBudget));
@@ -7509,6 +7512,91 @@ void markXfMemDirty() {
 // every peek, so it is not used there.
 static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
+#if defined(PORT_GAME_SMG)
+static uint32_t s_peekColorFrame = ~0u;
+static GX2Surface s_peekColorLinear, s_peekColorSnapshot;
+static GX2Surface* s_peekColorWrite = &s_peekColorLinear;
+static GX2Surface* s_peekColorRead = &s_peekColorSnapshot;
+static bool s_peekColorReady, s_peekColorQueued, s_peekColorCompleted;
+static uint64_t s_peekColorStamp;
+
+bool colourPeekNeedsSync() {
+    // The legacy and Cemu paths still copy for every peek.
+    return !s_peekColFrameMarker || runningUnderCemu() || !SMS_GX2_ASYNC_PEEK ||
+           s_peekColorFrame != g_displayFrames;
+}
+
+static bool readFrameColourPixels(GX2ColorBuffer* cb, const int (*points)[2], uint32_t count, uint32_t* out) {
+    if (s_peekColorReady && (s_peekColorLinear.width != cb->surface.width ||
+                             s_peekColorLinear.height != cb->surface.height)) {
+        if (s_peekColorQueued) GX2WaitTimeStamp(s_peekColorStamp);
+        MEMFreeToDefaultHeap(s_peekColorLinear.image);
+        MEMFreeToDefaultHeap(s_peekColorSnapshot.image);
+        s_peekColorReady = s_peekColorQueued = s_peekColorCompleted = false;
+        s_peekColorWrite = &s_peekColorLinear;
+        s_peekColorRead = &s_peekColorSnapshot;
+        s_peekColorFrame = ~0u;
+    }
+    if (!s_peekColorReady) {
+        memset(&s_peekColorLinear, 0, sizeof(s_peekColorLinear));
+        s_peekColorLinear.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+        s_peekColorLinear.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        s_peekColorLinear.width = cb->surface.width;
+        s_peekColorLinear.height = cb->surface.height;
+        s_peekColorLinear.depth = 1;
+        s_peekColorLinear.mipLevels = 1;
+        s_peekColorLinear.format = cb->surface.format;
+        s_peekColorLinear.aa = GX2_AA_MODE1X;
+        s_peekColorLinear.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        GX2CalcSurfaceSizeAndAlignment(&s_peekColorLinear);
+        s_peekColorSnapshot = s_peekColorLinear;
+        s_peekColorLinear.image = alignedZero(s_peekColorLinear.alignment, s_peekColorLinear.imageSize);
+        s_peekColorSnapshot.image = s_peekColorLinear.image ?
+            alignedZero(s_peekColorSnapshot.alignment, s_peekColorSnapshot.imageSize) : nullptr;
+        if (!s_peekColorSnapshot.image) {
+            if (s_peekColorLinear.image) MEMFreeToDefaultHeap(s_peekColorLinear.image);
+            s_peekColorLinear.image = nullptr;
+            return false;
+        }
+        DCFlushRange(s_peekColorLinear.image, s_peekColorLinear.imageSize);
+        DCFlushRange(s_peekColorSnapshot.image, s_peekColorSnapshot.imageSize);
+        s_peekColorReady = true;
+    }
+    if (s_peekColorFrame != g_displayFrames) {
+        if (s_peekColorQueued) {
+            GX2WaitTimeStamp(s_peekColorStamp);
+            GX2Surface* done = s_peekColorWrite;
+            s_peekColorWrite = s_peekColorRead;
+            s_peekColorRead = done;
+            s_peekColorCompleted = true;
+        }
+        GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
+        GX2CopySurface(&cb->surface, 0, 0, s_peekColorWrite, 0, 0); invalidateVertexUniforms();
+        ++s_perfPeekCopies;
+        gpuStampSurface(GPU_EFBCOPY, cb->surface, *s_peekColorWrite);
+        rebindTvTarget();
+        GX2Flush();
+        s_peekColorStamp = GX2GetLastSubmittedTimeStamp();
+        s_peekColorQueued = true;
+        s_peekColorFrame = g_displayFrames;
+    }
+    if (!s_peekColorCompleted) return false;
+    sms_wiiu_d4_event(D4_READBACK);
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t px = uint32_t(s_gameOffsetX + (float(points[i][0]) + 0.5f) * s_gameScaleX);
+        uint32_t py = uint32_t((float(points[i][1]) + 0.5f) * s_gameScaleY);
+        if (px >= s_peekColorRead->width) px = s_peekColorRead->width - 1;
+        if (py >= s_peekColorRead->height) py = s_peekColorRead->height - 1;
+        uint8_t* texel = static_cast<uint8_t*>(s_peekColorRead->image) +
+                         (size_t(py) * s_peekColorRead->pitch + px) * 4;
+        DCInvalidateRange(texel, 4);
+        out[i] = uint32_t(texel[3]) << 24 | uint32_t(texel[0]) << 16 | uint32_t(texel[1]) << 8 | texel[2];
+    }
+    return true;
+}
+#else
+bool colourPeekNeedsSync() { return true; }
+#endif
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
     dlCacheExternalStateChanged();
     ++s_perfPeeks;
@@ -7516,6 +7604,10 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     GX2ColorBuffer* cb = renderColour();
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !cb) return false;
     if (cb->surface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8 || cb->surface.aa != GX2_AA_MODE1X) return false;
+#if defined(PORT_GAME_SMG)
+    if (s_peekColFrameMarker && !runningUnderCemu() && SMS_GX2_ASYNC_PEEK)
+        return readFrameColourPixels(cb, points, count, out);
+#endif
     if (s_peekSurfaceReady && (s_peekSurface.width != cb->surface.width ||
                                s_peekSurface.height != cb->surface.height)) {
         MEMFreeToDefaultHeap(s_peekSurface.image);
@@ -7573,6 +7665,7 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
         }
         GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
         GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
+        ++s_perfPeekCopies;
         gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSurface);
         rebindTvTarget();
         GX2Flush();
@@ -7584,9 +7677,10 @@ static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) 
     GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, cb->surface.image, cb->surface.imageSize);
     GX2DrawDone();
     GX2CopySurface(&cb->surface, 0, 0, &s_peekSurface, 0, 0); invalidateVertexUniforms();
+    ++s_perfPeekCopies;
     gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSurface);
     GX2DrawDone();
-    if (cemu) { GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms(); gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSpecial); }
+    if (cemu) { GX2CopySurface(&cb->surface, 0, 0, &s_peekSpecial, 0, 0); invalidateVertexUniforms(); ++s_perfPeekCopies; gpuStampSurface(GPU_EFBCOPY, cb->surface, s_peekSpecial); }
     rebindTvTarget();
     const GX2Surface& linear = cemu ? s_peekSpecial : s_peekSurface;
     sms_wiiu_d4_event(D4_READBACK);
@@ -7930,7 +8024,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
 #else
         const unsigned m1copy = 0, m1copyMiss = 0, m1copyBytes = 0;
 #endif
-        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlMergeCalls=%u dlAvgDrawsX10=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u m1copy=%u m1copyMiss=%u m1copyBytes=%u",
+        WHBLogPrintf("SMS Wii U: [perf] frame=%u per-frame x0.1ms wall=%u fence=%u flush=%u tex=%u xform=%u draws=%u verts=%u unique=%u compact=%u gpuDraws=%u cpuDraws=%u gpuVerts=%u cpuVerts=%u rejected=%u vxSamples=%u vxMismatches=%u arenaPeak=%u overflows=%u copies=%u peeks=%u peekcopies=%u clears=%u vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u dlIdx=%u dlDraws=%u dlUploads=%u dlDecoded=%u dlHits=%u dlVariantHits=%u dlMisses=%u dlEvictions=%u dlArenaPromotionAttempts=%u dlArenaHitVerts=%u dlArenaHitDraws=%u dlFallbackNonTriVerts=%u dlFallbackNonTriDraws=%u dlFallbackMatrixVerts=%u dlFallbackMatrixDraws=%u dlFallbackGenerationVerts=%u dlFallbackGenerationDraws=%u dlFallbackUnwarmedVerts=%u dlFallbackUnwarmedDraws=%u dlFallbackCompactVerts=%u dlFallbackCompactDraws=%u dlMissVerts=%u dlMissDraws=%u dlImmSkipVerts=%u dlImmSkipDraws=%u dlImmBypassVerts=%u dlImmBypassDraws=%u dlImmDirectVerts=%u dlImmDirectDraws=%u dlMissBytesChanged=%u dlMissStateMismatch=%u dlMissStateVcd=%u dlMissStateVat=%u dlMissStateMatA=%u dlMissStateMatB=%u dlMissStateArray=%u dlMissStateZtex=%u dlMissStateExternal=%u gx2dl=%d dlRecorded=%u dlCalled=%u dlMergeCalls=%u dlAvgDrawsX10=%u dlBytes=%u dlMax=%u dlFallback=%u dlForbidden=%u dlOverflow=%u dlAlign=%u dlSplitCopy=%u dlSplitClear=%u dlSplitContext=%u dlSplitFrame=%u dlCoreInit=%u dlCoreRecord=%u dlCoreCall=%u tevFoldStages=%u tevFoldHits=%u tevFoldFallbacks=%u texnative=%u texI4=%u texI8=%u texIA4=%u texIA8=%u texRGB565=%u texCMPR=%u m1copy=%u m1copyMiss=%u m1copyBytes=%u",
                      (unsigned)g_displayFrames, ms(s_perfWall), ms(s_vertexFenceWait), ms(s_perfFlush), ms(s_perfTex), ms(s_perfXform),
                      (unsigned)(s_perfDraws / 30), (unsigned)(s_perfVerts / 30), (unsigned)(s_perfUnique / 30), (unsigned)(s_perfCompact / 30),
                      (unsigned)(s_perfGpuDraws / 30), (unsigned)(s_perfCpuDraws / 30),
@@ -7939,7 +8033,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
                      (unsigned)s_vertexSelfCheckSamples, (unsigned)s_vertexSelfCheckMismatches,
                      (unsigned)s_arenaPeak,
                      (unsigned)s_vertexArenaOverflows,
-                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfClears, (unsigned)s_perfVsyncHist[0], (unsigned)s_perfVsyncHist[1], (unsigned)s_perfVsyncHist[2], (unsigned)s_perfVsyncHist[3], (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)(s_perfDlUploads / 30), (unsigned)s_perfDlDecoded,
+                     (unsigned)s_perfCopies, (unsigned)s_perfPeeks, (unsigned)s_perfPeekCopies, (unsigned)s_perfClears, (unsigned)s_perfVsyncHist[0], (unsigned)s_perfVsyncHist[1], (unsigned)s_perfVsyncHist[2], (unsigned)s_perfVsyncHist[3], (unsigned)(g_dlReplayIdx / 30), (unsigned)(s_perfDlDraws / 30), (unsigned)(s_perfDlUploads / 30), (unsigned)s_perfDlDecoded,
                      (unsigned)dlcache.hits, (unsigned)dlcache.variantHits, (unsigned)dlcache.misses, (unsigned)dlcache.evictions,
                      (unsigned)(dlcache.arenaPromotionAttempts / 30),
                      (unsigned)(s_perfDlArenaHitVerts / 30), (unsigned)(s_perfDlArenaHitDraws / 30),
@@ -8018,7 +8112,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
             s_stKey = s_stVkey = s_stState = s_stShader = s_stXfu = 0;
             g_dlTicks = 0;
         }
-        s_perfCopies = s_perfPeeks = s_perfClears = 0;
+        s_perfCopies = s_perfPeeks = s_perfPeekCopies = s_perfClears = 0;
 #if defined(PORT_GAME_SMG)
         s_mem1CopyMisses = 0;
 #endif
