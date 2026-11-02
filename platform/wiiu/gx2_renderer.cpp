@@ -4901,6 +4901,7 @@ static BathDepthVertex* s_bathDepthQuadRing;
 static uint32_t s_bathDepthQuadNext;
 static BathLowResMapping s_bathFullMapping;
 static bool s_bathLowResMarker;
+static bool s_bathNoDepth;  // SD marker bathnodepth: skip the scene-depth downsample
 static bool s_bathHookActive;
 static bool s_bathCopyPending;
 static uint32_t s_bathLowResPasses;
@@ -5133,27 +5134,36 @@ static void bathBeginService(void*) {
     if (!s_bathLowRes.valid) return;
     bathSetMapping(true);
     GX2ClearColor(&s_bathLowRes.colour, 0.0f, 0.0f, 0.0f, 0.0f);
-    GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.sceneDepth.surface.image,
-                  s_bathLowRes.sceneDepth.surface.imageSize);
-    GX2ConvertDepthBufferToTextureSurface(&s_bathLowRes.sceneDepth,
-                                         &s_bathLowRes.depthTexture.surface, 0, 0);
-    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, s_bathLowRes.depthTexture.surface.image,
-                  s_bathLowRes.depthTexture.surface.imageSize);
+    if (s_bathNoDepth) {
+        // bathnodepth: drops are not depth-tested (the water mesh that samples
+        // the mask is), so no scene-depth downsample and no Z-export draw.
+        GX2ClearDepthStencilEx(&s_bathLowRes.depth, 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
+    } else {
+        GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.sceneDepth.surface.image,
+                      s_bathLowRes.sceneDepth.surface.imageSize);
+        GX2ConvertDepthBufferToTextureSurface(&s_bathLowRes.sceneDepth,
+                                             &s_bathLowRes.depthTexture.surface, 0, 0);
+        GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, s_bathLowRes.depthTexture.surface.image,
+                      s_bathLowRes.depthTexture.surface.imageSize);
+    }
     GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_bathLowRes.depth.surface.image,
                   s_bathLowRes.depth.surface.imageSize);
+    // Clears and the depth convert leave GX2's context state undefined (shader
+    // GPR split included, which hangs the GPU on hardware): restore the TV
+    // context like every other clear/copy here, then bind the bath target.
+    GX2SetContextState(WHBGfxGetTVContextState());
     GX2SetColorBuffer(&s_bathLowRes.colour, GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(&s_bathLowRes.depth);
     GX2SetViewport(0.0f, 0.0f, float(s_bathLowRes.colour.surface.width),
                    float(s_bathLowRes.colour.surface.height), 0.0f, 1.0f);
     GX2SetScissor(0, 0, s_bathLowRes.colour.surface.width, s_bathLowRes.colour.surface.height);
-    bathDrawDepth(s_bathLowRes.depthTexture, s_bathLowRes.depth);
+    if (!s_bathNoDepth) bathDrawDepth(s_bathLowRes.depthTexture, s_bathLowRes.depth);
     invalidateVertexUniforms();
 }
 
 static void bathEndService(void*) {
     bathSetMapping(false);
-    GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
-    GX2SetDepthBuffer(renderDepth());
+    rebindTvTarget(false);
     resetTargetScissor();
     applyState();
     invalidateVertexUniforms();
@@ -6037,7 +6047,9 @@ void rendererInit(float) {
     s_perfDlCoreInit = OSGetCoreId();
     s_gpuDiag = sdMarkerPresent("perfdiag");
     s_bathLowResMarker = sdMarkerPresent("bathlowres");
-    WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s", s_bathLowResMarker ? "on" : "off");
+    s_bathNoDepth = sdMarkerPresent("bathnodepth");
+    WHBLogPrintf("SMS Wii U: [bathlowres] marker=%s nodepth=%s", s_bathLowResMarker ? "on" : "off",
+                 s_bathNoDepth ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
     s_compactVx = !sdMarkerPresent("nocompactvx");
     if (!s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
