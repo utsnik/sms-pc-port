@@ -302,7 +302,8 @@ void MarioActor::calcViewWallShadowModel() {
 
 void MarioActor::drawShadow() const {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-    if (sms_wiiu_sd_marker("nomarioshadow")) {
+    static const int noMarioShadow = sms_wiiu_sd_marker("nomarioshadow");
+    if (noMarioShadow) {
         return;
     }
 #endif
@@ -553,7 +554,8 @@ void MarioActor::calcViewFootPrint() {
 
 void MarioActor::drawSilhouette() const {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-    if (sms_wiiu_sd_marker("nomariosil")) {
+    static const int noMarioSilhouette = sms_wiiu_sd_marker("nomariosil");
+    if (noMarioSilhouette) {
         return;
     }
 #endif

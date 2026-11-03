@@ -775,7 +775,8 @@ void MarioActor::draw() const {
 
 void MarioActor::drawIndirect() const {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-    if (sms_wiiu_sd_marker("nomarioindirect")) {
+    static const int noMarioIndirect = sms_wiiu_sd_marker("nomarioindirect");
+    if (noMarioIndirect) {
         return;
     }
 #endif
