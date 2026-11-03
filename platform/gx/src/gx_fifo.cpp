@@ -73,18 +73,38 @@ double monoSeconds() {
 void logmsg(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+#ifdef __WIIU__
+    va_list portAp;
+    va_copy(portAp, ap);
+#endif
     fprintf(stderr, "[sms_gx] ");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
+#ifdef __WIIU__
+    char message[512];
+    vsnprintf(message, sizeof message, fmt, portAp);
+    va_end(portAp);
+    port_log("[sms_gx] %s\n", message);
+#endif
     va_end(ap);
 }
 
 void fatal(const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
+#ifdef __WIIU__
+    va_list portAp;
+    va_copy(portAp, ap);
+#endif
     fprintf(stderr, "[sms_gx] fatal: ");
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
+#ifdef __WIIU__
+    char message[512];
+    vsnprintf(message, sizeof message, fmt, portAp);
+    va_end(portAp);
+    port_log("[sms_gx] fatal: %s\n", message);
+#endif
     va_end(ap);
     abort();
 }
@@ -1816,6 +1836,7 @@ static uint32_t s_workerPipeLen;
 static uint32_t s_workerPipeNeed = 1;
 static bool s_zeroCopyActive;
 static uint32_t s_zeroCopyCapacity;
+static bool s_zeroCopyShortTail;
 static bool s_zeroCopyCheck;
 static uint8_t s_zeroCopyCheckHead[5];
 static uint32_t s_zeroCopyCheckHeadLen;
@@ -1936,6 +1957,11 @@ void setProducerZeroCopyCheck(bool enabled) {
 static bool producerOpenZeroCopy() {
     if (!s_zeroCopyAppend || !s_producerMode || s_zeroCopyActive)
         return s_zeroCopyActive;
+    if (s_zeroCopyShortTail) {
+        GXPC_PipeBuf = s_pipeStorage;
+        pipeFastUpdate();
+        return false;
+    }
     uint8_t* bytes = nullptr;
     uint32_t capacity = 0;
     if (!::gx2prod::reserve(kProdChunk, &bytes, &capacity)) {
@@ -1945,6 +1971,7 @@ static bool producerOpenZeroCopy() {
     }
     s_zeroCopyActive = true;
     s_zeroCopyCapacity = capacity;
+    s_zeroCopyShortTail = false;
     GXPC_PipeBuf = bytes;
     GXPC_PipeLen = 0;
     pipeFastUpdate();
@@ -1956,9 +1983,11 @@ static void producerCommitZeroCopy() {
     const uint32_t bytes = s_pipeLen;
     uint8_t* committed = s_pipeBuf;
     const uint32_t capacity = s_zeroCopyCapacity;
+    const bool emptyShortTail = bytes == 0 && capacity < kProdChunk;
     zeroCopyCheckBytes(committed, bytes, capacity);
     s_zeroCopyActive = false;
     s_zeroCopyCapacity = 0;
+    s_zeroCopyShortTail = emptyShortTail;
     GXPC_PipeBuf = s_pipeStorage;
     GXPC_PipeLen = 0;
     pipeFastUpdate();
@@ -1966,9 +1995,10 @@ static void producerCommitZeroCopy() {
         fatal("zero-copy GX producer reservation commit failed");
 }
 
+static void producerFlushPending();
+
 void producerFrameBoundary() {
-    if (s_producerMode && s_zeroCopyAppend && s_zeroCopyActive)
-        producerCommitZeroCopy();
+    if (s_producerMode) producerFlushPending();
 }
 
 static void producerFlushPending() {
@@ -1986,11 +2016,13 @@ static void producerFlushPending() {
     pipeFastUpdate();
     ::gx2prod::append(chunk.data(), bytes);
     s_producerFlush.swap(chunk);
+    s_zeroCopyShortTail = false;
+    pipeFastUpdate();
 }
 
 void setProducerMode(bool enabled, bool zeroCopy) {
     SMS_PORT_HEAP_SCOPE();
-    if (s_producerMode && s_zeroCopyAppend)
+    if (s_producerMode)
         producerFlushPending();
     if (enabled) {
         // Any bytes already in the legacy pipe are consumed before the worker
@@ -2009,6 +2041,7 @@ void setProducerMode(bool enabled, bool zeroCopy) {
         s_workerPipe.reserve(256u << 10);
         s_producerFlush.clear();
         s_producerDrawSyncWrite = 0;
+        s_zeroCopyShortTail = false;
         s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
         s_pipeStorage = GXPC_PipeBuf;
         if (s_pipeCap < 2 * kProdChunk) pipeGrow(2 * kProdChunk);
@@ -2018,6 +2051,7 @@ void setProducerMode(bool enabled, bool zeroCopy) {
         s_producerMode = false;
         s_zeroCopyAppend = false;
         producerCommitZeroCopy();
+        s_zeroCopyShortTail = false;
         GXPC_PipeBuf = s_pipeStorage;
     }
     pipeFastUpdate();
@@ -2072,7 +2106,7 @@ static void producerDrawSyncService(void* opaque) {
 static uint8_t* s_redirectStart = nullptr;
 void setPipeRedirect(uint8_t* dest) {
 #ifdef __WIIU__
-    if (s_producerMode && s_zeroCopyAppend)
+    if (s_producerMode)
         producerFlushPending();
 #endif
     if (s_redirectStart && s_redirect > s_redirectStart) memoryWritten(s_redirectStart, size_t(s_redirect - s_redirectStart));
@@ -2083,6 +2117,9 @@ uint8_t* getPipeRedirect() { return s_redirect; }
 bool pipeIdle() { return s_pipeLen == 0; }
 
 static void pipeGrow(uint32_t need) {
+#ifdef __WIIU__
+    if (s_zeroCopyActive) producerCommitZeroCopy();
+#endif
     uint32_t cap = s_pipeCap ? s_pipeCap : 64u << 10;
     while (cap < need) cap *= 2;
     uint8_t* b = static_cast<uint8_t*>(realloc(s_pipeStorage ? s_pipeStorage : s_pipeBuf, cap));
@@ -2113,7 +2150,7 @@ static void pipeRun() {
 
 void drainCommandStream() {
 #ifdef __WIIU__
-    if (s_producerMode && s_zeroCopyAppend) {
+    if (s_producerMode) {
         // Producer bytes belong to the worker, even when a caller reaches
         // this legacy drain path without needing a GPU wait (for example an
         // asynchronous peek). Publishing first prevents the game thread
@@ -2135,6 +2172,7 @@ void drainCommandStream() {
 }
 
 static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer = false) {
+    if (!n) return;
     if (s_redirect && !forceProducer) {
         memcpy(s_redirect, bytes, n);
         s_redirect += n;
@@ -2143,26 +2181,34 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer 
 #ifdef __WIIU__
     if (s_producerMode) {
         if (s_zeroCopyAppend) {
-            if (!s_zeroCopyActive && !s_pipeLen) producerOpenZeroCopy();
-            if (s_zeroCopyActive && s_pipeLen <= s_zeroCopyCapacity &&
-                n <= s_zeroCopyCapacity - s_pipeLen) {
-                memcpy(s_pipeBuf + s_pipeLen, bytes, n);
-                s_pipeLen += n;
-                return;
-            }
-            if (s_zeroCopyActive) {
-                producerCommitZeroCopy();
-                if (producerOpenZeroCopy() && n <= s_zeroCopyCapacity) {
-                    memcpy(s_pipeBuf, bytes, n);
-                    s_pipeLen = n;
-                    return;
+            const uint8_t* source = bytes;
+            uint32_t remaining = n;
+            while (remaining) {
+                if (!s_zeroCopyActive) {
+                    if (s_pipeLen || !producerOpenZeroCopy()) break;
                 }
+                const uint32_t available = s_zeroCopyCapacity - s_pipeLen;
+                if (!available) {
+                    producerCommitZeroCopy();
+                    continue;
+                }
+                const uint32_t take = std::min(available, remaining);
+                memcpy(s_pipeBuf + s_pipeLen, source, take);
+                s_pipeLen += take;
+                source += take;
+                remaining -= take;
+                pipeFastUpdate();
+                if (remaining) producerCommitZeroCopy();
             }
+            if (!remaining) return;
+            bytes = source;
+            n = remaining;
         }
         s_pipeBuf = s_pipeStorage;
         if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
         memcpy(s_pipeBuf + s_pipeLen, bytes, n);
         s_pipeLen += n;
+        pipeFastUpdate();
         if (s_pipeLen >= kProdChunk) producerFlushPending();
         return;
     }
@@ -2170,6 +2216,7 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer 
     if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
     memcpy(s_pipeBuf + s_pipeLen, bytes, n);
     s_pipeLen += n;
+    pipeFastUpdate();
     if (s_pipeLen >= s_pipeNeed) pipeRun();
 }
 
@@ -2191,6 +2238,7 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         if (s_pipeLen + sizeof cmd > s_pipeCap) pipeGrow(s_pipeLen + sizeof cmd);
         memcpy(s_pipeBuf + s_pipeLen, cmd, sizeof cmd);
         s_pipeLen += sizeof cmd;
+        pipeFastUpdate();
         if (s_pipeLen >= kProdChunk) producerFlushPending();
         return;
     }
