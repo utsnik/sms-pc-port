@@ -513,6 +513,13 @@ endif()
 # with the GX self-tests' option, as CI's window job builds them. Not on
 # Windows, whose host threads need windows_stack.cpp and the game's runtime.
 if(SMS_GX_BUILD_TESTS AND NOT WIN32)
+	add_executable(sms_nativeps_array_concat_layout_test
+	  platform/mtx/tests/nativeps_array_concat_layout_test.cpp)
+	target_compile_features(sms_nativeps_array_concat_layout_test PRIVATE cxx_std_11)
+	enable_testing()
+	add_test(NAME sms_nativeps_array_concat_layout_test
+	  COMMAND sms_nativeps_array_concat_layout_test)
+
   add_executable(sms_thread_cancel_test platform/os/tests/thread_cancel_test.cpp platform/os/os_thread.cpp)
   target_include_directories(sms_thread_cancel_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/platform
     ${SMS_PORT_SRC} ${SMS_PORT_SRC}/port_include ${SMS_DECOMP_INCLUDE_DIRS})

@@ -5,6 +5,9 @@ extern "C" uint32_t sms_port_heap_fallback_bytes(void);
 
 #include "port_os.h"
 #include "port_framerate.h"
+#if defined(__WIIU__)
+#include "../gx/src/gx_internal.h"
+#endif
 
 #include <dolphin/vi.h>
 #include <whb/proc.h>
@@ -106,6 +109,9 @@ void sms_wiiu_frame_boundary(void)
 		sms_wiiu_native_sleep_ticks(kFrameTicks);
 		return;
 	}
+#if defined(__WIIU__)
+	gx::producerFrameBoundary();
+#endif
 	/* After EXITING, WHBProcIsRunning must never be called again (it blocks
 	 * forever) and GX2 must not be touched: shut down and leave. */
 	if (s_exit_logged)

@@ -1954,14 +1954,21 @@ static bool producerOpenZeroCopy() {
 static void producerCommitZeroCopy() {
     if (!s_zeroCopyActive) return;
     const uint32_t bytes = s_pipeLen;
-    zeroCopyCheckBytes(s_pipeBuf, bytes, s_zeroCopyCapacity);
-    if (!::gx2prod::commit(bytes))
-        fatal("zero-copy GX producer reservation commit failed");
+    uint8_t* committed = s_pipeBuf;
+    const uint32_t capacity = s_zeroCopyCapacity;
+    zeroCopyCheckBytes(committed, bytes, capacity);
     s_zeroCopyActive = false;
     s_zeroCopyCapacity = 0;
     GXPC_PipeBuf = s_pipeStorage;
     GXPC_PipeLen = 0;
     pipeFastUpdate();
+    if (!::gx2prod::commit(bytes))
+        fatal("zero-copy GX producer reservation commit failed");
+}
+
+void producerFrameBoundary() {
+    if (s_producerMode && s_zeroCopyAppend && s_zeroCopyActive)
+        producerCommitZeroCopy();
 }
 
 static void producerFlushPending() {

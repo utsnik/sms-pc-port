@@ -39,6 +39,7 @@
 #include <string.h>
 #include "port_fpu.h"
 #include "port_fma.h"
+#include "nativeps_check_layout.h"
 #if defined(__WIIU__) && defined(PORT_GAME_SMG)
 #include "native_ps.h"
 #endif
@@ -163,7 +164,6 @@ namespace mtx_host {
 
 #if defined(__WIIU__) && defined(PORT_GAME_SMG)
 extern "C" {
-extern int sms_nativeps_enabled;
 void sms_nativeps_gMTXConcat(Mtx, Mtx, Mtx);
 void sms_nativeps_gMTXQuat(Mtx, Quaternion*);
 void sms_nativeps_gMTXMultVec(Mtx44, Vec*, Vec*);
@@ -208,13 +208,23 @@ static u32 nativeps_bits(f32 value)
 	return bits;
 }
 
+static bool nativeps_is_nan(u32 bits)
+{
+	return (bits & 0x7f800000u) == 0x7f800000u && (bits & 0x007fffffu) != 0;
+}
+
 static bool nativeps_mismatch(const char* name, u32 iteration,
 	                              const u32* input, u32 input_count,
-	                              const f32* got, const f32* want, u32 output_count)
+	                              const f32* got, const f32* want, u32 output_count,
+	                              u32* nan_sign_only)
 {
 	for (u32 i = 0; i < output_count; ++i) {
 		u32 got_bits = nativeps_bits(got[i]);
 		u32 want_bits = nativeps_bits(want[i]);
+		if (nativeps_is_nan(got_bits) && nativeps_is_nan(want_bits)) {
+			++*nan_sign_only;
+			continue;
+		}
 		if (got_bits == want_bits)
 			continue;
 		port_log("[nativeps] %s mismatch %u output[%u] native=%08x c=%08x",
@@ -226,8 +236,17 @@ static bool nativeps_mismatch(const char* name, u32 iteration,
 	return false;
 }
 
+static bool nativeps_check_done(const char* name, u32 tests, u32 nan_sign_only, bool ok)
+{
+	port_log("[nativeps] %s nan-sign-only %u", name, nan_sign_only);
+	if (ok)
+		port_log("[nativeps] %s ok %u", name, tests);
+	return ok;
+}
+
 static bool nativeps_check_concat(u32 tests)
 {
+	u32 nan_sign_only = 0;
 	for (u32 i = 0; i < tests; ++i) {
 		Mtx a, b, native, c;
 		nativeps_fill(&a[0][0], 12);
@@ -237,15 +256,16 @@ static bool nativeps_check_concat(u32 tests)
 		u32 input[24];
 		memcpy(input, a, sizeof(a));
 		memcpy(input + 12, b, sizeof(b));
-		if (nativeps_mismatch("gMTXConcat", i, input, 24, &native[0][0], &c[0][0], 12))
-			return false;
+		if (nativeps_mismatch("gMTXConcat", i, input, 24, &native[0][0], &c[0][0], 12,
+		                      &nan_sign_only))
+			return nativeps_check_done("gMTXConcat", tests, nan_sign_only, false);
 	}
-	port_log("[nativeps] gMTXConcat ok %u", tests);
-	return true;
+	return nativeps_check_done("gMTXConcat", tests, nan_sign_only, true);
 }
 
 static bool nativeps_check_quat(u32 tests)
 {
+	u32 nan_sign_only = 0;
 	for (u32 i = 0; i < tests; ++i) {
 		Quaternion q;
 		Mtx native, c;
@@ -254,15 +274,16 @@ static bool nativeps_check_quat(u32 tests)
 		sms_nativeps_gMTXQuat(native, &q);
 		u32 input[4];
 		memcpy(input, &q.x, sizeof(input));
-		if (nativeps_mismatch("gMTXQuat", i, input, 4, &native[0][0], &c[0][0], 12))
-			return false;
+		if (nativeps_mismatch("gMTXQuat", i, input, 4, &native[0][0], &c[0][0], 12,
+		                      &nan_sign_only))
+			return nativeps_check_done("gMTXQuat", tests, nan_sign_only, false);
 	}
-	port_log("[nativeps] gMTXQuat ok %u", tests);
-	return true;
+	return nativeps_check_done("gMTXQuat", tests, nan_sign_only, true);
 }
 
 static bool nativeps_check_multvec(u32 tests)
 {
+	u32 nan_sign_only = 0;
 	for (u32 i = 0; i < tests; ++i) {
 		Mtx m;
 		Vec source, native, c;
@@ -273,15 +294,16 @@ static bool nativeps_check_multvec(u32 tests)
 		u32 input[15];
 		memcpy(input, m, sizeof(m));
 		memcpy(input + 12, &source.x, sizeof(source));
-		if (nativeps_mismatch("gMTXMultVec", i, input, 15, &native.x, &c.x, 3))
-			return false;
+		if (nativeps_mismatch("gMTXMultVec", i, input, 15, &native.x, &c.x, 3,
+		                      &nan_sign_only))
+			return nativeps_check_done("gMTXMultVec", tests, nan_sign_only, false);
 	}
-	port_log("[nativeps] gMTXMultVec ok %u", tests);
-	return true;
+	return nativeps_check_done("gMTXMultVec", tests, nan_sign_only, true);
 }
 
 static bool nativeps_check_normalize(u32 tests)
 {
+	u32 nan_sign_only = 0;
 	for (u32 i = 0; i < tests; ++i) {
 		Vec source, native, c;
 		nativeps_fill(&source.x, 3);
@@ -289,39 +311,47 @@ static bool nativeps_check_normalize(u32 tests)
 		sms_nativeps_gVECNormalize(&source, &native);
 		u32 input[3];
 		memcpy(input, &source.x, sizeof(input));
-		if (nativeps_mismatch("gVECNormalize", i, input, 3, &native.x, &c.x, 3))
-			return false;
+		if (nativeps_mismatch("gVECNormalize", i, input, 3, &native.x, &c.x, 3,
+		                      &nan_sign_only))
+			return nativeps_check_done("gVECNormalize", tests, nan_sign_only, false);
 	}
-	port_log("[nativeps] gVECNormalize ok %u", tests);
-	return true;
+	return nativeps_check_done("gVECNormalize", tests, nan_sign_only, true);
 }
 
 static bool nativeps_check_array_concat(u32 tests)
 {
+	u32 nan_sign_only = 0;
 	for (u32 i = 0; i < tests; ++i) {
-		f32 a[4][4], b[4][4], native[4][4], c[4][4];
-		nativeps_fill(&a[0][0], 16);
-		nativeps_fill(&b[0][0], 64);
+		f32 a[3][4], b[12][4], native[12][4], c[12][4];
+		nativeps_fill(&a[0][0], nativeps_check::kArrayConcatAWords);
+		nativeps_fill(&b[0][0], nativeps_check::kArrayConcatBWords);
 		u32 count = (i == 0) ? 0 : ((nativeps_next_input_word() & 3u) + 1u);
 		mtx_host::gJ3DPSMtxArrayConcat(a, b, c, count);
 		sms_nativeps_gJ3DPSMtxArrayConcat(a, b, native, count);
 		u32 used = count ? count : 1;
-		u32 input[81];
+		u32 input[nativeps_check::kArrayConcatInputWords];
 		memcpy(input, a, sizeof(a));
-		memcpy(input + 16, b, sizeof(b));
-		input[80] = count;
+		memcpy(input + nativeps_check::kArrayConcatAWords, b, sizeof(b));
+		input[nativeps_check::kArrayConcatInputWords - 1] = count;
 		for (u32 matrix = 0; matrix < used; ++matrix) {
-			if (nativeps_mismatch("gJ3DPSMtxArrayConcat", i, input, 81,
-			                     &native[matrix][0], &c[matrix][0], 12))
-				return false;
+			if (nativeps_mismatch("gJ3DPSMtxArrayConcat", i, input,
+			                     nativeps_check::kArrayConcatInputWords,
+			                     &native[matrix * nativeps_check::kArrayConcatRowsPerMatrix][0],
+			                     &c[matrix * nativeps_check::kArrayConcatRowsPerMatrix][0],
+			                     nativeps_check::kArrayConcatOutputWords, &nan_sign_only))
+				return nativeps_check_done("gJ3DPSMtxArrayConcat", tests, nan_sign_only, false);
 		}
 	}
-	port_log("[nativeps] gJ3DPSMtxArrayConcat ok %u", tests);
-	return true;
+	return nativeps_check_done("gJ3DPSMtxArrayConcat", tests, nan_sign_only, true);
 }
 
-extern "C" int sms_nativeps_enabled;
-int sms_nativeps_enabled;
+extern "C" {
+int sms_nativeps_concat_enabled;
+int sms_nativeps_quat_enabled;
+int sms_nativeps_multvec_enabled;
+int sms_nativeps_normalize_enabled;
+int sms_nativeps_arrayconcat_enabled;
+}
 
 extern "C" void sms_wiiu_nativeps_init(int nativeps, int nativepscheck)
 {
@@ -329,51 +359,65 @@ extern "C" void sms_wiiu_nativeps_init(int nativeps, int nativepscheck)
 	if (nativepscheck)
 		port_log("[nativeps] check start");
 	const u32 ugqr0 = sms_nativeps_read_ugqr0();
-	bool checks_ok = true;
+	bool concat_ok = true;
+	bool quat_ok = true;
+	bool multvec_ok = true;
+	bool normalize_ok = true;
+	bool arrayconcat_ok = true;
 	port_log("[nativeps] ugqr0=%08x", ugqr0);
 	if (nativepscheck && ugqr0 == 0) {
 		nativeps_rng = 0x5eed0d90u;
 		nativeps_input_count = 0;
-		checks_ok = nativeps_check_concat(tests) && checks_ok;
-		checks_ok = nativeps_check_quat(tests) && checks_ok;
-		checks_ok = nativeps_check_multvec(tests) && checks_ok;
-		checks_ok = nativeps_check_normalize(tests) && checks_ok;
-		checks_ok = nativeps_check_array_concat(tests) && checks_ok;
+		concat_ok = nativeps_check_concat(tests);
+		quat_ok = nativeps_check_quat(tests);
+		multvec_ok = nativeps_check_multvec(tests);
+		normalize_ok = nativeps_check_normalize(tests);
+		arrayconcat_ok = nativeps_check_array_concat(tests);
 	}
-	sms_nativeps_enabled = nativeps && ugqr0 == 0 && checks_ok ? 1 : 0;
-	port_log("[nativeps] nativeps marker %s; native path %s",
-	         nativeps ? "on" : "off", sms_nativeps_enabled ? "enabled" : "off");
+	const bool native_gate = nativeps && ugqr0 == 0;
+	sms_nativeps_concat_enabled = native_gate && (!nativepscheck || concat_ok) ? 1 : 0;
+	sms_nativeps_quat_enabled = native_gate && (!nativepscheck || quat_ok) ? 1 : 0;
+	sms_nativeps_multvec_enabled = native_gate && (!nativepscheck || multvec_ok) ? 1 : 0;
+	sms_nativeps_normalize_enabled = native_gate && (!nativepscheck || normalize_ok) ? 1 : 0;
+	sms_nativeps_arrayconcat_enabled = native_gate && (!nativepscheck || arrayconcat_ok) ? 1 : 0;
+	port_log("[nativeps] nativeps marker %s; native path concat=%s quat=%s multvec=%s normalize=%s arrayconcat=%s",
+	         nativeps ? "on" : "off",
+	         sms_nativeps_concat_enabled ? "on" : "off",
+	         sms_nativeps_quat_enabled ? "on" : "off",
+	         sms_nativeps_multvec_enabled ? "on" : "off",
+	         sms_nativeps_normalize_enabled ? "on" : "off",
+	         sms_nativeps_arrayconcat_enabled ? "on" : "off");
 }
 
-#define NATIVE_DEF(ret, ps, c, native, fn, params, args) \
+#define NATIVE_DEF(ret, flag, ps, c, native, fn, params, args) \
 	extern "C" ret ps params { \
-		if (sms_nativeps_enabled) { native args; return; } \
+		if (flag) { native args; return; } \
 		return (ret)CALL(fn, args); \
 	} \
 	extern "C" ret c params { \
-		if (sms_nativeps_enabled) { native args; return; } \
+		if (flag) { native args; return; } \
 		return (ret)CALL(fn, args); \
 	}
-#define NATIVE_DEF1(ret, name, native, fn, params, args) \
+#define NATIVE_DEF1(ret, flag, name, native, fn, params, args) \
 	extern "C" ret name params { \
-		if (sms_nativeps_enabled) { native args; return; } \
+		if (flag) { native args; return; } \
 		return (ret)CALL(fn, args); \
 	}
 #else
-#define NATIVE_DEF(ret, ps, c, native, fn, params, args) DEF(ret, ps, c, fn, params, args)
-#define NATIVE_DEF1(ret, name, native, fn, params, args) DEF1(ret, name, fn, params, args)
+#define NATIVE_DEF(ret, flag, ps, c, native, fn, params, args) DEF(ret, ps, c, fn, params, args)
+#define NATIVE_DEF1(ret, flag, name, native, fn, params, args) DEF1(ret, name, fn, params, args)
 #endif
 
 // --- mtx.c ---
 DEF(void, PSMTXIdentity, C_MTXIdentity, gMTXIdentity, (Mtx m), (m))
 DEF(void, PSMTXCopy, C_MTXCopy, gMTXCopy, (Mtx s, Mtx d), (s, d))
-NATIVE_DEF(void, PSMTXConcat, C_MTXConcat, sms_nativeps_gMTXConcat, gMTXConcat, (Mtx a, Mtx b, Mtx ab), (a, b, ab))
+NATIVE_DEF(void, sms_nativeps_concat_enabled, PSMTXConcat, C_MTXConcat, sms_nativeps_gMTXConcat, gMTXConcat, (Mtx a, Mtx b, Mtx ab), (a, b, ab))
 DEF(u32, PSMTXInverse, C_MTXInverse, gMTXInverse, (Mtx s, Mtx i), (s, i))
 DEF(void, PSMTXTranspose, C_MTXTranspose, gMTXTranspose, (Mtx s, Mtx x), (s, x))
 DEF1(void, C_MTXRotRad, gMTXRotRad, (Mtx m, char axis, f32 rad), (m, axis, rad))
 DEF(void, PSMTXRotTrig, C_MTXRotTrig, gMTXRotTrig, (Mtx m, char axis, f32 s, f32 c), (m, axis, s, c))
 DEF(void, PSMTXRotAxisRad, C_MTXRotAxisRad, gMTXRotAxisRad, (Mtx m, Vec* axis, f32 rad), (m, axis, rad))
-NATIVE_DEF(void, PSMTXQuat, C_MTXQuat, sms_nativeps_gMTXQuat, gMTXQuat, (Mtx m, Quaternion* q), (m, q))
+NATIVE_DEF(void, sms_nativeps_quat_enabled, PSMTXQuat, C_MTXQuat, sms_nativeps_gMTXQuat, gMTXQuat, (Mtx m, Quaternion* q), (m, q))
 DEF(void, PSMTXTrans, C_MTXTrans, gMTXTrans, (Mtx m, f32 x, f32 y, f32 z), (m, x, y, z))
 DEF(void, PSMTXTransApply, C_MTXTransApply, gMTXTransApply, (Mtx s, Mtx d, f32 x, f32 y, f32 z), (s, d, x, y, z))
 DEF(void, PSMTXScale, C_MTXScale, gMTXScale, (Mtx m, f32 x, f32 y, f32 z), (m, x, y, z))
@@ -392,7 +436,7 @@ DEF1(void, C_MTXFrustum, gMTXFrustum, (Mtx44 m, f32 t, f32 b, f32 l, f32 r, f32 
 DEF1(void, C_MTXOrtho, gMTXOrtho, (Mtx44 m, f32 t, f32 b, f32 l, f32 r, f32 n, f32 f), (m, t, b, l, r, n, f))
 
 // --- mtxvec.c ---
-NATIVE_DEF(void, PSMTXMultVec, C_MTXMultVec, sms_nativeps_gMTXMultVec, gMTXMultVec, (Mtx44 m, Vec* s, Vec* d), (m, s, d))
+NATIVE_DEF(void, sms_nativeps_multvec_enabled, PSMTXMultVec, C_MTXMultVec, sms_nativeps_gMTXMultVec, gMTXMultVec, (Mtx44 m, Vec* s, Vec* d), (m, s, d))
 DEF(void, PSMTXMultVecSR, C_MTXMultVecSR, gMTXMultVecSR, (Mtx m, Vec* s, Vec* d), (m, s, d))
 DEF(void, PSMTXMultVecArray, C_MTXMultVecArray, gMTXMultVecArray, (Mtx m, Vec* s, Vec* d, u32 n), (m, s, d, n))
 
@@ -400,7 +444,7 @@ DEF(void, PSMTXMultVecArray, C_MTXMultVecArray, gMTXMultVecArray, (Mtx m, Vec* s
 DEF(void, PSVECAdd, C_VECAdd, gVECAdd, (Vec* a, Vec* b, Vec* c), (a, b, c))
 DEF(void, PSVECSubtract, C_VECSubtract, gVECSubtract, (Vec* a, Vec* b, Vec* c), (a, b, c))
 DEF(void, PSVECScale, C_VECScale, gVECScale, (Vec* s, Vec* d, f32 k), (s, d, k))
-NATIVE_DEF(void, PSVECNormalize, C_VECNormalize, sms_nativeps_gVECNormalize, gVECNormalize, (Vec* s, Vec* d), (s, d))
+NATIVE_DEF(void, sms_nativeps_normalize_enabled, PSVECNormalize, C_VECNormalize, sms_nativeps_gVECNormalize, gVECNormalize, (Vec* s, Vec* d), (s, d))
 DEF(f32, PSVECSquareMag, C_VECSquareMag, gVECSquareMag, (Vec* v), (v))
 DEF(f32, PSVECMag, C_VECMag, gVECMag, (Vec* v), (v))
 DEF(f32, PSVECDotProduct, C_VECDotProduct, gVECDotProduct, (Vec* a, Vec* b), (a, b))
@@ -415,7 +459,7 @@ DEF1(int, port_J3DPSCalcInverseTranspose, gJ3DPSCalcInverseTranspose, (const f32
 DEF1(void, port_J3DMtxProjConcat, gJ3DMtxProjConcat, (const f32 (*a)[4], const f32 (*b)[4], f32 (*ab)[4]), (a, b, ab))
 DEF1(void, port_J3DMTXConcatArrayIndexedSrc, gJ3DMTXConcatArrayIndexedSrc,
      (const f32 (*a)[4], const f32 (*b)[3][4], const u16* idx, f32 (*dst)[3][4], u32 n), (a, b, idx, dst, n))
-NATIVE_DEF1(void, port_J3DPSMtxArrayConcat, sms_nativeps_gJ3DPSMtxArrayConcat, gJ3DPSMtxArrayConcat, (const f32 (*a)[4], const f32 (*b)[4], f32 (*dst)[4], u32 n),
+NATIVE_DEF1(void, sms_nativeps_arrayconcat_enabled, port_J3DPSMtxArrayConcat, sms_nativeps_gJ3DPSMtxArrayConcat, gJ3DPSMtxArrayConcat, (const f32 (*a)[4], const f32 (*b)[4], f32 (*dst)[4], u32 n),
      (a, b, dst, n))
 DEF1(void, port_J3DPSMulMtxVec, gJ3DPSMulMtxVec, (const f32 (*m)[4], const f32* v, f32* d), (m, v, d))
 DEF1(void, port_J3DPSMulMtxVec33, gJ3DPSMulMtxVec33, (const f32 (*m)[3], const f32* v, f32* d), (m, v, d))

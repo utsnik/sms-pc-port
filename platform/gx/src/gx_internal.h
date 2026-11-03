@@ -189,6 +189,7 @@ void rendererGameDlCall();
 void setProducerMode(bool enabled, bool zeroCopy = false);
 void setProducerZeroCopyCheck(bool enabled);
 bool producerMode();
+void producerFrameBoundary();
 // State the API sets outside the GX command stream (full host pointers that
 // do not survive ptrToPhys/physToPtr on Wii U, viewport/scissor floats, TLUT
 // loads, ...).  In producer mode it travels in order through the stream as a
