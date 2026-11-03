@@ -13,9 +13,12 @@
 #include "JSystem/JParticle/JPAResourceManager.hpp"
 #include "JPADirectionalBatch.hpp"
 #include <revolution/mtx.h>
+#include <cstring>
 #if defined(TARGET_WIIU)
 #include "wiiu/jpa_counters.h"
 extern "C" int sms_wiiu_sd_marker(const char*);
+extern "C" const char* sms_wiiu_stage_path(void);
+extern "C" void port_log(const char*, ...);
 #endif
 
 #if defined(TARGET_WIIU)
@@ -116,6 +119,109 @@ struct BillboardBatchMode {
     bool textureAnimated;
 };
 
+struct BillboardColorRejectResource {
+    JPAResource* resource;
+    unsigned count;
+    GXTevColorArg color[4];
+    GXTevAlphaArg alpha[4];
+    bool prmRgb;
+    bool envRgb;
+    bool alphaVarying;
+    bool envAlpha;
+};
+
+BillboardColorRejectResource sBillboardColorRejects[256];
+char sBillboardColorRejectStage[128];
+bool sHaveBillboardColorRejectStage;
+
+bool jpadiagMarker() {
+    static int marker = -1;
+    if (marker < 0) marker = sms_wiiu_sd_marker("jpadiag") != 0;
+    return marker != 0;
+}
+
+void resetBillboardColorRejects() {
+    for (unsigned i = 0; i < sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]); ++i)
+        sBillboardColorRejects[i].count = 0;
+}
+
+void noteBillboardColorReject(JPAResource* resource, const BillboardBatchMode& mode,
+                              const GXTevColorArg* color, const GXTevAlphaArg* alpha) {
+    if (!jpadiagMarker()) return;
+    BillboardColorRejectResource* entry = NULL;
+    for (unsigned i = 0; i < sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]); ++i) {
+        if (sBillboardColorRejects[i].resource == resource) {
+            entry = &sBillboardColorRejects[i];
+            break;
+        }
+    }
+    if (entry == NULL) {
+        for (unsigned i = 0; i < sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]); ++i) {
+            if (sBillboardColorRejects[i].count == 0) {
+                entry = &sBillboardColorRejects[i];
+                entry->resource = resource;
+                for (int j = 0; j < 4; ++j) {
+                    entry->color[j] = color[j];
+                    entry->alpha[j] = alpha[j];
+                }
+                entry->prmRgb = mode.prmRgb;
+                entry->envRgb = mode.envRgb;
+                entry->alphaVarying = mode.alpha;
+                entry->envAlpha = mode.envAlpha;
+                break;
+            }
+        }
+    }
+    if (entry != NULL) ++entry->count;
+}
+
+void reportBillboardColorRejects() {
+    if (!jpadiagMarker() || !sHaveBillboardColorRejectStage) return;
+    unsigned total = 0;
+    for (unsigned i = 0; i < sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]); ++i)
+        if (sBillboardColorRejects[i].count != 0) ++total;
+    port_log("[jpadiag] stage=%s colorResources=%u\n", sBillboardColorRejectStage, total);
+    unsigned selected[8];
+    unsigned selectedCount = 0;
+    for (unsigned rank = 0; rank < 8; ++rank) {
+        unsigned best = sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]);
+        for (unsigned i = 0; i < sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]); ++i) {
+            if (sBillboardColorRejects[i].count == 0) continue;
+            bool already = false;
+            for (unsigned j = 0; j < selectedCount; ++j)
+                if (selected[j] == i) already = true;
+            if (!already && (best == sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0]) ||
+                             sBillboardColorRejects[i].count > sBillboardColorRejects[best].count))
+                best = i;
+        }
+        if (best == sizeof(sBillboardColorRejects) / sizeof(sBillboardColorRejects[0])) break;
+        selected[selectedCount++] = best;
+        const BillboardColorRejectResource& entry = sBillboardColorRejects[best];
+        port_log("[jpadiag] rank=%u res=%u rejects=%u tevC=%u,%u,%u,%u tevA=%u,%u,%u,%u flags=prmRgb:%u,envRgb:%u,alpha:%u,envAlpha:%u\n",
+                 rank + 1, (unsigned)entry.resource->getUsrIdx(), entry.count,
+                 (unsigned)entry.color[0], (unsigned)entry.color[1],
+                 (unsigned)entry.color[2], (unsigned)entry.color[3],
+                 (unsigned)entry.alpha[0], (unsigned)entry.alpha[1],
+                 (unsigned)entry.alpha[2], (unsigned)entry.alpha[3],
+                 entry.prmRgb ? 1u : 0u, entry.envRgb ? 1u : 0u,
+                 entry.alphaVarying ? 1u : 0u, entry.envAlpha ? 1u : 0u);
+    }
+}
+
+void setBillboardColorRejectStage(const char* stage) {
+    if (!jpadiagMarker()) return;
+    if (!sHaveBillboardColorRejectStage) {
+        std::strncpy(sBillboardColorRejectStage, stage, sizeof(sBillboardColorRejectStage) - 1);
+        sBillboardColorRejectStage[sizeof(sBillboardColorRejectStage) - 1] = '\0';
+        sHaveBillboardColorRejectStage = true;
+    } else if (std::strcmp(sBillboardColorRejectStage, stage) != 0) {
+        reportBillboardColorRejects();
+        resetBillboardColorRejects();
+        std::strncpy(sBillboardColorRejectStage, stage, sizeof(sBillboardColorRejectStage) - 1);
+        sBillboardColorRejectStage[sizeof(sBillboardColorRejectStage) - 1] = '\0';
+    }
+}
+
 typedef SmsWiiuJpaRejectReason BillboardRejectReason;
 
 void rejectBillboardIneligible(BillboardRejectReason reason) {
@@ -208,17 +314,23 @@ bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* fun
     // One raster colour carries one varying RGB source and one varying alpha
     // source. The other TEV colour register may remain emitter state, but two
     // particle-varying sources in either component cannot be rewritten exactly.
-    if ((mode->rasterColorPrm && mode->rasterColorEnv) ||
-        (mode->rasterColorAlphaPrm && mode->rasterColorAlphaEnv)) {
-        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR;
+    const GXTevAlphaArg* alphaArgs = work->mpRes->getBsp()->getTevAlphaArg();
+    if (mode->rasterColorPrm && mode->rasterColorEnv) {
+        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR_RGB;
+        noteBillboardColorReject(work->mpRes, *mode, colorArgs, alphaArgs);
         return false;
     }
-    const GXTevAlphaArg* alphaArgs = work->mpRes->getBsp()->getTevAlphaArg();
+    if (mode->rasterColorAlphaPrm && mode->rasterColorAlphaEnv) {
+        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR_ALPHA;
+        noteBillboardColorReject(work->mpRes, *mode, colorArgs, alphaArgs);
+        return false;
+    }
     mode->rasterAlphaPrm = mode->alpha && hasTevAlphaArg(alphaArgs, GX_CA_A0);
     mode->rasterAlphaEnv = mode->envAlpha && hasTevAlphaArg(alphaArgs, GX_CA_A1);
     if ((mode->rasterColorAlphaPrm || mode->rasterAlphaPrm) &&
         (mode->rasterColorAlphaEnv || mode->rasterAlphaEnv)) {
-        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR;
+        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR_ALPHA;
+        noteBillboardColorReject(work->mpRes, *mode, colorArgs, alphaArgs);
         return false;
     }
     return true;
@@ -314,6 +426,21 @@ struct DirectionTracker {
         have = true;
     }
 };
+}
+#endif
+
+#if defined(TARGET_WIIU)
+extern "C" void sms_wiiu_jpa_diag_stage_tick() {
+    if (jpadiagMarker()) {
+        const char* stage = sms_wiiu_stage_path();
+        setBillboardColorRejectStage(stage != NULL ? stage : "unknown");
+    }
+}
+
+extern "C" void sms_wiiu_jpa_diag_flush() {
+    reportBillboardColorRejects();
+    resetBillboardColorRejects();
+    sHaveBillboardColorRejectStage = false;
 }
 #endif
 

@@ -7,6 +7,30 @@
 #include <revolution/gd.h>
 #include <stdint.h>
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" int sms_wiiu_sd_marker(const char*);
+
+namespace {
+bool vcdVatKeepMarker() {
+    static int marker = -1;
+    if (marker < 0) marker = sms_wiiu_sd_marker("vcdkeep") != 0;
+    return marker != 0;
+}
+}
+
+extern "C" int sms_wiiu_vcd_vat_keep_enabled() {
+    return vcdVatKeepMarker() ? 1 : 0;
+}
+
+extern "C" void sms_wiiu_vcd_vat_pass_boundary() {
+    if (vcdVatKeepMarker()) J3DShape::sOldVcdVatCmd = nullptr;
+}
+
+extern "C" void sms_wiiu_vcd_vat_writer() {
+    if (vcdVatKeepMarker()) J3DShape::sOldVcdVatCmd = nullptr;
+}
+#endif
+
 void J3DShape::initialize() {
     mMaterial = nullptr;
     mIndex = -1;

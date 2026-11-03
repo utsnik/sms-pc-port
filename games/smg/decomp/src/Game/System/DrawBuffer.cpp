@@ -8,6 +8,7 @@
 #include <cstring>
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
 #include "wiiu/drawown.h"
+extern "C" int sms_wiiu_vcd_vat_keep_enabled();
 #endif
 
 DrawBufferShapeDrawer::DrawBufferShapeDrawer(J3DMaterial* pMaterial, J3DMatPacket* pMatPacket, const char* pOwnerName)
@@ -196,7 +197,12 @@ void DrawBuffer::resetLightSort(const ActorLightCtrl* pLightCtrl) {
 
 void DrawBuffer::drawOpa() const {
     if (mNumActors > 0) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        if (!sms_wiiu_vcd_vat_keep_enabled())
+            J3DShape::sOldVcdVatCmd = nullptr;
+#else
         J3DShape::sOldVcdVatCmd = nullptr;
+#endif
         for (s32 idx = 0; idx < mNumOpaShapeDrawers; idx++) {
             getShapeDrawerByIndex(idx)->draw();
         }
@@ -205,7 +211,12 @@ void DrawBuffer::drawOpa() const {
 
 void DrawBuffer::drawXlu() const {
     if (mNumActors > 0) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        if (!sms_wiiu_vcd_vat_keep_enabled())
+            J3DShape::sOldVcdVatCmd = nullptr;
+#else
         J3DShape::sOldVcdVatCmd = nullptr;
+#endif
         for (s32 idx = mNumOpaShapeDrawers; idx < mNumShapeDrawers; idx++) {
             getShapeDrawerByIndex(idx)->draw();
         }

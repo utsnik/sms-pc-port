@@ -3,6 +3,10 @@
 #include "Game/Util/MemoryUtil.hpp"
 #include <algorithm>
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_vcd_vat_pass_boundary();
+#endif
+
 namespace {
     // static const char* sDrawTypeCameraName = ;
     // static const char* sPermitMultiCategoryArciveName = ;
@@ -88,6 +92,9 @@ void DrawBufferHolder::entry(s32 drawBufferType) {
 }
 
 void DrawBufferHolder::drawOpa(s32 drawBufferType) const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_vcd_vat_pass_boundary();
+#endif
     if (isBufferGroupEmpty(drawBufferType)) {
         return;
     }
@@ -96,6 +103,9 @@ void DrawBufferHolder::drawOpa(s32 drawBufferType) const {
 }
 
 void DrawBufferHolder::drawXlu(s32 drawBufferType) const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_vcd_vat_pass_boundary();
+#endif
     if (isBufferGroupEmpty(drawBufferType)) {
         return;
     }

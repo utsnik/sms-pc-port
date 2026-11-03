@@ -20,6 +20,15 @@ extern "C" void sms_wiiu_gx2_wait_peek(int colour);
 
 using namespace gx;
 
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_vcd_vat_writer(void) __attribute__((weak));
+static inline void noteVcdVatWriter() {
+    if (sms_wiiu_vcd_vat_writer != nullptr) sms_wiiu_vcd_vat_writer();
+}
+#else
+static inline void noteVcdVatWriter() {}
+#endif
+
 namespace gx {
 void traceNoteBegin();  // gx_trace.cpp (SMS_GX_TRACE_BT)
 void traceNoteProjection(const float* p);
@@ -465,6 +474,7 @@ void GXCallDisplayList(void* list, u32 nbytes) {
 
 // ================================================================== GXGeometry / GXAttr
 void GXSetVtxDesc(GXAttr attr, GXAttrType type) {
+    noteVcdVatWriter();
     uint32_t lo = GX_STATE.cpVcdLo, hi = GX_STATE.cpVcdHi;
     uint32_t t = uint32_t(type) & 3;
     if (attr == GX_VA_PNMTXIDX) lo = setField(lo, 1, 0, t != 0);
@@ -485,6 +495,7 @@ void GXSetVtxDescv(const GXVtxDescList* list) {
     for (; list->attr != GX_VA_NULL; list++) GXSetVtxDesc(list->attr, list->type);
 }
 void GXClearVtxDesc(void) {
+    noteVcdVatWriter();
     apiCP(CP_VCD_LO, 1u << 9);  // position direct, as the SDK leaves it
     apiCP(CP_VCD_HI, 0);
 }
@@ -510,6 +521,7 @@ void GXGetVtxDescv(GXVtxDescList* vcd) {
 }
 
 void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
+    noteVcdVatWriter();
     uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
     uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
     switch (attr) {

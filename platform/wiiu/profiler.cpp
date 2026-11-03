@@ -21,6 +21,11 @@
 #include <cstdio>
 #include <cstring>
 
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_jpa_diag_stage_tick(void);
+extern "C" void sms_wiiu_jpa_diag_flush(void);
+#endif
+
 namespace {
 
 typedef int64_t WutTime;
@@ -592,19 +597,21 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	// report covers exactly thirty completed frame boundaries.
 	extern uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 	extern uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
-	extern uint32_t s_jpaRejectTexture, s_jpaRejectColor, s_jpaRejectScale;
+	extern uint32_t s_jpaRejectTexture, s_jpaRejectColorRgb, s_jpaRejectColorAlpha, s_jpaRejectScale;
 	extern uint32_t s_jpaRejectProjection, s_jpaRejectBlendZmode, s_jpaRejectChild, s_jpaRejectOther;
 	extern uint32_t s_jpaType3, s_jpaType4;
 	extern uint32_t s_jpaType2;
 	extern void sms_wiiu_jpa_histogram_report(void);
 	static unsigned s_jpaWindowFrames;
+	sms_wiiu_jpa_diag_stage_tick();
 	if (++s_jpaWindowFrames == 30) {
-		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u rejTex=%u rejColor=%u rejScale=%u rejPrjMode=%u rejBlendZ=%u rejChild=%u rejOther=%u t2=%u t3=%u t4=%u\n",
+		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u rejTex=%u rejColorRgb=%u rejColorAlpha=%u rejScale=%u rejPrjMode=%u rejBlendZ=%u rejChild=%u rejOther=%u t2=%u t3=%u t4=%u\n",
 		         (unsigned)s_jpaParticles, (unsigned)s_jpaDraws,
 		         (unsigned)s_jpaSplits, (unsigned)s_jpaBatched,
 		         (unsigned)s_jpaRejectType, (unsigned)s_jpaRejectCallback,
 		         (unsigned)s_jpaRejectPrj, (unsigned)s_jpaRejectIneligible,
-		         (unsigned)s_jpaRejectTexture, (unsigned)s_jpaRejectColor,
+		         (unsigned)s_jpaRejectTexture, (unsigned)s_jpaRejectColorRgb,
+		         (unsigned)s_jpaRejectColorAlpha,
 		         (unsigned)s_jpaRejectScale, (unsigned)s_jpaRejectProjection,
 		         (unsigned)s_jpaRejectBlendZmode, (unsigned)s_jpaRejectChild,
 		         (unsigned)s_jpaRejectOther,
@@ -612,7 +619,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 		sms_wiiu_jpa_histogram_report();
 		s_jpaParticles = s_jpaDraws = s_jpaSplits = s_jpaBatched = 0;
 		s_jpaRejectType = s_jpaRejectCallback = s_jpaRejectPrj = s_jpaRejectIneligible = 0;
-		s_jpaRejectTexture = s_jpaRejectColor = s_jpaRejectScale = 0;
+		s_jpaRejectTexture = s_jpaRejectColorRgb = s_jpaRejectColorAlpha = s_jpaRejectScale = 0;
 		s_jpaRejectProjection = s_jpaRejectBlendZmode = s_jpaRejectChild = s_jpaRejectOther = 0;
 		s_jpaType2 = s_jpaType3 = s_jpaType4 = 0;
 		s_jpaWindowFrames = 0;
@@ -657,7 +664,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 #if defined(PORT_GAME_SMG)
 uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
-uint32_t s_jpaRejectTexture, s_jpaRejectColor, s_jpaRejectScale;
+uint32_t s_jpaRejectTexture, s_jpaRejectColorRgb, s_jpaRejectColorAlpha, s_jpaRejectScale;
 uint32_t s_jpaRejectProjection, s_jpaRejectBlendZmode, s_jpaRejectChild, s_jpaRejectOther;
 uint32_t s_jpaType2, s_jpaType3, s_jpaType4;
 struct JPAHistogramBucket {
@@ -732,7 +739,8 @@ extern "C" void sms_wiiu_jpa_reject_reason(unsigned reason)
 {
 	switch (reason) {
 	case SMS_WIIU_JPA_REJECT_TEXTURE: ++s_jpaRejectTexture; break;
-	case SMS_WIIU_JPA_REJECT_COLOR: ++s_jpaRejectColor; break;
+	case SMS_WIIU_JPA_REJECT_COLOR_RGB: ++s_jpaRejectColorRgb; break;
+	case SMS_WIIU_JPA_REJECT_COLOR_ALPHA: ++s_jpaRejectColorAlpha; break;
 	case SMS_WIIU_JPA_REJECT_SCALE: ++s_jpaRejectScale; break;
 	case SMS_WIIU_JPA_REJECT_PROJECTION: ++s_jpaRejectProjection; break;
 	case SMS_WIIU_JPA_REJECT_BLEND_ZMODE: ++s_jpaRejectBlendZmode; break;
@@ -821,6 +829,9 @@ extern "C" void sms_wiiu_hang_check(void)
 /* Every exit path cancels the alarm, or it fires into an unmapped process. */
 extern "C" void sms_wiiu_profiler_stop(void)
 {
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_jpa_diag_flush();
+#endif
 	if (s_wrunning) {
 		wut_OSCancelAlarm(s_walarm);
 		s_wrunning = false;
