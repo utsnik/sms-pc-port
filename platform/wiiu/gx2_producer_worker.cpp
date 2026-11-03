@@ -32,6 +32,7 @@ BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t)
     __asm__("OSReceiveMessage");
 void wut_OSSleepTicks(int64_t) __asm__("OSSleepTicks");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
+int64_t wut_OSGetSystemTime(void) __asm__("OSGetSystemTime");
 int sms_wiiu_pipe2_enabled(void);
 }
 
@@ -85,6 +86,60 @@ static bool s_serviceFailureLogged;
 static bool s_wrongServiceCoreLogged;
 static void (*s_flushHook)();
 static bool s_inService;
+
+static constexpr uint32_t kDrawownMaxOwners = 1024;
+static constexpr uint32_t kDrawownOtherOwner = kDrawownMaxOwners;
+static constexpr uint32_t kDrawownMaxStack = 32;
+static constexpr uint32_t kDrawownWindowFrames = 120;
+struct DrawownWorkerOwner {
+    const char* name;
+    uint64_t busyTicks;
+    uint64_t draws;
+};
+static bool s_drawownEnabled;
+static DrawownWorkerOwner s_drawownOwners[kDrawownMaxOwners + 1];
+static uint32_t s_drawownStack[kDrawownMaxStack];
+static uint32_t s_drawownStackDepth;
+static uint32_t s_drawownCurrent = kDrawownOtherOwner;
+static int64_t s_drawownStart;
+static bool s_drawownTiming;
+
+static inline int64_t drawownNow() { return wut_OSGetSystemTime(); }
+
+static void drawownAccumulate(int64_t now) {
+    if (!s_drawownEnabled || !s_drawownTiming) return;
+    const int64_t elapsed = now - s_drawownStart;
+    if (elapsed > 0)
+        s_drawownOwners[s_drawownCurrent].busyTicks += uint64_t(elapsed);
+    s_drawownStart = now;
+}
+
+static void drawownPause() {
+    if (!s_drawownEnabled || !s_drawownTiming) return;
+    const int64_t now = drawownNow();
+    drawownAccumulate(now);
+    s_drawownTiming = false;
+}
+
+static void drawownResume() {
+    if (!s_drawownEnabled || s_drawownTiming) return;
+    s_drawownStart = drawownNow();
+    s_drawownTiming = true;
+}
+
+static void drawownSwitch(uint32_t owner) {
+    if (!s_drawownEnabled) return;
+    if (owner > kDrawownMaxOwners) owner = kDrawownOtherOwner;
+    const int64_t now = drawownNow();
+    drawownAccumulate(now);
+    s_drawownCurrent = owner;
+    s_drawownStart = now;
+    s_drawownTiming = true;
+}
+
+static inline uint32_t drawownMicros(uint64_t ticks) {
+    return uint32_t(OSTicksToMicroseconds(ticks));
+}
 
 static inline void releaseBarrier() { __sync_synchronize(); }
 static inline void acquireBarrier() { __sync_synchronize(); }
@@ -154,6 +209,7 @@ static void consumeThrough(uint32_t target) {
 }
 
 static void drainWorker() {
+    drawownResume();
     for (;;) {
         acquireBarrier();
         const uint32_t target = s_byteWrite;
@@ -166,6 +222,7 @@ static void drainWorker() {
             const ServiceFn fn = s_requestFn;
             void* const arg = s_requestArg;
             s_hooks.boundary(kind);
+            drawownPause();
             if (fn) {
                 ServiceRecord operation = {SERVICE_CALLBACK, 0, nullptr, 0, fn, arg};
                 if (!pushService(operation, true)) return;
@@ -186,7 +243,11 @@ static void drainWorker() {
         add(&s_totals.workerBusyMicros, microsSince(busyStart));
 
         acquireBarrier();
-        if (s_byteRead == s_byteWrite && request == s_requestId) return;
+        if (s_byteRead == s_byteWrite && request == s_requestId) {
+            drawownPause();
+            return;
+        }
+        drawownResume();
     }
 }
 
@@ -268,6 +329,88 @@ bool start(const Hooks& hooks, bool core2) {
 }
 
 bool enabled() { return s_started; }
+
+void drawown_enable(bool enabled) {
+    s_drawownEnabled = enabled && s_started;
+    s_drawownStackDepth = 0;
+    s_drawownCurrent = kDrawownOtherOwner;
+    s_drawownStart = 0;
+    s_drawownTiming = false;
+    if (s_drawownEnabled) {
+        for (uint32_t i = 0; i <= kDrawownMaxOwners; ++i) {
+            s_drawownOwners[i].name = nullptr;
+            s_drawownOwners[i].busyTicks = 0;
+            s_drawownOwners[i].draws = 0;
+        }
+        s_drawownOwners[kDrawownOtherOwner].name = "other";
+    }
+}
+
+void drawown_owner_name(uint32_t owner, const char* name) {
+    if (owner < kDrawownMaxOwners && name && *name)
+        s_drawownOwners[owner].name = name;
+}
+
+void drawown_worker_push(uint32_t owner) {
+    if (!s_drawownEnabled) return;
+    if (s_drawownStackDepth < kDrawownMaxStack)
+        s_drawownStack[s_drawownStackDepth++] = s_drawownCurrent;
+    drawownSwitch(owner);
+}
+
+void drawown_worker_pop() {
+    if (!s_drawownEnabled) return;
+    const uint32_t owner = s_drawownStackDepth ? s_drawownStack[--s_drawownStackDepth]
+                                              : kDrawownOtherOwner;
+    drawownSwitch(owner);
+}
+
+void drawown_worker_draw() {
+    if (s_drawownEnabled)
+        ++s_drawownOwners[s_drawownCurrent].draws;
+}
+
+void drawown_report(uint32_t frame) {
+    if (!s_drawownEnabled || !frame || frame % kDrawownWindowFrames) return;
+    __sync_synchronize();
+    uint64_t totalTicks = 0;
+    for (uint32_t i = 0; i <= kDrawownMaxOwners; ++i)
+        totalTicks += s_drawownOwners[i].busyTicks;
+
+    uint32_t order[kDrawownMaxOwners + 1];
+    for (uint32_t i = 0; i <= kDrawownMaxOwners; ++i) order[i] = i;
+    const uint32_t limit = 16;
+    uint32_t reported = 0;
+    for (uint32_t rank = 0; rank < limit; ++rank) {
+        uint32_t best = rank;
+        for (uint32_t i = rank + 1; i <= kDrawownMaxOwners; ++i) {
+            const DrawownWorkerOwner& candidate = s_drawownOwners[order[i]];
+            const DrawownWorkerOwner& current = s_drawownOwners[order[best]];
+            if (candidate.busyTicks > current.busyTicks)
+                best = i;
+        }
+        const uint32_t tmp = order[rank];
+        order[rank] = order[best];
+        order[best] = tmp;
+        const DrawownWorkerOwner& owner = s_drawownOwners[order[rank]];
+        if (!owner.busyTicks && !owner.draws) break;
+        ++reported;
+    }
+
+    port_log("[wown] frame=%u worker_us=%u\n", frame,
+             unsigned(drawownMicros(totalTicks) / kDrawownWindowFrames));
+    for (uint32_t rank = 0; rank < reported; ++rank) {
+        const DrawownWorkerOwner& owner = s_drawownOwners[order[rank]];
+        const char* name = owner.name ? owner.name : "other";
+        port_log("[wown]  owner=%s us=%u draws=%u\n", name,
+                 unsigned(drawownMicros(owner.busyTicks) / kDrawownWindowFrames),
+                 unsigned(owner.draws * 10 / kDrawownWindowFrames));
+    }
+    for (uint32_t i = 0; i <= kDrawownMaxOwners; ++i) {
+        s_drawownOwners[i].busyTicks = 0;
+        s_drawownOwners[i].draws = 0;
+    }
+}
 
 void set_flush_hook(void (*fn)()) { s_flushHook = fn; }
 
@@ -521,6 +664,7 @@ void note_frame(uint32_t frame) {
              d.appendFailures, d.serviceFailures);
     s_lastLog = now;
     s_lastLogFrame = frame;
+    drawown_report(frame);
 }
 
 } // namespace gx2prod

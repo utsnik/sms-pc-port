@@ -1993,6 +1993,17 @@ void pipeWrite(const uint8_t* bytes, uint32_t n) { SMS_PORT_HEAP_SCOPE(); pipePu
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     const uint8_t cmd[8] = {0xF0, kind, slot, 0, uint8_t(value >> 24), uint8_t(value >> 16),
                             uint8_t(value >> 8), uint8_t(value)};
+    // Owner switches belong to the producer stream even when the game is
+    // simultaneously redirecting GX writes into a display-list buffer.  Do
+    // not let this private record become part of a list that may be replayed
+    // by GX2 or Cemu.
+    if (s_redirect && (kind == kHostDrawownPush || kind == kHostDrawownPop)) {
+        if (s_pipeLen + sizeof cmd > s_pipeCap) pipeGrow(s_pipeLen + sizeof cmd);
+        memcpy(s_pipeBuf + s_pipeLen, cmd, sizeof cmd);
+        s_pipeLen += sizeof cmd;
+        if (s_pipeLen >= kProdChunk) producerFlushPending();
+        return;
+    }
     pipePut(cmd, sizeof cmd);
 }
 
@@ -2046,6 +2057,12 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
             s_hostOps = true;
         }
         s_dlPtr = nullptr;
+        break;
+    case kHostDrawownPush:
+        gx2prod::drawown_worker_push(value);
+        break;
+    case kHostDrawownPop:
+        gx2prod::drawown_worker_pop();
         break;
     case kHostTlutPtr: s_tlutPtr = ptr; break;
     case kHostTlutOffset: s_tlutOffset = value; break;

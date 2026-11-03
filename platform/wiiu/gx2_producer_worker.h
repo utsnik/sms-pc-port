@@ -90,6 +90,16 @@ void publish_token(uint16_t token);
  * service(), hence on the integrating core-1 service path. */
 void bind_service(ServiceCallback callback);
 
+/* Optional SMG drawown accounting.  Owner switches arrive in the producer
+ * stream as private host-state records; draw notifications are emitted by
+ * worker-side flushBatch without allocating per draw. */
+void drawown_enable(bool enabled);
+void drawown_owner_name(uint32_t owner, const char* name);
+void drawown_worker_push(uint32_t owner);
+void drawown_worker_pop();
+void drawown_worker_draw();
+void drawown_report(uint32_t frame);
+
 Counters counters();
 void snapshot(Counters* out);
 /* Emits one cumulative-delta [prod] line on each nonzero multiple of 30. */

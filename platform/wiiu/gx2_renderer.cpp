@@ -1,6 +1,7 @@
 #include "port_heap.h"
 #include "runtime.h"
 #include "gx2_producer_worker.h"
+#include "../gx/src/gx_internal.h"
 #include <cstdio>
 #ifndef SMS_GX2_ASYNC_PEEK
 #define SMS_GX2_ASYNC_PEEK 1
@@ -351,13 +352,18 @@ static unsigned drawownFindOwner(const char* name, unsigned draw_type, unsigned 
     for (unsigned i = 0; i < s_drawownOwnerCount; ++i) {
         const DrawownOwner& owner = s_drawownOwners[i];
         if (owner.draw_type == draw_type && owner.kind == kind && owner.vtable == vtable &&
-            std::strcmp(owner.name, name) == 0)
+            std::strcmp(owner.name, name) == 0) {
+            if (s_gx2ProdEnabled)
+                gx2prod::drawown_owner_name(i, name);
             return i;
+        }
     }
     if (s_drawownOwnerCount >= kDrawownMaxOwners)
         return 0;
     const unsigned owner = s_drawownOwnerCount++;
     s_drawownOwners[owner] = {name, draw_type, kind, vtable, 0, 0};
+    if (s_gx2ProdEnabled)
+        gx2prod::drawown_owner_name(owner, name);
     return owner;
 }
 
@@ -365,6 +371,10 @@ static void drawownPush(unsigned owner, unsigned kind) {
     if (!s_drawown || s_drawownStackDepth >= kDrawownMaxStack)
         return;
     s_drawownStack[s_drawownStackDepth++] = {owner, kind};
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled)
+        producerHostState(kHostDrawownPush, 0, owner);
+#endif
 }
 
 static void drawownReport() {
@@ -472,12 +482,27 @@ extern "C" void sms_wiiu_drawown_push_kind(unsigned kind) {
     }
 }
 extern "C" void sms_wiiu_drawown_pop(void) {
-    if (s_drawown && s_drawownStackDepth)
+    if (s_drawown && s_drawownStackDepth) {
         --s_drawownStackDepth;
+#ifdef __WIIU__
+        if (s_gx2ProdEnabled)
+            producerHostState(kHostDrawownPop, 0, 0);
+#endif
+    }
 }
 extern "C" void sms_wiiu_drawown_record(unsigned verts) { drawownRecord(verts); }
+
+#ifdef __WIIU__
+static inline void drawownWorkerDraw() {
+    if (s_drawown && s_gx2ProdEnabled && OSGetCoreId() != 1)
+        gx2prod::drawown_worker_draw();
+}
+#else
+static inline void drawownWorkerDraw() {}
+#endif
 #else
 static inline void drawownRecord(unsigned) {}
+static inline void drawownWorkerDraw() {}
 #endif
 #if defined(PORT_GAME_SMG)
 static constexpr uint32_t kZtexConstReg = 47;
@@ -6427,6 +6452,9 @@ void rendererInit(float) {
             gx2prod::bind_service(gx2ProdCallList);
             setProducerMode(true);
             s_gx2ProdEnabled = true;
+#if defined(PORT_GAME_SMG)
+            gx2prod::drawown_enable(s_drawown);
+#endif
             WHBLogPrintf("SMS Wii U: [gx2prod] worker started core=%u",
                          s_gx2ProdCore2 ? 2u : 0u);
         } else {
@@ -7124,6 +7152,7 @@ void flushBatch() {
                                    dlArena() + pend.ref->baseVertex);
                 if (!s_d8NoDraw) {
                     drawownRecord(pend.nidx);
+                    drawownWorkerDraw();
                     GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                      const_cast<uint32_t*>(storedIdx), 0, 1);
                 }
@@ -7133,6 +7162,7 @@ void flushBatch() {
                                    dlArena() + pend.ref->baseVertex);
                 if (!s_d8NoDraw) {
                     drawownRecord(pend.nidx);
+                    drawownWorkerDraw();
                     GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
                                      const_cast<uint32_t*>(storedIdx), 0, 1);
                 }
@@ -7348,12 +7378,14 @@ void flushBatch() {
     if (listReady) {
         if (!s_d8NoDraw) {
             drawownRecord(indexCount);
+            drawownWorkerDraw();
             GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
         }
         gx2DlNoteDraw();
     } else {
         if (!s_d8NoDraw) {
             drawownRecord(indexCount);
+            drawownWorkerDraw();
             GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
         }
     }

@@ -197,7 +197,7 @@ enum ProducerHostKind : uint8_t {
     kHostViewport, kHostScissor, kHostCull, kHostLineWidth, kHostPointSize,
     kHostTcManual, kHostCopyDest, kHostTexImage, kHostCallDlPtr, kHostCallDlSize,
     kHostTlutPtr, kHostTlutOffset, kHostTlutLoad, kHostCopyOwner, kHostCopyDstWidth,
-    kHostCopyDstHeight,
+    kHostCopyDstHeight, kHostDrawownPush, kHostDrawownPop,
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
 #endif
