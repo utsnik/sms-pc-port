@@ -15,6 +15,7 @@
  *
  * The game's SDK has its own OSAlarm, so coreinit is bound by symbol name. */
 #include "runtime.h"
+#include "jpa_counters.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -591,20 +592,28 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	// report covers exactly thirty completed frame boundaries.
 	extern uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 	extern uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
+	extern uint32_t s_jpaRejectTexture, s_jpaRejectColor, s_jpaRejectScale;
+	extern uint32_t s_jpaRejectProjection, s_jpaRejectBlendZmode, s_jpaRejectChild, s_jpaRejectOther;
 	extern uint32_t s_jpaType3, s_jpaType4;
 	extern uint32_t s_jpaType2;
 	extern void sms_wiiu_jpa_histogram_report(void);
 	static unsigned s_jpaWindowFrames;
 	if (++s_jpaWindowFrames == 30) {
-		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u t2=%u t3=%u t4=%u\n",
+		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u rejTex=%u rejColor=%u rejScale=%u rejPrjMode=%u rejBlendZ=%u rejChild=%u rejOther=%u t2=%u t3=%u t4=%u\n",
 		         (unsigned)s_jpaParticles, (unsigned)s_jpaDraws,
 		         (unsigned)s_jpaSplits, (unsigned)s_jpaBatched,
 		         (unsigned)s_jpaRejectType, (unsigned)s_jpaRejectCallback,
 		         (unsigned)s_jpaRejectPrj, (unsigned)s_jpaRejectIneligible,
+		         (unsigned)s_jpaRejectTexture, (unsigned)s_jpaRejectColor,
+		         (unsigned)s_jpaRejectScale, (unsigned)s_jpaRejectProjection,
+		         (unsigned)s_jpaRejectBlendZmode, (unsigned)s_jpaRejectChild,
+		         (unsigned)s_jpaRejectOther,
 		         (unsigned)s_jpaType2, (unsigned)s_jpaType3, (unsigned)s_jpaType4);
 		sms_wiiu_jpa_histogram_report();
 		s_jpaParticles = s_jpaDraws = s_jpaSplits = s_jpaBatched = 0;
 		s_jpaRejectType = s_jpaRejectCallback = s_jpaRejectPrj = s_jpaRejectIneligible = 0;
+		s_jpaRejectTexture = s_jpaRejectColor = s_jpaRejectScale = 0;
+		s_jpaRejectProjection = s_jpaRejectBlendZmode = s_jpaRejectChild = s_jpaRejectOther = 0;
 		s_jpaType2 = s_jpaType3 = s_jpaType4 = 0;
 		s_jpaWindowFrames = 0;
 	}
@@ -648,6 +657,8 @@ extern "C" void sms_wiiu_profiler_tick(void)
 #if defined(PORT_GAME_SMG)
 uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
+uint32_t s_jpaRejectTexture, s_jpaRejectColor, s_jpaRejectScale;
+uint32_t s_jpaRejectProjection, s_jpaRejectBlendZmode, s_jpaRejectChild, s_jpaRejectOther;
 uint32_t s_jpaType2, s_jpaType3, s_jpaType4;
 struct JPAHistogramBucket {
 	unsigned type, count, emitters;
@@ -717,6 +728,18 @@ extern "C" void sms_wiiu_jpa_reject_type(void) { ++s_jpaRejectType; }
 extern "C" void sms_wiiu_jpa_reject_callback(void) { ++s_jpaRejectCallback; }
 extern "C" void sms_wiiu_jpa_reject_prj(void) { ++s_jpaRejectPrj; }
 extern "C" void sms_wiiu_jpa_reject_ineligible(void) { ++s_jpaRejectIneligible; }
+extern "C" void sms_wiiu_jpa_reject_reason(unsigned reason)
+{
+	switch (reason) {
+	case SMS_WIIU_JPA_REJECT_TEXTURE: ++s_jpaRejectTexture; break;
+	case SMS_WIIU_JPA_REJECT_COLOR: ++s_jpaRejectColor; break;
+	case SMS_WIIU_JPA_REJECT_SCALE: ++s_jpaRejectScale; break;
+	case SMS_WIIU_JPA_REJECT_PROJECTION: ++s_jpaRejectProjection; break;
+	case SMS_WIIU_JPA_REJECT_BLEND_ZMODE: ++s_jpaRejectBlendZmode; break;
+	case SMS_WIIU_JPA_REJECT_CHILD: ++s_jpaRejectChild; break;
+	default: ++s_jpaRejectOther; break;
+	}
+}
 extern "C" void sms_wiiu_jpa_type3(void) { ++s_jpaType3; }
 extern "C" void sms_wiiu_jpa_type4(void) { ++s_jpaType4; }
 extern "C" void sms_wiiu_jpa_type2(void) { ++s_jpaType2; }

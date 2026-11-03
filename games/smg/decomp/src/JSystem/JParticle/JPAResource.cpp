@@ -76,17 +76,27 @@ bool sameDirectionKey(const DirectionKey& a, const DirectionKey& b) {
     return !(a.flags & DirectionKeyAge) || a.age == b.age;
 }
 
-void countDirectionalParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shapeType) {
+bool directionalCallbackAllowed(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs,
+                                int funcCount, int shapeType, bool child) {
+    return work->mpEmtr->mpPtclCallBack == NULL ||
+        (!child && shapeType == 3 && funcCount > 0 && funcs[0] == &JPADrawRotDirection &&
+         jpa_batch::callbackDrawsNothing(work->mpEmtr->mpPtclCallBack));
+}
+
+void countDirectionalParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shapeType,
+                               bool child, JPAResource::ParticleFunc* funcs, int funcCount) {
     if (shapeType == 3) sms_wiiu_jpa_type3();
     if (shapeType == 4) sms_wiiu_jpa_type4();
     if (shapeType != 3 && shapeType != 4) {
         sms_wiiu_jpa_reject_type();
-    } else if (work->mpEmtr->mpPtclCallBack != NULL) {
+    } else if (!directionalCallbackAllowed(work, funcs, funcCount, shapeType, child)) {
         sms_wiiu_jpa_reject_callback();
     } else if (work->mPrjType != 0) {
         sms_wiiu_jpa_reject_prj();
+        sms_wiiu_jpa_reject_reason(SMS_WIIU_JPA_REJECT_PROJECTION);
     } else if (!jpa_batch::eligible(work, particle)) {
         sms_wiiu_jpa_reject_ineligible();
+        sms_wiiu_jpa_reject_reason(SMS_WIIU_JPA_REJECT_OTHER);
     }
 }
 
@@ -101,7 +111,15 @@ struct BillboardBatchMode {
     bool rasterPrm;
     bool rasterEnv;
     bool rasterAlpha;
+    bool textureAnimated;
 };
+
+typedef SmsWiiuJpaRejectReason BillboardRejectReason;
+
+void rejectBillboardIneligible(BillboardRejectReason reason) {
+    sms_wiiu_jpa_reject_ineligible();
+    sms_wiiu_jpa_reject_reason(reason);
+}
 
 bool hasTevColorArg(const GXTevColorArg* args, GXTevColorArg wanted) {
     for (int i = 0; i < 4; ++i)
@@ -116,7 +134,8 @@ bool hasTevAlphaArg(const GXTevAlphaArg* args, GXTevAlphaArg wanted) {
 }
 
 bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs,
-                        int funcCount, BillboardBatchMode* mode) {
+                        int funcCount, BillboardBatchMode* mode,
+                        BillboardRejectReason* rejectReason) {
     mode->prmRgb = false;
     mode->envRgb = false;
     mode->alpha = false;
@@ -127,13 +146,26 @@ bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* fun
     mode->rasterPrm = false;
     mode->rasterEnv = false;
     mode->rasterAlpha = false;
+    mode->textureAnimated = false;
+    *rejectReason = SMS_WIIU_JPA_REJECT_OTHER;
 
     const JPAResource::ParticleFunc registEnv = static_cast<JPAResource::ParticleFunc>(&JPARegistEnv);
+    const JPAResource::ParticleFunc loadTexAnm = static_cast<JPAResource::ParticleFunc>(&JPALoadTexAnm);
+    const JPAResource::ParticleFunc setPointSize = static_cast<JPAResource::ParticleFunc>(&JPASetPointSize);
+    const JPAResource::ParticleFunc setLineWidth = static_cast<JPAResource::ParticleFunc>(&JPASetLineWidth);
     for (int i = 1; i < funcCount; ++i) {
         JPAResource::ParticleFunc func = funcs[i];
         if (func == &JPADrawParticleCallBack) {
             if (work->mpEmtr->mpPtclCallBack != NULL &&
                 !jpa_batch::callbackDrawsNothing(work->mpEmtr->mpPtclCallBack)) return false;
+        } else if (func == loadTexAnm) {
+            mode->textureAnimated = true;
+        } else if (func == &JPALoadCalcTexCrdMtxAnm) {
+            *rejectReason = SMS_WIIU_JPA_REJECT_TEXTURE;
+            return false;
+        } else if (func == setPointSize || func == setLineWidth) {
+            *rejectReason = SMS_WIIU_JPA_REJECT_SCALE;
+            return false;
         } else if (func == &JPARegistPrmAlpha) {
             mode->prmRgb = true;
             mode->alpha = true;
@@ -158,8 +190,8 @@ bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* fun
             mode->envRgb = true;
             mode->envAlpha = true;
         } else {
-            // Texture animation, texture-coordinate animation and any future
-            // particle-side state changes cannot be represented by one draw.
+            // Keep unknown particle-side state on the original per-particle
+            // path rather than guessing at its effect on the GX registers.
             return false;
         }
     }
@@ -170,11 +202,17 @@ bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* fun
     // One raster colour carries one varying RGB register, while its alpha can
     // independently carry the particle alpha. If both C0 and C1 vary, the
     // exact TEV result needs the legacy per-particle register writes.
-    if (mode->rasterPrm && mode->rasterEnv) return false;
+    if (mode->rasterPrm && mode->rasterEnv) {
+        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR;
+        return false;
+    }
     const GXTevAlphaArg* alphaArgs = work->mpRes->getBsp()->getTevAlphaArg();
     const bool rasterPrmAlpha = mode->alpha && hasTevAlphaArg(alphaArgs, GX_CA_A0);
     const bool rasterEnvAlpha = mode->envAlpha && hasTevAlphaArg(alphaArgs, GX_CA_A1);
-    if (rasterPrmAlpha && rasterEnvAlpha) return false;
+    if (rasterPrmAlpha && rasterEnvAlpha) {
+        *rejectReason = SMS_WIIU_JPA_REJECT_COLOR;
+        return false;
+    }
     mode->rasterAlpha = rasterPrmAlpha || rasterEnvAlpha;
     mode->alphaFromParticleEnv = rasterEnvAlpha;
     return true;
@@ -196,11 +234,15 @@ void countBillboardParticle(JPAEmitterWorkData* work, JPABaseParticle* particle,
         sms_wiiu_jpa_reject_callback();
     } else if (work->mPrjType != 0) {
         sms_wiiu_jpa_reject_prj();
+        sms_wiiu_jpa_reject_reason(SMS_WIIU_JPA_REJECT_PROJECTION);
     } else {
         BillboardBatchMode mode;
-        if (particle->checkStatus(8) ||
-            !billboardBatchMode(work, funcs, funcCount, &mode))
-            sms_wiiu_jpa_reject_ineligible();
+        BillboardRejectReason reason;
+        if (particle->checkStatus(8)) {
+            rejectBillboardIneligible(SMS_WIIU_JPA_REJECT_OTHER);
+        } else if (!billboardBatchMode(work, funcs, funcCount, &mode, &reason)) {
+            rejectBillboardIneligible(reason);
+        }
     }
 }
 
@@ -211,17 +253,19 @@ bool batchMarker() {
 }
 
 bool canBatchDirectional(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs, int funcCount,
-                         int shapeType) {
+                         int shapeType, bool child) {
     return batchMarker() && (shapeType == 3 || shapeType == 4) && work->mPrjType == 0 &&
-        work->mpEmtr->mpPtclCallBack == NULL && funcCount > 0 &&
+        directionalCallbackAllowed(work, funcs, funcCount, shapeType, child) && funcCount > 0 &&
         (funcs[0] == &JPADrawDirection || funcs[0] == &JPADrawRotDirection);
 }
 
 bool canBatchBillboard(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs, int funcCount,
                        int shapeType, bool child, BillboardBatchMode* mode) {
+    BillboardRejectReason rejectReason;
     return batchMarker() && shapeType == 2 && work->mPrjType == 0 && funcCount > 0 &&
         (funcs[0] == &JPADrawBillboard || funcs[0] == &JPADrawRotBillboard) &&
-        billboardCallbackAllowed(work, child) && billboardBatchMode(work, funcs, funcCount, mode);
+        billboardCallbackAllowed(work, child) &&
+        billboardBatchMode(work, funcs, funcCount, mode, &rejectReason);
 }
 
 const char* jpaDrawFuncName(JPAResource::ParticleFunc func) {
@@ -244,7 +288,7 @@ void noteParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shape
     sms_wiiu_jpa_particle();
     const bool directionalFunc = funcCount > 0 &&
         (funcs[0] == &JPADrawDirection || funcs[0] == &JPADrawRotDirection);
-    if (directionalFunc) countDirectionalParticle(work, particle, shapeType);
+    if (directionalFunc) countDirectionalParticle(work, particle, shapeType, child, funcs, funcCount);
     else countBillboardParticle(work, particle, shapeType, child, funcs, funcCount);
     sms_wiiu_jpa_histogram(child, (unsigned)shapeType,
                            funcCount > 0 ? jpaDrawFuncName(funcs[0]) : "none",
@@ -1064,6 +1108,8 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
         }
         work->mpCurNode = node;
         for (int i = funcCount - 1; i > 0; --i) (*funcs[i])(work, particle);
+        if (key.flags & DirectionKeyTex)
+            work->mpResMgr->load(work->mpRes->getTexIdx(particle->mTexAnmIdx), GX_TEXMAP0);
         Mtx identity;
         PSMTXIdentity(identity);
         GXLoadPosMtxImm(identity, GX_PNMTX0);
@@ -1205,56 +1251,71 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
     typedef JPANode< JPABaseParticle > Node;
     Node* const end = work->mpAlivePtcl->getEnd();
     Node* node = reverse ? work->mpAlivePtcl->getLast() : work->mpAlivePtcl->getFirst();
-    unsigned visible = 0;
-    for (Node* scan = node; scan != end; scan = reverse ? scan->getPrev() : scan->getNext()) {
-        work->mpCurNode = scan;
-        noteParticle(work, scan->getObject(), 2, child, funcs, funcCount);
-        if (!scan->getObject()->checkStatus(8)) ++visible;
-    }
-    if (visible == 0) return;
-
-    Mtx identity;
-    PSMTXIdentity(identity);
-    GXLoadPosMtxImm(identity, GX_PNMTX0);
-    GXSetCurrentMtx(GX_PNMTX0);
-    GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
-    GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
-    if (mode.rasterPrm || mode.rasterEnv || mode.rasterAlpha) {
-        GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
-        GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
-    }
-    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-    setBillboardBatchTev(work, mode, texMap);
-    GXBegin(GX_QUADS, GX_VTXFMT0, visible * 4);
-    unsigned emitted = 0;
-    for (Node* scan = node; scan != end; scan = reverse ? scan->getPrev() : scan->getNext()) {
-        JPABaseParticle* particle = scan->getObject();
-        if (particle->checkStatus(8)) continue;
-        Mtx matrix;
-        billboardMatrix(work, particle, funcs[0] == &JPADrawRotBillboard, matrix);
-        for (unsigned corner = 0; corner < 4; ++corner) {
-            const jpa_batch::Vertex vertex = jpa_batch::transform(matrix, template_xyz + corner * 3);
-            GXPosition3f32(vertex.x, vertex.y, vertex.z);
-            if (mode.rasterPrm || mode.rasterEnv || mode.rasterAlpha) {
-                const GXColor color = billboardColor(work, particle, mode);
-                GXColor4u8(color.r, color.g, color.b, color.a);
-            }
-            GXTexCoord1x8(corner);
+    while (node != end) {
+        Node* runEnd = node;
+        const u8 texture = node->getObject()->mTexAnmIdx;
+        unsigned visible = 0;
+        while (runEnd != end) {
+            JPABaseParticle* particle = runEnd->getObject();
+            if (runEnd != node && mode.textureAnimated && particle->mTexAnmIdx != texture)
+                break;
+            work->mpCurNode = runEnd;
+            noteParticle(work, particle, 2, child, funcs, funcCount);
+            if (!particle->checkStatus(8)) ++visible;
+            runEnd = reverse ? runEnd->getPrev() : runEnd->getNext();
         }
-        if (emitted++ != 0) sms_wiiu_jpa_batched();
+
+        if (visible != 0) {
+            if (mode.textureAnimated)
+                work->mpResMgr->load(work->mpRes->getTexIdx(texture), texMap);
+
+            Mtx identity;
+            PSMTXIdentity(identity);
+            GXLoadPosMtxImm(identity, GX_PNMTX0);
+            GXSetCurrentMtx(GX_PNMTX0);
+            GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+            GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+            if (mode.rasterPrm || mode.rasterEnv || mode.rasterAlpha) {
+                GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+                GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+            }
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+            setBillboardBatchTev(work, mode, texMap);
+            GXBegin(GX_QUADS, GX_VTXFMT0, visible * 4);
+            unsigned emitted = 0;
+            for (Node* scan = node; scan != runEnd;
+                 scan = reverse ? scan->getPrev() : scan->getNext()) {
+                JPABaseParticle* particle = scan->getObject();
+                if (particle->checkStatus(8)) continue;
+                Mtx matrix;
+                billboardMatrix(work, particle, funcs[0] == &JPADrawRotBillboard, matrix);
+                for (unsigned corner = 0; corner < 4; ++corner) {
+                    const jpa_batch::Vertex vertex =
+                        jpa_batch::transform(matrix, template_xyz + corner * 3);
+                    GXPosition3f32(vertex.x, vertex.y, vertex.z);
+                    if (mode.rasterPrm || mode.rasterEnv || mode.rasterAlpha) {
+                        const GXColor color = billboardColor(work, particle, mode);
+                        GXColor4u8(color.r, color.g, color.b, color.a);
+                    }
+                    GXTexCoord1x8(corner);
+                }
+                if (emitted++ != 0) sms_wiiu_jpa_batched();
+            }
+            GXEnd();
+            sms_wiiu_jpa_draw();
+            GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
+            GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+            GXSetVtxDesc(GX_VA_CLR0, GX_NONE);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S8, 0);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
+            GXSetArray(GX_VA_POS, pos_array, 3);
+            GXSetArray(GX_VA_TEX0, tex_array, 2);
+            restoreBillboardBatchTev(work, mode, texMap);
+            GXLoadPosMtxImm(work->mPosCamMtx, GX_PNMTX0);
+            GXSetCurrentMtx(GX_PNMTX0);
+        }
+        node = runEnd;
     }
-    GXEnd();
-    sms_wiiu_jpa_draw();
-    GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
-    GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
-    GXSetVtxDesc(GX_VA_CLR0, GX_NONE);
-    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S8, 0);
-    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
-    GXSetArray(GX_VA_POS, pos_array, 3);
-    GXSetArray(GX_VA_TEX0, tex_array, 2);
-    restoreBillboardBatchTev(work, mode, texMap);
-    GXLoadPosMtxImm(work->mPosCamMtx, GX_PNMTX0);
-    GXSetCurrentMtx(GX_PNMTX0);
 }
 #endif
 
@@ -1307,7 +1368,7 @@ void JPAResource::drawP(JPAEmitterWorkData* work) {
                           reinterpret_cast<const signed char*>(jpa_pos + center),
                           jpa_pos + center, jpa_crd + (mpBaseShape->getTilingS() + 2 * mpBaseShape->getTilingT()) * 8,
                           GX_TEXMAP0);
-    } else if (canBatchDirectional(work, mpDrawParticleFuncList, mpDrawParticleFuncListNum, shapeType)) {
+    } else if (canBatchDirectional(work, mpDrawParticleFuncList, mpDrawParticleFuncListNum, shapeType, false)) {
         const int center = mpExtraShape != NULL
             ? (mpExtraShape->getScaleCenterX() + 3 * mpExtraShape->getScaleCenterY()) * 0xC : 0x30;
         const int offset = shapeType == 3 ? center + mpBaseShape->getBasePlaneType() * 0x6C : center;
@@ -1410,7 +1471,7 @@ void JPAResource::drawC(JPAEmitterWorkData* work) {
                           mpBaseShape->isDrawFwdAhead(), true, billboardMode,
                           reinterpret_cast<const signed char*>(jpa_pos + 0x30),
                           jpa_pos + 0x30, jpa_crd, GX_TEXMAP1);
-    } else if (canBatchDirectional(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum, shapeType)) {
+    } else if (canBatchDirectional(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum, shapeType, true)) {
         const int offset = shapeType == 3 ? 0x30 + mpChildShape->getBasePlaneType() * 0x6C : 0x30;
         drawDirectionalList(work, mpDrawParticleChildFuncList, mpDrawParticleChildFuncListNum,
                             mpBaseShape->isDrawFwdAhead(), false, shapeType,

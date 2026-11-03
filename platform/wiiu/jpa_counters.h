@@ -11,6 +11,7 @@ void sms_wiiu_jpa_reject_type(void);
 void sms_wiiu_jpa_reject_callback(void);
 void sms_wiiu_jpa_reject_prj(void);
 void sms_wiiu_jpa_reject_ineligible(void);
+void sms_wiiu_jpa_reject_reason(unsigned reason);
 void sms_wiiu_jpa_type3(void);
 void sms_wiiu_jpa_type4(void);
 void sms_wiiu_jpa_type2(void);
@@ -18,4 +19,14 @@ void sms_wiiu_jpa_histogram(int child, unsigned type, const char* func, int call
                             const void* emitter);
 #ifdef __cplusplus
 }
+
+enum SmsWiiuJpaRejectReason {
+	SMS_WIIU_JPA_REJECT_TEXTURE = 0,
+	SMS_WIIU_JPA_REJECT_COLOR,
+	SMS_WIIU_JPA_REJECT_SCALE,
+	SMS_WIIU_JPA_REJECT_PROJECTION,
+	SMS_WIIU_JPA_REJECT_BLEND_ZMODE,
+	SMS_WIIU_JPA_REJECT_CHILD,
+	SMS_WIIU_JPA_REJECT_OTHER,
+};
 #endif
