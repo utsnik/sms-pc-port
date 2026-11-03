@@ -9,6 +9,9 @@
 #include "Game/Util/SystemUtil.hpp"
 #include "port/port.h"
 #include <JSystem/JUtility/JUTTexture.hpp>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 
 namespace {
     void setTextureTrans(f32 x, f32 y) {
@@ -98,6 +101,9 @@ void ImageEffectLocalUtil::setupDrawTexture() {
 }
 
 void ImageEffectLocalUtil::drawTexture(JUTTexture* pTexture, s32 divisions, s32 tile, u8 intensity, ETexDrawType texDrawType) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    SmsWiiUDrawownScope drawownScope("ImageEffectLocalUtil::drawTexture");
+#endif
     pTexture->load(GX_TEXMAP0);
 
     if (texDrawType == TexDrawType_2) {

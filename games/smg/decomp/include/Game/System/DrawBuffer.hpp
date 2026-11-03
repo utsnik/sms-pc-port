@@ -18,7 +18,7 @@ struct PacketInfo {
 
 class DrawBufferShapeDrawer {
 public:
-    DrawBufferShapeDrawer(J3DMaterial*, J3DMatPacket*);
+    DrawBufferShapeDrawer(J3DMaterial*, J3DMatPacket*, const char*);
 
     void init(s32);
     void swap(DrawBufferShapeDrawer*);
@@ -42,11 +42,12 @@ public:
     /* 0x0C */ s32 mMaxPackets;
     /* 0x10 */ s32 mNumPackets;
     /* 0x14 */ PacketInfo** mPackets;
+    /* 0x18 */ const char* mOwnerName;
 };
 
 class DrawBuffer {
 public:
-    DrawBuffer(J3DModel* pModel);
+    DrawBuffer(J3DModel* pModel, const char* pOwnerName);
 
     void init(int);
     void add(const LiveActor*);
@@ -75,4 +76,5 @@ public:
     /* 0x1C */ s32 mNumShapeDrawers;
     /* 0x20 */ s32 mNumOpaShapeDrawers;
     /* 0x24 */ DrawBufferShapeDrawer** mShapeDrawers;
+    /* 0x28 */ const char* mOwnerName;
 };

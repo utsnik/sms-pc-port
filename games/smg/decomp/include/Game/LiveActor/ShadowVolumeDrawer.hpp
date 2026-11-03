@@ -15,6 +15,9 @@ class ShadowVolumeDrawer : public ShadowDrawer {
 public:
     ShadowVolumeDrawer(const char*);
 
+    static bool isBatchEnabled();
+    static void drawBatch(NameObj* const*, u32);
+
     virtual ~ShadowVolumeDrawer() {
     }
 
@@ -22,6 +25,8 @@ public:
     virtual void loadModelDrawMtx() const;
     virtual void drawShape() const;
     virtual bool isDraw() const;
+    virtual bool isShadowVolumeBatchable() const;
+    virtual u32 getShadowVolumeBatchState() const;
 
     void setStartDrawShepeOffset(f32);
     void setEndDrawShepeOffset(f32);

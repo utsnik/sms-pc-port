@@ -3,6 +3,9 @@
 #include "Game/Scene/SceneObjHolder.hpp"
 #include "Game/Util/DrawUtil.hpp"
 #include "Game/Util/ObjUtil.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" int sms_wiiu_sd_marker(const char*);
+#endif
 
 namespace {
     static Color8 sShapeColor(0xC0, 0xC0, 0, 4);
@@ -76,6 +79,98 @@ void ShadowVolumeDrawer::drawShape() const {
 
 bool ShadowVolumeDrawer::isDraw() const {
     return getController()->isDraw();
+}
+
+bool ShadowVolumeDrawer::isShadowVolumeBatchable() const {
+    return true;
+}
+
+u32 ShadowVolumeDrawer::getShadowVolumeBatchState() const {
+    return 0;
+}
+
+namespace {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    s32 sShadowVolumeBatchMarker = -1;
+#endif
+
+    void setShadowVolumePassState(bool subtract) {
+        GXSetCullMode(subtract ? GX_CULL_BACK : GX_CULL_FRONT);
+        GXSetBlendMode(subtract ? GX_BM_SUBTRACT : GX_BM_BLEND,
+                       subtract ? GX_BL_ZERO : GX_BL_ONE,
+                       subtract ? GX_BL_ZERO : GX_BL_ONE, GX_LO_COPY);
+    }
+}
+
+bool ShadowVolumeDrawer::isBatchEnabled() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (sShadowVolumeBatchMarker < 0) {
+        sShadowVolumeBatchMarker = sms_wiiu_sd_marker("svbatch") != 0;
+    }
+    return sShadowVolumeBatchMarker != 0;
+#else
+    return false;
+#endif
+}
+
+void ShadowVolumeDrawer::drawBatch(NameObj* const* pObjects, u32 count) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    u32 batchState = 0;
+    bool haveBatchState = false;
+    for (u32 i = 0; i < count; i++) {
+        ShadowVolumeDrawer* volume = static_cast< ShadowVolumeDrawer* >(pObjects[i]);
+        if (!volume->isShadowVolumeBatchable()) {
+            for (u32 j = 0; j < count; j++) {
+                static_cast< ShadowVolumeDrawer* >(pObjects[j])->draw();
+            }
+            return;
+        }
+
+        u32 state = volume->getShadowVolumeBatchState();
+        if (!haveBatchState) {
+            batchState = state;
+            haveBatchState = true;
+        } else if (state != batchState) {
+            // A state change could make the two-pass reorder observable. Keep
+            // the retail object-by-object order for mixed-state extensions.
+            for (u32 j = 0; j < count; j++) {
+                static_cast< ShadowVolumeDrawer* >(pObjects[j])->draw();
+            }
+            return;
+        }
+    }
+
+    GXColor shapeColor = reinterpret_cast< GXColor& >(::sShapeColor);
+    GXSetTevColor(GX_TEVREG0, shapeColor);
+    GXSetColorUpdate(0);
+    GXSetDstAlpha(0, 0);
+
+    setShadowVolumePassState(false);
+    for (u32 i = 0; i < count; i++) {
+        ShadowVolumeDrawer* volume = static_cast< ShadowVolumeDrawer* >(pObjects[i]);
+        if (volume->isDraw()) {
+            volume->loadModelDrawMtx();
+            volume->drawShape();
+        }
+    }
+
+    setShadowVolumePassState(true);
+    for (u32 i = 0; i < count; i++) {
+        ShadowVolumeDrawer* volume = static_cast< ShadowVolumeDrawer* >(pObjects[i]);
+        if (volume->isDraw()) {
+            volume->loadModelDrawMtx();
+            volume->drawShape();
+        }
+    }
+
+    GXSetCullMode(GX_CULL_NONE);
+    GXSetColorUpdate(1);
+    GXSetDstAlpha(1, 0);
+#else
+    for (u32 i = 0; i < count; i++) {
+        static_cast< ShadowVolumeDrawer* >(pObjects[i])->draw();
+    }
+#endif
 }
 
 void ShadowVolumeDrawer::draw() const {

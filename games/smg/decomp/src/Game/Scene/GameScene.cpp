@@ -58,6 +58,9 @@
 #include "Game/Util/StringUtil.hpp"
 #include "Game/Util/SystemUtil.hpp"
 #include <JSystem/J3DGraphBase/J3DSys.hpp>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 
 namespace {
     CometRetryButton* getCometRetryButton() {
@@ -644,6 +647,9 @@ bool GameScene::isPlayMovie() const {
 }
 
 void GameScene::draw3D() const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    SmsWiiUDrawownScope drawownScope("GameScene::draw3D");
+#endif
     if (!mDraw3D) {
         return;
     }
@@ -822,6 +828,9 @@ void GameScene::draw3D() const {
 }
 
 void GameScene::draw2D() const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    SmsWiiUDrawownScope drawownScope("GameScene::draw2D");
+#endif
     if (isPlayMovie()) {
         SceneFunction::executeDrawList2DMovie();
     } else {

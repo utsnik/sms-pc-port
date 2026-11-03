@@ -11,6 +11,12 @@
 #include "Game/Util/DrawUtil.hpp"
 #include "Game/Util/ScreenUtil.hpp"
 #include <JSystem/J3DGraphBase/J3DSys.hpp>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#define DRAWOWN_SCENE_SCOPE(name) SmsWiiUDrawownScope drawownScope(name)
+#else
+#define DRAWOWN_SCENE_SCOPE(name)
+#endif
 
 void SceneFunction::movementStopSceneController() {
     MR::getSceneObj< StopSceneController >(SceneObj_StopSceneController)->movement();
@@ -152,6 +158,7 @@ void SceneFunction::executeCalcViewAndEntryList2D() {
 }
 
 void SceneFunction::executeDrawBufferListNormalOpaBeforeVolumeShadow() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawBufferListNormalOpaBeforeVolumeShadow");
     CategoryList::drawOpa(MR::DrawBufferType_CrystalItem);
     CategoryList::drawXlu(MR::DrawBufferType_CrystalItem);
     CategoryList::drawOpa(MR::DrawBufferType_Crystal);
@@ -184,11 +191,13 @@ void SceneFunction::executeDrawBufferListNormalOpaBeforeVolumeShadow() {
 }
 
 void SceneFunction::executeDrawBufferListNormalOpaBeforeSilhouette() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawBufferListNormalOpaBeforeSilhouette");
     CategoryList::drawOpa(MR::DrawBufferType_NoShadowedMapObj);
     CategoryList::drawOpa(MR::DrawBufferType_NoShadowedMapObjStrongLight);
 }
 
 void SceneFunction::executeDrawBufferListNormalOpa() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawBufferListNormalOpa");
     CategoryList::drawOpa(MR::DrawBufferType_NoSilhouettedMapObj);
     CategoryList::drawOpa(MR::DrawBufferType_NoSilhouettedMapObjWeakLight);
     CategoryList::drawOpa(MR::DrawBufferType_NoSilhouettedMapObjStrongLight);
@@ -209,6 +218,7 @@ void SceneFunction::executeDrawBufferListNormalOpa() {
 }
 
 void SceneFunction::executeDrawBufferListNormalXlu() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawBufferListNormalXlu");
     CategoryList::drawXlu(MR::DrawBufferType_Planet);
     CategoryList::drawXlu(MR::DrawBufferType_PlanetLow);
     CategoryList::drawXlu(MR::DrawBufferType_Environment);
@@ -230,6 +240,7 @@ void SceneFunction::executeDrawBufferListNormalXlu() {
 }
 
 void SceneFunction::executeDrawListOpa() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawListOpa");
     CategoryList::execute(MR::DrawType_0x3);
     MR::reinitGX();
     CategoryList::execute(MR::DrawType_0x52);
@@ -264,6 +275,7 @@ void SceneFunction::executeDrawListOpa() {
 }
 
 void SceneFunction::executeDrawListXlu() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawListXlu");
     MR::reinitGX();
     CategoryList::execute(MR::DrawType_VolumeModel);
     CategoryList::execute(MR::DrawType_0x30);
@@ -277,17 +289,20 @@ void SceneFunction::executeDrawListXlu() {
 }
 
 void SceneFunction::executeDrawSilhouetteAndFillShadow() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawSilhouetteAndFillShadow");
     MR::fillSilhouetteColor();
     MR::loadViewMtx();
     MR::loadProjectionMtx();
 }
 
 void SceneFunction::executeDrawAlphaShadow() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawAlphaShadow");
     CategoryList::execute(MR::DrawType_AlphaShadow);
     MR::loadViewMtx();
 }
 
 void SceneFunction::executeDrawAfterIndirect() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawAfterIndirect");
     CategoryList::drawOpa(MR::DrawBufferType_IndirectPlanet);
     CategoryList::drawOpa(MR::DrawBufferType_IndirectMapObj);
     CategoryList::drawOpa(MR::DrawBufferType_IndirectMapObjStrongLight);
@@ -321,6 +336,7 @@ void SceneFunction::executeDrawAfterIndirect() {
 }
 
 void SceneFunction::executeDrawImageEffect() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawImageEffect");
     if (MR::isNormalBloomOn()) {
         MR::reinitGX();
         CategoryList::execute(MR::DrawType_BloomEffectPreDraw);
@@ -341,6 +357,7 @@ void SceneFunction::executeDrawImageEffect() {
 }
 
 void SceneFunction::executeDrawList2DNormal() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawList2DNormal");
     MR::drawInitFor2DModel();
     CategoryList::drawOpa(MR::DrawBufferType_Model3DFor2D);
     CategoryList::drawXlu(MR::DrawBufferType_Model3DFor2D);
@@ -359,6 +376,7 @@ void SceneFunction::executeDrawList2DNormal() {
 }
 
 void SceneFunction::executeDrawList2DMovie() {
+    DRAWOWN_SCENE_SCOPE("SceneFunction::executeDrawList2DMovie");
     MR::drawInitFor2DModel();
     CategoryList::execute(MR::DrawType_Movie);
     CategoryList::execute(MR::DrawType_MovieSubtitles);

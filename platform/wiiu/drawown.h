@@ -19,6 +19,12 @@ void sms_wiiu_drawown_pop(void);
 void sms_wiiu_drawown_record(unsigned verts);
 #ifdef __cplusplus
 }
+
+class SmsWiiUDrawownScope {
+public:
+    SmsWiiUDrawownScope(const char* name, const void* object = nullptr) { sms_wiiu_drawown_push_name(name, object); }
+    ~SmsWiiUDrawownScope() { sms_wiiu_drawown_pop(); }
+};
 #endif
 
 #endif
