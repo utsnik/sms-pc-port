@@ -592,19 +592,20 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	extern uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 	extern uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
 	extern uint32_t s_jpaType3, s_jpaType4;
+	extern uint32_t s_jpaType2;
 	extern void sms_wiiu_jpa_histogram_report(void);
 	static unsigned s_jpaWindowFrames;
 	if (++s_jpaWindowFrames == 30) {
-		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u t3=%u t4=%u\n",
+		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u t2=%u t3=%u t4=%u\n",
 		         (unsigned)s_jpaParticles, (unsigned)s_jpaDraws,
 		         (unsigned)s_jpaSplits, (unsigned)s_jpaBatched,
 		         (unsigned)s_jpaRejectType, (unsigned)s_jpaRejectCallback,
 		         (unsigned)s_jpaRejectPrj, (unsigned)s_jpaRejectIneligible,
-		         (unsigned)s_jpaType3, (unsigned)s_jpaType4);
+		         (unsigned)s_jpaType2, (unsigned)s_jpaType3, (unsigned)s_jpaType4);
 		sms_wiiu_jpa_histogram_report();
 		s_jpaParticles = s_jpaDraws = s_jpaSplits = s_jpaBatched = 0;
 		s_jpaRejectType = s_jpaRejectCallback = s_jpaRejectPrj = s_jpaRejectIneligible = 0;
-		s_jpaType3 = s_jpaType4 = 0;
+		s_jpaType2 = s_jpaType3 = s_jpaType4 = 0;
 		s_jpaWindowFrames = 0;
 	}
 #endif
@@ -647,7 +648,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 #if defined(PORT_GAME_SMG)
 uint32_t s_jpaParticles, s_jpaDraws, s_jpaSplits, s_jpaBatched;
 uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectIneligible;
-uint32_t s_jpaType3, s_jpaType4;
+uint32_t s_jpaType2, s_jpaType3, s_jpaType4;
 struct JPAHistogramBucket {
 	unsigned type, count, emitters;
 	const char* func;
@@ -718,6 +719,7 @@ extern "C" void sms_wiiu_jpa_reject_prj(void) { ++s_jpaRejectPrj; }
 extern "C" void sms_wiiu_jpa_reject_ineligible(void) { ++s_jpaRejectIneligible; }
 extern "C" void sms_wiiu_jpa_type3(void) { ++s_jpaType3; }
 extern "C" void sms_wiiu_jpa_type4(void) { ++s_jpaType4; }
+extern "C" void sms_wiiu_jpa_type2(void) { ++s_jpaType2; }
 #endif
 
 /* Called by the producer thread after it has entered the port heap scope.  The

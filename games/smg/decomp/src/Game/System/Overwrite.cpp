@@ -27,6 +27,7 @@
 #include <JSystem/JParticle/JPAFieldBlock.hpp>
 #include <JSystem/JParticle/JPAParticle.hpp>
 #include "../../JSystem/JParticle/JPADirectionalBatch.hpp"
+#include "Game/Effect/MultiEmitterParticleCallBack.hpp"
 #if defined(TARGET_WIIU)
 #include "wiiu/jpa_counters.h"
 #endif
@@ -563,6 +564,16 @@ bool jpa_batch::materialize(JPAEmitterWorkData* work, JPABaseParticle* particle,
     for (unsigned i = 0; i != 4; ++i)
         out[i] = transform(matrix, template_xyz + i * 3);
     return true;
+}
+
+bool jpa_batch::callbackDrawsNothing(JPAParticleCallBack* callback) {
+    if (callback == nullptr) return false;
+
+    // The SMG callback classes in this tree all derive from
+    // MultiEmitterParticleCallBack and only override execute(). Keep this
+    // test type-based so a callback supplied by another JPA client falls back
+    // instead of being silently discarded by the batcher.
+    return dynamic_cast<MultiEmitterParticleCallBack*>(callback) != nullptr;
 }
 #endif
 
