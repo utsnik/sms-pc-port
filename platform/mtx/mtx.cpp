@@ -169,6 +169,7 @@ void sms_nativeps_gMTXQuat(Mtx, Quaternion*);
 void sms_nativeps_gMTXMultVec(Mtx44, Vec*, Vec*);
 void sms_nativeps_gVECNormalize(Vec*, Vec*);
 void sms_nativeps_gJ3DPSMtxArrayConcat(const f32 (*)[4], const f32 (*)[4], f32 (*)[4], u32);
+u32 sms_nativeps_read_ugqr0();
 void port_log(const char*, ...);
 }
 
@@ -325,8 +326,12 @@ int sms_nativeps_enabled;
 extern "C" void sms_wiiu_nativeps_init(int nativeps, int nativepscheck)
 {
 	const u32 tests = 4096;
+	if (nativepscheck)
+		port_log("[nativeps] check start");
+	const u32 ugqr0 = sms_nativeps_read_ugqr0();
 	bool checks_ok = true;
-	if (nativepscheck) {
+	port_log("[nativeps] ugqr0=%08x", ugqr0);
+	if (nativepscheck && ugqr0 == 0) {
 		nativeps_rng = 0x5eed0d90u;
 		nativeps_input_count = 0;
 		checks_ok = nativeps_check_concat(tests) && checks_ok;
@@ -335,7 +340,7 @@ extern "C" void sms_wiiu_nativeps_init(int nativeps, int nativepscheck)
 		checks_ok = nativeps_check_normalize(tests) && checks_ok;
 		checks_ok = nativeps_check_array_concat(tests) && checks_ok;
 	}
-	sms_nativeps_enabled = nativeps && checks_ok ? 1 : 0;
+	sms_nativeps_enabled = nativeps && ugqr0 == 0 && checks_ok ? 1 : 0;
 	port_log("[nativeps] nativeps marker %s; native path %s",
 	         nativeps ? "on" : "off", sms_nativeps_enabled ? "enabled" : "off");
 }

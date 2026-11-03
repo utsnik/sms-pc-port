@@ -1,22 +1,24 @@
 /* Espresso's Gekko-compatible paired-single implementations for the hottest
- * GameCube MTX/VEC/J3D routines.  GQR0 is temporarily forced to float so the
- * psq_l/st instructions have the same no-conversion semantics as qr0 in the
- * DOL.  The Cafe caller's GQR0 is restored before every return. */
+ * GameCube MTX/VEC/J3D routines.  Callers must have UGQR0 set to plain float
+ * (zero); the user-mode wrapper checks that once before dispatching here. */
 
 	.machine "750cl"
 	.text
 	.align 2
 
 	.macro nativeps_begin
-	mfspr 0, 912
-	li 12, 0
-mtgqr 0, 12
 	.endm
 
 	.macro nativeps_end
-mtgqr 0, 0
 	blr
 	.endm
+
+	.globl sms_nativeps_read_ugqr0
+	.type sms_nativeps_read_ugqr0, @function
+sms_nativeps_read_ugqr0:
+	mfspr 3, 896
+	blr
+	.size sms_nativeps_read_ugqr0, .-sms_nativeps_read_ugqr0
 
 	.globl sms_nativeps_gMTXConcat
 	.type sms_nativeps_gMTXConcat, @function
@@ -69,7 +71,6 @@ sms_nativeps_gMTXConcat:
 	psq_st 2, 32(5), 0, 0
 	ps_madds1 0, 31, 5, 0
 	psq_st 0, 40(5), 0, 0
-	mtgqr 0, 0
 	lfd 14, 8(1)
 	lfd 15, 16(1)
 	lfd 31, 40(1)
@@ -235,7 +236,6 @@ sms_nativeps_gJ3DPSMtxArrayConcat:
 	ps_madds1 0, 31, 5, 0
 	psq_stu 0, 48(5), 0, 0
 	bdnz 2b
-	mtgqr 0, 0
 	lfd 14, 8(1)
 	lfd 15, 16(1)
 	lfd 31, 40(1)
