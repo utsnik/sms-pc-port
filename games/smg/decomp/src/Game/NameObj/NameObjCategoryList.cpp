@@ -1,5 +1,7 @@
 #include "Game/NameObj/NameObjCategoryList.hpp"
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "Game/LiveActor/ShadowVolumeDrawer.hpp"
+#include "Game/Scene/SceneFunction.hpp"
 #include "wiiu/drawown.h"
 #endif
 #include <algorithm>
@@ -38,6 +40,13 @@ void NameObjCategoryList::execute(int idx) {
     if (pCategoryInfo->mExecuteBeforeFunction != nullptr) {
         (*pCategoryInfo->mExecuteBeforeFunction)();
     }
+
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (idx == MR::DrawType_ShadowVolume && ShadowVolumeDrawer::isBatchEnabled()) {
+        ShadowVolumeDrawer::drawBatch(pCategoryInfo->mNameObjArr.begin(), pCategoryInfo->mNameObjArr.size());
+        return;
+    }
+#endif
 
     for (NameObj** pNameObj = pCategoryInfo->mNameObjArr.begin(); pNameObj != pCategoryInfo->mNameObjArr.end(); pNameObj++) {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
