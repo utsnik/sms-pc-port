@@ -27,6 +27,9 @@
 #include <nw4r/ut/RuntimeTypeInfo.h>
 #include <revolution/mtx.h>
 #include <revolution/types.h>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 
 namespace {
     namespace Local {
@@ -210,8 +213,14 @@ void LayoutManager::draw() const {
         return;
     }
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_drawown_push_kind(SMS_WIIU_DRAWOWN_2D);
+#endif
     MR::setupDrawForNW4RLayout(1.0f, true);
     mLayout->Draw(mDrawInfo);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_drawown_pop();
+#endif
 }
 
 void LayoutManager::addPaneCtrl(LayoutPaneCtrl* pPaneCtrl) {

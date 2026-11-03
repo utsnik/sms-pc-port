@@ -6,6 +6,9 @@
 #include "JSystem/JParticle/JPAEmitter.hpp"
 #include "JSystem/JParticle/JPAParticle.hpp"
 #include "JSystem/JParticle/JPAResourceManager.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 
 JPAEmitterManager::JPAEmitterManager(u32 i_ptclNum, u32 i_emtrNum, JKRHeap* pHeap, u8 i_gidMax, u8 i_ridMax) {
     emtrNum = i_emtrNum;
@@ -68,6 +71,9 @@ void JPAEmitterManager::calc(u8 group_id) {
 }
 
 void JPAEmitterManager::draw(JPADrawInfo const* drawInfo, u8 group_id) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_drawown_push_kind(SMS_WIIU_DRAWOWN_JPA);
+#endif
     drawInfo->getCamMtx(pWd->mPosCamMtx);
     drawInfo->getPrjMtx(pWd->mPrjMtx);
     calcYBBCam();
@@ -97,6 +103,9 @@ void JPAEmitterManager::draw(JPADrawInfo const* drawInfo, u8 group_id) {
             emtr->mpRes->draw(pWd, emtr);
         }
     }
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_drawown_pop();
+#endif
 }
 
 void JPAEmitterManager::forceDeleteEmitter(JPABaseEmitter* emtr) {

@@ -1,5 +1,8 @@
 #include "Game/NameObj/NameObjListExecutor.hpp"
 #include "Game/Scene/SceneFunction.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 
 NameObjListExecutor::NameObjListExecutor() : mBufferHolder(), mMovementList(), mCalcAnimList(), mDrawList() {
 }
@@ -112,7 +115,13 @@ void NameObjListExecutor::drawXlu(int drawBufferType) {
 }
 
 void NameObjListExecutor::executeDraw(int category) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_drawown_push_draw_type(static_cast<unsigned>(category));
+#endif
     mDrawList->execute(category);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_drawown_pop();
+#endif
 }
 
 void NameObjListExecutor::initMovementList() {

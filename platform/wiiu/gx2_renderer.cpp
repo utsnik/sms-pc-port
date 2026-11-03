@@ -49,6 +49,7 @@
 #include "imgfx_copy.h"
 #if defined(PORT_GAME_SMG)
 #include "gx2_ztex.h"
+#include "drawown.h"
 #endif
 
 #include <gx2/draw.h>
@@ -231,6 +232,135 @@ static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
 static bool initTevVertex();
 #if defined(PORT_GAME_SMG)
+static bool s_drawown;
+static constexpr unsigned kDrawownMaxOwners = 1024;
+static constexpr unsigned kDrawownMaxStack = 32;
+static constexpr unsigned kDrawownWindowFrames = 120;
+struct DrawownOwner {
+    const char* name;
+    unsigned draw_type;
+    unsigned kind;
+    uint64_t draws;
+    uint64_t verts;
+};
+struct DrawownTag {
+    unsigned owner;
+    unsigned kind;
+};
+static DrawownOwner s_drawownOwners[kDrawownMaxOwners];
+static DrawownTag s_drawownStack[kDrawownMaxStack];
+static unsigned s_drawownOwnerCount;
+static unsigned s_drawownStackDepth;
+static unsigned s_drawownOtherOwner;
+static bool s_drawownOtherOwnerReady;
+static uint64_t s_drawownTotalDraws;
+
+static const char* drawownName(const char* name) {
+    return name != nullptr && *name != '\0' ? name : "other";
+}
+
+static unsigned drawownFindOwner(const char* name, unsigned draw_type, unsigned kind) {
+    name = drawownName(name);
+    for (unsigned i = 0; i < s_drawownOwnerCount; ++i) {
+        const DrawownOwner& owner = s_drawownOwners[i];
+        if (owner.draw_type == draw_type && owner.kind == kind && std::strcmp(owner.name, name) == 0)
+            return i;
+    }
+    if (s_drawownOwnerCount >= kDrawownMaxOwners)
+        return 0;
+    const unsigned owner = s_drawownOwnerCount++;
+    s_drawownOwners[owner] = {name, draw_type, kind, 0, 0};
+    return owner;
+}
+
+static void drawownPush(unsigned owner, unsigned kind) {
+    if (!s_drawown || s_drawownStackDepth >= kDrawownMaxStack)
+        return;
+    s_drawownStack[s_drawownStackDepth++] = {owner, kind};
+}
+
+static void drawownReport() {
+    unsigned order[kDrawownMaxOwners];
+    for (unsigned i = 0; i < s_drawownOwnerCount; ++i)
+        order[i] = i;
+    const unsigned limit = s_drawownOwnerCount < 16 ? s_drawownOwnerCount : 16;
+    for (unsigned rank = 0; rank < limit; ++rank) {
+        unsigned best = rank;
+        for (unsigned i = rank + 1; i < s_drawownOwnerCount; ++i) {
+            if (s_drawownOwners[order[i]].draws > s_drawownOwners[order[best]].draws)
+                best = i;
+        }
+        const unsigned tmp = order[rank];
+        order[rank] = order[best];
+        order[best] = tmp;
+    }
+    WHBLogPrintf("[drawown] frame=%u total=%u", unsigned(g_displayFrames),
+                 unsigned(s_drawownTotalDraws / kDrawownWindowFrames));
+    for (unsigned rank = 0; rank < limit; ++rank) {
+        const DrawownOwner& owner = s_drawownOwners[order[rank]];
+        if (owner.draws == 0)
+            break;
+        const char* kind = owner.kind == SMS_WIIU_DRAWOWN_J3D ? "j3d" :
+                           owner.kind == SMS_WIIU_DRAWOWN_JPA ? "jpa" :
+                           owner.kind == SMS_WIIU_DRAWOWN_2D ? "2d" : "other";
+        if (owner.draw_type != ~0u)
+            WHBLogPrintf("[drawown]  owner=drawType%u draws=%u verts=%u kind=%s",
+                         owner.draw_type, unsigned(owner.draws * 10 / kDrawownWindowFrames),
+                         unsigned(owner.verts / kDrawownWindowFrames), kind);
+        else
+            WHBLogPrintf("[drawown]  owner=%s draws=%u verts=%u kind=%s", owner.name,
+                         unsigned(owner.draws * 10 / kDrawownWindowFrames),
+                         unsigned(owner.verts / kDrawownWindowFrames), kind);
+    }
+    for (unsigned i = 0; i < s_drawownOwnerCount; ++i) {
+        s_drawownOwners[i].draws = 0;
+        s_drawownOwners[i].verts = 0;
+    }
+    s_drawownTotalDraws = 0;
+}
+
+static void drawownRecord(unsigned verts) {
+    if (!s_drawown)
+        return;
+    if (!s_drawownStackDepth) {
+        if (!s_drawownOtherOwnerReady) {
+            s_drawownOtherOwner = drawownFindOwner("other", ~0u, SMS_WIIU_DRAWOWN_OTHER);
+            s_drawownOtherOwnerReady = true;
+        }
+    }
+    DrawownOwner& owner = s_drawownOwners[s_drawownStackDepth ? s_drawownStack[s_drawownStackDepth - 1].owner
+                                                               : s_drawownOtherOwner];
+    ++owner.draws;
+    owner.verts += verts;
+    ++s_drawownTotalDraws;
+}
+
+extern "C" void sms_wiiu_drawown_push_name(const char* name) {
+    if (!s_drawown) return;
+    drawownPush(drawownFindOwner(name, ~0u, SMS_WIIU_DRAWOWN_J3D), SMS_WIIU_DRAWOWN_J3D);
+}
+extern "C" void sms_wiiu_drawown_push_draw_type(unsigned draw_type) {
+    if (!s_drawown) return;
+    drawownPush(drawownFindOwner("drawType", draw_type, SMS_WIIU_DRAWOWN_OTHER), SMS_WIIU_DRAWOWN_OTHER);
+}
+extern "C" void sms_wiiu_drawown_push_kind(unsigned kind) {
+    if (!s_drawown) return;
+    if (s_drawownStackDepth) {
+        const DrawownOwner& base = s_drawownOwners[s_drawownStack[s_drawownStackDepth - 1].owner];
+        drawownPush(drawownFindOwner(base.name, base.draw_type, kind), kind);
+    } else {
+        drawownPush(drawownFindOwner("other", ~0u, kind), kind);
+    }
+}
+extern "C" void sms_wiiu_drawown_pop(void) {
+    if (s_drawown && s_drawownStackDepth)
+        --s_drawownStackDepth;
+}
+extern "C" void sms_wiiu_drawown_record(unsigned verts) { drawownRecord(verts); }
+#else
+static inline void drawownRecord(unsigned) {}
+#endif
+#if defined(PORT_GAME_SMG)
 static constexpr uint32_t kZtexConstReg = 47;
 static constexpr uint32_t kZtexRangeInvChan = _y;
 static constexpr uint32_t kZtexRangeChan = _z;
@@ -247,7 +377,7 @@ static bool envFlag(const char* name, bool fallback) {
            value[0] != 'f' && value[0] != 'F';
 }
 
-static bool sdMarkerPresent(const char* name) {
+static bool sdMarkerPresent(const char* name, bool log = true) {
     // Markers are intentionally read-only.  Try the explicit SD devoptab name
     // first (the Cemu portable card exposes it), then the resolved app root
     // used by Cafe's stdio implementation.
@@ -259,7 +389,8 @@ static bool sdMarkerPresent(const char* name) {
         FILE* marker = std::fopen(path, "rb");
         if (!marker) continue;
         std::fclose(marker);
-        WHBLogPrintf("SMS Wii U: marker %s present (%s)", name, path);
+        if (log)
+            WHBLogPrintf("SMS Wii U: marker %s present (%s)", name, path);
         return true;
     }
     return false;
@@ -6090,6 +6221,7 @@ void rendererInit(float) {
     s_peekColFrameMarker = sdDefaultOnMarker("peekcolframe");
     s_peekAsyncMarker = sdDefaultOnMarker("peekasync");
     s_mem1CopyMarker = sdDefaultOnMarker("mem1copy");
+    s_drawown = sdMarkerPresent("drawown", false);
     WHBLogPrintf("[defaults] earlyz=%d hiz=%d peek2=%d peekasync=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
                  s_earlyZMarker ? 1 : 0, s_hizMarker ? 1 : 0, s_peek2Marker ? 1 : 0,
                  s_peekAsyncMarker ? 1 : 0, s_textiledMarker ? 1 : 0,
@@ -6871,14 +7003,20 @@ void flushBatch() {
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    dlArena() + pend.ref->baseVertex);
-                if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
-                                 const_cast<uint32_t*>(storedIdx), 0, 1);
+                if (!s_d8NoDraw) {
+                    drawownRecord(pend.nidx);
+                    GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
+                                     const_cast<uint32_t*>(storedIdx), 0, 1);
+                }
                 gx2DlNoteDraw();
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    dlArena() + pend.ref->baseVertex);
-                if (!s_d8NoDraw) GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
-                                 const_cast<uint32_t*>(storedIdx), 0, 1);
+                if (!s_d8NoDraw) {
+                    drawownRecord(pend.nidx);
+                    GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
+                                     const_cast<uint32_t*>(storedIdx), 0, 1);
+                }
             }
             if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();
             sms_wiiu_d1_note_draw_core();
@@ -7089,10 +7227,16 @@ void flushBatch() {
     }
     sms_wiiu_d4_draw(indexCount, tevPath ? tevKey.stages : 0, g.bp[BP_CMODE0], tevTextureMask(tevKey));
     if (listReady) {
-        if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        if (!s_d8NoDraw) {
+            drawownRecord(indexCount);
+            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        }
         gx2DlNoteDraw();
     } else {
-        if (!s_d8NoDraw) GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        if (!s_d8NoDraw) {
+            drawownRecord(indexCount);
+            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        }
     }
     if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();  // diagnostic fence stays outside a list
     if (bracket) {
@@ -8367,6 +8511,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     ++g_displayFrames;
     if (!s_fpsWindowStart) s_fpsWindowStart = OSGetTime();
     if ((g_displayFrames % 120) == 0) {
+#if defined(PORT_GAME_SMG)
+        if (s_drawown) drawownReport();
+#endif
         logCopyOwnerWindow();
         logFpsWindow();
     }

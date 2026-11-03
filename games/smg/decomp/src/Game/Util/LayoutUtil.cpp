@@ -1,4 +1,7 @@
 #include "Game/Util/LayoutUtil.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 #include "Game/Effect/MultiEmitter.hpp"
 #include "Game/Screen/CustomTagProcessor.hpp"
 #include "Game/Screen/IconAButton.hpp"
@@ -638,9 +641,15 @@ namespace MR {
 
     void drawLayoutWithDrawInfoWithoutProjectionSetup(const LayoutActor* pActor, const nw4r::lyt::DrawInfo& rDrawInfo) {
         if (isExecuteDrawLayout(pActor)) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+            sms_wiiu_drawown_push_kind(SMS_WIIU_DRAWOWN_2D);
+#endif
             GXSetCullMode(GX_CULL_NONE);
             GXSetZMode(GX_FALSE, GX_NEVER, GX_FALSE);
             pActor->getLayoutManager()->mLayout->Draw(rDrawInfo);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+            sms_wiiu_drawown_pop();
+#endif
         }
     }
 

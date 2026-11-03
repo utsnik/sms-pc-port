@@ -6,6 +6,9 @@
 #include <JSystem/J3DGraphAnimator/J3DModel.hpp>
 #include <JSystem/J3DGraphBase/J3DMaterial.hpp>
 #include <cstring>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 
 DrawBufferShapeDrawer::DrawBufferShapeDrawer(J3DMaterial* pMaterial, J3DMatPacket* pMatPacket)
     : mMaterial(pMaterial), mMatPacket(pMatPacket), _8(1), mMaxPackets(0), mNumPackets(0), mPackets(nullptr) {
@@ -58,7 +61,15 @@ void DrawBufferShapeDrawer::draw() const {
             if (packet->mpDisplayListObj != nullptr) {
                 packet->mpDisplayListObj->callDL();
             }
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+            if (mPackets[idx]->mLightCtrl != nullptr && mPackets[idx]->mLightCtrl->mActor != nullptr)
+                sms_wiiu_drawown_push_name(mPackets[idx]->mLightCtrl->mActor->getName());
+#endif
             packet->drawFast();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+            if (mPackets[idx]->mLightCtrl != nullptr && mPackets[idx]->mLightCtrl->mActor != nullptr)
+                sms_wiiu_drawown_pop();
+#endif
         }
     }
 }

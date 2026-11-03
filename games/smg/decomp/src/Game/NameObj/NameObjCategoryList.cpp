@@ -1,4 +1,7 @@
 #include "Game/NameObj/NameObjCategoryList.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/drawown.h"
+#endif
 #include <algorithm>
 
 NameObjCategoryList::NameObjCategoryList(u32 count, const CategoryListInitialTable* pTable, NameObjMethod pMethod, bool allocateByCheck,
@@ -37,7 +40,13 @@ void NameObjCategoryList::execute(int idx) {
     }
 
     for (NameObj** pNameObj = pCategoryInfo->mNameObjArr.begin(); pNameObj != pCategoryInfo->mNameObjArr.end(); pNameObj++) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        sms_wiiu_drawown_push_name((*pNameObj)->getName());
+#endif
         (*mDelegator)(*pNameObj);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        sms_wiiu_drawown_pop();
+#endif
     }
 }
 
