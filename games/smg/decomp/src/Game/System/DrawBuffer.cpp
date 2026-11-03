@@ -10,8 +10,8 @@
 #include "wiiu/drawown.h"
 #endif
 
-DrawBufferShapeDrawer::DrawBufferShapeDrawer(J3DMaterial* pMaterial, J3DMatPacket* pMatPacket)
-    : mMaterial(pMaterial), mMatPacket(pMatPacket), _8(1), mMaxPackets(0), mNumPackets(0), mPackets(nullptr) {
+DrawBufferShapeDrawer::DrawBufferShapeDrawer(J3DMaterial* pMaterial, J3DMatPacket* pMatPacket, const char* pOwnerName)
+    : mMaterial(pMaterial), mMatPacket(pMatPacket), _8(1), mMaxPackets(0), mNumPackets(0), mPackets(nullptr), mOwnerName(pOwnerName) {
 }
 
 void DrawBufferShapeDrawer::init(s32 a1) {
@@ -62,14 +62,12 @@ void DrawBufferShapeDrawer::draw() const {
                 packet->mpDisplayListObj->callDL();
             }
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-            if (mPackets[idx]->mLightCtrl != nullptr && mPackets[idx]->mLightCtrl->mActor != nullptr)
-                sms_wiiu_drawown_push_name(mPackets[idx]->mLightCtrl->mActor->getName(),
-                                           mPackets[idx]->mLightCtrl->mActor);
+            const LiveActor* actor = mPackets[idx]->mLightCtrl != nullptr ? mPackets[idx]->mLightCtrl->mActor : nullptr;
+            sms_wiiu_drawown_push_name(actor != nullptr ? actor->getName() : mOwnerName, actor);
 #endif
             packet->drawFast();
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-            if (mPackets[idx]->mLightCtrl != nullptr && mPackets[idx]->mLightCtrl->mActor != nullptr)
-                sms_wiiu_drawown_pop();
+            sms_wiiu_drawown_pop();
 #endif
         }
     }
@@ -159,9 +157,9 @@ s32 DrawBufferShapeDrawer::findLightSortIndex(const ActorLightCtrl* pLightCtrl, 
     return mNumPackets;
 }
 
-DrawBuffer::DrawBuffer(J3DModel* pModel)
+DrawBuffer::DrawBuffer(J3DModel* pModel, const char* pOwnerName)
     : mModelData(pModel->mModelData), mModel(pModel), _8(0), mNumActors(0), mNumMaterials(0), mMaterialNos(nullptr), mNumShapeDrawers(0),
-      mNumOpaShapeDrawers(0), mShapeDrawers(nullptr) {
+      mNumOpaShapeDrawers(0), mShapeDrawers(nullptr), mOwnerName(pOwnerName) {
 }
 
 void DrawBuffer::init(int a1) {
@@ -269,11 +267,11 @@ void DrawBuffer::initTable() {
 
         if (!material->isDrawModeOpaTexEdge()) {
             mMaterialNos[idx] = opaIndex;
-            mShapeDrawers[opaIndex] = new DrawBufferShapeDrawer(material, mModel->getMatPacket(idx));
+            mShapeDrawers[opaIndex] = new DrawBufferShapeDrawer(material, mModel->getMatPacket(idx), mOwnerName);
             opaIndex++;
         } else {
             mMaterialNos[idx] = xluIndex + mNumOpaShapeDrawers;
-            mShapeDrawers[xluIndex + mNumOpaShapeDrawers] = new DrawBufferShapeDrawer(material, mModel->getMatPacket(idx));
+            mShapeDrawers[xluIndex + mNumOpaShapeDrawers] = new DrawBufferShapeDrawer(material, mModel->getMatPacket(idx), mOwnerName);
             xluIndex++;
         }
     }

@@ -6,7 +6,7 @@
 
 DrawBufferExecuter::DrawBufferExecuter(const char* pName, J3DModel* pModel, s32 a1)
     : mActors(nullptr), mMaxNumActors(0), mNumActors(0), mName(pName), mDrawBuffer(nullptr), mLightType(-1), mDrawBufferCount(0) {
-    mDrawBuffer = new DrawBuffer(pModel);
+    mDrawBuffer = new DrawBuffer(pModel, pName);
 }
 
 void DrawBufferExecuter::allocateActorListBuffer() {
