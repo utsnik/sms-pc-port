@@ -36,6 +36,10 @@
 #include <cstring>
 #include <revolution/gd/GDBase.h>
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" int sms_wiiu_sd_marker(const char* name);
+#endif
+
 namespace MR {
     void showMaterial(J3DModel*, const char*);
 };  // namespace MR
@@ -63,11 +67,11 @@ namespace {
 }  // namespace
 
 void MarioActor::initDrawAndModel() {
-    _218 = new DrawAdaptor(MR::Functor(this, &MarioActor::drawShadow), MR::DrawType_AlphaShadow);
-    _21C = new DrawAdaptor(MR::Functor(this, &MarioActor::drawSilhouette), MR::DrawType_0x28);
-    _220 = new DrawAdaptor(MR::Functor(this, &MarioActor::drawPreWipe), MR::DrawType_CometScreenFilter);
-    _228 = new DrawAdaptor(MR::Functor(this, &MarioActor::drawScreenBlend), MR::DrawType_CenterScreenBlur);
-    _22C = new DrawAdaptor(MR::Functor(this, &MarioActor::drawIndirect), MR::DrawType_0x24);
+    _218 = new DrawAdaptor(MR::Functor(this, &MarioActor::drawShadow), MR::DrawType_AlphaShadow, "MarioDraw:shadow");
+    _21C = new DrawAdaptor(MR::Functor(this, &MarioActor::drawSilhouette), MR::DrawType_0x28, "MarioDraw:silhouette");
+    _220 = new DrawAdaptor(MR::Functor(this, &MarioActor::drawPreWipe), MR::DrawType_CometScreenFilter, "MarioDraw:prewipe");
+    _228 = new DrawAdaptor(MR::Functor(this, &MarioActor::drawScreenBlend), MR::DrawType_CenterScreenBlur, "MarioDraw:screenblend");
+    _22C = new DrawAdaptor(MR::Functor(this, &MarioActor::drawIndirect), MR::DrawType_0x24, "MarioDraw:indirect");
 
     if (gIsLuigi) {
         initModelManagerWithAnm("Luigi", "MarioAnime", true);
@@ -770,6 +774,11 @@ void MarioActor::draw() const {
 }
 
 void MarioActor::drawIndirect() const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (sms_wiiu_sd_marker("nomarioindirect")) {
+        return;
+    }
+#endif
     drawModelBlur();
     drawIndirectModel();
 

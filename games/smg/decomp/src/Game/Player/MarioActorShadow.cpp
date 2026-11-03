@@ -20,6 +20,10 @@
 #include "Game/Util/ObjUtil.hpp"
 #include <JSystem/J3DGraphBase/J3DSys.hpp>
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" int sms_wiiu_sd_marker(const char* name);
+#endif
+
 void MarioActorShadow_FORCE_MATCH_SDATA2() {
     (void)1.0f;
     (void)0.0f;
@@ -297,6 +301,11 @@ void MarioActor::calcViewWallShadowModel() {
 }
 
 void MarioActor::drawShadow() const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (sms_wiiu_sd_marker("nomarioshadow")) {
+        return;
+    }
+#endif
     bool hidden = _482 || _481;
     if (hidden) {
         return;
@@ -543,6 +552,11 @@ void MarioActor::calcViewFootPrint() {
 }
 
 void MarioActor::drawSilhouette() const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (sms_wiiu_sd_marker("nomariosil")) {
+        return;
+    }
+#endif
     bool hidden = _482 || _483 || _481;
     if (hidden) {
         return;
