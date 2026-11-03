@@ -107,10 +107,12 @@ struct BillboardBatchMode {
     bool envAlpha;
     bool alphaAnimated;
     bool alphaFromParticlePrm;
-    bool alphaFromParticleEnv;
-    bool rasterPrm;
-    bool rasterEnv;
-    bool rasterAlpha;
+    bool rasterColorPrm;
+    bool rasterColorEnv;
+    bool rasterColorAlphaPrm;
+    bool rasterColorAlphaEnv;
+    bool rasterAlphaPrm;
+    bool rasterAlphaEnv;
     bool textureAnimated;
 };
 
@@ -142,10 +144,12 @@ bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* fun
     mode->envAlpha = false;
     mode->alphaAnimated = false;
     mode->alphaFromParticlePrm = false;
-    mode->alphaFromParticleEnv = false;
-    mode->rasterPrm = false;
-    mode->rasterEnv = false;
-    mode->rasterAlpha = false;
+    mode->rasterColorPrm = false;
+    mode->rasterColorEnv = false;
+    mode->rasterColorAlphaPrm = false;
+    mode->rasterColorAlphaEnv = false;
+    mode->rasterAlphaPrm = false;
+    mode->rasterAlphaEnv = false;
     mode->textureAnimated = false;
     *rejectReason = SMS_WIIU_JPA_REJECT_OTHER;
 
@@ -197,24 +201,26 @@ bool billboardBatchMode(JPAEmitterWorkData* work, JPAResource::ParticleFunc* fun
     }
 
     const GXTevColorArg* colorArgs = work->mpRes->getBsp()->getTevColorArg();
-    mode->rasterPrm = mode->prmRgb && hasTevColorArg(colorArgs, GX_CC_C0);
-    mode->rasterEnv = mode->envRgb && hasTevColorArg(colorArgs, GX_CC_C1);
-    // One raster colour carries one varying RGB register, while its alpha can
-    // independently carry the particle alpha. If both C0 and C1 vary, the
-    // exact TEV result needs the legacy per-particle register writes.
-    if (mode->rasterPrm && mode->rasterEnv) {
+    mode->rasterColorPrm = mode->prmRgb && hasTevColorArg(colorArgs, GX_CC_C0);
+    mode->rasterColorEnv = mode->envRgb && hasTevColorArg(colorArgs, GX_CC_C1);
+    mode->rasterColorAlphaPrm = mode->alpha && hasTevColorArg(colorArgs, GX_CC_A0);
+    mode->rasterColorAlphaEnv = mode->envAlpha && hasTevColorArg(colorArgs, GX_CC_A1);
+    // One raster colour carries one varying RGB source and one varying alpha
+    // source. The other TEV colour register may remain emitter state, but two
+    // particle-varying sources in either component cannot be rewritten exactly.
+    if ((mode->rasterColorPrm && mode->rasterColorEnv) ||
+        (mode->rasterColorAlphaPrm && mode->rasterColorAlphaEnv)) {
         *rejectReason = SMS_WIIU_JPA_REJECT_COLOR;
         return false;
     }
     const GXTevAlphaArg* alphaArgs = work->mpRes->getBsp()->getTevAlphaArg();
-    const bool rasterPrmAlpha = mode->alpha && hasTevAlphaArg(alphaArgs, GX_CA_A0);
-    const bool rasterEnvAlpha = mode->envAlpha && hasTevAlphaArg(alphaArgs, GX_CA_A1);
-    if (rasterPrmAlpha && rasterEnvAlpha) {
+    mode->rasterAlphaPrm = mode->alpha && hasTevAlphaArg(alphaArgs, GX_CA_A0);
+    mode->rasterAlphaEnv = mode->envAlpha && hasTevAlphaArg(alphaArgs, GX_CA_A1);
+    if ((mode->rasterColorAlphaPrm || mode->rasterAlphaPrm) &&
+        (mode->rasterColorAlphaEnv || mode->rasterAlphaEnv)) {
         *rejectReason = SMS_WIIU_JPA_REJECT_COLOR;
         return false;
     }
-    mode->rasterAlpha = rasterPrmAlpha || rasterEnvAlpha;
-    mode->alphaFromParticleEnv = rasterEnvAlpha;
     return true;
 }
 
@@ -1163,24 +1169,23 @@ static GXColor billboardColor(JPAEmitterWorkData* work, JPABaseParticle* particl
                               const BillboardBatchMode& mode) {
     GXColor color = {255, 255, 255, 255};
     JPABaseEmitter* emitter = work->mpEmtr;
-    if (mode.rasterPrm) {
+    if (mode.rasterColorPrm) {
         color.r = COLOR_MULTI(particle->mPrmClr.r, emitter->mGlobalPrmClr.r);
         color.g = COLOR_MULTI(particle->mPrmClr.g, emitter->mGlobalPrmClr.g);
         color.b = COLOR_MULTI(particle->mPrmClr.b, emitter->mGlobalPrmClr.b);
-    } else if (mode.rasterEnv) {
+    } else if (mode.rasterColorEnv) {
         color.r = COLOR_MULTI(particle->mEnvClr.r, emitter->mGlobalEnvClr.r);
         color.g = COLOR_MULTI(particle->mEnvClr.g, emitter->mGlobalEnvClr.g);
         color.b = COLOR_MULTI(particle->mEnvClr.b, emitter->mGlobalEnvClr.b);
     }
-    if (mode.rasterAlpha) {
+    if (mode.rasterColorAlphaPrm || mode.rasterAlphaPrm) {
         u8 alpha;
-        if (mode.alphaFromParticleEnv) {
-            alpha = COLOR_MULTI(particle->mEnvClr.a, emitter->mGlobalEnvClr.a);
-        } else {
-            alpha = mode.alphaFromParticlePrm ? particle->mPrmClr.a : emitter->mPrmClr.a;
-            alpha = COLOR_MULTI(alpha, emitter->mGlobalPrmClr.a);
-            if (mode.alphaAnimated) alpha = COLOR_MULTI(alpha, particle->mPrmColorAlphaAnm);
-        }
+        alpha = mode.alphaFromParticlePrm ? particle->mPrmClr.a : emitter->mPrmClr.a;
+        alpha = COLOR_MULTI(alpha, emitter->mGlobalPrmClr.a);
+        if (mode.alphaAnimated) alpha = COLOR_MULTI(alpha, particle->mPrmColorAlphaAnm);
+        color.a = alpha;
+    } else if (mode.rasterColorAlphaEnv || mode.rasterAlphaEnv) {
+        const u8 alpha = COLOR_MULTI(particle->mEnvClr.a, emitter->mGlobalEnvClr.a);
         color.a = alpha;
     }
     return color;
@@ -1215,20 +1220,25 @@ static void billboardMatrix(JPAEmitterWorkData* work, JPABaseParticle* particle,
 
 static void setBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchMode& mode,
                                  GXTexMapID texMap) {
-    if (!mode.rasterPrm && !mode.rasterEnv && !mode.rasterAlpha) return;
+    if (!mode.rasterColorPrm && !mode.rasterColorEnv &&
+        !mode.rasterColorAlphaPrm && !mode.rasterColorAlphaEnv &&
+        !mode.rasterAlphaPrm && !mode.rasterAlphaEnv)
+        return;
     const GXTevColorArg* sourceColor = work->mpRes->getBsp()->getTevColorArg();
     GXTevColorArg color[4] = {sourceColor[0], sourceColor[1], sourceColor[2], sourceColor[3]};
     for (int i = 0; i < 4; ++i) {
-        if (mode.rasterPrm && color[i] == GX_CC_C0) color[i] = GX_CC_RASC;
-        if (mode.rasterEnv && color[i] == GX_CC_C1) color[i] = GX_CC_RASC;
+        if (mode.rasterColorPrm && color[i] == GX_CC_C0) color[i] = GX_CC_RASC;
+        if (mode.rasterColorEnv && color[i] == GX_CC_C1) color[i] = GX_CC_RASC;
+        if (mode.rasterColorAlphaPrm && color[i] == GX_CC_A0) color[i] = GX_CC_RASA;
+        if (mode.rasterColorAlphaEnv && color[i] == GX_CC_A1) color[i] = GX_CC_RASA;
     }
     const GXTevAlphaArg* sourceAlpha = work->mpRes->getBsp()->getTevAlphaArg();
     GXTevAlphaArg alpha[4] = {sourceAlpha[0], sourceAlpha[1], sourceAlpha[2], sourceAlpha[3]};
     for (int i = 0; i < 4; ++i) {
-        if (mode.rasterAlpha && ((mode.alphaFromParticleEnv && alpha[i] == GX_CA_A1) ||
-                                 (!mode.alphaFromParticleEnv && alpha[i] == GX_CA_A0)))
-            alpha[i] = GX_CA_RASA;
+        if (mode.rasterAlphaPrm && alpha[i] == GX_CA_A0) alpha[i] = GX_CA_RASA;
+        if (mode.rasterAlphaEnv && alpha[i] == GX_CA_A1) alpha[i] = GX_CA_RASA;
     }
+    GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, texMap, GX_COLOR0A0);
     GXSetTevColorIn(GX_TEVSTAGE0, color[0], color[1], color[2], color[3]);
     GXSetTevAlphaIn(GX_TEVSTAGE0, alpha[0], alpha[1], alpha[2], alpha[3]);
@@ -1236,7 +1246,10 @@ static void setBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchM
 
 static void restoreBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchMode& mode,
                                      GXTexMapID texMap) {
-    if (!mode.rasterPrm && !mode.rasterEnv && !mode.rasterAlpha) return;
+    if (!mode.rasterColorPrm && !mode.rasterColorEnv &&
+        !mode.rasterColorAlphaPrm && !mode.rasterColorAlphaEnv &&
+        !mode.rasterAlphaPrm && !mode.rasterAlphaEnv)
+        return;
     const GXTevColorArg* color = work->mpRes->getBsp()->getTevColorArg();
     const GXTevAlphaArg* alpha = work->mpRes->getBsp()->getTevAlphaArg();
     GXSetTevColorIn(GX_TEVSTAGE0, color[0], color[1], color[2], color[3]);
@@ -1275,7 +1288,9 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
             GXSetCurrentMtx(GX_PNMTX0);
             GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
             GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
-            if (mode.rasterPrm || mode.rasterEnv || mode.rasterAlpha) {
+            if (mode.rasterColorPrm || mode.rasterColorEnv ||
+                mode.rasterColorAlphaPrm || mode.rasterColorAlphaEnv ||
+                mode.rasterAlphaPrm || mode.rasterAlphaEnv) {
                 GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
                 GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
             }
@@ -1293,7 +1308,9 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
                     const jpa_batch::Vertex vertex =
                         jpa_batch::transform(matrix, template_xyz + corner * 3);
                     GXPosition3f32(vertex.x, vertex.y, vertex.z);
-                    if (mode.rasterPrm || mode.rasterEnv || mode.rasterAlpha) {
+                    if (mode.rasterColorPrm || mode.rasterColorEnv ||
+                        mode.rasterColorAlphaPrm || mode.rasterColorAlphaEnv ||
+                        mode.rasterAlphaPrm || mode.rasterAlphaEnv) {
                         const GXColor color = billboardColor(work, particle, mode);
                         GXColor4u8(color.r, color.g, color.b, color.a);
                     }
