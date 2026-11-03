@@ -12,7 +12,7 @@ enum SmsWiiUDrawownKind {
 #ifdef __cplusplus
 extern "C" {
 #endif
-void sms_wiiu_drawown_push_name(const char* name);
+void sms_wiiu_drawown_push_name(const char* name, const void* object);
 void sms_wiiu_drawown_push_draw_type(unsigned draw_type);
 void sms_wiiu_drawown_push_kind(unsigned kind);
 void sms_wiiu_drawown_pop(void);

@@ -232,14 +232,25 @@ static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
 static bool initTevVertex();
 #if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_gx2_renderer_begin(void);
+extern "C" void sms_wiiu_gx2_renderer_end(void);
 static bool s_drawown;
 static constexpr unsigned kDrawownMaxOwners = 1024;
 static constexpr unsigned kDrawownMaxStack = 32;
 static constexpr unsigned kDrawownWindowFrames = 120;
+static constexpr unsigned kDrawownMaxCallers = 256;
+static constexpr unsigned kDrawownMaxCallerProbe = 32;
+static constexpr unsigned kDrawownMaxReportedCallers = 12;
 struct DrawownOwner {
     const char* name;
     unsigned draw_type;
     unsigned kind;
+    uint32_t vtable;
+    uint64_t draws;
+    uint64_t verts;
+};
+struct DrawownCaller {
+    uint32_t pc[3];
     uint64_t draws;
     uint64_t verts;
 };
@@ -248,6 +259,7 @@ struct DrawownTag {
     unsigned kind;
 };
 static DrawownOwner s_drawownOwners[kDrawownMaxOwners];
+static DrawownCaller s_drawownCallers[kDrawownMaxCallers];
 static DrawownTag s_drawownStack[kDrawownMaxStack];
 static unsigned s_drawownOwnerCount;
 static unsigned s_drawownStackDepth;
@@ -255,21 +267,97 @@ static unsigned s_drawownOtherOwner;
 static bool s_drawownOtherOwnerReady;
 static uint64_t s_drawownTotalDraws;
 
+static bool drawownCodeAddress(uint32_t address) {
+    return address >= 0x01000000u && address < 0x10000000u && !(address & 3);
+}
+
+static bool drawownStackAddress(uint32_t address) {
+    return address >= 0x10000000u && address < 0x50000000u && !(address & 3);
+}
+
+static bool drawownRendererAddress(uint32_t address) {
+    const uint32_t begin = uint32_t(reinterpret_cast<uintptr_t>(&sms_wiiu_gx2_renderer_begin));
+    const uint32_t end = uint32_t(reinterpret_cast<uintptr_t>(&sms_wiiu_gx2_renderer_end));
+    return address >= begin && address < end;
+}
+
+static bool drawownFifoAddress(uint32_t address) {
+    const uint32_t first = uint32_t(reinterpret_cast<uintptr_t>(&GXPC_Write8));
+    const uint32_t last = uint32_t(reinterpret_cast<uintptr_t>(&GXPC_WriteF32));
+    const uint32_t begin = first < last ? first : last;
+    /* The four GXPC_Write* functions are emitted contiguously; keep the
+     * complete final function out of the caller tuple as well. */
+    const uint32_t end = (first < last ? last : first) + 0x120u;
+    return address >= begin && address < end;
+}
+
+/* drawownRecord is called immediately before the GX draw.  Its own frame and
+ * the renderer/fifo frames are bookkeeping, so retain only the first three
+ * game-side return addresses.  The fixed walk and table keep this disabled
+ * path allocation-free even when the marker is enabled. */
+__attribute__((noinline)) static void drawownCaptureCallers(uint32_t out[3]) {
+    uint32_t sp;
+    __asm__ volatile("mr %0,1" : "=r"(sp));
+    bool skipRecordFrame = true;
+    unsigned found = 0;
+    for (unsigned depth = 0; depth < kDrawownMaxStack && found < 3; ++depth) {
+        if (!drawownStackAddress(sp))
+            break;
+        const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
+        if (!drawownStackAddress(next) || next <= sp || next - sp >= 0x10000u)
+            break;
+        const uint32_t ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+        sp = next;
+        if (skipRecordFrame) {
+            skipRecordFrame = false;
+            continue;
+        }
+        if (drawownCodeAddress(ret) && !drawownRendererAddress(ret) && !drawownFifoAddress(ret))
+            out[found++] = ret;
+    }
+}
+
+static unsigned drawownCallerHash(const uint32_t pc[3]) {
+    uint32_t hash = pc[0] * 2654435761u;
+    hash ^= pc[1] * 2246822519u;
+    hash ^= pc[2] * 3266489917u;
+    return hash & (kDrawownMaxCallers - 1);
+}
+
+static DrawownCaller* drawownFindCaller(const uint32_t pc[3]) {
+    unsigned slot = drawownCallerHash(pc);
+    for (unsigned probe = 0; probe < kDrawownMaxCallerProbe; ++probe,
+                   slot = (slot + 1) & (kDrawownMaxCallers - 1)) {
+        DrawownCaller& caller = s_drawownCallers[slot];
+        if (caller.draws != 0) {
+            if (caller.pc[0] == pc[0] && caller.pc[1] == pc[1] && caller.pc[2] == pc[2])
+                return &caller;
+        } else {
+            caller.pc[0] = pc[0];
+            caller.pc[1] = pc[1];
+            caller.pc[2] = pc[2];
+            return &caller;
+        }
+    }
+    return nullptr;
+}
+
 static const char* drawownName(const char* name) {
     return name != nullptr && *name != '\0' ? name : "other";
 }
 
-static unsigned drawownFindOwner(const char* name, unsigned draw_type, unsigned kind) {
+static unsigned drawownFindOwner(const char* name, unsigned draw_type, unsigned kind, uint32_t vtable) {
     name = drawownName(name);
     for (unsigned i = 0; i < s_drawownOwnerCount; ++i) {
         const DrawownOwner& owner = s_drawownOwners[i];
-        if (owner.draw_type == draw_type && owner.kind == kind && std::strcmp(owner.name, name) == 0)
+        if (owner.draw_type == draw_type && owner.kind == kind && owner.vtable == vtable &&
+            std::strcmp(owner.name, name) == 0)
             return i;
     }
     if (s_drawownOwnerCount >= kDrawownMaxOwners)
         return 0;
     const unsigned owner = s_drawownOwnerCount++;
-    s_drawownOwners[owner] = {name, draw_type, kind, 0, 0};
+    s_drawownOwners[owner] = {name, draw_type, kind, vtable, 0, 0};
     return owner;
 }
 
@@ -308,23 +396,44 @@ static void drawownReport() {
                          owner.draw_type, unsigned(owner.draws * 10 / kDrawownWindowFrames),
                          unsigned(owner.verts / kDrawownWindowFrames), kind);
         else
-            WHBLogPrintf("[drawown]  owner=%s draws=%u verts=%u kind=%s", owner.name,
+            WHBLogPrintf("[drawown]  owner=%s vt=%08x draws=%u verts=%u kind=%s", owner.name,
+                         unsigned(owner.vtable),
                          unsigned(owner.draws * 10 / kDrawownWindowFrames),
                          unsigned(owner.verts / kDrawownWindowFrames), kind);
+    }
+    unsigned callerOrder[kDrawownMaxCallers];
+    for (unsigned i = 0; i < kDrawownMaxCallers; ++i)
+        callerOrder[i] = i;
+    for (unsigned rank = 0; rank < kDrawownMaxReportedCallers; ++rank) {
+        unsigned best = rank;
+        for (unsigned i = rank + 1; i < kDrawownMaxCallers; ++i) {
+            if (s_drawownCallers[callerOrder[i]].draws > s_drawownCallers[callerOrder[best]].draws)
+                best = i;
+        }
+        const unsigned tmp = callerOrder[rank];
+        callerOrder[rank] = callerOrder[best];
+        callerOrder[best] = tmp;
+        const DrawownCaller& caller = s_drawownCallers[callerOrder[rank]];
+        if (caller.draws == 0)
+            break;
+        WHBLogPrintf("[drawown]  pc=%08x %08x %08x draws=%u verts=%u", caller.pc[0], caller.pc[1],
+                     caller.pc[2], unsigned(caller.draws * 10 / kDrawownWindowFrames),
+                     unsigned(caller.verts / kDrawownWindowFrames));
     }
     for (unsigned i = 0; i < s_drawownOwnerCount; ++i) {
         s_drawownOwners[i].draws = 0;
         s_drawownOwners[i].verts = 0;
     }
+    std::memset(s_drawownCallers, 0, sizeof(s_drawownCallers));
     s_drawownTotalDraws = 0;
 }
 
-static void drawownRecord(unsigned verts) {
+__attribute__((noinline)) static void drawownRecord(unsigned verts) {
     if (!s_drawown)
         return;
     if (!s_drawownStackDepth) {
         if (!s_drawownOtherOwnerReady) {
-            s_drawownOtherOwner = drawownFindOwner("other", ~0u, SMS_WIIU_DRAWOWN_OTHER);
+            s_drawownOtherOwner = drawownFindOwner("other", ~0u, SMS_WIIU_DRAWOWN_OTHER, 0);
             s_drawownOtherOwnerReady = true;
         }
     }
@@ -332,24 +441,34 @@ static void drawownRecord(unsigned verts) {
                                                                : s_drawownOtherOwner];
     ++owner.draws;
     owner.verts += verts;
+    if (!s_drawownStackDepth) {
+        uint32_t pc[3] = {};
+        drawownCaptureCallers(pc);
+        DrawownCaller* caller = drawownFindCaller(pc);
+        if (caller != nullptr) {
+            ++caller->draws;
+            caller->verts += verts;
+        }
+    }
     ++s_drawownTotalDraws;
 }
 
-extern "C" void sms_wiiu_drawown_push_name(const char* name) {
+extern "C" void sms_wiiu_drawown_push_name(const char* name, const void* object) {
     if (!s_drawown) return;
-    drawownPush(drawownFindOwner(name, ~0u, SMS_WIIU_DRAWOWN_J3D), SMS_WIIU_DRAWOWN_J3D);
+    const uint32_t vtable = object != nullptr ? *static_cast<const uint32_t*>(object) : 0;
+    drawownPush(drawownFindOwner(name, ~0u, SMS_WIIU_DRAWOWN_J3D, vtable), SMS_WIIU_DRAWOWN_J3D);
 }
 extern "C" void sms_wiiu_drawown_push_draw_type(unsigned draw_type) {
     if (!s_drawown) return;
-    drawownPush(drawownFindOwner("drawType", draw_type, SMS_WIIU_DRAWOWN_OTHER), SMS_WIIU_DRAWOWN_OTHER);
+    drawownPush(drawownFindOwner("drawType", draw_type, SMS_WIIU_DRAWOWN_OTHER, 0), SMS_WIIU_DRAWOWN_OTHER);
 }
 extern "C" void sms_wiiu_drawown_push_kind(unsigned kind) {
     if (!s_drawown) return;
     if (s_drawownStackDepth) {
         const DrawownOwner& base = s_drawownOwners[s_drawownStack[s_drawownStackDepth - 1].owner];
-        drawownPush(drawownFindOwner(base.name, base.draw_type, kind), kind);
+        drawownPush(drawownFindOwner(base.name, base.draw_type, kind, base.vtable), kind);
     } else {
-        drawownPush(drawownFindOwner("other", ~0u, kind), kind);
+        drawownPush(drawownFindOwner("other", ~0u, kind, 0), kind);
     }
 }
 extern "C" void sms_wiiu_drawown_pop(void) {

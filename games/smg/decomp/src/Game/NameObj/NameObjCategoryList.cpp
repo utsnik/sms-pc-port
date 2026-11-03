@@ -41,7 +41,7 @@ void NameObjCategoryList::execute(int idx) {
 
     for (NameObj** pNameObj = pCategoryInfo->mNameObjArr.begin(); pNameObj != pCategoryInfo->mNameObjArr.end(); pNameObj++) {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-        sms_wiiu_drawown_push_name((*pNameObj)->getName());
+        sms_wiiu_drawown_push_name((*pNameObj)->getName(), *pNameObj);
 #endif
         (*mDelegator)(*pNameObj);
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)

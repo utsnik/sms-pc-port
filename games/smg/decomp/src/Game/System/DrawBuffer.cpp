@@ -63,7 +63,8 @@ void DrawBufferShapeDrawer::draw() const {
             }
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
             if (mPackets[idx]->mLightCtrl != nullptr && mPackets[idx]->mLightCtrl->mActor != nullptr)
-                sms_wiiu_drawown_push_name(mPackets[idx]->mLightCtrl->mActor->getName());
+                sms_wiiu_drawown_push_name(mPackets[idx]->mLightCtrl->mActor->getName(),
+                                           mPackets[idx]->mLightCtrl->mActor);
 #endif
             packet->drawFast();
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
