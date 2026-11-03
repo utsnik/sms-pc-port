@@ -15,6 +15,7 @@ if(PORT_GAME STREQUAL "smg")
   if(NOT SMS_WIIU)
     message(FATAL_ERROR "PORT_GAME=smg requires the Wii U target (SMS_WIIU=ON)")
   endif()
+  enable_language(ASM)
   set(PORT_WIIU_BUILD_DIR "/mnt/buildcache/wiiu-build/smg" CACHE PATH
       "External Wii U output directory")
   set(SMG_WIIU_BUILD_DIR "${PORT_WIIU_BUILD_DIR}" CACHE PATH

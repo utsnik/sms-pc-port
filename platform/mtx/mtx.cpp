@@ -39,6 +39,9 @@
 #include <string.h>
 #include "port_fpu.h"
 #include "port_fma.h"
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+#include "native_ps.h"
+#endif
 
 extern "C" {
 void PSMTXMultVecSR(Mtx m, Vec* src, Vec* dst);
@@ -158,16 +161,214 @@ namespace mtx_host {
 #define DEF1(ret, name, fn, params, args) \
 	extern "C" ret name params { return (ret)CALL(fn, args); }
 
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+extern "C" {
+extern int sms_nativeps_enabled;
+void sms_nativeps_gMTXConcat(Mtx, Mtx, Mtx);
+void sms_nativeps_gMTXQuat(Mtx, Quaternion*);
+void sms_nativeps_gMTXMultVec(Mtx44, Vec*, Vec*);
+void sms_nativeps_gVECNormalize(Vec*, Vec*);
+void sms_nativeps_gJ3DPSMtxArrayConcat(const f32 (*)[4], const f32 (*)[4], f32 (*)[4], u32);
+void port_log(const char*, ...);
+}
+
+static u32 nativeps_rng = 0x5eed0d90u;
+static u32 nativeps_input_count;
+
+static u32 nativeps_next_input_word()
+{
+	static const u32 edges[] = {
+		0x00000000u, 0x80000000u, 0x00000001u, 0x80000001u,
+		0x007fffffu, 0x807fffffu, 0x00800000u, 0x80800000u,
+		0x3f800000u, 0xbf800000u, 0x3f000000u, 0xbf000000u,
+		0x40000000u, 0xc0000000u, 0x3eaaaaabu, 0xbeaaaaabu,
+	};
+	u32 word = nativeps_rng = nativeps_rng * 1664525u + 1013904223u;
+	if ((nativeps_input_count++ & 15u) < sizeof(edges) / sizeof(edges[0]))
+		return edges[(nativeps_input_count - 1) & 15u];
+	/* Keep random products finite while still covering both signs and a broad
+	 * normal range.  The fixed edge table above supplies the denormals and
+	 * signed zeroes without ever supplying a NaN input. */
+	return (word & 0x807fffffu) | ((0x78u + ((word >> 23) & 0x0bu)) << 23);
+}
+
+static void nativeps_fill(f32* dst, u32 count)
+{
+	for (u32 i = 0; i < count; ++i) {
+		u32 word = nativeps_next_input_word();
+		memcpy(&dst[i], &word, sizeof(word));
+	}
+}
+
+static u32 nativeps_bits(f32 value)
+{
+	u32 bits;
+	memcpy(&bits, &value, sizeof(bits));
+	return bits;
+}
+
+static bool nativeps_mismatch(const char* name, u32 iteration,
+	                              const u32* input, u32 input_count,
+	                              const f32* got, const f32* want, u32 output_count)
+{
+	for (u32 i = 0; i < output_count; ++i) {
+		u32 got_bits = nativeps_bits(got[i]);
+		u32 want_bits = nativeps_bits(want[i]);
+		if (got_bits == want_bits)
+			continue;
+		port_log("[nativeps] %s mismatch %u output[%u] native=%08x c=%08x",
+		         name, iteration, i, got_bits, want_bits);
+		for (u32 j = 0; j < input_count; ++j)
+			port_log("[nativeps] %s input[%u]=%08x", name, j, input[j]);
+		return true;
+	}
+	return false;
+}
+
+static bool nativeps_check_concat(u32 tests)
+{
+	for (u32 i = 0; i < tests; ++i) {
+		Mtx a, b, native, c;
+		nativeps_fill(&a[0][0], 12);
+		nativeps_fill(&b[0][0], 12);
+		mtx_host::gMTXConcat(a, b, c);
+		sms_nativeps_gMTXConcat(a, b, native);
+		u32 input[24];
+		memcpy(input, a, sizeof(a));
+		memcpy(input + 12, b, sizeof(b));
+		if (nativeps_mismatch("gMTXConcat", i, input, 24, &native[0][0], &c[0][0], 12))
+			return false;
+	}
+	port_log("[nativeps] gMTXConcat ok %u", tests);
+	return true;
+}
+
+static bool nativeps_check_quat(u32 tests)
+{
+	for (u32 i = 0; i < tests; ++i) {
+		Quaternion q;
+		Mtx native, c;
+		nativeps_fill(&q.x, 4);
+		mtx_host::gMTXQuat(c, &q);
+		sms_nativeps_gMTXQuat(native, &q);
+		u32 input[4];
+		memcpy(input, &q.x, sizeof(input));
+		if (nativeps_mismatch("gMTXQuat", i, input, 4, &native[0][0], &c[0][0], 12))
+			return false;
+	}
+	port_log("[nativeps] gMTXQuat ok %u", tests);
+	return true;
+}
+
+static bool nativeps_check_multvec(u32 tests)
+{
+	for (u32 i = 0; i < tests; ++i) {
+		Mtx m;
+		Vec source, native, c;
+		nativeps_fill(&m[0][0], 12);
+		nativeps_fill(&source.x, 3);
+		mtx_host::gMTXMultVec(m, &source, &c);
+		sms_nativeps_gMTXMultVec(m, &source, &native);
+		u32 input[15];
+		memcpy(input, m, sizeof(m));
+		memcpy(input + 12, &source.x, sizeof(source));
+		if (nativeps_mismatch("gMTXMultVec", i, input, 15, &native.x, &c.x, 3))
+			return false;
+	}
+	port_log("[nativeps] gMTXMultVec ok %u", tests);
+	return true;
+}
+
+static bool nativeps_check_normalize(u32 tests)
+{
+	for (u32 i = 0; i < tests; ++i) {
+		Vec source, native, c;
+		nativeps_fill(&source.x, 3);
+		mtx_host::gVECNormalize(&source, &c);
+		sms_nativeps_gVECNormalize(&source, &native);
+		u32 input[3];
+		memcpy(input, &source.x, sizeof(input));
+		if (nativeps_mismatch("gVECNormalize", i, input, 3, &native.x, &c.x, 3))
+			return false;
+	}
+	port_log("[nativeps] gVECNormalize ok %u", tests);
+	return true;
+}
+
+static bool nativeps_check_array_concat(u32 tests)
+{
+	for (u32 i = 0; i < tests; ++i) {
+		f32 a[4][4], b[4][4], native[4][4], c[4][4];
+		nativeps_fill(&a[0][0], 16);
+		nativeps_fill(&b[0][0], 64);
+		u32 count = (i == 0) ? 0 : ((nativeps_next_input_word() & 3u) + 1u);
+		mtx_host::gJ3DPSMtxArrayConcat(a, b, c, count);
+		sms_nativeps_gJ3DPSMtxArrayConcat(a, b, native, count);
+		u32 used = count ? count : 1;
+		u32 input[81];
+		memcpy(input, a, sizeof(a));
+		memcpy(input + 16, b, sizeof(b));
+		input[80] = count;
+		for (u32 matrix = 0; matrix < used; ++matrix) {
+			if (nativeps_mismatch("gJ3DPSMtxArrayConcat", i, input, 81,
+			                     &native[matrix][0], &c[matrix][0], 12))
+				return false;
+		}
+	}
+	port_log("[nativeps] gJ3DPSMtxArrayConcat ok %u", tests);
+	return true;
+}
+
+extern "C" int sms_nativeps_enabled;
+int sms_nativeps_enabled;
+
+extern "C" void sms_wiiu_nativeps_init(int nativeps, int nativepscheck)
+{
+	const u32 tests = 4096;
+	bool checks_ok = true;
+	if (nativepscheck) {
+		nativeps_rng = 0x5eed0d90u;
+		nativeps_input_count = 0;
+		checks_ok = nativeps_check_concat(tests) && checks_ok;
+		checks_ok = nativeps_check_quat(tests) && checks_ok;
+		checks_ok = nativeps_check_multvec(tests) && checks_ok;
+		checks_ok = nativeps_check_normalize(tests) && checks_ok;
+		checks_ok = nativeps_check_array_concat(tests) && checks_ok;
+	}
+	sms_nativeps_enabled = nativeps && checks_ok ? 1 : 0;
+	port_log("[nativeps] nativeps marker %s; native path %s",
+	         nativeps ? "on" : "off", sms_nativeps_enabled ? "enabled" : "off");
+}
+
+#define NATIVE_DEF(ret, ps, c, native, fn, params, args) \
+	extern "C" ret ps params { \
+		if (sms_nativeps_enabled) { native args; return; } \
+		return (ret)CALL(fn, args); \
+	} \
+	extern "C" ret c params { \
+		if (sms_nativeps_enabled) { native args; return; } \
+		return (ret)CALL(fn, args); \
+	}
+#define NATIVE_DEF1(ret, name, native, fn, params, args) \
+	extern "C" ret name params { \
+		if (sms_nativeps_enabled) { native args; return; } \
+		return (ret)CALL(fn, args); \
+	}
+#else
+#define NATIVE_DEF(ret, ps, c, native, fn, params, args) DEF(ret, ps, c, fn, params, args)
+#define NATIVE_DEF1(ret, name, native, fn, params, args) DEF1(ret, name, fn, params, args)
+#endif
+
 // --- mtx.c ---
 DEF(void, PSMTXIdentity, C_MTXIdentity, gMTXIdentity, (Mtx m), (m))
 DEF(void, PSMTXCopy, C_MTXCopy, gMTXCopy, (Mtx s, Mtx d), (s, d))
-DEF(void, PSMTXConcat, C_MTXConcat, gMTXConcat, (Mtx a, Mtx b, Mtx ab), (a, b, ab))
+NATIVE_DEF(void, PSMTXConcat, C_MTXConcat, sms_nativeps_gMTXConcat, gMTXConcat, (Mtx a, Mtx b, Mtx ab), (a, b, ab))
 DEF(u32, PSMTXInverse, C_MTXInverse, gMTXInverse, (Mtx s, Mtx i), (s, i))
 DEF(void, PSMTXTranspose, C_MTXTranspose, gMTXTranspose, (Mtx s, Mtx x), (s, x))
 DEF1(void, C_MTXRotRad, gMTXRotRad, (Mtx m, char axis, f32 rad), (m, axis, rad))
 DEF(void, PSMTXRotTrig, C_MTXRotTrig, gMTXRotTrig, (Mtx m, char axis, f32 s, f32 c), (m, axis, s, c))
 DEF(void, PSMTXRotAxisRad, C_MTXRotAxisRad, gMTXRotAxisRad, (Mtx m, Vec* axis, f32 rad), (m, axis, rad))
-DEF(void, PSMTXQuat, C_MTXQuat, gMTXQuat, (Mtx m, Quaternion* q), (m, q))
+NATIVE_DEF(void, PSMTXQuat, C_MTXQuat, sms_nativeps_gMTXQuat, gMTXQuat, (Mtx m, Quaternion* q), (m, q))
 DEF(void, PSMTXTrans, C_MTXTrans, gMTXTrans, (Mtx m, f32 x, f32 y, f32 z), (m, x, y, z))
 DEF(void, PSMTXTransApply, C_MTXTransApply, gMTXTransApply, (Mtx s, Mtx d, f32 x, f32 y, f32 z), (s, d, x, y, z))
 DEF(void, PSMTXScale, C_MTXScale, gMTXScale, (Mtx m, f32 x, f32 y, f32 z), (m, x, y, z))
@@ -186,7 +387,7 @@ DEF1(void, C_MTXFrustum, gMTXFrustum, (Mtx44 m, f32 t, f32 b, f32 l, f32 r, f32 
 DEF1(void, C_MTXOrtho, gMTXOrtho, (Mtx44 m, f32 t, f32 b, f32 l, f32 r, f32 n, f32 f), (m, t, b, l, r, n, f))
 
 // --- mtxvec.c ---
-DEF(void, PSMTXMultVec, C_MTXMultVec, gMTXMultVec, (Mtx44 m, Vec* s, Vec* d), (m, s, d))
+NATIVE_DEF(void, PSMTXMultVec, C_MTXMultVec, sms_nativeps_gMTXMultVec, gMTXMultVec, (Mtx44 m, Vec* s, Vec* d), (m, s, d))
 DEF(void, PSMTXMultVecSR, C_MTXMultVecSR, gMTXMultVecSR, (Mtx m, Vec* s, Vec* d), (m, s, d))
 DEF(void, PSMTXMultVecArray, C_MTXMultVecArray, gMTXMultVecArray, (Mtx m, Vec* s, Vec* d, u32 n), (m, s, d, n))
 
@@ -194,7 +395,7 @@ DEF(void, PSMTXMultVecArray, C_MTXMultVecArray, gMTXMultVecArray, (Mtx m, Vec* s
 DEF(void, PSVECAdd, C_VECAdd, gVECAdd, (Vec* a, Vec* b, Vec* c), (a, b, c))
 DEF(void, PSVECSubtract, C_VECSubtract, gVECSubtract, (Vec* a, Vec* b, Vec* c), (a, b, c))
 DEF(void, PSVECScale, C_VECScale, gVECScale, (Vec* s, Vec* d, f32 k), (s, d, k))
-DEF(void, PSVECNormalize, C_VECNormalize, gVECNormalize, (Vec* s, Vec* d), (s, d))
+NATIVE_DEF(void, PSVECNormalize, C_VECNormalize, sms_nativeps_gVECNormalize, gVECNormalize, (Vec* s, Vec* d), (s, d))
 DEF(f32, PSVECSquareMag, C_VECSquareMag, gVECSquareMag, (Vec* v), (v))
 DEF(f32, PSVECMag, C_VECMag, gVECMag, (Vec* v), (v))
 DEF(f32, PSVECDotProduct, C_VECDotProduct, gVECDotProduct, (Vec* a, Vec* b), (a, b))
@@ -209,7 +410,7 @@ DEF1(int, port_J3DPSCalcInverseTranspose, gJ3DPSCalcInverseTranspose, (const f32
 DEF1(void, port_J3DMtxProjConcat, gJ3DMtxProjConcat, (const f32 (*a)[4], const f32 (*b)[4], f32 (*ab)[4]), (a, b, ab))
 DEF1(void, port_J3DMTXConcatArrayIndexedSrc, gJ3DMTXConcatArrayIndexedSrc,
      (const f32 (*a)[4], const f32 (*b)[3][4], const u16* idx, f32 (*dst)[3][4], u32 n), (a, b, idx, dst, n))
-DEF1(void, port_J3DPSMtxArrayConcat, gJ3DPSMtxArrayConcat, (const f32 (*a)[4], const f32 (*b)[4], f32 (*dst)[4], u32 n),
+NATIVE_DEF1(void, port_J3DPSMtxArrayConcat, sms_nativeps_gJ3DPSMtxArrayConcat, gJ3DPSMtxArrayConcat, (const f32 (*a)[4], const f32 (*b)[4], f32 (*dst)[4], u32 n),
      (a, b, dst, n))
 DEF1(void, port_J3DPSMulMtxVec, gJ3DPSMulMtxVec, (const f32 (*m)[4], const f32* v, f32* d), (m, v, d))
 DEF1(void, port_J3DPSMulMtxVec33, gJ3DPSMulMtxVec33, (const f32 (*m)[3], const f32* v, f32* d), (m, v, d))

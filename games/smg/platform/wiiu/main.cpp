@@ -1,6 +1,7 @@
 #include "runtime.h"
 
 #include "port/port.h"
+#include <mtx/native_ps.h>
 
 #include <whb/log_udp.h>
 #include <whb/proc.h>
@@ -18,6 +19,8 @@ int main(int, char**)
     WHBLogUdpInit();
     WHBProcInit();
     smg_wiiu_runtime_init();
+    sms_wiiu_nativeps_init(sms_wiiu_sd_marker("nativeps"),
+                           sms_wiiu_sd_marker("nativepscheck"));
 
     port_os_init();
     port_os_threads_init();

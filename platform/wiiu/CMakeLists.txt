@@ -120,8 +120,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/alarm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp)
 
   # The MSL printf shim calls newlib's snprintf: keep compat.h's printf
   # bindings out of its own translation unit.
@@ -129,9 +128,12 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
     PROPERTIES COMPILE_DEFINITIONS PORT_PLATFORM_CODE=1)
-  set_source_files_properties(
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S
-    PROPERTIES COMPILE_OPTIONS "-Wa,-mgekko")
+  set(SMG_WIIU_ASM_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../platform/mtx/native_ps.S
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/ps/ps_probe.S)
+  set_source_files_properties(${SMG_WIIU_ASM_SOURCES} PROPERTIES LANGUAGE ASM)
+  add_library(smg_wiiu_asm OBJECT ${SMG_WIIU_ASM_SOURCES})
+  target_compile_options(smg_wiiu_asm PRIVATE -mcpu=750 -meabi -mhard-float -Wa,-mgekko)
   # Keep the complete Galaxy provider in one retained text section so the
   # ownership audit covers every exported KPAD/WPAD definition, including
   # compatibility entry points not reached by this boot path yet.
@@ -180,7 +182,8 @@ if(PORT_GAME STREQUAL "smg")
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
 
   add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES}
-    $<TARGET_OBJECTS:smg_wiiu_shared>)
+    $<TARGET_OBJECTS:smg_wiiu_shared>
+    $<TARGET_OBJECTS:smg_wiiu_asm>)
   target_include_directories(smg BEFORE PRIVATE
     ${SMG_GAME_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../gx/include
