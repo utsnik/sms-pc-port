@@ -41,6 +41,28 @@ void NameObjCategoryList::execute(int idx) {
         (*pCategoryInfo->mExecuteBeforeFunction)();
     }
 
+    for (NameObj** pNameObj = pCategoryInfo->mNameObjArr.begin(); pNameObj != pCategoryInfo->mNameObjArr.end(); pNameObj++) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        sms_wiiu_drawown_push_name((*pNameObj)->getName(), *pNameObj);
+#endif
+        (*mDelegator)(*pNameObj);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        sms_wiiu_drawown_pop();
+#endif
+    }
+}
+
+void NameObjCategoryList::executeShadowVolumeBatch(int idx) {
+    CategoryInfo* pCategoryInfo = &mCategoryInfo[idx];
+
+    if (pCategoryInfo->mNameObjArr.size() == 0) {
+        return;
+    }
+
+    if (pCategoryInfo->mExecuteBeforeFunction != nullptr) {
+        (*pCategoryInfo->mExecuteBeforeFunction)();
+    }
+
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
     if (idx == MR::DrawType_ShadowVolume && ShadowVolumeDrawer::isBatchEnabled()) {
         ShadowVolumeDrawer::drawBatch(pCategoryInfo->mNameObjArr.begin(), pCategoryInfo->mNameObjArr.size());

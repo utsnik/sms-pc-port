@@ -52,6 +52,7 @@ public:
     ~NameObjCategoryList();
 
     void execute(int);
+    void executeShadowVolumeBatch(int);
     void incrementCheck(NameObj*, int);
     void allocateBuffer();
     void add(NameObj*, int);

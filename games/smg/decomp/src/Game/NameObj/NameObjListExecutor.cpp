@@ -118,7 +118,14 @@ void NameObjListExecutor::executeDraw(int category) {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
     sms_wiiu_drawown_push_draw_type(static_cast<unsigned>(category));
 #endif
-    mDrawList->execute(category);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (category == MR::DrawType_ShadowVolume) {
+        mDrawList->executeShadowVolumeBatch(category);
+    } else
+#endif
+    {
+        mDrawList->execute(category);
+    }
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
     sms_wiiu_drawown_pop();
 #endif
