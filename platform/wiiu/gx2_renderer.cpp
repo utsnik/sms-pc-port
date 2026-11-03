@@ -1199,6 +1199,7 @@ static uint32_t s_pipe1DlArenaUsed[2];
 static uint32_t s_pipe1DlArenaSlot;
 static bool s_gx2ProdMarker;
 static bool s_gx2ProdCore2;
+static bool s_zcAppend;
 extern "C" int sms_wiiu_memset_dcbz;  // os_core.cpp
 static constexpr uint32_t kGx2DlAlignment = 32;
 static constexpr uint32_t kGx2DlArenaBytes = 4u << 20;
@@ -6383,6 +6384,8 @@ void rendererInit(float) {
     // the marker, and no GX2 display-list call is reachable while it is off.
     s_gx2ProdMarker = sdMarkerPresent("gx2prod");
     s_gx2ProdCore2 = sdMarkerPresent("gx2core2");
+    s_zcAppend = sdMarkerPresent("zcappend");
+    WHBLogPrintf("SMS Wii U: [zcappend] marker=%s", s_zcAppend ? "on" : "off");
     // gx2prod owns the complete worker-side list path; it implies the
     // hardware display-list emitter, while the old gx2dl marker remains an
     // independent opt-in for the single-threaded path.
@@ -6450,7 +6453,7 @@ void rendererInit(float) {
         gx2prod::Hooks hooks = {gx2ProdConsume, gx2ProdBoundary, nullptr};
         if (gx2prod::start(hooks, s_gx2ProdCore2)) {
             gx2prod::bind_service(gx2ProdCallList);
-            setProducerMode(true);
+            setProducerMode(true, s_zcAppend);
             s_gx2ProdEnabled = true;
 #if defined(PORT_GAME_SMG)
             gx2prod::drawown_enable(s_drawown);

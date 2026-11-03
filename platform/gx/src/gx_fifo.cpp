@@ -1805,13 +1805,17 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
 static uint32_t s_pipeCap = 0;
 static uint32_t s_pipeNeed = 1;
 static uint8_t* s_redirect = nullptr;
+static uint8_t* s_pipeStorage;
 #ifdef __WIIU__
 static bool s_producerMode;
+static bool s_zeroCopyAppend;
 static const uint32_t kProdChunk = 16u << 10;
 static std::vector<uint8_t> s_workerPipe;
 static std::vector<uint8_t> s_producerFlush;
 static uint32_t s_workerPipeLen;
 static uint32_t s_workerPipeNeed = 1;
+static bool s_zeroCopyActive;
+static uint32_t s_zeroCopyCapacity;
 #endif
 }  // namespace gx
 // the buffer, its length and how far the inline writers may fill it (gx_pc.h)
@@ -1824,12 +1828,9 @@ uint32_t GXPC_PipeLen = 0, GXPC_PipeFast = 0;
 namespace gx {
 static void pipeFastUpdate() {
 #ifdef __WIIU__
-    // Inline writers must not append directly to the legacy buffer while the
-    // producer ring is active: that buffer belongs to the old same-thread
-    // parser.  Keeping the fast window closed also preserves byte order for
-    // commands split across GXPC_Put* calls.
-    GXPC_PipeFast = s_redirect ? 0 : s_producerMode ? std::min(s_pipeCap, kProdChunk)
-                                                   : std::min(s_pipeCap, s_pipeNeed - 1);
+    GXPC_PipeFast = s_redirect ? 0 : s_zeroCopyActive ? s_zeroCopyCapacity
+                                                       : s_producerMode ? std::min(s_pipeCap, kProdChunk)
+                                                                         : std::min(s_pipeCap, s_pipeNeed - 1);
 #else
     GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
 #endif
@@ -1839,7 +1840,41 @@ static void pipeFastUpdate() {
 bool producerMode() { return s_producerMode; }
 
 static void pipeGrow(uint32_t need);
+static bool producerOpenZeroCopy() {
+    if (!s_zeroCopyAppend || !s_producerMode || s_zeroCopyActive)
+        return s_zeroCopyActive;
+    uint8_t* bytes = nullptr;
+    uint32_t capacity = 0;
+    if (!::gx2prod::reserve(kProdChunk, &bytes, &capacity)) {
+        GXPC_PipeBuf = s_pipeStorage;
+        pipeFastUpdate();
+        return false;
+    }
+    s_zeroCopyActive = true;
+    s_zeroCopyCapacity = capacity;
+    GXPC_PipeBuf = bytes;
+    GXPC_PipeLen = 0;
+    pipeFastUpdate();
+    return true;
+}
+
+static void producerCommitZeroCopy() {
+    if (!s_zeroCopyActive) return;
+    const uint32_t bytes = s_pipeLen;
+    if (!::gx2prod::commit(bytes))
+        fatal("zero-copy GX producer reservation commit failed");
+    s_zeroCopyActive = false;
+    s_zeroCopyCapacity = 0;
+    GXPC_PipeBuf = s_pipeStorage;
+    GXPC_PipeLen = 0;
+    pipeFastUpdate();
+}
+
 static void producerFlushPending() {
+    if (s_zeroCopyActive) {
+        producerCommitZeroCopy();
+        return;
+    }
     if (!s_pipeLen) return;
     SMS_PORT_HEAP_SCOPE();
     std::vector<uint8_t> chunk;
@@ -1852,9 +1887,10 @@ static void producerFlushPending() {
     s_producerFlush.swap(chunk);
 }
 
-void setProducerMode(bool enabled) {
+void setProducerMode(bool enabled, bool zeroCopy) {
     SMS_PORT_HEAP_SCOPE();
     s_producerMode = enabled;
+    s_zeroCopyAppend = enabled && zeroCopy;
     if (enabled) {
         // Any bytes already in the legacy pipe are consumed before the worker
         // becomes visible.  The marker is read during renderer init, before
@@ -1868,8 +1904,13 @@ void setProducerMode(bool enabled) {
         s_workerPipe.reserve(256u << 10);
         s_producerFlush.clear();
         s_producerDrawSyncWrite = 0;
+        s_pipeStorage = GXPC_PipeBuf;
         if (s_pipeCap < 2 * kProdChunk) pipeGrow(2 * kProdChunk);
         ::gx2prod::set_flush_hook(producerFlushPending);
+        producerOpenZeroCopy();
+    } else {
+        producerCommitZeroCopy();
+        GXPC_PipeBuf = s_pipeStorage;
     }
     pipeFastUpdate();
 }
@@ -1932,9 +1973,14 @@ bool pipeIdle() { return s_pipeLen == 0; }
 static void pipeGrow(uint32_t need) {
     uint32_t cap = s_pipeCap ? s_pipeCap : 64u << 10;
     while (cap < need) cap *= 2;
-    uint8_t* b = static_cast<uint8_t*>(realloc(s_pipeBuf, cap));
+    uint8_t* b = static_cast<uint8_t*>(realloc(s_pipeStorage ? s_pipeStorage : s_pipeBuf, cap));
     if (!b) fatal("out of memory growing the write-gather pipe");
+    s_pipeStorage = b;
+#ifdef __WIIU__
+    if (!s_zeroCopyActive) s_pipeBuf = b;
+#else
     s_pipeBuf = b;
+#endif
     s_pipeCap = cap;
     pipeFastUpdate();
 }
@@ -1966,14 +2012,31 @@ void drainCommandStream() {
     pipeFastUpdate();
 }
 
-static inline void pipePut(const uint8_t* bytes, uint32_t n) {
-    if (s_redirect) {
+static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer = false) {
+    if (s_redirect && !forceProducer) {
         memcpy(s_redirect, bytes, n);
         s_redirect += n;
         return;
     }
 #ifdef __WIIU__
     if (s_producerMode) {
+        if (s_zeroCopyAppend) {
+            if (!s_zeroCopyActive && !s_pipeLen) producerOpenZeroCopy();
+            if (s_zeroCopyActive && s_pipeLen + n <= s_zeroCopyCapacity) {
+                memcpy(s_pipeBuf + s_pipeLen, bytes, n);
+                s_pipeLen += n;
+                return;
+            }
+            if (s_zeroCopyActive) {
+                producerCommitZeroCopy();
+                if (producerOpenZeroCopy() && n <= s_zeroCopyCapacity) {
+                    memcpy(s_pipeBuf, bytes, n);
+                    s_pipeLen = n;
+                    return;
+                }
+            }
+        }
+        s_pipeBuf = s_pipeStorage;
         if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
         memcpy(s_pipeBuf + s_pipeLen, bytes, n);
         s_pipeLen += n;
@@ -1998,6 +2061,10 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     // not let this private record become part of a list that may be replayed
     // by GX2 or Cemu.
     if (s_redirect && (kind == kHostDrawownPush || kind == kHostDrawownPop)) {
+        if (s_zeroCopyAppend) {
+            pipePut(cmd, sizeof cmd, true);
+            return;
+        }
         if (s_pipeLen + sizeof cmd > s_pipeCap) pipeGrow(s_pipeLen + sizeof cmd);
         memcpy(s_pipeBuf + s_pipeLen, cmd, sizeof cmd);
         s_pipeLen += sizeof cmd;

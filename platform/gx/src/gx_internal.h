@@ -186,7 +186,7 @@ uint8_t* getPipeRedirect();
 void producerConsume(const uint8_t* bytes, uint32_t n);
 void producerBoundary(uint32_t kind);
 void rendererGameDlCall();
-void setProducerMode(bool enabled);
+void setProducerMode(bool enabled, bool zeroCopy = false);
 bool producerMode();
 // State the API sets outside the GX command stream (full host pointers that
 // do not survive ptrToPhys/physToPtr on Wii U, viewport/scissor floats, TLUT

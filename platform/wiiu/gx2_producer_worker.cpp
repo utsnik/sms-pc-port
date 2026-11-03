@@ -6,6 +6,7 @@
 #include <coreinit/core.h>
 #include <coreinit/time.h>
 
+#include <algorithm>
 #include <cstring>
 
 namespace gx2prod {
@@ -84,6 +85,10 @@ static uint32_t s_lastLogFrame;
 static bool s_appendFailureLogged;
 static bool s_serviceFailureLogged;
 static bool s_wrongServiceCoreLogged;
+static bool s_byteReservation;
+static uint32_t s_reservedWrite;
+static uint32_t s_reservedUsed;
+static uint32_t s_reservedCapacity;
 static void (*s_flushHook)();
 static bool s_inService;
 
@@ -305,6 +310,8 @@ bool start(const Hooks& hooks, bool core2) {
     s_wokenAt = 0;
     s_appendFailureLogged = s_serviceFailureLogged = false;
     s_wrongServiceCoreLogged = false;
+    s_byteReservation = false;
+    s_reservedWrite = s_reservedUsed = s_reservedCapacity = 0;
     std::memset(&s_worker, 0, sizeof s_worker);
     std::memset(&s_wakeQueue, 0, sizeof s_wakeQueue);
     wut_OSInitMessageQueue(&s_wakeQueue, s_wakeSlots, kWakeSlots);
@@ -463,6 +470,58 @@ bool append(const uint8_t* bytes, uint32_t size) {
     // Keep ordered display-list services moving while the game is recording;
     // this also prevents a busy producer from filling the service ring before
     // its next synchronous boundary.
+    if (s_serviceRead != s_serviceWrite)
+        serviceImpl(false);
+    return true;
+}
+
+bool reserve(uint32_t requested, uint8_t** out, uint32_t* capacity) {
+    if (!s_started || !requested || !out || !capacity || s_byteReservation)
+        return false;
+
+    const uint32_t write = s_byteWrite;
+    acquireBarrier();
+    const uint32_t read = s_byteRead;
+    const uint32_t used = write - read;
+    if (used >= kByteRingSize)
+        return false;
+
+    const uint32_t offset = write % kByteRingSize;
+    const uint32_t contiguous = kByteRingSize - offset;
+    const uint32_t available = kByteRingSize - used;
+    const uint32_t amount = std::min(requested, std::min(contiguous, available));
+    if (!amount)
+        return false;
+
+    s_byteReservation = true;
+    s_reservedWrite = write;
+    s_reservedUsed = used;
+    s_reservedCapacity = amount;
+    *out = s_byteRing + offset;
+    *capacity = amount;
+    return true;
+}
+
+bool commit(uint32_t size) {
+    if (!s_started || !s_byteReservation || size > s_reservedCapacity)
+        return false;
+
+    const uint32_t write = s_reservedWrite;
+    const uint32_t used = s_reservedUsed;
+    s_byteReservation = false;
+    s_reservedWrite = s_reservedUsed = s_reservedCapacity = 0;
+    if (!size)
+        return true;
+
+    /* Match append(): all command bytes become visible before byteWrite is
+     * published, and the worker only consumes through that published index. */
+    releaseBarrier();
+    s_byteWrite = write + size;
+    updateHighWater(used + size);
+    if (!used || s_byteWrite - s_wokenAt >= (32u << 10)) {
+        s_wokenAt = s_byteWrite;
+        wakeWorker();
+    }
     if (s_serviceRead != s_serviceWrite)
         serviceImpl(false);
     return true;

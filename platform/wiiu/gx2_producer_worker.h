@@ -60,6 +60,13 @@ bool enabled();
 /* Producer/core-1 API.  False is a hard probe failure (normally a full
  * byte ring); callers must not silently fall back to same-thread parsing. */
 bool append(const uint8_t* bytes, uint32_t size);
+/* Reserve one contiguous producer-ring segment for direct GX command writes.
+ * The reservation is not visible to the worker until commit(), so callers may
+ * fill the returned bytes with the same release-before-index publication rule
+ * used by append().  A false return leaves the ring untouched; callers should
+ * use the staging append path in that case. */
+bool reserve(uint32_t requested, uint8_t** out, uint32_t* capacity);
+bool commit(uint32_t size);
 /* Wake the worker without waiting for a boundary. */
 void wake();
 /* Flush the producer's coalescing buffer before a worker wake or wait. */
