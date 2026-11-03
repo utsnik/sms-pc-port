@@ -19,6 +19,8 @@
 extern "C" int sms_wiiu_sd_marker(const char*);
 extern "C" const char* sms_wiiu_stage_path(void);
 extern "C" void port_log(const char*, ...);
+extern "C" void GXGetVtxDesc(GXAttr, GXAttrType*);
+extern "C" void GXGetVtxAttrFmt(GXVtxFmt, GXAttr, GXCompCnt*, GXCompType*, u8*);
 #endif
 
 #if defined(TARGET_WIIU)
@@ -1398,6 +1400,64 @@ static GXColor billboardEnvColor(JPAEmitterWorkData* work, JPABaseParticle* part
     return color;
 }
 
+static void restoreBillboardParticleTev(JPAEmitterWorkData* work, JPABaseParticle* particle,
+                                        JPAResource::ParticleFunc* funcs, int funcCount) {
+    const JPAResource::ParticleFunc registEnv = static_cast<JPAResource::ParticleFunc>(&JPARegistEnv);
+    const JPAResource::ParticleFunc registAlphaEnv = static_cast<JPAResource::ParticleFunc>(&JPARegistAlphaEnv);
+    bool prmWritten = false;
+    bool envWritten = false;
+    for (int i = funcCount - 1; i > 0; --i) {
+        const JPAResource::ParticleFunc func = funcs[i];
+        if (func == &JPARegistPrmAlphaEnv) {
+            if (!prmWritten) {
+                GXSetTevColor(GX_TEVREG0, billboardPrmColor(work, particle));
+                prmWritten = true;
+            }
+            if (!envWritten) {
+                GXSetTevColor(GX_TEVREG1, billboardEnvColor(work, particle));
+                envWritten = true;
+            }
+        } else if (func == &JPARegistPrmAlpha) {
+            if (!prmWritten) {
+                GXSetTevColor(GX_TEVREG0, billboardPrmColor(work, particle));
+                prmWritten = true;
+            }
+        } else if (func == registAlphaEnv) {
+            if (!prmWritten) {
+                GXColor prm = work->mpEmtr->mPrmClr;
+                prm.r = COLOR_MULTI(prm.r, work->mpEmtr->mGlobalPrmClr.r);
+                prm.g = COLOR_MULTI(prm.g, work->mpEmtr->mGlobalPrmClr.g);
+                prm.b = COLOR_MULTI(prm.b, work->mpEmtr->mGlobalPrmClr.b);
+                prm.a = COLOR_MULTI(prm.a, work->mpEmtr->mGlobalPrmClr.a);
+                prm.a = COLOR_MULTI(prm.a, particle->mPrmColorAlphaAnm);
+                GXSetTevColor(GX_TEVREG0, prm);
+                prmWritten = true;
+            }
+            if (!envWritten) {
+                GXSetTevColor(GX_TEVREG1, billboardEnvColor(work, particle));
+                envWritten = true;
+            }
+        } else if (func == &JPARegistAlpha) {
+            if (!prmWritten) {
+                GXColor prm = work->mpEmtr->mPrmClr;
+                prm.r = COLOR_MULTI(prm.r, work->mpEmtr->mGlobalPrmClr.r);
+                prm.g = COLOR_MULTI(prm.g, work->mpEmtr->mGlobalPrmClr.g);
+                prm.b = COLOR_MULTI(prm.b, work->mpEmtr->mGlobalPrmClr.b);
+                prm.a = COLOR_MULTI(prm.a, work->mpEmtr->mGlobalPrmClr.a);
+                prm.a = COLOR_MULTI(prm.a, particle->mPrmColorAlphaAnm);
+                GXSetTevColor(GX_TEVREG0, prm);
+                prmWritten = true;
+            }
+        } else if (func == registEnv) {
+            if (!envWritten) {
+                GXSetTevColor(GX_TEVREG1, billboardEnvColor(work, particle));
+                envWritten = true;
+            }
+        }
+        if (prmWritten && envWritten) break;
+    }
+}
+
 static void setBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchMode& mode,
                                  GXTexMapID texMap) {
     if (!mode.rasterColorPrm && !mode.rasterColorEnv &&
@@ -1425,6 +1485,8 @@ static void setBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchM
         GXSetTevOrder(GX_TEVSTAGE1, GX_TEXCOORD0, texMap, GX_COLOR0A0);
         GXSetTevColorIn(GX_TEVSTAGE1, color[0], color[1], color[2], color[3]);
         GXSetTevAlphaIn(GX_TEVSTAGE1, alpha[0], alpha[1], alpha[2], alpha[3]);
+        GXSetTevColorOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GXSetTevAlphaOp(GX_TEVSTAGE1, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
         GXSetTevDirect(GX_TEVSTAGE0);
         GXSetTevDirect(GX_TEVSTAGE1);
         GXSetNumTevStages(2);
@@ -1463,6 +1525,8 @@ static void restoreBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBa
         GXSetChanCtrl(GX_COLOR1A1, GX_FALSE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
         GXSetTevColorIn(GX_TEVSTAGE0, color[0], color[1], color[2], color[3]);
         GXSetTevAlphaIn(GX_TEVSTAGE0, alpha[0], alpha[1], alpha[2], alpha[3]);
+        GXSetTevColorOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
+        GXSetTevAlphaOp(GX_TEVSTAGE0, GX_TEV_ADD, GX_TB_ZERO, GX_CS_SCALE_1, GX_TRUE, GX_TEVPREV);
         GXSetTevDirect(GX_TEVSTAGE0);
         GXSetTevDirect(GX_TEVSTAGE1);
         GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, texMap, GX_COLOR_NULL);
@@ -1480,19 +1544,37 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
                               const BillboardBatchMode& mode, const signed char* template_xyz,
                               const void* pos_array, const void* tex_array, GXTexMapID texMap) {
     typedef JPANode< JPABaseParticle > Node;
+    GXAttrType savedPosDesc, savedTexDesc, savedClr0Desc, savedClr1Desc;
+    GXCompCnt savedPosCnt, savedTexCnt, savedClr0Cnt, savedClr1Cnt;
+    GXCompType savedPosType, savedTexType, savedClr0Type, savedClr1Type;
+    u8 savedPosFrac, savedTexFrac, savedClr0Frac, savedClr1Frac;
+    GXGetVtxDesc(GX_VA_POS, &savedPosDesc);
+    GXGetVtxDesc(GX_VA_TEX0, &savedTexDesc);
+    GXGetVtxDesc(GX_VA_CLR0, &savedClr0Desc);
+    GXGetVtxDesc(GX_VA_CLR1, &savedClr1Desc);
+    GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, &savedPosCnt, &savedPosType, &savedPosFrac);
+    GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, &savedTexCnt, &savedTexType, &savedTexFrac);
+    GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, &savedClr0Cnt, &savedClr0Type, &savedClr0Frac);
+    GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, &savedClr1Cnt, &savedClr1Type, &savedClr1Frac);
     Node* const end = work->mpAlivePtcl->getEnd();
     Node* node = reverse ? work->mpAlivePtcl->getLast() : work->mpAlivePtcl->getFirst();
     while (node != end) {
         Node* runEnd = node;
         const u8 texture = node->getObject()->mTexAnmIdx;
         unsigned visible = 0;
+        JPABaseParticle* lastParticle = NULL;
+        JPABaseParticle* lastVisibleParticle = NULL;
         while (runEnd != end) {
             JPABaseParticle* particle = runEnd->getObject();
             if (runEnd != node && mode.textureAnimated && particle->mTexAnmIdx != texture)
                 break;
+            lastParticle = particle;
             work->mpCurNode = runEnd;
             noteParticle(work, particle, 2, child, funcs, funcCount);
-            if (!particle->checkStatus(8)) ++visible;
+            if (!particle->checkStatus(8)) {
+                ++visible;
+                lastVisibleParticle = particle;
+            }
             runEnd = reverse ? runEnd->getPrev() : runEnd->getNext();
         }
 
@@ -1517,6 +1599,7 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
                 GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
             }
             GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
             setBillboardBatchTev(work, mode, texMap);
             GXBegin(GX_QUADS, GX_VTXFMT0, visible * 4);
             unsigned emitted = 0;
@@ -1547,18 +1630,24 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
             }
             GXEnd();
             sms_wiiu_jpa_draw();
-            GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
-            GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
-            GXSetVtxDesc(GX_VA_CLR0, GX_NONE);
-            if (mode.twoColor) GXSetVtxDesc(GX_VA_CLR1, GX_NONE);
-            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_S8, 0);
-            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
+            GXSetVtxDesc(GX_VA_POS, savedPosDesc);
+            GXSetVtxDesc(GX_VA_TEX0, savedTexDesc);
+            GXSetVtxDesc(GX_VA_CLR0, savedClr0Desc);
+            GXSetVtxDesc(GX_VA_CLR1, savedClr1Desc);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, savedPosCnt, savedPosType, savedPosFrac);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, savedTexCnt, savedTexType, savedTexFrac);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, savedClr0Cnt, savedClr0Type, savedClr0Frac);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, savedClr1Cnt, savedClr1Type, savedClr1Frac);
             GXSetArray(GX_VA_POS, pos_array, 3);
             GXSetArray(GX_VA_TEX0, tex_array, 2);
             restoreBillboardBatchTev(work, mode, texMap);
-            GXLoadPosMtxImm(work->mPosCamMtx, GX_PNMTX0);
-            GXSetCurrentMtx(GX_PNMTX0);
+            if (lastVisibleParticle != NULL) {
+                Mtx matrix;
+                billboardMatrix(work, lastVisibleParticle, funcs[0] == &JPADrawRotBillboard, matrix);
+                GXLoadPosMtxImm(matrix, GX_PNMTX0);
+            }
         }
+        if (lastParticle != NULL) restoreBillboardParticleTev(work, lastParticle, funcs, funcCount);
         node = runEnd;
     }
 }
