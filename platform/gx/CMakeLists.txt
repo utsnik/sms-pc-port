@@ -178,6 +178,10 @@ if(SMS_GX_BUILD_TESTS)
     target_compile_features(gx2_texture_native_test PRIVATE cxx_std_17)
     add_test(NAME gx2_texture_native_test COMMAND gx2_texture_native_test)
 
+    add_executable(gx2_producer_ring_test tests/gx2_producer_ring_test.cpp)
+    target_compile_features(gx2_producer_ring_test PRIVATE cxx_std_11)
+    add_test(NAME gx2_producer_ring_test COMMAND gx2_producer_ring_test)
+
     add_library(gx2_texture_pack_core STATIC
         src/gx_texture_pack_common.cpp
         src/gx2_texture_pack_format.cpp

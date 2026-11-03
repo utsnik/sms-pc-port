@@ -1,4 +1,5 @@
 #include "gx2_producer_worker.h"
+#include "gx2_producer_ring.h"
 
 #include "runtime.h"
 #include "port_heap.h"
@@ -6,7 +7,6 @@
 #include <coreinit/core.h>
 #include <coreinit/time.h>
 
-#include <algorithm>
 #include <cstring>
 
 namespace gx2prod {
@@ -482,23 +482,15 @@ bool reserve(uint32_t requested, uint8_t** out, uint32_t* capacity) {
     const uint32_t write = s_byteWrite;
     acquireBarrier();
     const uint32_t read = s_byteRead;
-    const uint32_t used = write - read;
-    if (used >= kByteRingSize)
-        return false;
-
-    const uint32_t offset = write % kByteRingSize;
-    const uint32_t contiguous = kByteRingSize - offset;
-    const uint32_t available = kByteRingSize - used;
-    const uint32_t amount = std::min(requested, std::min(contiguous, available));
-    if (!amount)
-        return false;
+    ByteReservation reservation = {};
+    if (!reserveBytes(write, read, kByteRingSize, requested, &reservation)) return false;
 
     s_byteReservation = true;
-    s_reservedWrite = write;
-    s_reservedUsed = used;
-    s_reservedCapacity = amount;
-    *out = s_byteRing + offset;
-    *capacity = amount;
+    s_reservedWrite = reservation.write;
+    s_reservedUsed = reservation.used;
+    s_reservedCapacity = reservation.capacity;
+    *out = s_byteRing + reservation.offset;
+    *capacity = reservation.capacity;
     return true;
 }
 
@@ -508,6 +500,9 @@ bool commit(uint32_t size) {
 
     const uint32_t write = s_reservedWrite;
     const uint32_t used = s_reservedUsed;
+    ByteReservation reservation = {write, used, write % kByteRingSize, s_reservedCapacity};
+    uint32_t nextWrite = 0;
+    if (!commitBytes(reservation, size, &nextWrite)) return false;
     s_byteReservation = false;
     s_reservedWrite = s_reservedUsed = s_reservedCapacity = 0;
     if (!size)
@@ -516,7 +511,7 @@ bool commit(uint32_t size) {
     /* Match append(): all command bytes become visible before byteWrite is
      * published, and the worker only consumes through that published index. */
     releaseBarrier();
-    s_byteWrite = write + size;
+    s_byteWrite = nextWrite;
     updateHighWater(used + size);
     if (!used || s_byteWrite - s_wokenAt >= (32u << 10)) {
         s_wokenAt = s_byteWrite;
@@ -536,6 +531,7 @@ void wake() {
 
 void wait(uint32_t kind) {
     if (!s_started) return;
+    if (s_byteReservation && s_flushHook) s_flushHook();
     /* A pipe2 worker may reach GX2DrawDone/GXFlush through the worker-side
      * parser. It cannot wait for a barrier that only core 1 can service. */
     if (sms_wiiu_pipe2_enabled() && OSGetCoreId() != 1)
@@ -577,6 +573,7 @@ bool queueBoundary(uint32_t kind, ServiceFn fn, void* arg) {
 
 void waitPending(uint32_t kind) {
     if (!s_started || !s_pendingRequest) return;
+    if (s_byteReservation && s_flushHook) s_flushHook();
     const OSTime startTime = OSGetTime();
     const uint32_t request = s_pendingRequest;
     while (!reached(s_serviceDone, request)) {

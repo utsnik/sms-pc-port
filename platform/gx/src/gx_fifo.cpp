@@ -1816,6 +1816,11 @@ static uint32_t s_workerPipeLen;
 static uint32_t s_workerPipeNeed = 1;
 static bool s_zeroCopyActive;
 static uint32_t s_zeroCopyCapacity;
+static bool s_zeroCopyCheck;
+static uint8_t s_zeroCopyCheckHead[5];
+static uint32_t s_zeroCopyCheckHeadLen;
+static uint32_t s_zeroCopyCheckRemaining;
+static uint32_t s_zeroCopyCheckErrors;
 #endif
 }  // namespace gx
 // the buffer, its length and how far the inline writers may fill it (gx_pc.h)
@@ -1828,7 +1833,7 @@ uint32_t GXPC_PipeLen = 0, GXPC_PipeFast = 0;
 namespace gx {
 static void pipeFastUpdate() {
 #ifdef __WIIU__
-    GXPC_PipeFast = s_redirect ? 0 : s_zeroCopyActive ? s_zeroCopyCapacity
+    GXPC_PipeFast = s_redirect ? 0 : s_zeroCopyActive ? (s_pipeLen <= s_zeroCopyCapacity ? s_zeroCopyCapacity : 0)
                                                        : s_producerMode ? std::min(s_pipeCap, kProdChunk)
                                                                          : std::min(s_pipeCap, s_pipeNeed - 1);
 #else
@@ -1840,6 +1845,94 @@ static void pipeFastUpdate() {
 bool producerMode() { return s_producerMode; }
 
 static void pipeGrow(uint32_t need);
+
+static uint32_t zeroCopyCheckHeaderLength(uint8_t op) {
+    if (op == 0x10) return 5;
+    if (op >= 0x80 && op < 0xC0) return 3;
+    return 1;
+}
+
+static uint32_t zeroCopyCheckCommandLength(const uint8_t* p, uint32_t available) {
+    const uint8_t op = p[0];
+    if (op == 0x00 || op == 0x48 || op == 0x44) return 1;
+    if (op == 0x08) return 6;
+    if (op == 0x10) {
+        if (available < 5) return 5;
+        return 5 + ((be32(p + 1) >> 16) + 1) * 4;
+    }
+    if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) return 5;
+    if (op == 0x40) return 9;
+    if (op == 0x61) return 5;
+    if (op == 0xF0) return 8;
+    if (op >= 0x80 && op < 0xC0)
+        return 3 + uint32_t(be16(p + 1)) * layoutFor(op & 7).size;
+    return 1;
+}
+
+static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t capacity) {
+    if (!s_zeroCopyCheck) return;
+    if (!bytes || size > capacity) {
+        if (s_zeroCopyCheckErrors++ == 0)
+            logmsg("zccheck: committed bytes exceed the active reservation (%u > %u)", size, capacity);
+        return;
+    }
+
+    uint32_t pos = 0;
+    while (pos < size) {
+        if (s_zeroCopyCheckRemaining) {
+            const uint32_t take = std::min(s_zeroCopyCheckRemaining, size - pos);
+            s_zeroCopyCheckRemaining -= take;
+            pos += take;
+            continue;
+        }
+
+        if (s_zeroCopyCheckHeadLen) {
+            const uint32_t header = zeroCopyCheckHeaderLength(s_zeroCopyCheckHead[0]);
+            const uint32_t take = std::min(header - s_zeroCopyCheckHeadLen, size - pos);
+            memcpy(s_zeroCopyCheckHead + s_zeroCopyCheckHeadLen, bytes + pos, take);
+            s_zeroCopyCheckHeadLen += take;
+            pos += take;
+            if (s_zeroCopyCheckHeadLen < header) return;
+            const uint32_t len = zeroCopyCheckCommandLength(s_zeroCopyCheckHead, s_zeroCopyCheckHeadLen);
+            if (!len || len < s_zeroCopyCheckHeadLen) {
+                if (s_zeroCopyCheckErrors++ == 0)
+                    logmsg("zccheck: invalid carried command boundary (len=%u head=%u)", len,
+                           s_zeroCopyCheckHeadLen);
+                s_zeroCopyCheckHeadLen = 0;
+                continue;
+            }
+            s_zeroCopyCheckRemaining = len - s_zeroCopyCheckHeadLen;
+            s_zeroCopyCheckHeadLen = 0;
+            continue;
+        }
+
+        const uint8_t op = bytes[pos];
+        const uint32_t header = zeroCopyCheckHeaderLength(op);
+        const uint32_t available = size - pos;
+        if (available < header) {
+            memcpy(s_zeroCopyCheckHead, bytes + pos, available);
+            s_zeroCopyCheckHeadLen = available;
+            return;
+        }
+        const uint32_t len = zeroCopyCheckCommandLength(bytes + pos, available);
+        if (!len) {
+            if (s_zeroCopyCheckErrors++ == 0)
+                logmsg("zccheck: invalid committed command boundary at offset %u", pos);
+            return;
+        }
+        if (len > available) {
+            s_zeroCopyCheckRemaining = len - available;
+            return;
+        }
+        pos += len;
+    }
+}
+
+void setProducerZeroCopyCheck(bool enabled) {
+    s_zeroCopyCheck = enabled;
+    s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
+}
+
 static bool producerOpenZeroCopy() {
     if (!s_zeroCopyAppend || !s_producerMode || s_zeroCopyActive)
         return s_zeroCopyActive;
@@ -1861,6 +1954,7 @@ static bool producerOpenZeroCopy() {
 static void producerCommitZeroCopy() {
     if (!s_zeroCopyActive) return;
     const uint32_t bytes = s_pipeLen;
+    zeroCopyCheckBytes(s_pipeBuf, bytes, s_zeroCopyCapacity);
     if (!::gx2prod::commit(bytes))
         fatal("zero-copy GX producer reservation commit failed");
     s_zeroCopyActive = false;
@@ -1889,13 +1983,17 @@ static void producerFlushPending() {
 
 void setProducerMode(bool enabled, bool zeroCopy) {
     SMS_PORT_HEAP_SCOPE();
-    s_producerMode = enabled;
-    s_zeroCopyAppend = enabled && zeroCopy;
+    if (s_producerMode && s_zeroCopyAppend)
+        producerFlushPending();
     if (enabled) {
         // Any bytes already in the legacy pipe are consumed before the worker
         // becomes visible.  The marker is read during renderer init, before
         // the game starts issuing frame commands.
+        s_producerMode = false;
+        s_zeroCopyAppend = false;
         drainCommandStream();
+        s_producerMode = true;
+        s_zeroCopyAppend = zeroCopy;
         GXPC_PipeLen = 0;
         s_pipeNeed = 1;
         s_workerPipeLen = 0;
@@ -1904,11 +2002,14 @@ void setProducerMode(bool enabled, bool zeroCopy) {
         s_workerPipe.reserve(256u << 10);
         s_producerFlush.clear();
         s_producerDrawSyncWrite = 0;
+        s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
         s_pipeStorage = GXPC_PipeBuf;
         if (s_pipeCap < 2 * kProdChunk) pipeGrow(2 * kProdChunk);
         ::gx2prod::set_flush_hook(producerFlushPending);
         producerOpenZeroCopy();
     } else {
+        s_producerMode = false;
+        s_zeroCopyAppend = false;
         producerCommitZeroCopy();
         GXPC_PipeBuf = s_pipeStorage;
     }
@@ -1963,6 +2064,10 @@ static void producerDrawSyncService(void* opaque) {
 // GameCube, so the game flushes nothing): stamp them when the redirect ends.
 static uint8_t* s_redirectStart = nullptr;
 void setPipeRedirect(uint8_t* dest) {
+#ifdef __WIIU__
+    if (s_producerMode && s_zeroCopyAppend)
+        producerFlushPending();
+#endif
     if (s_redirectStart && s_redirect > s_redirectStart) memoryWritten(s_redirectStart, size_t(s_redirect - s_redirectStart));
     s_redirect = s_redirectStart = dest;
     pipeFastUpdate();
@@ -2000,6 +2105,16 @@ static void pipeRun() {
 }
 
 void drainCommandStream() {
+#ifdef __WIIU__
+    if (s_producerMode && s_zeroCopyAppend) {
+        // Producer bytes belong to the worker, even when a caller reaches
+        // this legacy drain path without needing a GPU wait (for example an
+        // asynchronous peek). Publishing first prevents the game thread
+        // from parsing an open reservation as if it were its own FIFO.
+        producerFlushPending();
+        return;
+    }
+#endif
     // GXPC_Put* normally drains as soon as a complete command is available.
     // A final explicit pass makes the producer/consumer boundary observable
     // at the synchronous GX fences without changing FIFO byte order or the
@@ -2022,7 +2137,8 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer 
     if (s_producerMode) {
         if (s_zeroCopyAppend) {
             if (!s_zeroCopyActive && !s_pipeLen) producerOpenZeroCopy();
-            if (s_zeroCopyActive && s_pipeLen + n <= s_zeroCopyCapacity) {
+            if (s_zeroCopyActive && s_pipeLen <= s_zeroCopyCapacity &&
+                n <= s_zeroCopyCapacity - s_pipeLen) {
                 memcpy(s_pipeBuf + s_pipeLen, bytes, n);
                 s_pipeLen += n;
                 return;
