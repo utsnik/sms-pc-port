@@ -59,6 +59,10 @@ extern "C" const u8* port_varam_ptr(u32 addr);
 #endif
 extern "C" void __DSPHandler(int interrupt, void* context); // JSystem/osdsp_task.c
 
+#ifdef TARGET_WIIU
+extern "C" void __real_DCFlushRange(void*, uint32_t); // coreinit's, not the GX-stamping wrapper (os_core.cpp)
+#endif
+
 namespace {
 
 const u32 kPrefix = 0xF3550000u; // JASystem::DSPInterface::JAS_DSP_PREFIX << 16
@@ -81,6 +85,8 @@ struct Hle {
 	// frame state from the 0x82 command
 	int16_t* outA;
 	int16_t* outB;
+	void* voices;
+	u32 nvoices;
 	u32 subframes, sub, subSamples;
 	u16 master;
 	u64 subframesRendered;
@@ -128,6 +134,13 @@ void post(u32 m)
 	SMS_PORT_HEAP_SCOPE();
 	g.fromDsp.push_back(m);
 }
+
+volatile u32 s_syncFrames;
+/* fromWorker: called by the mixer thread. It is an argument, not a shared flag:
+ * a ReleaseHalt arriving on core 1 while the worker ran the 0x82 frame command
+ * read the worker's flag, re-ran the 0x82 inline and dropped the release, so no
+ * subframe was ever rendered and the game was silent from the first frame. */
+void execute(bool fromWorker = false);
 
 #if defined(SMG_DSP_ASYNC)
 /* wut's coreinit ABI is deliberately kept separate from the decomp's
@@ -224,7 +237,6 @@ struct AsyncState {
 };
 
 AsyncState s_async;
-volatile u32 s_syncFrames;
 // Async-path debug counters (logged with the 10 s audio stats).
 volatile u32 s_dbgMails, s_dbgAsserts, s_dbgLastAssertMail, s_dbgSkippedMails;
 volatile u32 s_dbgQueued[4], s_dbgExec[4], s_dbgReleaseIdle, s_dbgReplies, s_dbgReplyPosts;
@@ -290,12 +302,6 @@ BOOL receive_ptr(WutMessageQueue* q, void** p)
 #endif
 }
 bool s_workerRelease;
-
-/* fromWorker: called by the mixer thread. It is an argument, not a shared flag:
- * a ReleaseHalt arriving on core 1 while the worker ran the 0x82 frame command
- * read the worker's flag, re-ran the 0x82 inline and dropped the release, so no
- * subframe was ever rendered and the game was silent from the first frame. */
-void execute(bool fromWorker = false);
 
 void queue_reply(u32 first, u32 second)
 {
@@ -509,8 +515,6 @@ void stop_async()
 }
 #else
 // Host builds (platform/audio/tests) run the synchronous path only.
-volatile u32 s_syncFrames;
-void execute(bool fromWorker = false);
 #endif
 
 // Raise the DSP interrupt: runs the decomp's __DSPHandler in interrupt
@@ -589,6 +593,22 @@ void render_subframe()
 	} else
 #endif
 	port_dspmix_render(g.outA + g.sub * n, g.outB + g.sub * n, (int)n, g.master);
+#ifdef TARGET_WIIU
+	/* On GameCube the DSP writes these blocks by DMA. The Wii U mixer writes
+	 * through the CPU cache, while JASDSPBuf invalidates the ranges before the
+	 * game consumes them; flush them first so RAM contains the DSP results. */
+#if defined(PORT_GAME_SMG)
+	DCFlushRange(g.outA + g.sub * n, n * sizeof(int16_t));
+	DCFlushRange(g.outB + g.sub * n, n * sizeof(int16_t));
+	if (g.voices)
+		DCFlushRange(g.voices, g.nvoices * 0x180);
+#else
+	__real_DCFlushRange(g.outA + g.sub * n, n * sizeof(int16_t));
+	__real_DCFlushRange(g.outB + g.sub * n, n * sizeof(int16_t));
+	if (g.voices)
+		__real_DCFlushRange(g.voices, g.nvoices * 0x180);
+#endif
+#endif
 	g.sub++;
 	g.subframesRendered++;
 #if defined(PORT_GAME_SMG)
@@ -680,6 +700,8 @@ void execute(bool fromWorker)
 	case 0x81: // DsetupTable(n, CH_BUF, DSPRES_FILTER, DSPADPCM_FILTER, FX_BUF)
 		if (w.size() >= 5) {
 			port_dspmix_set_aram(aram_lookup);
+			g.voices  = (void*)(uintptr_t)w[1];
+			g.nvoices = w[0] & 0xFFFF;
 			port_dspmix_setup(w[0] & 0xFFFF, (void*)(uintptr_t)w[1], (const uint32_t*)(uintptr_t)w[2],
 			                  (const uint32_t*)(uintptr_t)w[3], (void*)(uintptr_t)w[4]);
 #ifdef TARGET_WIIU

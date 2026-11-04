@@ -97,14 +97,23 @@ static uint32_t update_played()
 	return 0;
 }
 
-static void set_voice_mix(AXVoice* voice, uint32_t bus)
+static void set_voice_mix(AXVoice* voice, uint32_t channel)
 {
-	AXVoiceDeviceMixData mix;
-	std::memset(&mix, 0, sizeof mix);
-	mix.bus[bus].volume = 0x8000;
-	AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_TV, 0, &mix);
+	/* AXSetVoiceDeviceMix reads one entry per device channel (6), each with
+	 * four buses (0 = main, 1-3 = aux A-C). Each voice feeds the main bus of
+	 * its own channel: voice 0 left, voice 1 right. */
+	AXVoiceDeviceMixData mix[6];
+	std::memset(mix, 0, sizeof mix);
+	mix[channel].bus[0].volume = 0x8000;
+	AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_TV, 0, mix);
 	if (!s_axTvOnly)
-		AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_DRC, 0, &mix); // GamePad
+		AXSetVoiceDeviceMix(voice, AX_DEVICE_TYPE_DRC, 0, mix); // GamePad
+	/* A voice's own volume is 0 after AXAcquireVoice; without this the
+	 * voices play silently even though the mixer output is full scale. */
+	AXVoiceVeData ve;
+	std::memset(&ve, 0, sizeof ve);
+	ve.volume = 0x8000;
+	AXSetVoiceVe(voice, &ve);
 }
 
 static bool configure_voice(AXVoice* voice, int16_t* data, uint32_t sourceRate, uint32_t bus)
