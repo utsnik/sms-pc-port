@@ -5573,6 +5573,34 @@ static GX2DepthBuffer* renderDepth() {
     return s_renderOwn ? &s_renderDepth : WHBGfxGetTVDepthBuffer();
 }
 
+#if defined(PORT_GAME_SMG)
+/* Galaxy's wide EFB carries 456 picture lines in a 480-line render target.
+ * The target is intentionally left at its normal size for rendering, EFB
+ * copies, and peeks; describe only the final picture rectangle as the source
+ * of the scan-buffer copy so GX2 scales those lines to the display height. */
+static bool s_presentScaleLogged[2];
+
+static void copyGameToScanBuffer(GX2ScanTarget target) {
+    GX2ColorBuffer* colour = renderColour();
+    if (!colour) return;
+    const uint32_t imageHeight = (colour->surface.height * 456u + 479u) / 480u;
+    const uint32_t slot = target == GX2_SCAN_TARGET_DRC ? 1u : 0u;
+    if (imageHeight && imageHeight < colour->surface.height) {
+        GX2ColorBuffer source = *colour;
+        source.surface.height = imageHeight;
+        if (!s_presentScaleLogged[slot]) {
+            s_presentScaleLogged[slot] = true;
+            WHBLogPrintf("SMG Wii U: [present-scale] %s source=%ux%u -> scan height=%u",
+                         slot ? "DRC" : "TV", unsigned(source.surface.width), unsigned(imageHeight),
+                         unsigned(colour->surface.height));
+        }
+        GX2CopyColorBufferToScanBuffer(&source, target);
+    } else {
+        GX2CopyColorBufferToScanBuffer(colour, target);
+    }
+}
+#endif
+
 // Frame start (instead of WHBGfxBeginRenderTV + clear) and present.
 extern "C" void sms_wiiu_gx2_target_begin(void) {
     initRenderTarget();
@@ -5591,11 +5619,19 @@ extern "C" void sms_wiiu_gx2_target_present(void) {
     if (queueProducerPresent()) return;
     if (s_d7NoSwap) return;
     if (!s_noScanTv) {
+#if defined(PORT_GAME_SMG)
+        copyGameToScanBuffer(GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+#else
         GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+#endif
         if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
     }
     if (!s_noScanDrc) {
+#if defined(PORT_GAME_SMG)
+        copyGameToScanBuffer(GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+#else
         GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+#endif
         if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
     }
 }
@@ -7625,11 +7661,19 @@ static void producerPresentService(void* opaque) {
     ProducerFrameState& frame = *static_cast<ProducerFrameState*>(opaque);
     if (!s_d7NoSwap) {
         if (!s_noScanTv) {
+#if defined(PORT_GAME_SMG)
+            copyGameToScanBuffer(GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+#else
             GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
+#endif
             if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
         }
         if (!s_noScanDrc) {
+#if defined(PORT_GAME_SMG)
+            copyGameToScanBuffer(GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+#else
             GX2CopyColorBufferToScanBuffer(renderColour(), GX2_SCAN_TARGET_DRC); invalidateVertexUniforms();
+#endif
             if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
         }
     }
