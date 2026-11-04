@@ -291,7 +291,9 @@ bool start(const Hooks& hooks, bool core2) {
     std::memset(&s_totals, 0, sizeof s_totals);
     std::memset(&s_lastLog, 0, sizeof s_lastLog);
     s_lastLogFrame = 0;
+#if !defined(PORT_GAME_SMG)
     if (!sms_wiiu_sd_marker("gx2prod")) return false;
+#endif
     if (!hooks.consume || !hooks.boundary) {
         port_log("SMS Wii U: [prod] missing consume/boundary hook; worker refused\n");
         return false;

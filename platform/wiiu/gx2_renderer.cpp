@@ -528,7 +528,11 @@ static bool sdMarkerPresent(const char* name, bool log = true) {
     char sdPath[160], appPath[160];
     std::snprintf(sdPath, sizeof(sdPath), "sd:/wiiu/apps/sms/%s", name);
     std::snprintf(appPath, sizeof(appPath), "%s%s", sms_wiiu_app_root(), name);
+#if defined(PORT_GAME_SMG)
+    const char* paths[] = {appPath};
+#else
     const char* paths[] = {sdPath, appPath};
+#endif
     for (const char* path : paths) {
         FILE* marker = std::fopen(path, "rb");
         if (!marker) continue;
@@ -6383,9 +6387,9 @@ void rendererInit(float) {
 #endif
     // Read the Stage 1 switch exactly once.  No frame or present path probes
     // the marker, and no GX2 display-list call is reachable while it is off.
-    s_gx2ProdMarker = sdMarkerPresent("gx2prod");
+    s_gx2ProdMarker = sdGameDefaultMarker("gx2prod");
     s_gx2ProdCore2 = sdMarkerPresent("gx2core2");
-    s_zcAppend = sdMarkerPresent("zcappend");
+    s_zcAppend = sdGameDefaultMarker("zcappend");
     WHBLogPrintf("SMS Wii U: [zcappend] marker=%s", s_zcAppend ? "on" : "off");
     s_zcCheck = s_zcAppend && sdMarkerPresent("zccheck");
     WHBLogPrintf("SMS Wii U: [zccheck] marker=%s", s_zcCheck ? "on" : "off");

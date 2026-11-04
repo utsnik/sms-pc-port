@@ -19,7 +19,7 @@ int main(int, char**)
     WHBLogUdpInit();
     WHBProcInit();
     smg_wiiu_runtime_init();
-    sms_wiiu_nativeps_init(sms_wiiu_sd_marker("nativeps"),
+    sms_wiiu_nativeps_init(!sms_wiiu_sd_marker("nonativeps"),
                            sms_wiiu_sd_marker("nativepscheck"));
 
     port_os_init();
