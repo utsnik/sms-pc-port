@@ -125,7 +125,8 @@ void WPadHVSwing::update() {
     }
 
 #if defined(TARGET_WIIU)
-    if (mChannel == WPAD_CHAN0) {
+    /* mChannel is the device (core/Nunchuk); the spin belongs to player 1's core. */
+    if (mChannel == WPAD_DEV_CORE && pPad->mChannel == WPAD_CHAN0) {
         const uint32_t spinFrames = sms_wiiu_spin_frames_since_press();
         if (spinFrames < 6) {
             mIsSwing = true;
