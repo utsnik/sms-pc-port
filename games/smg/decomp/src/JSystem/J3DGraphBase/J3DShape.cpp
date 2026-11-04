@@ -13,7 +13,7 @@ extern "C" int sms_wiiu_sd_marker(const char*);
 namespace {
 bool vcdVatKeepMarker() {
     static int marker = -1;
-    if (marker < 0) marker = sms_wiiu_sd_marker("vcdkeep") != 0;
+    if (marker < 0) marker = sms_wiiu_sd_marker("novcdkeep") == 0;
     return marker != 0;
 }
 }

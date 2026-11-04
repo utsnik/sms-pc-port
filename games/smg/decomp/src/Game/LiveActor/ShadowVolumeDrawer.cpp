@@ -105,7 +105,7 @@ namespace {
 bool ShadowVolumeDrawer::isBatchEnabled() {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
     if (sShadowVolumeBatchMarker < 0) {
-        sShadowVolumeBatchMarker = sms_wiiu_sd_marker("svbatch") != 0;
+        sShadowVolumeBatchMarker = sms_wiiu_sd_marker("nosvbatch") == 0;
     }
     return sShadowVolumeBatchMarker != 0;
 #else

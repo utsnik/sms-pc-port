@@ -248,7 +248,7 @@ bool batchMarker();
 
 bool batchMarker2() {
     static int marker = -1;
-    if (marker < 0) marker = batchMarker() && sms_wiiu_sd_marker("jpabatch2") != 0;
+    if (marker < 0) marker = batchMarker() && sms_wiiu_sd_marker("nojpabatch2") == 0;
     return marker != 0;
 }
 
@@ -400,7 +400,7 @@ void countBillboardParticle(JPAEmitterWorkData* work, JPABaseParticle* particle,
 
 bool batchMarker() {
     static int marker = -1;
-    if (marker < 0) marker = sms_wiiu_sd_marker("jpabatch") != 0;
+    if (marker < 0) marker = sms_wiiu_sd_marker("nojpabatch") == 0;
     return marker != 0;
 }
 

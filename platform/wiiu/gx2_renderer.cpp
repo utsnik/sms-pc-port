@@ -6357,11 +6357,11 @@ void rendererInit(float) {
     s_dlArenaEnabled = !sdMarkerPresent("nodlarena");
     g_dlVariantsEnabled = !sdMarkerPresent("nodlvariants");
     g_dlPromoteFirst = sdMarkerPresent("dlpromotefirst");
-    g_dlIgnoreExternal = sdMarkerPresent("dlnoexternal");
+    g_dlIgnoreExternal = sdGameDefaultMarker("dlnoexternal");
     g_dlNoHash = sdMarkerPresent("dlnohash");
     // d43: track write stamps over the whole 0x10000000-0x1fffffff user range (RPX data, game arena, MEM1 copy,
     // system heap), not just the arena: display lists outside it were hashed on every call (~9 MB/frame).
-    if (sdMarkerPresent("stampwide")) GXPC_SetWriteStampWindow(reinterpret_cast<void*>(uintptr_t(0x10000000u)));
+    if (sdGameDefaultMarker("stampwide")) GXPC_SetWriteStampWindow(reinterpret_cast<void*>(uintptr_t(0x10000000u)));
 #if defined(PORT_GAME_SMG)
     // d49 switches are read once here so shader generation, depth setup, and
     // peek scheduling cannot observe a changing SD card during a run.
