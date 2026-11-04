@@ -3,6 +3,10 @@
 #include "Game/System/WPad.hpp"
 #include "Game/System/WPadHVSwing.hpp"
 
+#if defined(TARGET_WIIU)
+extern "C" uint32_t sms_wiiu_spin_frames_since_press(void);
+#endif
+
 void WPadHVSwing_FORCE_MATCH_SDATA2() {
     (void)1.0f;
     (void)0.0f;
@@ -119,4 +123,14 @@ void WPadHVSwing::update() {
             mIsTriggerSwing = true;
         }
     }
+
+#if defined(TARGET_WIIU)
+    if (mChannel == WPAD_CHAN0) {
+        const uint32_t spinFrames = sms_wiiu_spin_frames_since_press();
+        if (spinFrames < 6) {
+            mIsSwing = true;
+            mIsTriggerSwing = spinFrames == 0;
+        }
+    }
+#endif
 }

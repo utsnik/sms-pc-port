@@ -23,6 +23,7 @@ enum ScriptKind {
     SCRIPT_STICK,
     SCRIPT_POINTER,
     SCRIPT_SHOT,
+    SCRIPT_SPIN,
 };
 
 struct ScriptEvent {
@@ -52,6 +53,10 @@ int64_t s_autopress_start;
 bool s_autopress_exit_requested;
 #endif
 u32 s_previous_hold;
+bool s_spin_hold;
+bool s_vpad_spin_hold;
+u32 s_spin_last_frame = ~0u;
+u32 s_spin_frames_since_press = ~0u;
 u32 s_vpad_hold;
 f32 s_vpad_stick_x;
 f32 s_vpad_stick_y;
@@ -121,6 +126,10 @@ bool button_control(const char* name, u32* button)
     }
     return false;
 }
+
+/* Autoplay tokens use button@frame+hold; spin@frame+hold generates the same
+ * Y/X press edge as a GamePad spin without exposing either button as a Wii
+ * button. */
 
 bool stick_control(const char* name, f32* x, f32* y)
 {
@@ -344,6 +353,8 @@ AppendResult append_button_or_stick(char* name, char* timing)
         kind = SCRIPT_STICK;
     } else if (std::strcmp(name, "shot") == 0) {
         kind = SCRIPT_SHOT; /* shot@<field>: one TV+DRC screenshot (needs <app root>shots/) */
+    } else if (std::strcmp(name, "spin") == 0) {
+        kind = SCRIPT_SPIN;
     } else {
         return APPEND_INVALID;
     }
@@ -504,8 +515,6 @@ void map_vpad(const VPADStatus& vpad)
     u32 result = 0;
     if (vpad.hold & VPAD_BUTTON_A) result |= WPAD_BUTTON_A;
     if (vpad.hold & VPAD_BUTTON_B) result |= WPAD_BUTTON_B;
-    if (vpad.hold & VPAD_BUTTON_X) result |= WPAD_BUTTON_1;
-    if (vpad.hold & VPAD_BUTTON_Y) result |= WPAD_BUTTON_2;
     if (vpad.hold & VPAD_BUTTON_ZR) result |= WPAD_BUTTON_B;
     if (vpad.hold & VPAD_BUTTON_ZL) result |= WPAD_BUTTON_Z;
     if (vpad.hold & VPAD_BUTTON_L) result |= WPAD_BUTTON_C;
@@ -517,6 +526,7 @@ void map_vpad(const VPADStatus& vpad)
     if (vpad.hold & VPAD_BUTTON_MINUS) result |= WPAD_BUTTON_MINUS;
     if (vpad.hold & VPAD_BUTTON_HOME) result |= WPAD_BUTTON_HOME;
     s_vpad_hold = result;
+    s_vpad_spin_hold = (vpad.hold & (VPAD_BUTTON_X | VPAD_BUTTON_Y)) != 0;
     s_vpad_stick_x = vpad.leftStick.x;
     s_vpad_stick_y = vpad.leftStick.y;
     update_hardware_pointer(vpad);
@@ -558,6 +568,7 @@ void fill_status(KPADStatus& status)
     f32 stick_x = s_vpad_stick_x;
     f32 stick_y = s_vpad_stick_y;
     const ScriptEvent* pointer = nullptr;
+    bool spin = s_vpad_spin_hold;
     for (u32 i = 0; i < s_script_count; ++i) {
         ScriptEvent& event = s_script[i];
         const bool active = field >= event.at && field < event.until;
@@ -581,9 +592,20 @@ void fill_status(KPADStatus& status)
         else if (event.kind == SCRIPT_STICK) {
             stick_x = event.stick_x;
             stick_y = event.stick_y;
-        } else {
+        } else if (event.kind == SCRIPT_SPIN)
+            spin = true;
+        else {
             pointer = &event;
         }
+    }
+
+    if (field != s_spin_last_frame) {
+        if (spin && !s_spin_hold)
+            s_spin_frames_since_press = 0;
+        else if (s_spin_frames_since_press != ~0u)
+            ++s_spin_frames_since_press;
+        s_spin_hold = spin;
+        s_spin_last_frame = field;
     }
 
     status.hold = hold;
@@ -631,6 +653,10 @@ void WPADInit(void)
     s_initialized = true;
     s_connected = false;
     s_previous_hold = 0;
+    s_spin_hold = false;
+    s_vpad_spin_hold = false;
+    s_spin_last_frame = ~0u;
+    s_spin_frames_since_press = ~0u;
     s_vpad_hold = 0;
     s_vpad_stick_x = 0.0f;
     s_vpad_stick_y = 0.0f;
@@ -663,9 +689,20 @@ void KPADInit(void)
 void KPADReset(void)
 {
     s_previous_hold = 0;
+    s_spin_hold = false;
+    s_vpad_spin_hold = false;
+    s_spin_last_frame = ~0u;
+    s_spin_frames_since_press = ~0u;
     s_connect_reported = false;
     s_extension_reported = false;
 }
+
+#if defined(TARGET_WIIU)
+uint32_t sms_wiiu_spin_frames_since_press(void)
+{
+    return s_spin_frames_since_press;
+}
+#endif
 
 void KPADSetAccParam(s32, f32, f32) {}
 void KPADSetBtnRepeat(s32, f32, f32) {}
