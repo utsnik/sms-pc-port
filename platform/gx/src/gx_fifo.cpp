@@ -643,9 +643,9 @@ struct VtxLayout {
 static const uint8_t kCompSize[5] = {1, 1, 2, 2, 4};
 static const uint8_t kColorSize[6] = {2, 3, 4, 2, 3, 4};
 
-static void buildLayout(int vat, VtxLayout& L) {
-    uint32_t lo = g.cpVcdLo, hi = g.cpVcdHi;
-    uint32_t A = g.cpVatA[vat], B = g.cpVatB[vat], C = g.cpVatC[vat];
+static void buildLayoutFromCp(uint32_t lo, uint32_t hi, const uint32_t* vatA, const uint32_t* vatB,
+                              const uint32_t* vatC, int vat, VtxLayout& L) {
+    uint32_t A = vatA[vat], B = vatB[vat], C = vatC[vat];
     memset(&L, 0, sizeof(L));
     L.pnmtx.mode = lo & 1;
     for (int i = 0; i < 8; i++) L.texmtx[i].mode = (lo >> (1 + i)) & 1;
@@ -682,6 +682,10 @@ static void buildLayout(int vat, VtxLayout& L) {
         else s += idxSize(L.tex[t].mode);
     }
     L.size = s;
+}
+
+static void buildLayout(int vat, VtxLayout& L) {
+    buildLayoutFromCp(g.cpVcdLo, g.cpVcdHi, g.cpVatA, g.cpVatB, g.cpVatC, vat, L);
 }
 
 // buildLayout for the current registers, rebuilt only when they change
@@ -1838,7 +1842,14 @@ static bool s_zeroCopyActive;
 static uint32_t s_zeroCopyCapacity;
 static bool s_zeroCopyShortTail;
 static bool s_zeroCopyCheck;
-static uint8_t s_zeroCopyCheckHead[5];
+struct ZeroCopyCheckCp {
+    uint32_t vcdLo, vcdHi;
+    uint32_t vatA[8], vatB[8], vatC[8];
+    uint32_t known;
+};
+static ZeroCopyCheckCp s_zeroCopyCheckCp;
+static bool s_zeroCopyCheckPaused;
+static uint8_t s_zeroCopyCheckHead[9];
 static uint32_t s_zeroCopyCheckHeadLen;
 static uint32_t s_zeroCopyCheckRemaining;
 static uint32_t s_zeroCopyCheckErrors;
@@ -1868,26 +1879,179 @@ bool producerMode() { return s_producerMode; }
 static void pipeGrow(uint32_t need);
 
 static uint32_t zeroCopyCheckHeaderLength(uint8_t op) {
+    if (op == 0x08) return 6;
     if (op == 0x10) return 5;
+    if (op == 0x40) return 9;
+    if (op == 0xF0) return 8;
     if (op >= 0x80 && op < 0xC0) return 3;
     return 1;
 }
 
-static uint32_t zeroCopyCheckCommandLength(const uint8_t* p, uint32_t available) {
-    const uint8_t op = p[0];
-    if (op == 0x00 || op == 0x48 || op == 0x44) return 1;
-    if (op == 0x08) return 6;
-    if (op == 0x10) {
-        if (available < 5) return 5;
-        return 5 + ((be32(p + 1) >> 16) + 1) * 4;
+enum {
+    kZeroCopyCheckVcdLo = 0,
+    kZeroCopyCheckVcdHi = 1,
+    kZeroCopyCheckVatA = 2,
+    kZeroCopyCheckVatB = 10,
+    kZeroCopyCheckVatC = 18,
+    kZeroCopyCheckCpAll = (1u << 26) - 1,
+};
+
+static void zeroCopyCheckReset() {
+    s_zeroCopyCheckCp.vcdLo = gProducer.cpVcdLo;
+    s_zeroCopyCheckCp.vcdHi = gProducer.cpVcdHi;
+    memcpy(s_zeroCopyCheckCp.vatA, gProducer.cpVatA, sizeof s_zeroCopyCheckCp.vatA);
+    memcpy(s_zeroCopyCheckCp.vatB, gProducer.cpVatB, sizeof s_zeroCopyCheckCp.vatB);
+    memcpy(s_zeroCopyCheckCp.vatC, gProducer.cpVatC, sizeof s_zeroCopyCheckCp.vatC);
+    s_zeroCopyCheckCp.known = kZeroCopyCheckCpAll;
+    s_zeroCopyCheckPaused = false;
+    s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
+}
+
+static void zeroCopyCheckPause(const char* reason) {
+    if (!s_zeroCopyCheckPaused) {
+        if (s_zeroCopyCheckErrors++ == 0)
+            logmsg("zccheck: %s; checking paused until the next checker resync", reason);
+        s_zeroCopyCheckPaused = true;
+        s_zeroCopyCheckCp.known = 0;
     }
-    if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) return 5;
-    if (op == 0x40) return 9;
-    if (op == 0x61) return 5;
-    if (op == 0xF0) return 8;
-    if (op >= 0x80 && op < 0xC0)
-        return 3 + uint32_t(be16(p + 1)) * layoutFor(op & 7).size;
-    return 1;
+    s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = 0;
+}
+
+static void zeroCopyCheckCpWrite(uint8_t reg, uint32_t value) {
+    switch (reg & 0xF0) {
+    case CP_VCD_LO:
+        s_zeroCopyCheckCp.vcdLo = value;
+        s_zeroCopyCheckCp.known |= 1u << kZeroCopyCheckVcdLo;
+        break;
+    case CP_VCD_HI:
+        s_zeroCopyCheckCp.vcdHi = value;
+        s_zeroCopyCheckCp.known |= 1u << kZeroCopyCheckVcdHi;
+        break;
+    case CP_VAT_A:
+        s_zeroCopyCheckCp.vatA[reg & 7] = value;
+        s_zeroCopyCheckCp.known |= 1u << (kZeroCopyCheckVatA + (reg & 7));
+        break;
+    case CP_VAT_B:
+        s_zeroCopyCheckCp.vatB[reg & 7] = value;
+        s_zeroCopyCheckCp.known |= 1u << (kZeroCopyCheckVatB + (reg & 7));
+        break;
+    case CP_VAT_C:
+        s_zeroCopyCheckCp.vatC[reg & 7] = value;
+        s_zeroCopyCheckCp.known |= 1u << (kZeroCopyCheckVatC + (reg & 7));
+        break;
+    default:
+        break;
+    }
+}
+
+static bool zeroCopyCheckCommandLength(const uint8_t* p, uint32_t available, uint32_t* out) {
+    const uint8_t op = p[0];
+    if (op == 0x00 || op == 0x48 || op == 0x44) { *out = 1; return true; }
+    if (op == 0x08) { *out = 6; return true; }
+    if (op == 0x10) {
+        if (available < 5) { *out = 5; return true; }
+        *out = 5 + ((be32(p + 1) >> 16) + 1) * 4;
+        return true;
+    }
+    if (op == 0x20 || op == 0x28 || op == 0x30 || op == 0x38) { *out = 5; return true; }
+    if (op == 0x40) { *out = 9; return true; }
+    if (op == 0x61) { *out = 5; return true; }
+    if (op == 0xF0) { *out = 8; return true; }
+    if (op >= 0x80 && op < 0xC0) {
+        if (s_zeroCopyCheckCp.known != kZeroCopyCheckCpAll) return false;
+        VtxLayout L;
+        buildLayoutFromCp(s_zeroCopyCheckCp.vcdLo, s_zeroCopyCheckCp.vcdHi, s_zeroCopyCheckCp.vatA,
+                          s_zeroCopyCheckCp.vatB, s_zeroCopyCheckCp.vatC, op & 7, L);
+        const uint64_t len = 3u + uint64_t(be16(p + 1)) * L.size;
+        if (len > 0xFFFFFFFFu) return false;
+        *out = uint32_t(len);
+        return true;
+    }
+    *out = 1;
+    return true;
+}
+
+static bool zeroCopyCheckApplyCommand(const uint8_t* p, uint32_t len) {
+    if (p[0] == 0x08) {
+        zeroCopyCheckCpWrite(p[1], be32(p + 2));
+    } else if (p[0] == 0x40) {
+        zeroCopyCheckPause("display-list call may change CP state");
+        return false;
+    } else if (p[0] == 0xF0 && p[1] == kHostCallDlSize) {
+        zeroCopyCheckPause("host display-list call may change CP state");
+        return false;
+    }
+    (void)len;
+    return true;
+}
+
+static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t capacity);
+
+static void zeroCopyCheckResyncBytes(const uint8_t* bytes, uint32_t size, uint32_t capacity) {
+    uint32_t pos = 0;
+    while (pos < size) {
+        if (s_zeroCopyCheckRemaining) {
+            const uint32_t take = std::min(s_zeroCopyCheckRemaining, size - pos);
+            s_zeroCopyCheckRemaining -= take;
+            pos += take;
+            continue;
+        }
+        if (s_zeroCopyCheckHeadLen) {
+            const uint32_t header = zeroCopyCheckHeaderLength(s_zeroCopyCheckHead[0]);
+            if (header == 3) {
+                // A vertex command cannot be crossed without a known layout.
+                s_zeroCopyCheckHeadLen = 0;
+                return;
+            }
+            const uint32_t take = std::min(header - s_zeroCopyCheckHeadLen, size - pos);
+            memcpy(s_zeroCopyCheckHead + s_zeroCopyCheckHeadLen, bytes + pos, take);
+            s_zeroCopyCheckHeadLen += take;
+            pos += take;
+            if (s_zeroCopyCheckHeadLen < header) return;
+            uint32_t len = 0;
+            if (!zeroCopyCheckCommandLength(s_zeroCopyCheckHead, s_zeroCopyCheckHeadLen, &len) ||
+                !len || len < s_zeroCopyCheckHeadLen) {
+                s_zeroCopyCheckHeadLen = 0;
+                return;
+            }
+            if (len == s_zeroCopyCheckHeadLen && !zeroCopyCheckApplyCommand(s_zeroCopyCheckHead, len)) return;
+            s_zeroCopyCheckRemaining = len - s_zeroCopyCheckHeadLen;
+            s_zeroCopyCheckHeadLen = 0;
+            if (s_zeroCopyCheckPaused && s_zeroCopyCheckCp.known == kZeroCopyCheckCpAll)
+                s_zeroCopyCheckPaused = false;
+            if (s_zeroCopyCheckPaused) return;
+            continue;
+        }
+
+        const uint8_t op = bytes[pos];
+        if (op >= 0x80 && op < 0xC0) {
+            if (s_zeroCopyCheckCp.known != kZeroCopyCheckCpAll) return;
+            s_zeroCopyCheckPaused = false;
+            zeroCopyCheckBytes(bytes + pos, size - pos, capacity);
+            return;
+        }
+        const uint32_t header = zeroCopyCheckHeaderLength(op);
+        const uint32_t available = size - pos;
+        if (available < header) {
+            memcpy(s_zeroCopyCheckHead, bytes + pos, available);
+            s_zeroCopyCheckHeadLen = available;
+            return;
+        }
+        uint32_t len = 0;
+        if (!zeroCopyCheckCommandLength(bytes + pos, available, &len) || !len) return;
+        if (len > available) {
+            s_zeroCopyCheckRemaining = len - available;
+            return;
+        }
+        if (!zeroCopyCheckApplyCommand(bytes + pos, len)) return;
+        pos += len;
+        if (s_zeroCopyCheckPaused && s_zeroCopyCheckCp.known == kZeroCopyCheckCpAll)
+            s_zeroCopyCheckPaused = false;
+        if (!s_zeroCopyCheckPaused && s_zeroCopyCheckCp.known == kZeroCopyCheckCpAll) {
+            if (pos < size) zeroCopyCheckBytes(bytes + pos, size - pos, capacity);
+            return;
+        }
+    }
 }
 
 static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t capacity) {
@@ -1895,6 +2059,10 @@ static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t cap
     if (!bytes || size > capacity) {
         if (s_zeroCopyCheckErrors++ == 0)
             logmsg("zccheck: committed bytes exceed the active reservation (%u > %u)", size, capacity);
+        return;
+    }
+    if (s_zeroCopyCheckPaused) {
+        zeroCopyCheckResyncBytes(bytes, size, capacity);
         return;
     }
 
@@ -1914,14 +2082,16 @@ static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t cap
             s_zeroCopyCheckHeadLen += take;
             pos += take;
             if (s_zeroCopyCheckHeadLen < header) return;
-            const uint32_t len = zeroCopyCheckCommandLength(s_zeroCopyCheckHead, s_zeroCopyCheckHeadLen);
-            if (!len || len < s_zeroCopyCheckHeadLen) {
+            uint32_t len = 0;
+            if (!zeroCopyCheckCommandLength(s_zeroCopyCheckHead, s_zeroCopyCheckHeadLen, &len) ||
+                !len || len < s_zeroCopyCheckHeadLen) {
                 if (s_zeroCopyCheckErrors++ == 0)
                     logmsg("zccheck: invalid carried command boundary (len=%u head=%u)", len,
                            s_zeroCopyCheckHeadLen);
                 s_zeroCopyCheckHeadLen = 0;
                 continue;
             }
+            if (len == s_zeroCopyCheckHeadLen && !zeroCopyCheckApplyCommand(s_zeroCopyCheckHead, len)) return;
             s_zeroCopyCheckRemaining = len - s_zeroCopyCheckHeadLen;
             s_zeroCopyCheckHeadLen = 0;
             continue;
@@ -1935,7 +2105,11 @@ static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t cap
             s_zeroCopyCheckHeadLen = available;
             return;
         }
-        const uint32_t len = zeroCopyCheckCommandLength(bytes + pos, available);
+        uint32_t len = 0;
+        if (!zeroCopyCheckCommandLength(bytes + pos, available, &len)) {
+            zeroCopyCheckPause("vertex layout is not fully known");
+            return;
+        }
         if (!len) {
             if (s_zeroCopyCheckErrors++ == 0)
                 logmsg("zccheck: invalid committed command boundary at offset %u", pos);
@@ -1945,13 +2119,15 @@ static void zeroCopyCheckBytes(const uint8_t* bytes, uint32_t size, uint32_t cap
             s_zeroCopyCheckRemaining = len - available;
             return;
         }
+        if (!zeroCopyCheckApplyCommand(bytes + pos, len)) return;
         pos += len;
     }
 }
 
 void setProducerZeroCopyCheck(bool enabled) {
     s_zeroCopyCheck = enabled;
-    s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
+    if (enabled) zeroCopyCheckReset();
+    else s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
 }
 
 static bool producerOpenZeroCopy() {
@@ -1998,7 +2174,7 @@ static void producerCommitZeroCopy() {
 static void producerFlushPending();
 
 void producerFrameBoundary() {
-    if (s_producerMode) producerFlushPending();
+    if (s_producerMode && s_zeroCopyAppend) producerFlushPending();
 }
 
 static void producerFlushPending() {
@@ -2017,12 +2193,11 @@ static void producerFlushPending() {
     ::gx2prod::append(chunk.data(), bytes);
     s_producerFlush.swap(chunk);
     s_zeroCopyShortTail = false;
-    pipeFastUpdate();
 }
 
 void setProducerMode(bool enabled, bool zeroCopy) {
     SMS_PORT_HEAP_SCOPE();
-    if (s_producerMode)
+    if (s_producerMode && s_zeroCopyAppend)
         producerFlushPending();
     if (enabled) {
         // Any bytes already in the legacy pipe are consumed before the worker
@@ -2042,7 +2217,8 @@ void setProducerMode(bool enabled, bool zeroCopy) {
         s_producerFlush.clear();
         s_producerDrawSyncWrite = 0;
         s_zeroCopyShortTail = false;
-        s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
+        if (s_zeroCopyCheck) zeroCopyCheckReset();
+        else s_zeroCopyCheckHeadLen = s_zeroCopyCheckRemaining = s_zeroCopyCheckErrors = 0;
         s_pipeStorage = GXPC_PipeBuf;
         if (s_pipeCap < 2 * kProdChunk) pipeGrow(2 * kProdChunk);
         ::gx2prod::set_flush_hook(producerFlushPending);
@@ -2106,7 +2282,7 @@ static void producerDrawSyncService(void* opaque) {
 static uint8_t* s_redirectStart = nullptr;
 void setPipeRedirect(uint8_t* dest) {
 #ifdef __WIIU__
-    if (s_producerMode)
+    if (s_producerMode && s_zeroCopyAppend)
         producerFlushPending();
 #endif
     if (s_redirectStart && s_redirect > s_redirectStart) memoryWritten(s_redirectStart, size_t(s_redirect - s_redirectStart));
@@ -2150,7 +2326,7 @@ static void pipeRun() {
 
 void drainCommandStream() {
 #ifdef __WIIU__
-    if (s_producerMode) {
+    if (s_producerMode && s_zeroCopyAppend) {
         // Producer bytes belong to the worker, even when a caller reaches
         // this legacy drain path without needing a GPU wait (for example an
         // asynchronous peek). Publishing first prevents the game thread
@@ -2172,7 +2348,6 @@ void drainCommandStream() {
 }
 
 static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer = false) {
-    if (!n) return;
     if (s_redirect && !forceProducer) {
         memcpy(s_redirect, bytes, n);
         s_redirect += n;
@@ -2197,7 +2372,6 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer 
                 s_pipeLen += take;
                 source += take;
                 remaining -= take;
-                pipeFastUpdate();
                 if (remaining) producerCommitZeroCopy();
             }
             if (!remaining) return;
@@ -2208,7 +2382,6 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer 
         if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
         memcpy(s_pipeBuf + s_pipeLen, bytes, n);
         s_pipeLen += n;
-        pipeFastUpdate();
         if (s_pipeLen >= kProdChunk) producerFlushPending();
         return;
     }
@@ -2216,7 +2389,6 @@ static inline void pipePut(const uint8_t* bytes, uint32_t n, bool forceProducer 
     if (s_pipeLen + n > s_pipeCap) pipeGrow(s_pipeLen + n);
     memcpy(s_pipeBuf + s_pipeLen, bytes, n);
     s_pipeLen += n;
-    pipeFastUpdate();
     if (s_pipeLen >= s_pipeNeed) pipeRun();
 }
 
@@ -2238,7 +2410,6 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         if (s_pipeLen + sizeof cmd > s_pipeCap) pipeGrow(s_pipeLen + sizeof cmd);
         memcpy(s_pipeBuf + s_pipeLen, cmd, sizeof cmd);
         s_pipeLen += sizeof cmd;
-        pipeFastUpdate();
         if (s_pipeLen >= kProdChunk) producerFlushPending();
         return;
     }
