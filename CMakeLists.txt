@@ -33,6 +33,15 @@ if(PORT_GAME STREQUAL "smg")
     # from folding e.g. sprintf(d, "%s", s) into strcpy behind the shim.
     -fno-builtin-sprintf -fno-builtin-snprintf -fno-builtin-vsprintf
     -fno-builtin-vsnprintf)
+  # Galaxy returns before the Sunshine source setup below, but the shared THP
+  # decoder is built from the patched Dolphin SDK sources. Reuse that patch
+  # pipeline here without changing the PORT_GAME=sms configuration.
+  set(SMS_DECOMP ${CMAKE_CURRENT_SOURCE_DIR}/decomp)
+  set(SMS_DECOMP_INCLUDE_SUBDIRS include
+    libs/dolphin/include libs/THPPlayer/include
+    libs/PowerPC_EABI_Support/include libs/TRK_MINNOW_DOLPHIN/include
+    libs/OdemuExi2/include)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/patches.cmake)
   include(${CMAKE_CURRENT_SOURCE_DIR}/games/smg/cmake/sources.cmake)
   message(STATUS "PORT_GAME=smg: selected Galaxy source manifest")
   message(STATUS "SMG targets: smg_game and smg")

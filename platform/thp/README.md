@@ -43,6 +43,18 @@ The platform glob must not pick up `platform/thp/tests`: the test keeps its patc
 make -C platform/thp/tests run          # MOVIE=data/openingA.thp by default; DISC=..., WORK=... to override
 ```
 
+For the Galaxy prologue smoke test, limit the read-only walk to the first
+frames and audio records:
+
+```sh
+ARCH=-m64 DISC=/mnt/build2/wiiu-build/gamedata/smg/extracted/DATA/files \
+  MOVIE=MovieData/PrologueA.thp FRAMES=8 make -C platform/thp/tests run
+```
+
+The test calls `THPInit`, `THPVideoDecode`, and `THPAudioDecode` directly—the
+same decoder entry points used by Galaxy's `THPSimplePlayerWrapper`—and fails
+if the checked video is black or the decoded audio peak is silent.
+
 The test reads the movie from the extracted disc (read-only) and decodes every frame the way the player does, using a big-endian frame walk.
 It writes five frames as PNGs (Y/U/V untiled, BT.601 to RGB) and all audio (track 0) as a WAV.
 It fails if any frame fails to decode, or if the audio sample count differs from the header.

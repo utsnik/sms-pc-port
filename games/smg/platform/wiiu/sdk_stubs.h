@@ -52,9 +52,6 @@
   X(NWC24SetMsgMBDelay) \
   X(NWC24SetMsgLedPattern) \
   X(NWC24SetMsgAltName) \
-  X(THPInit) \
-  X(THPVideoDecode) \
-  X(THPAudioDecode) \
   X(VFInitEx) \
   X(NWC24InitMsgObj) \
   X(NWC24GetMyUserId) \

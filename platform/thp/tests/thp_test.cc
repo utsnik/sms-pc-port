@@ -155,14 +155,26 @@ int main(int argc, char** argv)
 	}
 	printf("%s: %ux%u, %u frames at %.3f fps; audio %u ch %u Hz, %u samples, %u tracks\n", mov.c_str(), w, h,
 	       frames, fps, channels, freq, samples, tracks);
+	u32 frame_limit = frames;
+	if (getenv("FRAMES")) {
+		frame_limit = (u32)strtoul(getenv("FRAMES"), NULL, 10);
+		if (frame_limit == 0 || frame_limit > frames) {
+			fprintf(stderr, "FRAMES must be between 1 and %u\n", frames);
+			return 1;
+		}
+	}
 
-	THPInit();
+	if (!THPInit()) {
+		fprintf(stderr, "THPInit failed\n");
+		return 1;
+	}
 	std::vector<u8> ty(w * h), tu(w * h / 4), tv(w * h / 4), work(0x10000);
 	std::vector<u8> rgb(w * h * 3);
 	std::vector<s16> pcm, abuf(0x10000);
 	u32 dumps[] = { 1, frames / 4, frames / 2, frames * 3 / 4, frames - 1 };
 	u32 pos = data, size = first, decoded = 0;
-	for (u32 i = 0; i < frames && pos + size <= d.size(); i++) {
+	bool video_non_black = false;
+	for (u32 i = 0; i < frame_limit && pos + size <= d.size(); i++) {
 		std::vector<u8> fb(d.begin() + pos, d.begin() + pos + size); // like the read buffer
 		u32 next = be32(&fb[0]);
 		u8* p    = &fb[8 + ncomp * 4];
@@ -176,6 +188,12 @@ int main(int argc, char** argv)
 					continue;
 				}
 				decoded++;
+				for (u32 y = 0; y < h; y++)
+					for (u32 x = 0; x < w; x++) {
+						u8 yv = i8_at(ty.data(), w, x, y);
+						if (yv > 24)
+							video_non_black = true;
+					}
 				bool dump = false;
 				for (u32 k : dumps)
 					dump |= k == i;
@@ -225,11 +243,21 @@ int main(int argc, char** argv)
 		rms += (double)s * s;
 	}
 	rms = pcm.empty() ? 0 : sqrt(rms / pcm.size());
-	printf("video: %u/%u frames decoded; audio: %u samples (header %u) = %.2f s vs video %.2f s, peak %.0f rms %.0f -> %s\n",
-	       decoded, frames, nsamp, samples, freq ? (double)nsamp / freq : 0, frames / fps, peak, rms, wav.c_str());
-	if (decoded != frames)
+	bool audio_non_silent = peak > 8;
+	printf("video: %u/%u frames decoded; audio: %u samples (header %u) = %.2f s vs video %.2f s, peak %.0f rms %.0f; non-black=%s non-silent=%s -> %s\n",
+	       decoded, frame_limit, nsamp, samples, freq ? (double)nsamp / freq : 0, decoded / fps, peak, rms,
+	       video_non_black ? "yes" : "no", audio_non_silent ? "yes" : "no", wav.c_str());
+	if (decoded != frame_limit)
 		fails++;
-	if (samples && nsamp != samples) {
+	if (!video_non_black) {
+		fprintf(stderr, "decoded video is black across the checked frames\n");
+		fails++;
+	}
+	if (!audio_non_silent) {
+		fprintf(stderr, "decoded audio is silent across the checked frames\n");
+		fails++;
+	}
+	if (frame_limit == frames && samples && nsamp != samples) {
 		fprintf(stderr, "audio length %u != header %u\n", nsamp, samples);
 		fails++;
 	}

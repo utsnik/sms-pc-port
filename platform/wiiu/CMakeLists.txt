@@ -180,6 +180,16 @@ if(PORT_GAME STREQUAL "smg")
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
   target_compile_options(smg_game PRIVATE ${SMG_GAME_FLAGS}
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
+  # Galaxy's THP player calls the same decoder entry points as Sunshine. Keep
+  # the decoder sources in the shared platform/thp owner; only these C files
+  # also need the Dolphin port compatibility helpers used by the patched
+  # decoder, while the Galaxy game sources keep their own ABI boundary.
+  set_source_files_properties(
+    ${SMS_PATCH_ROOT}/libs/dolphin/src/thp/THPDec.c
+    ${SMS_PATCH_ROOT}/libs/dolphin/src/thp/THPAudio.c
+    PROPERTIES COMPILE_OPTIONS
+    "-include;${CMAKE_CURRENT_SOURCE_DIR}/../../src/port_compat.h")
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../../platform/thp/thp.cmake)
 
   add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES}
     $<TARGET_OBJECTS:smg_wiiu_shared>
