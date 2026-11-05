@@ -5583,11 +5583,15 @@ static bool s_presentScaleLogged[2];
 static void copyGameToScanBuffer(GX2ScanTarget target) {
     GX2ColorBuffer* colour = renderColour();
     if (!colour) return;
-    const uint32_t imageHeight = (colour->surface.height * 456u + 479u) / 480u;
+    // Tiled surfaces need a height in whole 8-line micro tiles, and the copy
+    // reads the colour buffer through its precomputed registers: a bare
+    // height edit (684 lines, stale regs) made the TV picture jump/smear.
+    const uint32_t imageHeight = ((colour->surface.height * 456u) / 480u) & ~7u;
     const uint32_t slot = target == GX2_SCAN_TARGET_DRC ? 1u : 0u;
     if (imageHeight && imageHeight < colour->surface.height) {
         GX2ColorBuffer source = *colour;
         source.surface.height = imageHeight;
+        GX2InitColorBufferRegs(&source);
         if (!s_presentScaleLogged[slot]) {
             s_presentScaleLogged[slot] = true;
             WHBLogPrintf("SMG Wii U: [present-scale] %s source=%ux%u -> scan height=%u",
