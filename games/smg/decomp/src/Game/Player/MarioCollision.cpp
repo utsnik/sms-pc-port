@@ -954,12 +954,18 @@ const TVec3f& Mario::getWallNorm() const {
     return mFrontVec;
 }
 
+// The original returned a reference to a temporary zero vector (a harmless
+// dangling stack read under CodeWarrior). GCC turns a returned address of a
+// local into null, so checkGround's front-wall test (mMovementStates._8 with no
+// back wall, _19) read address 0: DSI in Mario::checkGround.
+static const TVec3f sZeroWallNorm(0.0f, 0.0f, 0.0f);
+
 const TVec3f& Mario::getSideWallNorm() const {
     if (mMovementStates._1A) {
         return *mSideWallTriangle->getNormal(0);
     }
 
-    return TVec3f(gZeroVec);
+    return sZeroWallNorm;
 }
 
 const TVec3f& Mario::getFrontWallNorm() const {
@@ -967,7 +973,7 @@ const TVec3f& Mario::getFrontWallNorm() const {
         return *mFrontWallTriangle->getNormal(0);
     }
 
-    return TVec3f(gZeroVec);
+    return sZeroWallNorm;
 }
 
 const TVec3f& Mario::getBackWallNorm() const {
@@ -975,7 +981,7 @@ const TVec3f& Mario::getBackWallNorm() const {
         return *mBackWallTriangle->getNormal(0);
     }
 
-    return TVec3f(gZeroVec);
+    return sZeroWallNorm;
 }
 
 const TVec3f& Mario::getWallPos() const {

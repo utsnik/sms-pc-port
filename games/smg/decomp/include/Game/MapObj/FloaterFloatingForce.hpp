@@ -18,7 +18,9 @@ public:
     }
 
     virtual const TVec3f& getCurrentVelocity() const {
-        return TVec3f(0.0f, 0.0f, 0.0f);
+        // Not a reference to a temporary: GCC returns null for that.
+        static const TVec3f sZeroVelocity(0.0f, 0.0f, 0.0f);
+        return sZeroVelocity;
     }
 
     /* 0x18 */ const char* _18;

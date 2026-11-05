@@ -162,7 +162,8 @@ namespace JGeometry {
             y = rA.y - rB.y;
         }
 
-        inline TVec2& subInline(const TVec2< T >& other) const {
+        // By value: the original returned a reference to the local (GCC: null).
+        inline TVec2 subInline(const TVec2< T >& other) const {
             TVec2 ret = *this;
             ret.sub(other);
             return ret;
