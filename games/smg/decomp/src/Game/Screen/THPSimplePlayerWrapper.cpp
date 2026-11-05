@@ -384,6 +384,15 @@ bool THPSimplePlayerWrapper::videoDecode(u8* pFile) {
         return false;
     }
 
+    // The decoder alternates two fixed Y/U/V sets.  Publish each decoded
+    // frame before GX samples those same addresses again; on Wii U this also
+    // stamps the ranges used by the GX2 texture hash/cache invalidation path.
+    const u32 ysize = OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize);
+    const u32 uvsize = OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize / 4);
+    DCFlushRange(mTextureSet[_310].ytexture, ysize);
+    DCFlushRange(mTextureSet[_310].utexture, uvsize);
+    DCFlushRange(mTextureSet[_310].vtexture, uvsize);
+
     mTextureSet[_310].frameNumber = mReadBuffer[mNextDecodeIndex].frameNumber;
     return true;
 }

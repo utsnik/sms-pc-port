@@ -1595,7 +1595,11 @@ void GXInitTlutRegion(GXTlutRegion* region, u32 addr, GXTlutSize size) {
 void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
 void GXInvalidateTexAll(void) {
 #ifdef __WIIU__
-    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+    if (producerMode()) {
+        ::gx2prod::wait(::gx2prod::kWaitFlush);
+        textureInvalidateAll();
+        return;
+    }
 #endif
     flushBatch();
     textureInvalidateAll();
