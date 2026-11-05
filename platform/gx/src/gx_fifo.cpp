@@ -2478,6 +2478,7 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         break;
     case kHostTlutPtr: s_tlutPtr = ptr; break;
     case kHostTlutOffset: s_tlutOffset = value; break;
+    case kHostTexInvalidate: textureInvalidateAll(); break;
     case kHostTlutLoad:
         onStateChange();
         if (s_tlutPtr && s_tlutOffset + value <= sizeof g.tlutMem) memcpy(g.tlutMem + s_tlutOffset, s_tlutPtr, value);

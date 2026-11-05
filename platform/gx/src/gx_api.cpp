@@ -1603,12 +1603,13 @@ void GXInvalidateTexAll(void) {
 // A CPU-side decoder (THP) rewrote texture memory in place. Producer mode
 // keeps GXInvalidateTexAll cheap (the game calls it every frame and a
 // generation bump defeats the fast-draw replay), so the decoder asks for the
-// full invalidation here, once per decoded frame.
+// full invalidation here, once per decoded frame. It travels in the command
+// stream so the worker applies it in order: waiting for a flush here stalled
+// the main thread for a worker frame on every movie frame (prologue ~23 fps).
 void GXPC_InvalidateTexturesAfterCpuWrite(void) {
 #ifdef __WIIU__
     if (producerMode()) {
-        ::gx2prod::wait(::gx2prod::kWaitFlush);
-        textureInvalidateAll();
+        producerHostState(kHostTexInvalidate, 0, 0);
         return;
     }
 #endif
