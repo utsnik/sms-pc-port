@@ -257,14 +257,30 @@ u32 OSGetConsoleSimulatedMemSize(void) { return port_mem1_size; }
 
 void* OSPhysicalToCached(u32 paddr)
 {
+#if defined(PORT_GAME_SMG)
+	// Galaxy keeps game data in a MEM1 arena too; OSCachedToPhysical gives
+	// those (and any other) pointers outside the MEM2 arena as themselves.
+	if (paddr >= sms_wiiu_mem2_size && paddr < 0x40000000u)
+		return reinterpret_cast<void*>(uintptr_t(paddr));
+#endif
 	return paddr < sms_wiiu_mem2_size ? sms_wiiu_mem2_base + paddr : nullptr;
 }
 void* OSPhysicalToUncached(u32 paddr) { return OSPhysicalToCached(paddr); }
 u32 OSCachedToPhysical(void* p)
 {
-	if (!p || p < sms_wiiu_mem2_base ||
-	    static_cast<uint8_t*>(p) >= sms_wiiu_mem2_base + sms_wiiu_mem2_size)
+	if (!p) return 0;
+	if (p < sms_wiiu_mem2_base ||
+	    static_cast<uint8_t*>(p) >= sms_wiiu_mem2_base + sms_wiiu_mem2_size) {
+#if defined(PORT_GAME_SMG)
+		// MEM1-arena data (e.g. Mario's model in a galaxy) went to 0, so GD-built
+		// vertex-array bases (J3D's VcdVat lists set TEX0 that way) decoded as
+		// null and every Mario texcoord was (0,0). The GX decoder's physToPtr
+		// maps values >= the MEM2 arena size back unchanged, so pass them through.
+		const uintptr_t a = reinterpret_cast<uintptr_t>(p);
+		if (a >= sms_wiiu_mem2_size && a < 0x40000000u) return static_cast<u32>(a);
+#endif
 		return 0;
+	}
 	return static_cast<u32>(static_cast<uint8_t*>(p) - sms_wiiu_mem2_base);
 }
 u32 OSUncachedToPhysical(void* p) { return OSCachedToPhysical(p); }
