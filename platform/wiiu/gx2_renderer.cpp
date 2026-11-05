@@ -6402,7 +6402,11 @@ void rendererInit(float) {
     // d49 switches are read once here so shader generation, depth setup, and
     // peek scheduling cannot observe a changing SD card during a run.
     s_earlyZMarker = sdDefaultOnMarker("earlyz");
-    s_hizMarker = sdDefaultOnMarker("hiz");
+    // Galaxy's silhouette is a reverse-depth (GEQUAL) destination-alpha pass.
+    // Keep the real depth buffer authoritative for it: the optional HiZ
+    // metadata path is not covered by WUT's public clear flags and can leave
+    // that pass accepting pixels which the depth surface rejects.
+    s_hizMarker = sdMarkerPresent("hiz");
     s_peek2Marker = sdDefaultOnMarker("peek2");
     s_peekColFrameMarker = sdDefaultOnMarker("peekcolframe");
     s_peekAsyncMarker = sdDefaultOnMarker("peekasync");
