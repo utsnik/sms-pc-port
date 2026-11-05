@@ -4,7 +4,7 @@ Stage 2 Task 9. This compares the protocol Super Mario Galaxy's JAudio2 expects 
 
 Galaxy sources: `games/smg/decomp/src/JSystem/JAudio2/` (`JASDSPInterface.cpp`, `JASAudioThread.cpp`, `JASDSPChannel.cpp`, `dspproc.cpp`, `dsptask.cpp`, plus `osdsp_task.cpp`, `JASAiCtrl.cpp`, `JASAramStream.cpp`). These five files are byte-identical to GalaxyQuest `wiiu-stage2`'s copies (`cmp`, 2026-10-22).
 
-Earlier research for this task: `.superpowers/sdd/2026-10-22-smg-wiiu-stage2-boot-cemu/research-audio-protocol.md` and `research-ast-stream.md`. Where this page disagrees with them, this page is right; the corrections are listed at the end.
+Earlier research informed this page. Where this page disagrees with that research, this page is right; the corrections are listed at the end.
 
 Checks:
 
