@@ -554,10 +554,7 @@ void MarioActor::calcViewFootPrint() {
 
 void MarioActor::drawSilhouette() const {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
-    /* Off by default on Wii U: the silhouette is drawn over Mario even where he
-     * is visible (white face, blue sleeves on hardware). SD marker mariosil
-     * turns it back on until that is fixed. */
-    static const int noMarioSilhouette = !sms_wiiu_sd_marker("mariosil");
+    static const int noMarioSilhouette = sms_wiiu_sd_marker("nomariosil");
     if (noMarioSilhouette) {
         return;
     }
