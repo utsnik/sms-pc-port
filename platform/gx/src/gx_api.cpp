@@ -1595,6 +1595,17 @@ void GXInitTlutRegion(GXTlutRegion* region, u32 addr, GXTlutSize size) {
 void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
 void GXInvalidateTexAll(void) {
 #ifdef __WIIU__
+    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+#endif
+    flushBatch();
+    textureInvalidateAll();
+}
+// A CPU-side decoder (THP) rewrote texture memory in place. Producer mode
+// keeps GXInvalidateTexAll cheap (the game calls it every frame and a
+// generation bump defeats the fast-draw replay), so the decoder asks for the
+// full invalidation here, once per decoded frame.
+void GXPC_InvalidateTexturesAfterCpuWrite(void) {
+#ifdef __WIIU__
     if (producerMode()) {
         ::gx2prod::wait(::gx2prod::kWaitFlush);
         textureInvalidateAll();

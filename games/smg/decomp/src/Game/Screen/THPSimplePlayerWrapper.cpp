@@ -15,6 +15,8 @@ static u16 VolumeTable[] = {0,     2,     8,     18,    32,    50,    73,    99,
                             18723, 19115, 19511, 19911, 20316, 20724, 21136, 21553, 21974, 22398, 22827, 23260, 23696, 24137, 24582, 25031,
                             25484, 25941, 26402, 26868, 27337, 27810, 28288, 28769, 29255, 29744, 30238, 30736, 31238, 31744, 32254, 32768};
 
+extern "C" void GXPC_InvalidateTexturesAfterCpuWrite(void);
+
 static s32 WorkBuffer[16] __attribute__((aligned(32)));
 
 // One stereo frame of s16 samples.  The original clears with sizeof(s16*),
@@ -392,6 +394,7 @@ bool THPSimplePlayerWrapper::videoDecode(u8* pFile) {
     DCFlushRange(mTextureSet[_310].ytexture, ysize);
     DCFlushRange(mTextureSet[_310].utexture, uvsize);
     DCFlushRange(mTextureSet[_310].vtexture, uvsize);
+    GXPC_InvalidateTexturesAfterCpuWrite();
 
     mTextureSet[_310].frameNumber = mReadBuffer[mNextDecodeIndex].frameNumber;
     return true;
