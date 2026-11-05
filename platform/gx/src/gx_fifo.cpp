@@ -1865,9 +1865,12 @@ uint32_t GXPC_PipeLen = 0, GXPC_PipeFast = 0;
 namespace gx {
 static void pipeFastUpdate() {
 #ifdef __WIIU__
+    // With zero-copy append and no open reservation, the fast writers must
+    // stop so the next write reaches pipePut, which opens a new reservation;
+    // filling the legacy buffer instead would silently turn zcappend off.
     GXPC_PipeFast = s_redirect ? 0 : s_zeroCopyActive ? (s_pipeLen <= s_zeroCopyCapacity ? s_zeroCopyCapacity : 0)
-                                                       : s_producerMode ? std::min(s_pipeCap, kProdChunk)
-                                                                         : std::min(s_pipeCap, s_pipeNeed - 1);
+                                   : s_producerMode ? (s_zeroCopyAppend ? 0 : std::min(s_pipeCap, kProdChunk))
+                                                    : std::min(s_pipeCap, s_pipeNeed - 1);
 #else
     GXPC_PipeFast = s_redirect ? 0 : std::min(s_pipeCap, s_pipeNeed - 1);
 #endif
@@ -2543,14 +2546,40 @@ void GXPC_SetDefaultArrayBigEndian(int bigEndian) {
     g_arrayGen++;
 }
 
-void GXPC_Write8(uint8_t v) { pipePut(&v, 1); }
+// The out-of-line writers (every BP/CP/XF register load in gx_api.cpp) take
+// the same fast path as the inline ones in gx_pc.h before falling back to
+// pipePut, whose zero-copy loop and variable-length memcpy dominated
+// Galaxy's main-thread leaf profile.
+void GXPC_Write8(uint8_t v) {
+    if (s_pipeLen + 1 <= GXPC_PipeFast) { s_pipeBuf[s_pipeLen++] = v; return; }
+    if (s_redirect) { *s_redirect++ = v; return; }
+    pipePut(&v, 1);
+}
 void GXPC_Write16(uint16_t v) {
-    uint8_t b[2] = {uint8_t(v >> 8), uint8_t(v)};
-    pipePut(b, 2);
+    uint8_t* p;
+    if (s_pipeLen + 2 <= GXPC_PipeFast) { p = s_pipeBuf + s_pipeLen; s_pipeLen += 2; }
+    else if (s_redirect) { p = s_redirect; s_redirect += 2; }
+    else {
+        uint8_t b[2] = {uint8_t(v >> 8), uint8_t(v)};
+        pipePut(b, 2);
+        return;
+    }
+    p[0] = uint8_t(v >> 8);
+    p[1] = uint8_t(v);
 }
 void GXPC_Write32(uint32_t v) {
-    uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
-    pipePut(b, 4);
+    uint8_t* p;
+    if (s_pipeLen + 4 <= GXPC_PipeFast) { p = s_pipeBuf + s_pipeLen; s_pipeLen += 4; }
+    else if (s_redirect) { p = s_redirect; s_redirect += 4; }
+    else {
+        uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)};
+        pipePut(b, 4);
+        return;
+    }
+    p[0] = uint8_t(v >> 24);
+    p[1] = uint8_t(v >> 16);
+    p[2] = uint8_t(v >> 8);
+    p[3] = uint8_t(v);
 }
 void GXPC_WriteF32(float f) {
     uint32_t v;
